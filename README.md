@@ -6,7 +6,13 @@ markdown knowledge base concurrently without git push/pull.
 
 This repository is the proof of concept described in [`docs/spec.md`](docs/spec.md)
 (issue #2) together with the comparative test suite from [`docs/test-suite.md`](docs/test-suite.md)
-(issue #1). Measured results: [`docs/results.md`](docs/results.md).
+(issue #1).
+
+- **Install:** [`docs/INSTALL.md`](docs/INSTALL.md) · **Use:** [`docs/USAGE.md`](docs/USAGE.md)
+- **Benchmark results:** [`bench/RESULTS.md`](bench/RESULTS.md) (raw data in `bench/results/`)
+- **Skills for AI agents:** [`skills/textdb-install`](skills/textdb-install/SKILL.md) and
+  [`skills/textdb-use`](skills/textdb-use/SKILL.md) — copy a folder into `.claude/skills/` (project) or
+  `~/.claude/skills/` (user) to make it available as `/textdb-install` and `/textdb-use`.
 
 ## Layout
 
@@ -19,6 +25,7 @@ This repository is the proof of concept described in [`docs/spec.md`](docs/spec.
 | `bench/harness` | The test suite runner and six backends (`fs`, `fs-git`, `sql-text-sqlite`, `sql-text-pg`, `textdb-sqlite`, `textdb-pg`) |
 | `bench/harness/tests/*.toml` | The test matrix as data |
 | `docs/decisions` | ADRs recorded during the POC |
+| `skills/` | Agent skills: installing and using textdb |
 
 ## Build and test
 
