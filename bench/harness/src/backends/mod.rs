@@ -71,16 +71,20 @@ pub fn col_bytes(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Vec<u8>> {
 }
 
 /// Directory size in bytes (like `du -sb`).
+/// Iterative: NS-02 nests folders 1000 deep, and one frame per level overflows the stack
+/// — sooner on Windows, whose 1 MiB main stack is a fraction of Linux's 8 MiB.
 pub fn du(path: &Path) -> u64 {
     let mut total = 0;
-    if let Ok(rd) = std::fs::read_dir(path) {
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for e in rd.flatten() {
             let md = match e.metadata() {
                 Ok(m) => m,
                 Err(_) => continue,
             };
             if md.is_dir() {
-                total += du(&e.path());
+                pending.push(e.path());
             } else {
                 total += md.len();
             }

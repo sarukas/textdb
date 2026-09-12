@@ -6,3 +6,6 @@
 *.db-wal
 *.db-shm
 /bench/out.log
+/bench/run-xs.log
+/bench/out-*
+/bench/data-*

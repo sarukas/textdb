@@ -39,8 +39,15 @@ fn run(label: &str, extractor: bool, fts: bool) {
         n, (w1 - w0) / 1024, (w1 - w0) / 1024 / n, dbsz / 1024, wal / 1024, chunks, chunk_bytes / 1024, nodes, commits);
 }
 
+/// Measures write amplification through `/proc/self/io`, which only Linux provides. On
+/// other platforms there is no equivalent counter, so the test reports that it did not run
+/// rather than failing on a missing path.
 #[test]
 fn write_amplification_breakdown() {
+    if !std::path::Path::new("/proc/self/io").exists() {
+        eprintln!("skipped: /proc/self/io is Linux-only, no write-amplification counter here");
+        return;
+    }
     run("full        ", true, true);
     run("no extractor", false, true);
     run("no fts      ", true, false);

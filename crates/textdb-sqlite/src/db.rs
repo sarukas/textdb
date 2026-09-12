@@ -268,17 +268,37 @@ impl<'c> TextDb<'c> {
             }
             return Ok(n.id);
         }
-        let parent = self.ensure_folder(parent_of(&path))?;
+        // Walk up to the deepest folder that already exists, collecting what is missing,
+        // then create those top down. Recursing per component instead costs one stack
+        // frame per path segment, which overflows on a deeply nested path.
+        let mut missing: Vec<String> = Vec::new();
+        let mut cur = path.clone();
+        let mut parent = loop {
+            if cur == "/" {
+                break self.ensure_root()?;
+            }
+            match self.node_by_path(&cur)? {
+                Some(n) if n.kind != 0 => return Err(TextdbError::InvalidEdit(format!("{} is a file", cur))),
+                Some(n) => break n.id,
+                None => {
+                    let up = parent_of(&cur).to_string();
+                    missing.push(std::mem::replace(&mut cur, up));
+                }
+            }
+        };
         let now = Self::now();
-        self.conn
-            .prepare_cached(&format!(
-                "INSERT INTO {}node(parent_id, name, kind, path, created_at, updated_at) VALUES (?1, ?2, 0, ?3, ?4, ?4)",
-                self.p
-            ))
-            .map_err(sql_err)?
-            .execute(params![parent, name_of(&path), path, now])
-            .map_err(sql_err)?;
-        Ok(self.conn.last_insert_rowid())
+        for p in missing.iter().rev() {
+            self.conn
+                .prepare_cached(&format!(
+                    "INSERT INTO {}node(parent_id, name, kind, path, created_at, updated_at) VALUES (?1, ?2, 0, ?3, ?4, ?4)",
+                    self.p
+                ))
+                .map_err(sql_err)?
+                .execute(params![parent, name_of(p), p, now])
+                .map_err(sql_err)?;
+            parent = self.conn.last_insert_rowid();
+        }
+        Ok(parent)
     }
 
     /// Create a file (parents created), commit version 1.

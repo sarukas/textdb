@@ -1,0 +1,28 @@
+{
+  "backends": [
+    "fs",
+    "sql-text-sqlite",
+    "textdb-sqlite"
+  ],
+  "cpu": "unavailable",
+  "cpus": 8,
+  "disk": "",
+  "filesystem": "unavailable",
+  "git": "git version 2.50.0.windows.1",
+  "harness_commit": "a7498023a7efee4a3686a579a5ce2093f67d8f29",
+  "host": "Sarunas-Ch",
+  "kernel": "3.6.3-086201ea.x86_64",
+  "mode": "fast",
+  "note": "Container environment: page-cache drop may be unavailable (cache column then says warm); dolt harness N/A (no binary reachable).",
+  "os": "unavailable",
+  "postgres": "not used",
+  "profile": "poc",
+  "ram_gib": 0.0,
+  "rg": "",
+  "rustc": "rustc 1.93.0 (254b59607 2026-01-19)",
+  "scale": 0.1,
+  "seed": 20260912,
+  "size": "xs",
+  "sqlite": "3.53.2",
+  "started": "2026-09-12T18:34:03Z"
+}

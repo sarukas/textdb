@@ -166,7 +166,18 @@ impl Params<'_> {
     fn override_for(&self, k: &str) -> Option<&toml::Value> {
         self.sized.and_then(|t| t.get(k))
     }
+    /// Scale a value the test actually declared.
+    ///
+    /// Only ever applied to a value read from the TOML, never to a caller's default: a
+    /// default is the suite saying "this knob is not in play here", and a floor applied to
+    /// it would invent behaviour the test never asked for. `duration_s` is the sharp
+    /// example — absent means "run `ops_per_writer` operations, no deadline", and flooring
+    /// that 0.0 up to 2.0 silently turned every ops-bounded concurrency test into a
+    /// two-second timed one. An explicit zero means off and stays off.
     fn apply_scale(&self, k: &str, v: f64) -> f64 {
+        if v <= 0.0 {
+            return v;
+        }
         match SCALED.iter().find(|(name, _)| *name == k) {
             // The floor keeps a shrunk test meaningful; growth is deliberately uncapped.
             Some((_, floor)) => (v * self.scale).round().max(*floor as f64),
@@ -177,8 +188,10 @@ impl Params<'_> {
         if let Some(v) = self.override_for(k).and_then(|v| v.as_integer()) {
             return v as u64;
         }
-        let raw = self.get(k).and_then(|v| v.as_integer()).map(|v| v as u64).unwrap_or(default);
-        self.apply_scale(k, raw as f64) as u64
+        match self.get(k).and_then(|v| v.as_integer()) {
+            Some(raw) => self.apply_scale(k, raw as f64) as u64,
+            None => default,
+        }
     }
     pub fn usize(&self, k: &str, default: usize) -> usize {
         self.u64(k, default as u64) as usize
@@ -187,11 +200,10 @@ impl Params<'_> {
         if let Some(v) = self.override_for(k).and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64))) {
             return v;
         }
-        let raw = self
-            .get(k)
-            .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
-            .unwrap_or(default);
-        self.apply_scale(k, raw)
+        match self.get(k).and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64))) {
+            Some(raw) => self.apply_scale(k, raw),
+            None => default,
+        }
     }
     pub fn str(&self, k: &str, default: &str) -> String {
         self.override_for(k)

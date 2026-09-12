@@ -33,6 +33,15 @@ variant = "rename_folder"
 descendants = [1000, 10000, 50000]
 [test.poc]
 descendants = [1000, 5000]
+# `descendants` is a list of measurement points, not a volume dial, so the scale factor
+# leaves it alone. These select fewer points instead — without them a folder rename of
+# 6000 files dominates a small run.
+[test.xs]
+descendants = [200]
+[test.s]
+descendants = [1000]
+[test.l]
+descendants = [1000, 5000, 20000]
 
 [[test]]
 id = "NS-04"
