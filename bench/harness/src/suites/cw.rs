@@ -385,7 +385,15 @@ pub fn concurrent_writes(ctx: &Ctx) -> anyhow::Result<()> {
             ctx.cell.metric(&case, "rename_failures", rename_failures.load(Ordering::Relaxed) as f64);
         }
         if lost > 0 {
-            ctx.cell.fail(&case, "no_lost_updates", &format!("{} lost updates", lost));
+            // A backend that declares no write guard is expected to lose updates; that
+            // count is the measurement, not a defect, so it must not void its timings.
+            let unguarded = backend.capabilities().concurrency_guard.starts_with("none");
+            let detail = format!("{} lost updates", lost);
+            if unguarded {
+                ctx.cell.expected(&case, "no_lost_updates", &detail);
+            } else {
+                ctx.cell.fail(&case, "no_lost_updates", &detail);
+            }
         } else {
             ctx.cell.metric(&case, "no_lost_updates", 1.0);
         }

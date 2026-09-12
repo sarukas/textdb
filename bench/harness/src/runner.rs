@@ -27,6 +27,29 @@ pub struct TestDef {
     /// Backends this test does not apply to (recorded as N/A with `note`).
     #[serde(default)]
     pub na: Vec<String>,
+    /// Explicit per-size overrides, for the tests where scaling a volume parameter is the
+    /// wrong move — XL picks which document sizes to use rather than shrinking them.
+    #[serde(default)]
+    pub xs: toml::Table,
+    #[serde(default)]
+    pub s: toml::Table,
+    #[serde(default)]
+    pub m: toml::Table,
+    #[serde(default)]
+    pub l: toml::Table,
+}
+
+impl TestDef {
+    /// The `[test.<size>]` table for this size, or None when the test declares none.
+    pub fn sized(&self, size: Size) -> Option<&toml::Table> {
+        let t = match size {
+            Size::Xs => &self.xs,
+            Size::S => &self.s,
+            Size::M => &self.m,
+            Size::L => &self.l,
+        };
+        (!t.is_empty()).then_some(t)
+    }
 }
 
 fn one() -> u32 {
@@ -54,41 +77,147 @@ pub fn load_tests(dir: &Path) -> anyhow::Result<Vec<TestDef>> {
     Ok(out)
 }
 
-/// Parameter access with profile fallback.
+/// How much work a run does, independent of which parameter set it reads.
+///
+/// The matrix has always had two parameter sets — `spec` (the scale the specification
+/// asks for) and `poc` (what fits in a proof-of-concept run) — chosen per test in TOML.
+/// Size is the orthogonal knob: it scales *volume* without touching any axis a test is
+/// actually about. A full-copy-history baseline stores every version in full, so a test
+/// like ME-05 (1 MiB × 3000 edits) writes gigabytes; `--size s` makes that tractable
+/// while still comparing the same backends on the same shape of workload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Size {
+    Xs,
+    S,
+    M,
+    L,
+}
+
+impl Size {
+    pub fn parse(s: &str) -> Option<Size> {
+        match s {
+            "xs" => Some(Size::Xs),
+            "s" => Some(Size::S),
+            "m" => Some(Size::M),
+            "l" => Some(Size::L),
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Size::Xs => "xs",
+            Size::S => "s",
+            Size::M => "m",
+            Size::L => "l",
+        }
+    }
+    /// Multiplier applied to the volume parameters. `m` is 1.0, i.e. unchanged.
+    pub fn scale(self) -> f64 {
+        match self {
+            Size::Xs => 0.1,
+            Size::S => 0.3,
+            Size::M => 1.0,
+            Size::L => 3.0,
+        }
+    }
+}
+
+/// Parameters that set how *much* work a test does, with the floor each may not go below.
+///
+/// Everything absent from this table is a semantic axis and is never scaled: `sizes`
+/// straddles the chunker's min/max boundaries on purpose, `writers` and `readers` are the
+/// independent variable of the concurrency families, and `pattern`, `variant`, `depth` and
+/// the rest select what is being tested rather than how much of it. Scaling
+/// `ops_per_writer` shrinks a concurrency run without collapsing its x-axis.
+const SCALED: &[(&str, u64)] = &[
+    ("n_files", 10),
+    ("file_size", 256),
+    ("size", 1024),
+    ("n_edits", 20),
+    ("sequential_edits", 5),
+    ("ops_per_writer", 5),
+    ("duration_s", 2),
+    ("n_queries", 10),
+    ("edits_before_search", 20),
+    ("n_versions", 2),
+    ("descendants", 10),
+    ("edit_lines", 1),
+    // Checkpoint cadence scales with the edit count it samples, so the number of
+    // checkpoints in a run stays the same at every size.
+    ("checkpoint_every", 1),
+    ("footprint_every", 1),
+];
+
+/// Parameter access with profile fallback and size scaling.
 pub struct Params<'a> {
     pub primary: &'a toml::Table,
     pub fallback: &'a toml::Table,
+    /// Per-test `[test.<size>]` overrides. Taken verbatim — never scaled, because an
+    /// explicit value is already the value the author intended for that size.
+    pub sized: Option<&'a toml::Table>,
+    pub scale: f64,
 }
 
 impl Params<'_> {
     fn get(&self, k: &str) -> Option<&toml::Value> {
         self.primary.get(k).or_else(|| self.fallback.get(k))
     }
+    /// An explicit `[test.<size>]` entry wins over anything the scale would produce.
+    fn override_for(&self, k: &str) -> Option<&toml::Value> {
+        self.sized.and_then(|t| t.get(k))
+    }
+    fn apply_scale(&self, k: &str, v: f64) -> f64 {
+        match SCALED.iter().find(|(name, _)| *name == k) {
+            // The floor keeps a shrunk test meaningful; growth is deliberately uncapped.
+            Some((_, floor)) => (v * self.scale).round().max(*floor as f64),
+            None => v,
+        }
+    }
     pub fn u64(&self, k: &str, default: u64) -> u64 {
-        self.get(k).and_then(|v| v.as_integer()).map(|v| v as u64).unwrap_or(default)
+        if let Some(v) = self.override_for(k).and_then(|v| v.as_integer()) {
+            return v as u64;
+        }
+        let raw = self.get(k).and_then(|v| v.as_integer()).map(|v| v as u64).unwrap_or(default);
+        self.apply_scale(k, raw as f64) as u64
     }
     pub fn usize(&self, k: &str, default: usize) -> usize {
         self.u64(k, default as u64) as usize
     }
     pub fn f64(&self, k: &str, default: f64) -> f64 {
-        self.get(k)
+        if let Some(v) = self.override_for(k).and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64))) {
+            return v;
+        }
+        let raw = self
+            .get(k)
             .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
-            .unwrap_or(default)
+            .unwrap_or(default);
+        self.apply_scale(k, raw)
     }
     pub fn str(&self, k: &str, default: &str) -> String {
-        self.get(k).and_then(|v| v.as_str()).unwrap_or(default).to_string()
+        self.override_for(k)
+            .or_else(|| self.get(k))
+            .and_then(|v| v.as_str())
+            .unwrap_or(default)
+            .to_string()
     }
     pub fn bool(&self, k: &str, default: bool) -> bool {
-        self.get(k).and_then(|v| v.as_bool()).unwrap_or(default)
+        self.override_for(k)
+            .or_else(|| self.get(k))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default)
     }
     pub fn list_u64(&self, k: &str, default: &[u64]) -> Vec<u64> {
-        self.get(k)
+        // Lists are semantic axes (`sizes` straddles the chunk boundaries), so they are
+        // never scaled — only an explicit per-size table can change them.
+        self.override_for(k)
+            .or_else(|| self.get(k))
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|x| x.as_integer()).map(|x| x as u64).collect())
             .unwrap_or_else(|| default.to_vec())
     }
     pub fn list_f64(&self, k: &str, default: &[f64]) -> Vec<f64> {
-        self.get(k)
+        self.override_for(k)
+            .or_else(|| self.get(k))
             .and_then(|v| v.as_array())
             .map(|a| {
                 a.iter()
@@ -98,7 +227,8 @@ impl Params<'_> {
             .unwrap_or_else(|| default.to_vec())
     }
     pub fn list_str(&self, k: &str, default: &[&str]) -> Vec<String> {
-        self.get(k)
+        self.override_for(k)
+            .or_else(|| self.get(k))
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
             .unwrap_or_else(|| default.iter().map(|s| s.to_string()).collect())
@@ -218,6 +348,7 @@ impl<'a> Ctx<'a> {
 
 pub struct RunOpts {
     pub profile: String,
+    pub size: Size,
     pub mode: Mode,
     pub seed: u64,
     pub work: PathBuf,
@@ -290,7 +421,12 @@ pub fn run_all(tests: &[TestDef], backends: &[String], sink: &Sink, o: &RunOpts)
                 let ctx = Ctx::new(
                     cell,
                     backend.as_ref(),
-                    Params { primary, fallback },
+                    Params {
+                        primary,
+                        fallback,
+                        sized: t.sized(o.size),
+                        scale: o.size.scale(),
+                    },
                     o.seed.wrapping_add(rep as u64),
                     o.work.join(b),
                     o.verbose,

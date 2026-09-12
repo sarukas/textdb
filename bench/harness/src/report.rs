@@ -48,10 +48,13 @@ fn aggregate(rows: &[Row]) -> BTreeMap<(String, String, String, String), BTreeMa
     for ((fam, test, case, metric, backend), rs) in groups {
         let fail = rs.iter().find(|r| r.note.starts_with("FAIL"));
         let na = rs.iter().find(|r| r.note.starts_with("N/A"));
+        let expected = rs.iter().find(|r| r.note.starts_with("EXPECTED"));
         let entry = if let Some(f) = fail {
             (None, f.note.clone())
         } else if let Some(n) = na {
             (None, n.note.clone())
+        } else if let Some(e) = expected {
+            (None, e.note.clone())
         } else {
             let mut vals: Vec<f64> = rs.iter().filter_map(|r| r.value).collect();
             if vals.is_empty() {
@@ -115,6 +118,7 @@ pub fn render(rows: &[Row], manifest: &serde_json::Value, backends: &[String]) -
                         Some((Some(v), _)) => fmt(metric, *v),
                         Some((None, note)) if note.starts_with("FAIL") => format!("**FAIL** {}", note.trim_start_matches("FAIL: ").chars().take(60).collect::<String>()),
                         Some((None, note)) if note.starts_with("N/A") => format!("N/A ({})", note.trim_start_matches("N/A: ").chars().take(50).collect::<String>()),
+                        Some((None, note)) if note.starts_with("EXPECTED") => format!("_expected_ {}", note.trim_start_matches("EXPECTED: ").chars().take(50).collect::<String>()),
                         Some((None, note)) => note.chars().take(60).collect(),
                         None => "–".into(),
                     };
@@ -165,7 +169,16 @@ pub fn render(rows: &[Row], manifest: &serde_json::Value, backends: &[String]) -
 
     // Failures list.
     let fails: Vec<&Row> = rows.iter().filter(|r| r.note.starts_with("FAIL")).collect();
+    let expected_n = rows.iter().filter(|r| r.note.starts_with("EXPECTED")).count();
     md.push_str(&format!("## Oracle failures ({})\n\n", fails.len()));
+    if expected_n > 0 {
+        md.push_str(&format!(
+            "{} further oracle violations are the documented behaviour of the backend that produced them — a backend \
+             declaring no write guard is expected to lose updates, and that count is the measurement. They appear in \
+             the family tables as _expected_ and do not void any timings.\n\n",
+            expected_n
+        ));
+    }
     if fails.is_empty() {
         md.push_str("None.\n\n");
     } else {

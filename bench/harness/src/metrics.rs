@@ -178,6 +178,15 @@ impl<'a> Cell<'a> {
         self.push(case, "na", None, &format!("N/A: {}", reason));
     }
 
+    /// An oracle violation that is the expected, documented behaviour of this backend, and
+    /// therefore the measurement rather than a defect — `fs` has no concurrency control,
+    /// so its lost updates are the number the suite exists to report. Recorded and shown,
+    /// but it does not void the cell's timings: voiding them would delete the very
+    /// baseline the other backends are compared against.
+    pub fn expected(&self, case: &str, metric: &str, detail: &str) {
+        self.push(case, metric, Some(1.0), &format!("EXPECTED: {}", detail));
+    }
+
     /// Void this cell's timings without emitting a per-case FAIL row (the caller has
     /// already described the problem some other way).
     pub fn mark_failed(&self, reason: &str) {
