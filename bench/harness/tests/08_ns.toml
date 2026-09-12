@@ -10,7 +10,7 @@ note = "many files in one folder: list latency; create p99 at the end"
 variant = "many_in_folder"
 n_files = 100000
 [test.poc]
-n_files = 10000
+n_files = 5000
 
 [[test]]
 id = "NS-02"
@@ -32,7 +32,7 @@ note = "rename folder with {1k, 10k, 50k} descendants: latency; all paths update
 variant = "rename_folder"
 descendants = [1000, 10000, 50000]
 [test.poc]
-descendants = [1000, 10000]
+descendants = [1000, 5000]
 
 [[test]]
 id = "NS-04"

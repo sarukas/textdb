@@ -114,9 +114,17 @@ pub fn edit_sequence(ctx: &Ctx) -> anyhow::Result<()> {
                 (old, format!("<{:08}>", i).into_bytes())
             }
             "random_bytes" => {
-                let at = rng.gen_range(0..cur.len().max(1));
-                let len = rng.gen_range(8..64).min(cur.len() - at);
-                let old = cur[at..at + len].to_vec();
+                // Random byte-range edits, snapped to UTF-8 character boundaries so every
+                // backend (including TEXT-typed baselines) can express them.
+                let mut at = rng.gen_range(0..cur.len().max(1));
+                while at > 0 && at < cur.len() && (cur[at] & 0xC0) == 0x80 {
+                    at -= 1;
+                }
+                let mut end = (at + rng.gen_range(8..64)).min(cur.len());
+                while end < cur.len() && (cur[end] & 0xC0) == 0x80 {
+                    end += 1;
+                }
+                let old = cur[at..end].to_vec();
                 if crate::reference::find_unique(&cur, &old).is_none() {
                     continue;
                 }
