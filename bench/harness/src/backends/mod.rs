@@ -11,8 +11,17 @@ use std::path::Path;
 /// Construct a fresh, empty backend instance under `work` for the given id.
 pub fn make(id: &str, work: &Path, mode: Mode, pg_url: Option<&str>) -> anyhow::Result<Option<Box<dyn Backend>>> {
     let dir = work.join(id);
-    let _ = std::fs::remove_dir_all(&dir);
+    // A failed reset must never be silent: it would leave the previous rep's data in place
+    // and every measurement after it would be against the wrong state.
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            anyhow::bail!("could not reset {}: {}", dir.display(), e);
+        }
+    }
     std::fs::create_dir_all(&dir)?;
+    if std::fs::read_dir(&dir)?.next().is_some() {
+        anyhow::bail!("{} is not empty after reset", dir.display());
+    }
     Ok(Some(match id {
         "fs" => Box::new(fs::FsBackend::new(&dir, mode)?),
         "fs-git" => Box::new(fs_git::FsGitBackend::new(&dir, mode)?),

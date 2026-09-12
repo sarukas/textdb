@@ -178,6 +178,7 @@ pub mod io_counters {
     }
 
     /// Blocks written by waited-for children (git), in bytes.
+    #[cfg(unix)]
     pub fn children_write_bytes() -> u64 {
         unsafe {
             let mut ru: libc::rusage = std::mem::zeroed();
@@ -187,5 +188,11 @@ pub mod io_counters {
                 0
             }
         }
+    }
+
+    /// No child rusage accounting outside Unix; the metric reports 0.
+    #[cfg(not(unix))]
+    pub fn children_write_bytes() -> u64 {
+        0
     }
 }
