@@ -284,6 +284,12 @@ impl<'a> Ctx<'a> {
         let t = Instant::now();
         let r = f();
         let d = t.elapsed();
+        // A backend that does not implement an operation returns immediately. Timing that
+        // refusal would record a sub-microsecond sample for work never done, and make the
+        // backend look infinitely fast at the operation it cannot perform at all.
+        if matches!(r, Err(BackendError::NotSupported(_))) {
+            return r;
+        }
         lat.push(d);
         self.ops.lock().unwrap().entry(op).or_default().push(d);
         r
