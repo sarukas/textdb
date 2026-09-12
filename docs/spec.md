@@ -324,7 +324,7 @@ textdb/
   bench/
     harness/            # workload generator, metrics, all backends (incl. baselines)
     scripts/            # Postgres cluster start script
-    dolt/               # Dolt schema + runner (N/A in this environment, see results.md)
+    dolt/               # Dolt schema + runner (N/A in this environment, see ../bench/RESULTS.md)
   corpora/              # import scripts for test repositories
   docs/
     spec.md             # this file
