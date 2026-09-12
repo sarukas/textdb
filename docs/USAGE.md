@@ -111,6 +111,24 @@ Errors carry the same codes as text: `TX001 conflict: {json}`, `TX002 …`, `TX0
 SQLite is single-writer; the rebase path is exercised when `base_version` is older than the
 current version, and `BEGIN IMMEDIATE` inside the functions keeps each operation atomic.
 
+## Python
+
+```python
+from textdb import Corpus, Conflict
+with Corpus.open("postgresql://user@host/db", author="agent-7") as kb:   # or sqlite:///kb.db
+    kb.load_folder("./notes", "/notes")
+    text, v = kb.read_versioned("/notes/index.md")
+    kb.edit("/notes/index.md", "TODO", "DONE")
+    try:
+        kb.update("/notes/index.md", text.replace("a", "b"), base_version=v)
+    except Conflict as c:
+        new = kb.read("/notes/index.md").replace("a", "b")          # rebuild on the current text (c.theirs has the region)
+        kb.update("/notes/index.md", new, base_version=c.current_version)
+```
+
+Full API in [`python/README.md`](../python/README.md); the `python -m textdb` CLI covers
+load/ls/cat/search/edit/append/history/diff/mv/rm/export.
+
 ## Recommended agent workflow
 
 1. **Read** `content, version` once (or `kb.section` / `kb.lines` for the part you need).

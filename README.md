@@ -10,9 +10,12 @@ This repository is the proof of concept described in [`docs/spec.md`](docs/spec.
 
 - **Install:** [`docs/INSTALL.md`](docs/INSTALL.md) · **Use:** [`docs/USAGE.md`](docs/USAGE.md)
 - **Benchmark results:** [`bench/RESULTS.md`](bench/RESULTS.md) (raw data in `bench/results/`)
-- **Skills for AI agents:** [`skills/textdb-install`](skills/textdb-install/SKILL.md) and
-  [`skills/textdb-use`](skills/textdb-use/SKILL.md) — copy a folder into `.claude/skills/` (project) or
-  `~/.claude/skills/` (user) to make it available as `/textdb-install` and `/textdb-use`.
+- **Python library:** [`python/`](python/README.md) — `Corpus.open("sqlite:///kb.db" | "postgresql://…")`,
+  file/folder loaders, anchored edits, conflict handling, CLI.
+- **Skills for AI agents:** [`skills/textdb-install`](skills/textdb-install/SKILL.md),
+  [`skills/textdb-use-postgres`](skills/textdb-use-postgres/SKILL.md),
+  [`skills/textdb-use-sqlite`](skills/textdb-use-sqlite/SKILL.md) — copy a folder into `.claude/skills/`
+  (project) or `~/.claude/skills/` (user) to make it available as a slash command.
 
 ## Layout
 
@@ -21,7 +24,9 @@ This repository is the proof of concept described in [`docs/spec.md`](docs/spec.
 | `crates/textdb-core` | Engine-agnostic algorithms: FastCDC chunker with newline snap, BLAKE3 prolly tree, `Storage` trait, materialize/locate, localised edit, tree diff, diff3, commit-with-rebase |
 | `crates/textdb-md` | Markdown `StructureExtractor` (sections, wikilinks, frontmatter) |
 | `crates/textdb-sqlite` | SQLite binding: shadow tables, `CREATE VIRTUAL TABLE kb USING textdb(...)`, table-valued and scalar functions, FTS5 on chunks |
+| `crates/textdb-sqlite-ext` | Loadable SQLite extension (`libtextdb_sqlite_ext.so`) for Python, the `sqlite3` shell, any language |
 | `crates/textdb-pg` | Postgres 16 extension (pgrx): schema `kb`, updatable views `kb.file`/`kb.folder`/`kb.file_version`, functions, SQLSTATEs `TX001`/`TX002` |
+| `python/` | Python library `textdb` with swappable Postgres/SQLite backends, loaders, CLI |
 | `bench/harness` | The test suite runner and six backends (`fs`, `fs-git`, `sql-text-sqlite`, `sql-text-pg`, `textdb-sqlite`, `textdb-pg`) |
 | `bench/harness/tests/*.toml` | The test matrix as data |
 | `docs/decisions` | ADRs recorded during the POC |

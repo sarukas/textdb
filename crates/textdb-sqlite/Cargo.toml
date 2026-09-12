@@ -6,10 +6,17 @@ license.workspace = true
 repository.workspace = true
 description = "SQLite binding for textdb: shadow tables, virtual table, table-valued functions, FTS5"
 
+[features]
+default = ["bundled"]
+# Compile SQLite in (library / CLI / harness use).
+bundled = ["rusqlite/bundled"]
+# Build as part of a loadable SQLite extension (see crates/textdb-sqlite-ext).
+loadable_extension = ["rusqlite/loadable_extension"]
+
 [dependencies]
 textdb-core = { path = "../textdb-core" }
 textdb-md = { path = "../textdb-md" }
-rusqlite = { workspace = true }
+rusqlite = { version = "0.40", default-features = false, features = ["vtab", "functions"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]

@@ -7,6 +7,8 @@ textdb ships as four Rust crates and one Postgres extension. Pick what you need:
 | Versioned documents inside **PostgreSQL 16** with an SQL surface (`kb.file`, `kb.search`, …) | [Postgres extension](#postgres-extension-textdb_pg) |
 | The same inside an **embedded SQLite** database from a Rust program | [SQLite crate](#sqlite-crate-textdb-sqlite) |
 | Only the algorithms (chunker, prolly tree, edit, rebase, diff) | [Core crate](#core-crate-textdb-core) |
+| To use it **from Python** (either backend) | [Python library](#python-library) |
+| To load the SQLite module in the `sqlite3` shell or any language | [Loadable SQLite extension](#loadable-sqlite-extension) |
 | To reproduce the benchmarks | [Benchmark harness](#benchmark-harness) |
 
 ## Prerequisites
@@ -113,7 +115,31 @@ cargo build --release -p textdb-bench                     # builds target/releas
 ./target/release/textdb-corpus export kb.db ./roundtrip && diff -r ./my-notes ./roundtrip
 ```
 
-A standalone loadable `.so` for the `sqlite3` shell is not built in the POC.
+## Loadable SQLite extension
+
+For Python, the `sqlite3` shell, or any non-Rust language:
+
+```sh
+cd crates/textdb-sqlite-ext && cargo build --release        # → target/release/libtextdb_sqlite_ext.so
+sqlite3 kb.db ".load $PWD/target/release/libtextdb_sqlite_ext" \
+        "CREATE VIRTUAL TABLE IF NOT EXISTS kb USING textdb(store='kb_');" \
+        "INSERT INTO kb(path, content) VALUES ('/hello.md', 'hi');" "SELECT * FROM textdb_history('/hello.md');"
+```
+
+The crate is outside the main workspace because rusqlite's `loadable_extension` feature and
+the `bundled` SQLite cannot be built together. Entry points: `sqlite3_textdbsqliteext_init`
+(auto-derived from the file name) and `sqlite3_extension_init`. Install by copying the `.so`
+anywhere and referencing it (Python: `TEXTDB_SQLITE_EXT`).
+
+## Python library
+
+```sh
+pip install -e python/                # SQLite only (stdlib sqlite3 + the loadable extension above)
+pip install -e 'python/[postgres]'    # + psycopg2-binary for postgresql:// URLs
+python -m textdb sqlite:///kb.db load ./notes /notes
+```
+
+See [`python/README.md`](../python/README.md) and the examples in `python/examples/`.
 
 ## Core crate (`textdb-core`)
 
