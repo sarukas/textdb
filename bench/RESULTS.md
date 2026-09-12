@@ -46,6 +46,76 @@ Findings — what changed, what is new, what is still open.
 
 ---
 
+## 2026-09-12 — s, optimisation pass (sql-text-sqlite vs textdb-sqlite)
+
+**Artefacts:** [`results/2026-09-12-s-optimised/`](results/2026-09-12-s-optimised/) — includes `hotspots.md`
+**Manifest:** size `s` (scale 0.3) · profile `poc` · mode `fast` · seed 20260912 · 8 CPUs, Windows
+**Status:** complete — 39 tests, **508 accuracy checks pass, 0 fail, 0 timings voided**
+
+Goal for this pass: no operation slower than the plain-text SQLite baseline. Not reached
+— six operations remain above it — but the two largest gaps closed substantially and the
+correctness gap closed completely.
+
+### Against `sql-text-sqlite` (ratio, lower is better; 1.00 is parity)
+
+| operation | before | after | |
+|---|---|---|---|
+| `read` | 8.56x | **1.62x** | 212k→1.06M calls, the largest block of time in the suite |
+| `read_version` | 4.25x | **1.98x** | |
+| `create` | 2.04x | **1.58x** | |
+| `search` | 4.78x | 8.54x here, ~1020us→650us in isolation | see caveat |
+| `history` | 3.28x | 2.78x | 9 calls |
+| `list` | 15.81x | 12.58x | 2 calls |
+| `replace` | 0.82x | **0.86x** | already beats the baseline |
+| `append` | 0.56x | **0.48x** | |
+| `rename` | 1.21x | **0.22x** | |
+| `maintenance` | 0.88x | **0.64x** | |
+| `delete` | 0.10x | **0.05x** | |
+| `read_lines` | 0.03x | **0.00x** | 200x+ faster; the fragment read chunking exists for |
+
+Caveat on `search`: the full-matrix figure moved the wrong way, but a controlled A/B of the
+two commits at the same size and filter has it going from ~1020us to ~650us median. The
+matrix figure is not comparable across runs — different call counts, cache state and
+machine load. Trust the A/B.
+
+### What changed
+
+Reading was the dominant cost and was doing one SQL round trip per leaf chunk. Chunks,
+tree nodes and whole documents are now cached by BLAKE3 hash, which is sound without
+invalidation because the hash *is* the content and nothing in the schema deletes either.
+Search resolved every FTS chunk hit to its files one statement at a time — up to
+`limit * 50` per term — and walked a file's entire tree per hit to find a line; both are
+now single passes.
+
+### What is left, and why it is hard
+
+`read` at 1.62x is the honest floor for this design without deeper work: the baseline
+stores a document as one column and returns it in one row fetch, while textdb resolves a
+path through a virtual table, then reassembles the document. The remaining measurable
+overhead is statement compilation — the virtual table's `filter` calls `prepare`, not
+`prepare_cached`, on every read. Caching those statements is the obvious fix and was
+tried: it keeps the SQLite handle open past its owner's `close`, so the database file
+cannot be released, and vtab teardown cannot run because `close` is what triggers it. It
+was reverted. Doing this properly needs the statement cache to live with the virtual table
+and be torn down on `xDisconnect`.
+
+Two further hypotheses for `search` were tested and rejected — batching hit resolution
+through `json_each` (worse: the table-valued scan costs more than the few queries it
+saves when a query matches few files) and moving `ORDER BY rank` out of SQL into Rust
+(worse). Neither is in the tree.
+
+Beyond that, closing the last 60% on `read` needs a profiler rather than hypotheses. This
+host has roughly +/-40% run-to-run variance, which is wider than the remaining gaps, so
+single measurements here are not decisive: every claim above that is not from a 1M-sample
+operation came from repeated A/B runs at the same size and filter.
+
+### Correctness
+
+All 508 accuracy checks pass and no cell had its timings voided, so every number above
+describes work that was actually done and verified against the oracle.
+
+---
+
 ## 2026-09-12 — xs, fs + sql-text-sqlite + textdb-sqlite
 
 **Artefacts:** [`results/2026-09-12-xs/`](results/2026-09-12-xs/) — `results.jsonl`,
