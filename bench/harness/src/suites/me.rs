@@ -31,7 +31,9 @@ pub fn edit_sequence(ctx: &Ctx) -> anyhow::Result<()> {
     let check_versions = ctx.params.bool("check_versions", false);
     let footprint_every = ctx.params.usize("footprint_every", 0);
     let lines_per_edit = ctx.params.usize("lines_per_edit", 1);
-    let path = "/me/doc.md";
+    let content_kind = ctx.params.str("content", "markdown");
+    // Markdown documents exercise structure extraction too; other content is plain text.
+    let path = if content_kind == "markdown" { "/me/doc.md" } else { "/me/doc.txt" };
     let mut g = Generator::new(ctx.seed);
     let body = make_content(ctx, &mut g, size);
     let mut reference = Reference::default();

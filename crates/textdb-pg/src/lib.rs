@@ -128,6 +128,19 @@ BEGIN
 END $$;
 CREATE TRIGGER folder_iud INSTEAD OF INSERT OR UPDATE OR DELETE ON kb.folder FOR EACH ROW EXECUTE FUNCTION kb.folder_iud();
 
+-- Write entry points: the Rust functions return a JSON outcome; errors become SQLSTATEs here
+-- (TX001 conflict with the JSON payload as DETAIL, TX002 contention, TX003 not found, TX004 invalid edit).
+CREATE FUNCTION kb._check(r jsonb) RETURNS bigint LANGUAGE plpgsql AS $$
+BEGIN
+  IF r ? 'code' THEN
+    RAISE EXCEPTION USING ERRCODE = r->>'code', MESSAGE = r->>'message', DETAIL = coalesce(r->>'detail', '');
+  END IF;
+  RETURN (r->>'version')::bigint;
+END $$;
+CREATE FUNCTION kb._update_content(path text, content text, base_version bigint, author text, message text) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb._check(kb._update_content_j(path, content, base_version, author, message)) $$;
+CREATE FUNCTION kb.edit(path text, old text, new text, author text) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb._check(kb._edit_j(path, old, new, author)) $$;
+CREATE FUNCTION kb.append(path text, tail text, author text) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb._check(kb._append_j(path, tail, author)) $$;
+
 -- Attribute notation (spec §7.2): f.content is the view column; the rest are wrappers.
 CREATE FUNCTION kb.lines(f kb.file, l_from bigint, l_to bigint) RETURNS text LANGUAGE sql STABLE AS $$ SELECT kb.lines(f.path, l_from, l_to) $$;
 CREATE FUNCTION kb.section(f kb.file, heading text) RETURNS text LANGUAGE sql STABLE AS $$ SELECT kb.section(f.path, heading) $$;
@@ -172,6 +185,42 @@ mod kb {
         match r {
             Ok(v) => v,
             Err(e) => fail(e),
+        }
+    }
+
+    /// Outcome of a write as JSON for the PL/pgSQL wrapper `kb._check`, which turns an error
+    /// object into `RAISE EXCEPTION USING ERRCODE = …` (pgrx re-raises panics as XX000, so
+    /// custom SQLSTATEs must be raised from SQL).
+    fn json_result(r: Result<i64, TextdbError>) -> pgrx::JsonB {
+        pgrx::JsonB(match r {
+            Ok(v) => serde_json::json!({ "version": v }),
+            Err(e) => {
+                let detail = match &e {
+                    TextdbError::Conflict(c) => serde_json::to_string(c).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                serde_json::json!({ "code": e.code(), "message": e.to_string(), "detail": detail })
+            }
+        })
+    }
+
+    fn file_by_path_r(path: &str) -> Result<NodeRow, TextdbError> {
+        match node_by_path(path) {
+            Some(n) if n.kind == 1 => Ok(n),
+            Some(_) => Err(TextdbError::InvalidEdit(format!("{} is a folder", path))),
+            None => Err(TextdbError::NotFound(path.to_string())),
+        }
+    }
+
+    fn root_of_version_r(file_id: i64, version: u64) -> Result<Hash, TextdbError> {
+        let root = Spi::get_one_with_args::<Vec<u8>>(
+            "SELECT root FROM kb.commit WHERE file_id = $1 AND version = $2",
+            &[file_id.into(), (version as i64).into()],
+        )
+        .map_err(|e| TextdbError::Storage(e.to_string()))?;
+        match root {
+            Some(r) => to_hash(&r),
+            None => Err(TextdbError::NotFound(format!("version {} of file {}", version, file_id))),
         }
     }
 
@@ -266,6 +315,10 @@ mod kb {
         if lower.ends_with(".md") || lower.ends_with(".markdown") {
             let bytes = ok(materialize(&st, &c.root));
             let s = MarkdownExtractor.extract(&bytes);
+            // HEAD-only structure rows (ADR 0007).
+            for t in ["kb.section", "kb.link", "kb.frontmatter"] {
+                Spi::run_with_args(&format!("DELETE FROM {} WHERE file_id = $1", t), &[file_id.into()]).unwrap_or_else(|e| spi_err(e));
+            }
             for sec in &s.sections {
                 Spi::run_with_args(
                     "INSERT INTO kb.section(file_id, version, heading_path, level, line_from, line_to) VALUES ($1, $2, $3, $4, $5, $6)",
@@ -333,31 +386,39 @@ mod kb {
         let path = ok(normalize_path(path));
         match node_by_path(&path) {
             None => _create(&path, content, author, message),
-            Some(_) => _update_content(&path, content, None, author, message),
+            Some(_) => match update_content_impl(&path, content, None, author, message) {
+                Ok(v) => v,
+                Err(e) => fail(e),
+            },
         }
     }
 
     /// Whole-content update: diff against `base_version` (or HEAD) → edit set → commit with rebase.
+    /// Returns a JSON outcome; `kb._update_content` (SQL) raises TX001/TX002/… from it.
     #[pg_extern(volatile)]
-    fn _update_content(path: &str, content: &str, base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> i64 {
-        let path = ok(normalize_path(path));
-        let n = file_by_path(&path);
-        let cur = n.root.unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
+    fn _update_content_j(path: &str, content: &str, base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> pgrx::JsonB {
+        json_result(update_content_impl(path, content, base_version, author, message))
+    }
+
+    fn update_content_impl(path: &str, content: &str, base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> Result<i64, TextdbError> {
+        let path = normalize_path(path)?;
+        let n = file_by_path_r(&path)?;
+        let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let base = match base_version {
-            Some(v) if v != n.version => root_of_version(n.id, v as u64),
+            Some(v) if v != n.version => root_of_version_r(n.id, v as u64)?,
             _ => cur,
         };
         let mut st = SpiStorage::new();
-        let old = ok(materialize(&st, &base));
+        let old = materialize(&st, &base)?;
         let edits = byte_edits(&old, content.as_bytes());
         if edits.is_empty() && base == cur {
-            return n.version;
+            return Ok(n.version);
         }
-        let c = ok(commit(&mut st, &P, n.id as u64, &path, &base, &edits, RETRIES));
+        let c = commit(&mut st, &P, n.id as u64, &path, &base, &edits, RETRIES)?;
         if c.kind != CommitKind::NoOp {
             record_commit(n.id, &path, &c, Some(&cur), author, message);
         }
-        c.version as i64
+        Ok(c.version as i64)
     }
 
     fn root_of_version(file_id: i64, version: u64) -> Hash {
@@ -373,24 +434,25 @@ mod kb {
     }
 
     /// Strict replace: `old` must occur exactly once in the current content (spec §7.2 `edit`).
+    /// JSON outcome; `kb.edit(...)` (SQL) raises from it.
     #[pg_extern(volatile)]
-    fn edit(path: &str, old: &str, new: &str, author: Option<&str>) -> i64 {
-        edit_impl(path, old, new, author)
+    fn _edit_j(path: &str, old: &str, new: &str, author: Option<&str>) -> pgrx::JsonB {
+        json_result(edit_impl(path, old, new, author))
     }
 
-    fn edit_impl(path: &str, old: &str, new: &str, author: Option<&str>) -> i64 {
-        let path = ok(normalize_path(path));
-        let n = file_by_path(&path);
-        let cur = n.root.unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
+    fn edit_impl(path: &str, old: &str, new: &str, author: Option<&str>) -> Result<i64, TextdbError> {
+        let path = normalize_path(path)?;
+        let n = file_by_path_r(&path)?;
+        let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let mut st = SpiStorage::new();
-        let content = ok(materialize(&st, &cur));
-        let pos = ok(find_unique(&content, old.as_bytes()));
+        let content = materialize(&st, &cur)?;
+        let pos = find_unique(&content, old.as_bytes())?;
         let edits = [Edit::new(pos as u64, (pos + old.len()) as u64, new.as_bytes().to_vec())];
-        let c = ok(commit(&mut st, &P, n.id as u64, &path, &cur, &edits, RETRIES));
+        let c = commit(&mut st, &P, n.id as u64, &path, &cur, &edits, RETRIES)?;
         if c.kind != CommitKind::NoOp {
             record_commit(n.id, &path, &c, Some(&cur), author, Some("edit"));
         }
-        c.version as i64
+        Ok(c.version as i64)
     }
 
     fn find_unique(content: &[u8], old: &[u8]) -> Result<usize, TextdbError> {
@@ -413,21 +475,22 @@ mod kb {
         found.ok_or_else(|| TextdbError::InvalidEdit("old text not found".into()))
     }
 
+    /// Append at the current end; never conflicts. JSON outcome; `kb.append(...)` (SQL) raises.
     #[pg_extern(volatile)]
-    fn append(path: &str, tail: &str, author: Option<&str>) -> i64 {
-        append_impl(path, tail, author)
+    fn _append_j(path: &str, tail: &str, author: Option<&str>) -> pgrx::JsonB {
+        json_result(append_impl(path, tail, author))
     }
 
-    fn append_impl(path: &str, tail: &str, author: Option<&str>) -> i64 {
-        let path = ok(normalize_path(path));
-        let n = file_by_path(&path);
-        let cur = n.root.unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
+    fn append_impl(path: &str, tail: &str, author: Option<&str>) -> Result<i64, TextdbError> {
+        let path = normalize_path(path)?;
+        let n = file_by_path_r(&path)?;
+        let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let mut st = SpiStorage::new();
-        let c = ok(commit_append(&mut st, &P, n.id as u64, &path, tail.as_bytes(), RETRIES));
+        let c = commit_append(&mut st, &P, n.id as u64, &path, tail.as_bytes(), RETRIES)?;
         if c.kind != CommitKind::NoOp {
             record_commit(n.id, &path, &c, Some(&cur), author, Some("append"));
         }
-        c.version as i64
+        Ok(c.version as i64)
     }
 
     /// Rename/move a file or folder: subtree path rewrite in one statement, ids stable.
@@ -649,7 +712,7 @@ mod kb {
                     .select(
                         "SELECT r.file_id, c.id, ts_rank(c.tsv, q) FROM kb.chunk c JOIN kb.chunk_ref r ON r.chunk_id = c.id JOIN kb.node n ON n.id = r.file_id, to_tsquery('simple', $1) q WHERE c.tsv @@ q AND n.deleted_at IS NULL AND n.kind = 1 AND ($2 = '/' OR n.path LIKE $2 || '/%') ORDER BY 3 DESC LIMIT $3",
                         None,
-                        &[tsq.as_str().into(), prefix.as_str().into(), ((limit * 50) as i64).into()],
+                        &[tsq.as_str().into(), prefix.as_str().into(), ((limit.saturating_mul(50)).min(500_000) as i64).into()],
                     )
                     .unwrap_or_else(|e| spi_err(e));
                 let mut m = std::collections::HashMap::new();

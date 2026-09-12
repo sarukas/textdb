@@ -22,6 +22,7 @@ struct WriterResult {
     /// (path, line index, marker) of the last committed write per (path, line) by this writer.
     last_markers: Vec<(String, usize, String)>,
     committed: u64,
+    first_error: Option<String>,
 }
 
 pub fn concurrent_writes(ctx: &Ctx) -> anyhow::Result<()> {
@@ -218,8 +219,11 @@ pub fn concurrent_writes(ctx: &Ctx) -> anyhow::Result<()> {
                                     last_seen.insert(path.clone(), x);
                                 }
                             }
-                            Err(_) => {
+                            Err(e) => {
                                 res.out.error += 1;
+                                if res.first_error.is_none() {
+                                    res.first_error = Some(e.to_string());
+                                }
                                 last_seen.remove(path);
                             }
                         }
@@ -270,7 +274,11 @@ pub fn concurrent_writes(ctx: &Ctx) -> anyhow::Result<()> {
         let mut absorbed = 0;
         let mut committed = 0u64;
         let mut markers: Vec<(String, usize, String)> = Vec::new();
+        let mut first_error: Option<String> = None;
         for r in &results {
+            if first_error.is_none() {
+                first_error = r.first_error.clone();
+            }
             lat.extend(&r.lat);
             out.add(&r.out);
             absorbed += r.absorbed;
@@ -338,6 +346,9 @@ pub fn concurrent_writes(ctx: &Ctx) -> anyhow::Result<()> {
         }
         out.lost_updates = lost;
         ctx.cell.outcomes(&case, &out);
+        if let Some(e) = first_error {
+            ctx.cell.note(&case, "first_error", &e.chars().take(200).collect::<String>());
+        }
         ctx.cell.metric(&case, "absorbed_identical", absorbed as f64);
         ctx.cell.lat(&case, "write", &lat);
         ctx.cell.metric(&case, "throughput_ops_s", lat.samples.len() as f64 / elapsed.max(1e-9));

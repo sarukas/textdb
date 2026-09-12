@@ -11,7 +11,7 @@ pub fn long_lines(ctx: &Ctx) -> anyhow::Result<()> {
     let sizes = ctx.params.list_u64("sizes", &[1 << 20]);
     for (si, &size) in sizes.iter().enumerate() {
         let case = size_label(size);
-        let path = format!("/ll/{}-{}.md", variant, si);
+        let path = format!("/ll/{}-{}.txt", variant, si);
         let mut g = Generator::new(ctx.seed.wrapping_add(si as u64));
         let mut body = match variant.as_str() {
             "multibyte" => {

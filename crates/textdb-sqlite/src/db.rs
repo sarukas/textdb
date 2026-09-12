@@ -382,12 +382,20 @@ impl<'c> TextDb<'c> {
                 .execute(params![&h[..], file_id, c.version as i64])
                 .map_err(sql_err)?;
         }
-        // Structure rows (markdown only).
+        // Structure rows (markdown only), kept for HEAD only: per-version rows cost more
+        // than the chunk data itself (ADR 0007); historical structure is recomputable.
         if let Some(ex) = &self.extractor {
             let lower = path.to_ascii_lowercase();
             if lower.ends_with(".md") || lower.ends_with(".markdown") {
                 let bytes = materialize(&st, &c.root)?;
                 let s = ex.extract(&bytes);
+                for t in ["section", "link", "frontmatter"] {
+                    self.conn
+                        .prepare_cached(&format!("DELETE FROM {}{} WHERE file_id = ?1", self.p, t))
+                        .map_err(sql_err)?
+                        .execute(params![file_id])
+                        .map_err(sql_err)?;
+                }
                 for sec in &s.sections {
                     self.conn
                         .prepare_cached(&format!(

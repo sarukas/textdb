@@ -14,7 +14,7 @@ pub fn xl(ctx: &Ctx) -> anyhow::Result<()> {
     let seq_edits = ctx.params.usize("sequential_edits", 0);
     for (si, &size) in sizes.iter().enumerate() {
         let case = size_label(size);
-        let path = format!("/xl/f{}.md", si);
+        let path = format!("/xl/f{}.txt", si); // plain text: content-layer cost, no structure extraction
         let mut g = Generator::new(ctx.seed.wrapping_add(si as u64));
         let mut body = g.markdown(size as usize, &GenOpts::default());
         ctx.backend.reset_counters()?;

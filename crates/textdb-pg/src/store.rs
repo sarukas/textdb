@@ -119,11 +119,52 @@ impl NodeRow {
 
 /// Storage over the `kb` tables via SPI. Chunk and node writes are idempotent
 /// (`ON CONFLICT DO NOTHING`); `cas_root` is the only mutation.
-pub struct SpiStorage;
+///
+/// Writes are buffered and flushed in ascending hash order immediately before the CAS.
+/// Two transactions inserting the same not-yet-committed chunks in opposite orders would
+/// otherwise wait on each other's unique-index entries and deadlock (seen with identical
+/// concurrent edits on a hot file); a global insertion order makes lock waits acyclic.
+pub struct SpiStorage {
+    pending_chunks: std::collections::BTreeMap<Hash, Vec<u8>>,
+    pending_nodes: std::collections::BTreeMap<Hash, Vec<u8>>,
+}
 
 impl SpiStorage {
     pub fn new() -> Self {
-        SpiStorage
+        SpiStorage {
+            pending_chunks: Default::default(),
+            pending_nodes: Default::default(),
+        }
+    }
+
+    /// Persist buffered chunks and nodes (sorted by hash) — called before every CAS and
+    /// at the end of a write that created no new version.
+    pub fn flush(&mut self) -> Result<()> {
+        for (h, b) in std::mem::take(&mut self.pending_chunks) {
+            let nlines = textdb_core::chunker::count_newlines(&b) as i32;
+            Spi::run_with_args(
+                "INSERT INTO kb.chunk(hash, bytes, nlines) VALUES ($1, $2, $3) ON CONFLICT (hash) DO NOTHING",
+                &[h.to_vec().into(), b.into(), nlines.into()],
+            )
+            .map_err(map)?;
+        }
+        for (h, enc) in std::mem::take(&mut self.pending_nodes) {
+            Spi::run_with_args(
+                "INSERT INTO kb.tree_node(hash, children) VALUES ($1, $2) ON CONFLICT (hash) DO NOTHING",
+                &[h.to_vec().into(), enc.into()],
+            )
+            .map_err(map)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SpiStorage {
+    fn drop(&mut self) {
+        // Anything still pending belongs to a write that did not reach CAS (no-op or
+        // error); persisting it is harmless (content-addressed, idempotent) and keeps
+        // `chunk_ref`/search consistent for callers that recorded the hashes.
+        let _ = self.flush();
     }
 }
 
@@ -133,19 +174,21 @@ fn map(e: pgrx::spi::Error) -> TextdbError {
 
 impl Storage for SpiStorage {
     fn get_chunk(&self, h: &Hash) -> Result<Option<Vec<u8>>> {
+        if let Some(b) = self.pending_chunks.get(h) {
+            return Ok(Some(b.clone()));
+        }
         Spi::get_one_with_args::<Vec<u8>>("SELECT bytes FROM kb.chunk WHERE hash = $1", &[h.to_vec().into()]).map_err(map)
     }
 
     fn put_chunk(&mut self, h: &Hash, b: &[u8]) -> Result<()> {
-        let nlines = textdb_core::chunker::count_newlines(b) as i32;
-        Spi::run_with_args(
-            "INSERT INTO kb.chunk(hash, bytes, nlines) VALUES ($1, $2, $3) ON CONFLICT (hash) DO NOTHING",
-            &[h.to_vec().into(), b.to_vec().into(), nlines.into()],
-        )
-        .map_err(map)
+        self.pending_chunks.entry(*h).or_insert_with(|| b.to_vec());
+        Ok(())
     }
 
     fn get_node(&self, h: &Hash) -> Result<Option<Node>> {
+        if let Some(e) = self.pending_nodes.get(h) {
+            return Node::decode(e).map(Some).ok_or_else(|| TextdbError::Storage("corrupt tree node".into()));
+        }
         let enc = Spi::get_one_with_args::<Vec<u8>>("SELECT children FROM kb.tree_node WHERE hash = $1", &[h.to_vec().into()]).map_err(map)?;
         match enc {
             None => Ok(None),
@@ -154,11 +197,8 @@ impl Storage for SpiStorage {
     }
 
     fn put_node(&mut self, h: &Hash, n: &Node) -> Result<()> {
-        Spi::run_with_args(
-            "INSERT INTO kb.tree_node(hash, children) VALUES ($1, $2) ON CONFLICT (hash) DO NOTHING",
-            &[h.to_vec().into(), n.encode().into()],
-        )
-        .map_err(map)
+        self.pending_nodes.entry(*h).or_insert_with(|| n.encode());
+        Ok(())
     }
 
     fn get_root(&self, file_id: u64) -> Result<Option<(Hash, u64)>> {
@@ -174,6 +214,7 @@ impl Storage for SpiStorage {
     }
 
     fn cas_root(&mut self, file_id: u64, expect: Option<&Hash>, new: &Hash) -> Result<bool> {
+        self.flush()?;
         let n = match expect {
             Some(e) => Spi::get_one_with_args::<i64>(
                 "WITH u AS (UPDATE kb.node SET root = $1, version = version + 1, updated_at = now() WHERE id = $2 AND root = $3 AND deleted_at IS NULL RETURNING 1) SELECT count(*) FROM u",
