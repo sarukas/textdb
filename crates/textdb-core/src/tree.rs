@@ -202,6 +202,46 @@ pub struct LeafRef {
 }
 
 /// All leaves in order with their offsets. O(n) — used by search result mapping and tests.
+/// The first leaf under `root` whose chunk is `hash`, without collecting the rest.
+///
+/// Search resolves each hit to a line by locating the matching chunk inside the file.
+/// Collecting every leaf and then scanning the vector costs a full walk and an allocation
+/// per hit, where the answer is usually found part way through and needs neither.
+pub fn find_leaf<S: Storage + ?Sized>(storage: &S, root: &Hash, hash: &Hash) -> Result<Option<LeafRef>> {
+    let n = storage.node(root)?;
+    find_leaf_in(storage, &n, 0, 0, hash)
+}
+
+fn find_leaf_in<S: Storage + ?Sized>(
+    storage: &S,
+    node: &Node,
+    mut boff: u64,
+    mut loff: u64,
+    hash: &Hash,
+) -> Result<Option<LeafRef>> {
+    for c in &node.children {
+        if c.is_leaf {
+            if &c.hash == hash {
+                return Ok(Some(LeafRef {
+                    hash: c.hash,
+                    byte_off: boff,
+                    line_off: loff,
+                    nbytes: c.nbytes,
+                    nlines: c.nlines,
+                }));
+            }
+        } else {
+            let child = storage.node(&c.hash)?;
+            if let Some(l) = find_leaf_in(storage, &child, boff, loff, hash)? {
+                return Ok(Some(l));
+            }
+        }
+        boff += c.nbytes;
+        loff += c.nlines;
+    }
+    Ok(None)
+}
+
 pub fn leaves<S: Storage + ?Sized>(storage: &S, root: &Hash) -> Result<Vec<LeafRef>> {
     let n = storage.node(root)?;
     let mut out = Vec::new();
