@@ -88,7 +88,7 @@ pub fn xl(ctx: &Ctx) -> anyhow::Result<()> {
             let r = ctx.timed(&mut el, || ctx.backend.replace(&path, &old, &new, None));
             let c = format!("{}@{:.0}%", case, pos * 100.0);
             match r {
-                Ok(WriteOutcome::Committed { .. }) => {
+                Ok(WriteOutcome::Committed { .. }) | Ok(WriteOutcome::Absorbed { .. }) => {
                     body = crate::reference::splice(&body, &old, &new).unwrap();
                     let written = ctx.backend.bytes_written_since_reset().unwrap_or(0);
                     let changed = old.len().max(new.len()) as f64;
@@ -123,7 +123,7 @@ pub fn xl(ctx: &Ctx) -> anyhow::Result<()> {
                     None => continue,
                 };
                 match ctx.timed(&mut sl, || ctx.backend.replace(&path, &old, &new, None)) {
-                    Ok(WriteOutcome::Committed { .. }) => {
+                    Ok(WriteOutcome::Committed { .. }) | Ok(WriteOutcome::Absorbed { .. }) => {
                         body = crate::reference::splice(&body, &old, &new).unwrap();
                         done += 1;
                     }

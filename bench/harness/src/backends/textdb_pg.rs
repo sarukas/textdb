@@ -13,9 +13,20 @@ use crate::backends::sql_text_pg::pg_written_bytes;
 use crate::reference::splice;
 
 static INSTANCE: AtomicU64 = AtomicU64::new(1);
+static WRITE_TAG: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
-    static CONNS: RefCell<HashMap<u64, Client>> = RefCell::new(HashMap::new());
+    // `ManuallyDrop`: a `postgres::Client` must not be dropped during thread-local teardown
+    // (its tokio runtime is already gone); connections are closed via `thread_done`/`Drop`.
+    static CONNS: RefCell<HashMap<u64, std::mem::ManuallyDrop<Client>>> = RefCell::new(HashMap::new());
+}
+
+fn close_conn(id: u64) {
+    let _ = CONNS.try_with(|m| {
+        if let Some(mut c) = m.borrow_mut().remove(&id) {
+            unsafe { std::mem::ManuallyDrop::drop(&mut c) };
+        }
+    });
 }
 
 pub struct TextdbPg {
@@ -51,7 +62,7 @@ impl TextdbPg {
         CONNS.with(|m| {
             let mut m = m.borrow_mut();
             if !m.contains_key(&self.id) {
-                m.insert(self.id, self.open()?);
+                m.insert(self.id, std::mem::ManuallyDrop::new(self.open()?));
             }
             f(m.get_mut(&self.id).unwrap())
         })
@@ -80,7 +91,16 @@ impl TextdbPg {
     }
 }
 
+impl Drop for TextdbPg {
+    fn drop(&mut self) {
+        close_conn(self.id);
+    }
+}
+
 impl Backend for TextdbPg {
+    fn thread_done(&self) {
+        close_conn(self.id);
+    }
     fn id(&self) -> &'static str {
         "textdb-pg"
     }
@@ -187,16 +207,26 @@ impl Backend for TextdbPg {
                     Some(n) => String::from_utf8(n).unwrap(),
                     None => return Ok(WriteOutcome::Conflict { current_region: seen.into_bytes() }),
                 };
+                // Unique author tag: a kb.file_version row with it exists iff a version was created.
+                let tag = format!("bench-{}", WRITE_TAG.fetch_add(1, Ordering::Relaxed));
                 match c.execute(
-                    "UPDATE kb.file SET content = $1, base_version = $2, updated_by = 'bench' WHERE path = $3",
-                    &[&next, &(v as i64), &path],
+                    "UPDATE kb.file SET content = $1, base_version = $2, updated_by = $4 WHERE path = $3",
+                    &[&next, &(v as i64), &path, &tag],
                 ) {
                     Ok(_) => {
-                        let nv = c.query_one("SELECT version FROM kb.file WHERE path = $1", &[&path])?.get::<_, i64>(0) as u64;
-                        Ok(WriteOutcome::Committed {
-                            version: nv,
-                            direct: nv == v + 1,
-                        })
+                        let mine = c
+                            .query_one("SELECT max(version) FROM kb.history($1) WHERE author = $2", &[&path, &tag])?
+                            .get::<_, Option<i64>>(0);
+                        match mine {
+                            Some(nv) => Ok(WriteOutcome::Committed {
+                                version: nv as u64,
+                                direct: nv as u64 == v + 1,
+                            }),
+                            None => {
+                                let nv = c.query_one("SELECT version FROM kb.file WHERE path = $1", &[&path])?.get::<_, i64>(0) as u64;
+                                Ok(WriteOutcome::Absorbed { version: nv })
+                            }
+                        }
                     }
                     Err(e) => Self::map_write_err(e),
                 }

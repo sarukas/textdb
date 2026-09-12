@@ -647,7 +647,7 @@ mod kb {
             let files: std::collections::HashMap<i64, (i64, f32)> = Spi::connect(|client| {
                 let t = client
                     .select(
-                        "SELECT r.file_id, c.id, ts_rank(c.tsv, q) FROM kb.chunk c, to_tsquery('simple', $1) q JOIN kb.chunk_ref r ON r.chunk_id = c.id JOIN kb.node n ON n.id = r.file_id WHERE c.tsv @@ q AND n.deleted_at IS NULL AND n.kind = 1 AND ($2 = '/' OR n.path LIKE $2 || '/%') ORDER BY 3 DESC LIMIT $3",
+                        "SELECT r.file_id, c.id, ts_rank(c.tsv, q) FROM kb.chunk c JOIN kb.chunk_ref r ON r.chunk_id = c.id JOIN kb.node n ON n.id = r.file_id, to_tsquery('simple', $1) q WHERE c.tsv @@ q AND n.deleted_at IS NULL AND n.kind = 1 AND ($2 = '/' OR n.path LIKE $2 || '/%') ORDER BY 3 DESC LIMIT $3",
                         None,
                         &[tsq.as_str().into(), prefix.as_str().into(), ((limit * 50) as i64).into()],
                     )

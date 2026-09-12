@@ -114,6 +114,7 @@ pub fn concurrent_reads(ctx: &Ctx) -> anyhow::Result<()> {
                         }
                     }
                     results.lock().unwrap().push((lat, torn, errors));
+                    backend.thread_done();
                 });
             }
             if writer_every_ms > 0 {
@@ -144,6 +145,7 @@ pub fn concurrent_reads(ctx: &Ctx) -> anyhow::Result<()> {
                         std::thread::sleep(Duration::from_millis(writer_every_ms));
                     }
                     *writes.lock().unwrap() = (lat, n);
+                    backend.thread_done();
                 });
             }
         });

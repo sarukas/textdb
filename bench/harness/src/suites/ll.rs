@@ -86,7 +86,7 @@ pub fn long_lines(ctx: &Ctx) -> anyhow::Result<()> {
         ctx.backend.reset_counters()?;
         let mut el = Latencies::default();
         match ctx.timed(&mut el, || ctx.backend.replace(&path, &old, &new, None)) {
-            Ok(WriteOutcome::Committed { .. }) => {
+            Ok(WriteOutcome::Committed { .. }) | Ok(WriteOutcome::Absorbed { .. }) => {
                 body = crate::reference::splice(&body, &old, &new).unwrap();
                 ctx.cell.lat(&case, "replace", &el);
                 let written = ctx.backend.bytes_written_since_reset().unwrap_or(0);

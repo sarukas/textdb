@@ -34,7 +34,7 @@ Every test in this suite runs the same operations against every storage format u
 
 ## 4. Uniform backend interface
 
-See `bench/harness/src/backend.rs` — `Backend` trait with `create/delete/rename/list`, `read/read_lines/read_version`, `overwrite/replace/append`, `search/history`, and the measurement hooks `storage_bytes`, `bytes_written_since_reset`, `reset_counters`. `WriteOutcome` is `Committed { version, direct }`, `Conflict { current_region }` or `Contention`.
+See `bench/harness/src/backend.rs` — `Backend` trait with `create/delete/rename/list`, `read/read_lines/read_version`, `overwrite/replace/append`, `search/history`, and the measurement hooks `storage_bytes`, `bytes_written_since_reset`, `reset_counters`. `WriteOutcome` is `Committed { version, direct }`, `Absorbed { version }` (the write succeeded but an identical concurrent change had already produced that content, so no new version was created — reported separately as `absorbed_identical`), `Conflict { current_region }` or `Contention`. For the `textdb-*` backends the outcome is classified through the SQL surface itself: each write carries a unique author tag and the history is checked for a version with that tag.
 
 `storage_bytes` / `bytes_written`: fs via directory walk and `/proc/self/io` (`wchar`) plus children `ru_oublock` for git; Postgres via `pg_total_relation_size` and `pg_stat_io` + `pg_stat_wal` (PG16); SQLite via file sizes and `/proc/self/io`.
 

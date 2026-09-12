@@ -13,6 +13,7 @@ use crate::backends::col_bytes;
 use crate::reference::splice;
 
 static INSTANCE: AtomicU64 = AtomicU64::new(1);
+static WRITE_TAG: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     static CONNS: RefCell<HashMap<u64, Connection>> = RefCell::new(HashMap::new());
@@ -199,16 +200,32 @@ impl Backend for TextdbSqlite {
                     Some(n) => n,
                     None => return Ok(WriteOutcome::Conflict { current_region: seen }),
                 };
+                // A unique author tag lets the outcome be classified through the SQL surface:
+                // a commit row carrying the tag exists iff this write created a version.
+                let tag = format!("bench-{}", WRITE_TAG.fetch_add(1, Ordering::Relaxed));
                 match c.execute(
-                    "UPDATE kb SET content = ?1, base_version = ?2, author = 'bench' WHERE path = ?3",
-                    params![content_param(&next), v as i64, path],
+                    "UPDATE kb SET content = ?1, base_version = ?2, author = ?4 WHERE path = ?3",
+                    params![content_param(&next), v as i64, path, tag],
                 ) {
                     Ok(_) => {
-                        let nv: i64 = c.query_row("SELECT version FROM kb WHERE path = ?1", params![path], |r| r.get(0))?;
-                        Ok(WriteOutcome::Committed {
-                            version: nv as u64,
-                            direct: nv as u64 == v + 1,
-                        })
+                        let mine: Option<i64> = c
+                            .query_row(
+                                "SELECT max(version) FROM textdb_history(?1) WHERE author = ?2",
+                                params![path, tag],
+                                |r| r.get(0),
+                            )
+                            .optional()?
+                            .flatten();
+                        match mine {
+                            Some(nv) => Ok(WriteOutcome::Committed {
+                                version: nv as u64,
+                                direct: nv as u64 == v + 1,
+                            }),
+                            None => {
+                                let nv: i64 = c.query_row("SELECT version FROM kb WHERE path = ?1", params![path], |r| r.get(0))?;
+                                Ok(WriteOutcome::Absorbed { version: nv as u64 })
+                            }
+                        }
                     }
                     Err(e) => Self::map_write_err(e),
                 }

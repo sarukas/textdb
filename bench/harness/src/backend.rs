@@ -31,7 +31,10 @@ impl From<rusqlite::Error> for BackendError {
 }
 impl From<postgres::Error> for BackendError {
     fn from(e: postgres::Error) -> Self {
-        BackendError::Other(e.to_string())
+        match e.as_db_error() {
+            Some(db) => BackendError::Other(format!("{} {}: {}", e, db.code().code(), db.message())),
+            None => BackendError::Other(e.to_string()),
+        }
     }
 }
 impl From<std::io::Error> for BackendError {
@@ -84,6 +87,9 @@ pub struct Hit {
 pub enum WriteOutcome {
     /// `direct` is true when no other writer committed between the caller's base and this write.
     Committed { version: Version, direct: bool },
+    /// The write succeeded but produced no new version: an identical change had already
+    /// been committed concurrently (textdb merges identical concurrent edits).
+    Absorbed { version: Version },
     Conflict { current_region: Vec<u8> },
     Contention,
 }
@@ -153,6 +159,8 @@ pub trait Backend: Send + Sync {
     fn warm(&self) -> R<()> {
         Ok(())
     }
+    /// Called by every agent thread before it exits, so per-thread connections close cleanly.
+    fn thread_done(&self) {}
 }
 
 /// Process-level write accounting shared by the in-process backends.

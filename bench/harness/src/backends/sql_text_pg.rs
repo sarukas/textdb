@@ -15,7 +15,17 @@ use crate::backends::{first_hit_line, query_terms};
 static INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
-    static CONNS: RefCell<HashMap<u64, Client>> = RefCell::new(HashMap::new());
+    // `ManuallyDrop`: a `postgres::Client` must not be dropped during thread-local teardown
+    // (its tokio runtime is already gone); connections are closed via `thread_done`/`Drop`.
+    static CONNS: RefCell<HashMap<u64, std::mem::ManuallyDrop<Client>>> = RefCell::new(HashMap::new());
+}
+
+fn close_conn(id: u64) {
+    let _ = CONNS.try_with(|m| {
+        if let Some(mut c) = m.borrow_mut().remove(&id) {
+            unsafe { std::mem::ManuallyDrop::drop(&mut c) };
+        }
+    });
 }
 
 pub struct SqlTextPg {
@@ -67,7 +77,7 @@ impl SqlTextPg {
         CONNS.with(|m| {
             let mut m = m.borrow_mut();
             if !m.contains_key(&self.id) {
-                m.insert(self.id, self.open()?);
+                m.insert(self.id, std::mem::ManuallyDrop::new(self.open()?));
             }
             f(m.get_mut(&self.id).unwrap())
         })
@@ -110,7 +120,16 @@ pub fn pg_written_bytes(c: &mut Client) -> R<u64> {
     Ok(row.get::<_, i64>(0) as u64)
 }
 
+impl Drop for SqlTextPg {
+    fn drop(&mut self) {
+        close_conn(self.id);
+    }
+}
+
 impl Backend for SqlTextPg {
+    fn thread_done(&self) {
+        close_conn(self.id);
+    }
     fn id(&self) -> &'static str {
         "sql-text-pg"
     }

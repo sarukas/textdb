@@ -109,8 +109,24 @@ pub fn concurrent_writes(ctx: &Ctx) -> anyhow::Result<()> {
                             },
                         };
                         let nl = n_lines(&seen).max(1);
-                        let marker = format!("w{} n{} {}", w, i, rng.gen::<u32>());
-                        let (line_idx, old, new): (usize, Vec<u8>, Vec<u8>) = match pattern.as_str() {
+                        let marker = format!("w{:03} n{:06} {:010}", w, i, rng.gen::<u32>());
+                        // Candidate line for this op; blank or non-unique lines are skipped
+                        // (a few tries) so the oracle measures concurrency, not string ambiguity.
+                        let pick = |seen: &[u8], first: usize, span: usize| -> Option<(usize, Vec<u8>)> {
+                            for t in 0..span.min(8) {
+                                let idx = first + (t % span.max(1));
+                                if idx >= nl {
+                                    break;
+                                }
+                                let (s, e) = line_span(seen, idx)?;
+                                let old = &seen[s..e];
+                                if !old.is_empty() && find_unique(seen, old).is_some() {
+                                    return Some((idx, old.to_vec()));
+                                }
+                            }
+                            None
+                        };
+                        let picked: Option<(usize, Vec<u8>, Vec<u8>)> = match pattern.as_str() {
                             "same_line" => {
                                 let (s, e) = line_span(&seen, counter_line).unwrap_or((0, 0));
                                 let old = seen[s..e].to_vec();
@@ -120,28 +136,32 @@ pub fn concurrent_writes(ctx: &Ctx) -> anyhow::Result<()> {
                                     .and_then(|t| t.split_whitespace().next())
                                     .and_then(|t| t.parse().ok())
                                     .unwrap_or(0);
-                                (counter_line, old, format!("count: {}", cur + 1).into_bytes())
+                                Some((counter_line, old, format!("count: {}", cur + 1).into_bytes()))
                             }
                             "same_section" => {
-                                // Section = lines [10, 10 + 2N); writer w owns none — distinct lines chosen per op.
                                 let lo = 10.min(nl - 1);
                                 let hi = (lo + 2 * n).min(nl);
                                 let idx = lo + (w + i * n) % (hi - lo).max(1);
-                                let (s, e) = line_span(&seen, idx).unwrap();
-                                (idx, seen[s..e].to_vec(), marker.clone().into_bytes())
+                                pick(&seen, idx, hi - idx).map(|(idx, old)| (idx, old, marker.clone().into_bytes()))
                             }
-                            "append" => (usize::MAX, Vec::new(), format!("{}\n", marker).into_bytes()),
+                            "append" => Some((usize::MAX, Vec::new(), format!("{}\n", marker).into_bytes())),
                             "zipf_files" | "rename_race" => {
                                 let idx = rng.gen_range(0..nl);
-                                let (s, e) = line_span(&seen, idx).unwrap();
-                                (idx, seen[s..e].to_vec(), marker.clone().into_bytes())
+                                pick(&seen, idx, nl - idx).map(|(idx, old)| (idx, old, marker.clone().into_bytes()))
                             }
                             _ => {
                                 // disjoint_sections: writer w owns line block [w*k, (w+1)*k)
                                 let k = (nl0 / n).max(1);
-                                let idx = (w * k + i % k).min(nl - 1);
-                                let (s, e) = line_span(&seen, idx).unwrap();
-                                (idx, seen[s..e].to_vec(), marker.clone().into_bytes())
+                                let first = (w * k + i % k).min(nl - 1);
+                                let span = ((w + 1) * k).min(nl).saturating_sub(first).max(1);
+                                pick(&seen, first, span).map(|(idx, old)| (idx, old, marker.clone().into_bytes()))
+                            }
+                        };
+                        let (line_idx, old, new) = match picked {
+                            Some(x) => x,
+                            None => {
+                                i += 1;
+                                continue;
                             }
                         };
                         let t = Instant::now();
@@ -153,11 +173,15 @@ pub fn concurrent_writes(ctx: &Ctx) -> anyhow::Result<()> {
                         };
                         res.lat.push(t.elapsed());
                         match r {
+                            Ok(WriteOutcome::Absorbed { .. }) => {
+                                // No new version: an identical concurrent change was absorbed.
+                                res.absorbed += 1;
+                                if let Ok(x) = backend.read_versioned(path) {
+                                    last_seen.insert(path.clone(), x);
+                                }
+                            }
                             Ok(WriteOutcome::Committed { version, direct }) => {
-                                if version != 0 && version == ver {
-                                    // No new version: identical concurrent change absorbed.
-                                    res.absorbed += 1;
-                                } else {
+                                {
                                     if direct {
                                         res.out.committed_direct += 1;
                                     } else {
@@ -205,6 +229,7 @@ pub fn concurrent_writes(ctx: &Ctx) -> anyhow::Result<()> {
                         }
                     }
                     results.lock().unwrap().push(res);
+                    backend.thread_done();
                 });
             }
             if pattern == "rename_race" {
@@ -225,6 +250,7 @@ pub fn concurrent_writes(ctx: &Ctx) -> anyhow::Result<()> {
                         }
                         renames.fetch_add(2, Ordering::Relaxed);
                     }
+                    backend.thread_done();
                 });
                 // Writers use fixed paths; stop the renamer when they finish.
                 // (scope waits for writer threads; signal by polling results count)
@@ -366,7 +392,7 @@ pub fn uniquify_lines(body: &[u8]) -> Vec<u8> {
         }
         out.extend_from_slice(line);
         if !line.is_empty() {
-            out.extend_from_slice(format!(" ·{}", n).as_bytes());
+            out.extend_from_slice(format!(" ·{:06}", n).as_bytes());
         }
         i += 1;
     }

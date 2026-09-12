@@ -137,7 +137,7 @@ pub fn edit_sequence(ctx: &Ctx) -> anyhow::Result<()> {
             ctx.timed(&mut lat, || ctx.backend.replace(path, &old, &new, None))
         };
         match r {
-            Ok(WriteOutcome::Committed { .. }) => {}
+            Ok(WriteOutcome::Committed { .. }) | Ok(WriteOutcome::Absorbed { .. }) => {}
             Ok(other) => {
                 failures += 1;
                 ctx.cell.fail("", "replace", &format!("edit {} unexpected outcome {:?}", i, other));
