@@ -1,0 +1,7 @@
+/target
+**/target
+/bench/out
+/bench/data
+*.db
+*.db-wal
+*.db-shm
