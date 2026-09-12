@@ -21,6 +21,10 @@ use textdb_core::{Hash, Node, Storage, TextdbError};
 /// not shared between threads; each writer thread warms its own.
 const CHUNK_BUDGET: usize = 96 << 20;
 const NODE_BUDGET: usize = 16 << 20;
+const DOC_BUDGET: usize = 64 << 20;
+/// Documents above this are not cached: a single one would evict everything else, and the
+/// tests that use documents this large read each of them once.
+const DOC_MAX: usize = 8 << 20;
 
 struct Lru<V> {
     map: HashMap<Hash, (u64, usize, V)>,
@@ -73,6 +77,13 @@ impl<V: Clone> Lru<V> {
 thread_local! {
     static CHUNKS: RefCell<Lru<Arc<Vec<u8>>>> = RefCell::new(Lru::new(CHUNK_BUDGET));
     static NODES: RefCell<Lru<Node>> = RefCell::new(Lru::new(NODE_BUDGET));
+    /// Whole documents, keyed by root hash. The root hash covers the entire document, so
+    /// this is the same content-addressed argument as the chunk cache, one level up: a
+    /// document that has not been rewritten needs neither the tree walk nor the
+    /// concatenation. The flag records whether the bytes are UTF-8, which is a property of
+    /// the content and so equally cacheable — it saves re-validating megabytes on a read
+    /// that only wants to hand the text back.
+    static DOCS: RefCell<Lru<(Arc<Vec<u8>>, bool)>> = RefCell::new(Lru::new(DOC_BUDGET));
 }
 
 pub struct SqliteStorage<'c> {
@@ -114,6 +125,20 @@ impl<'c> SqliteStorage<'c> {
             CHUNKS.with(|c| c.borrow_mut().put(*h, a.len(), a.clone()));
             a
         }))
+    }
+
+    /// The whole document under `root`, with whether it is valid UTF-8.
+    pub fn document(&self, root: &Hash) -> Result<(Arc<Vec<u8>>, bool)> {
+        if let Some(d) = DOCS.with(|c| c.borrow_mut().get(root)) {
+            return Ok(d);
+        }
+        let bytes = textdb_core::materialize(self, root)?;
+        let utf8 = std::str::from_utf8(&bytes).is_ok();
+        let entry = (Arc::new(bytes), utf8);
+        if entry.0.len() <= DOC_MAX {
+            DOCS.with(|c| c.borrow_mut().put(*root, entry.0.len(), entry.clone()));
+        }
+        Ok(entry)
     }
 
     pub fn now() -> String {
