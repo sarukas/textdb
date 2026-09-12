@@ -10,6 +10,7 @@ use crate::backend::Backend;
 use crate::gen::{GenOpts, Generator};
 use crate::metrics::Latencies;
 use crate::reference::Reference;
+use crate::ops;
 use crate::runner::Ctx;
 use crate::suites::{line_edit, n_lines, Zipf};
 
@@ -159,11 +160,22 @@ pub fn concurrent_reads(ctx: &Ctx) -> anyhow::Result<()> {
             errors += e;
         }
         ctx.cell.lat(&case, &variant, &lat);
+        // Attribute the readers' samples to the operation the variant actually issued.
+        ctx.record_op(
+            match variant.as_str() {
+                "read_lines" => ops::READ_LINES,
+                "read_version" => ops::READ_VERSION,
+                "search" => ops::SEARCH,
+                _ => ops::READ,
+            },
+            &lat,
+        );
         ctx.cell.metric(&case, "throughput_ops_s", lat.samples.len() as f64 / elapsed.max(1e-9));
         ctx.cell.metric(&case, "errors", errors as f64);
         if writer_every_ms > 0 {
             let (wl, wn) = writes.into_inner().unwrap();
             ctx.cell.lat(&case, "writer_replace", &wl);
+            ctx.record_op(ops::REPLACE, &wl);
             ctx.cell.metric(&case, "writes", wn as f64);
             if torn > 0 {
                 ctx.cell.fail(&case, "torn_reads", &format!("{} reads matched no committed version", torn));

@@ -1,10 +1,13 @@
 //! Test-case loading (TOML data, not code) and dispatch to the suite implementations.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::backend::{Backend, BackendError, Mode, R};
 use crate::metrics::{Cell, Latencies, Sink};
+use crate::reference::Reference;
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct TestDef {
@@ -110,9 +113,80 @@ pub struct Ctx<'a> {
     pub seed: u64,
     pub work: PathBuf,
     pub verbose: bool,
+    /// Run-wide latency per operation name, filled in by `op`.
+    ops: Mutex<BTreeMap<&'static str, Latencies>>,
+    /// Oracle the suite built, compared against the backend after the suite finishes.
+    reference: Mutex<Option<Reference>>,
 }
 
-impl Ctx<'_> {
+impl<'a> Ctx<'a> {
+    pub fn new(cell: Cell<'a>, backend: &'a dyn Backend, params: Params<'a>, seed: u64, work: PathBuf, verbose: bool) -> Self {
+        Ctx {
+            cell,
+            backend,
+            params,
+            seed,
+            work,
+            verbose,
+            ops: Mutex::new(BTreeMap::new()),
+            reference: Mutex::new(None),
+        }
+    }
+
+    /// Time one call and attribute it to a named operation from [`crate::ops`].
+    ///
+    /// The latency lands both in the suite's per-case bucket and in the run-wide bucket
+    /// for that operation. The lock is taken *after* the elapsed time is read, so the
+    /// bookkeeping never appears in the measurement.
+    pub fn op<T>(&self, op: &'static str, lat: &mut Latencies, f: impl FnOnce() -> R<T>) -> R<T> {
+        let t = Instant::now();
+        let r = f();
+        let d = t.elapsed();
+        lat.push(d);
+        self.ops.lock().unwrap().entry(op).or_default().push(d);
+        r
+    }
+
+    /// `op` for a call whose latency the suite does not bucket per case.
+    pub fn op_only<T>(&self, op: &'static str, f: impl FnOnce() -> R<T>) -> R<T> {
+        let mut sink = Latencies::default();
+        self.op(op, &mut sink, f)
+    }
+
+    /// Merge an already-collected batch of samples into an operation's bucket.
+    ///
+    /// The concurrency suites time inside their worker threads and merge once at the end.
+    /// Calling `op` per operation there would put a process-wide lock between every write
+    /// of every writer, serialising the threads and changing the contention the test
+    /// exists to measure.
+    pub fn record_op(&self, op: &'static str, l: &Latencies) {
+        if !l.samples.is_empty() {
+            self.ops.lock().unwrap().entry(op).or_default().extend(l);
+        }
+    }
+
+    /// Hand the suite's oracle to the post-run accuracy check. Suites that model what the
+    /// backend should contain call this; the rest get the structural checks only.
+    pub fn set_reference(&self, r: Reference) {
+        *self.reference.lock().unwrap() = Some(r);
+    }
+
+    /// Emit `op_<name>_<stat>` rows for every operation the cell timed.
+    pub fn flush_ops(&self) {
+        let ops = self.ops.lock().unwrap();
+        for name in crate::ops::ALL {
+            if let Some(l) = ops.get(name) {
+                if !l.samples.is_empty() {
+                    self.cell.lat("ops", &format!("op_{}", name), l);
+                }
+            }
+        }
+    }
+
+    pub fn take_reference(&self) -> Option<Reference> {
+        self.reference.lock().unwrap().take()
+    }
+
     /// Time one call; on N/A record it and return None.
     pub fn timed<T>(&self, lat: &mut Latencies, f: impl FnOnce() -> R<T>) -> R<T> {
         let t = Instant::now();
@@ -154,6 +228,12 @@ pub struct RunOpts {
 }
 
 /// Try to drop the page cache (fairness rule 3). Returns whether it worked.
+#[cfg(not(unix))]
+pub fn drop_page_cache() -> bool {
+    false
+}
+
+#[cfg(unix)]
 pub fn drop_page_cache() -> bool {
     unsafe {
         libc::sync();
@@ -181,15 +261,15 @@ pub fn run_all(tests: &[TestDef], backends: &[String], sink: &Sink, o: &RunOpts)
                 } else {
                     "warm"
                 };
-                let cell = Cell {
+                let cell = Cell::new(
                     sink,
-                    test: t.id.clone(),
-                    family: t.family.clone(),
-                    backend: b.clone(),
-                    mode: o.mode.name().to_string(),
-                    cache: cache.to_string(),
+                    t.id.clone(),
+                    t.family.clone(),
+                    b.clone(),
+                    o.mode.name().to_string(),
+                    cache.to_string(),
                     rep,
-                };
+                );
                 if t.na.iter().any(|x| x == b) {
                     cell.na("", &t.note);
                     continue;
@@ -207,22 +287,39 @@ pub fn run_all(tests: &[TestDef], backends: &[String], sink: &Sink, o: &RunOpts)
                 };
                 let _ = backend.warm();
                 let (primary, fallback) = if o.profile == "spec" { (&t.spec, &t.spec) } else { (&t.poc, &t.spec) };
-                let ctx = Ctx {
+                let ctx = Ctx::new(
                     cell,
-                    backend: backend.as_ref(),
-                    params: Params { primary, fallback },
-                    seed: o.seed.wrapping_add(rep as u64),
-                    work: o.work.join(b),
-                    verbose: o.verbose,
-                };
+                    backend.as_ref(),
+                    Params { primary, fallback },
+                    o.seed.wrapping_add(rep as u64),
+                    o.work.join(b),
+                    o.verbose,
+                );
+
+                // Untimed: prove the store is clean and the backend actually works before
+                // anything it does is allowed to count as a measurement.
+                let ready = crate::verify::precheck(&ctx);
+                let _ = ctx.backend.reset_counters();
+
                 let started = Instant::now();
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::suites::dispatch(&t.kind, &ctx)));
-                match r {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => ctx.cell.fail("", "suite", &e.to_string()),
-                    Err(_) => ctx.cell.fail("", "suite", "panicked"),
+                if ready {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::suites::dispatch(&t.kind, &ctx)));
+                    match r {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => ctx.cell.fail("", "suite", &e.to_string()),
+                        Err(_) => ctx.cell.fail("", "suite", "panicked"),
+                    }
                 }
                 ctx.cell.metric("", "wall_s", started.elapsed().as_secs_f64());
+
+                // Untimed: the suite's own claims, checked against the store it left behind.
+                if ready {
+                    let reference = ctx.take_reference();
+                    crate::verify::postcheck(&ctx, reference.as_ref());
+                }
+                ctx.flush_ops();
+                // Publishes the held-back timings, or voids them if any check failed.
+                ctx.cell.finish();
             }
             eprintln!("   {:<16} {:>7.1}s", b, t0.elapsed().as_secs_f64());
         }

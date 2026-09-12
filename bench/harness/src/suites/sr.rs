@@ -9,6 +9,7 @@ use rand::{Rng, SeedableRng};
 use crate::gen::Generator;
 use crate::metrics::Latencies;
 use crate::reference::Reference;
+use crate::ops;
 use crate::runner::Ctx;
 use crate::suites::{import_corpus, line_edit, n_lines};
 
@@ -151,7 +152,7 @@ pub fn search(ctx: &Ctx) -> anyhow::Result<()> {
                 .filter(|p| p.starts_with(&prefix_filter) || prefix_filter == "/")
                 .filter(|p| matches(&toks[*p], kind, &terms))
                 .collect();
-            match ctx.timed(&mut lat, || ctx.backend.search(&query, &prefix_filter)) {
+            match ctx.op(ops::SEARCH, &mut lat, || ctx.backend.search(&query, &prefix_filter)) {
                 Ok(hits) => {
                     let got: BTreeSet<String> = hits.into_iter().map(|h| h.path).collect();
                     for p in &truth {
@@ -182,5 +183,6 @@ pub fn search(ctx: &Ctx) -> anyhow::Result<()> {
         ctx.cell.metric(&case, "recall", recall);
         ctx.cell.metric(&case, "precision", precision);
     }
+    ctx.set_reference(reference);
     Ok(())
 }
