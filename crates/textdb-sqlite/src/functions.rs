@@ -32,7 +32,9 @@ fn text_or_blob(b: Vec<u8>) -> Value {
 
 fn with_db<T>(ctx: &Context, prefix: &str, f: impl FnOnce(&TextDb) -> textdb_core::storage::Result<T>) -> Result<T> {
     let conn = unsafe { ctx.get_connection()? };
-    let db = TextDb::attach(&conn, prefix, false);
+    // Scalar functions run inside a SELECT: open one write transaction for the whole
+    // operation instead of autocommitting every nested statement.
+    let db = TextDb::attach(&conn, prefix, true);
     f(&db).map_err(map_err)
 }
 

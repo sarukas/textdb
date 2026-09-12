@@ -1,1 +1,81 @@
 # textdb
+
+Versioned, chunk-shared text documents inside an SQL database, with compare-and-swap
+commits and automatic rebase — so many humans and AI agents can read, search and edit a
+markdown knowledge base concurrently without git push/pull.
+
+This repository is the proof of concept described in [`docs/spec.md`](docs/spec.md)
+(issue #2) together with the comparative test suite from [`docs/test-suite.md`](docs/test-suite.md)
+(issue #1). Measured results: [`docs/results.md`](docs/results.md).
+
+## Layout
+
+| Path | What |
+|---|---|
+| `crates/textdb-core` | Engine-agnostic algorithms: FastCDC chunker with newline snap, BLAKE3 prolly tree, `Storage` trait, materialize/locate, localised edit, tree diff, diff3, commit-with-rebase |
+| `crates/textdb-md` | Markdown `StructureExtractor` (sections, wikilinks, frontmatter) |
+| `crates/textdb-sqlite` | SQLite binding: shadow tables, `CREATE VIRTUAL TABLE kb USING textdb(...)`, table-valued and scalar functions, FTS5 on chunks |
+| `crates/textdb-pg` | Postgres 16 extension (pgrx): schema `kb`, updatable views `kb.file`/`kb.folder`/`kb.file_version`, functions, SQLSTATEs `TX001`/`TX002` |
+| `bench/harness` | The test suite runner and six backends (`fs`, `fs-git`, `sql-text-sqlite`, `sql-text-pg`, `textdb-sqlite`, `textdb-pg`) |
+| `bench/harness/tests/*.toml` | The test matrix as data |
+| `docs/decisions` | ADRs recorded during the POC |
+
+## Build and test
+
+```sh
+cargo test --workspace --release          # core property tests P1–P6, md, sqlite SQL-surface tests
+```
+
+Postgres extension (needs `postgresql-server-dev-16`, `libclang`, `cargo-pgrx 0.18`):
+
+```sh
+cargo install cargo-pgrx --version 0.18.1 --locked
+cargo pgrx init --pg16 $(which pg_config)
+cd crates/textdb-pg && cargo pgrx install --release --pg-config $(which pg_config)
+psql -c 'CREATE EXTENSION textdb_pg'
+```
+
+## Using it
+
+SQLite:
+
+```sql
+CREATE VIRTUAL TABLE kb USING textdb(store='kb_');
+INSERT INTO kb(path, content, author) VALUES ('/notes/a.md', '# A' || char(10) || 'alpha', 'alice');
+UPDATE kb SET content = replace(content, 'alpha', 'ALPHA') WHERE path = '/notes/a.md';   -- diff → edit → commit
+UPDATE kb SET content = ?, base_version = 1 WHERE path = '/notes/a.md';                  -- rebase against a stale read
+SELECT textdb_edit('/notes/a.md', 'ALPHA', 'beta');                                       -- strict replace
+SELECT * FROM textdb_search('beta', '/notes');
+SELECT * FROM textdb_history('/notes/a.md');
+SELECT textdb_content('/notes/a.md', 1), textdb_diff('/notes/a.md', 1, 2);
+UPDATE kb SET path = '/archive/notes' WHERE path = '/notes';                              -- move a folder
+DELETE FROM kb WHERE path = '/archive';                                                   -- tombstone
+```
+
+Postgres:
+
+```sql
+INSERT INTO kb.file(path, content) VALUES ('/notes/a.md', E'# A\nalpha\n');
+UPDATE kb.file SET content = replace(content, 'alpha', 'ALPHA') WHERE path = '/notes/a.md';
+SELECT kb.edit(f, 'ALPHA', 'beta') FROM kb.file f WHERE f.path = '/notes/a.md';
+SELECT * FROM kb.search('beta', '/notes');
+SELECT version, author FROM kb.history('/notes/a.md');
+SELECT content FROM kb.file_version WHERE path = '/notes/a.md' AND version = 1;
+```
+
+A conflicting concurrent edit raises SQLSTATE `TX001` whose `DETAIL` is a JSON payload
+with `base`, `theirs` (current text) and `ours` for the overlapping lines; `TX002` is
+retry-budget exhaustion.
+
+## Running the comparative suite
+
+```sh
+bench/scripts/pg-start.sh                       # throwaway PG16 cluster, prints the URL
+cargo build --release -p textdb-bench
+./target/release/textdb-bench run --profile poc --pg postgres://postgres@localhost:54329/postgres \
+    --out bench/out --work bench/data [--backends fs,textdb-sqlite] [--filter CW,ME-06] [--mode durable]
+./target/release/textdb-bench report --out bench/out     # regenerate report.md from results.jsonl
+```
+
+`--profile spec` replays the matrix at the scale issue #1 asks for (50k files, 1 GiB files,
+minutes per N); `poc` is the scaled-down profile used for `docs/results.md`.

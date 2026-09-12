@@ -143,19 +143,29 @@ impl<'c> TextDb<'c> {
         SqliteStorage::now()
     }
 
-    /// Run `f` inside a write transaction when this handle manages transactions.
+    /// Run `f` atomically. A handle that manages transactions opens `BEGIN IMMEDIATE …
+    /// COMMIT` in autocommit mode (this also works from inside a scalar SQL function and
+    /// avoids one autocommit per nested statement) and a nested `SAVEPOINT` inside an
+    /// explicit transaction. Inside a virtual-table update (`manage_tx == false`) the
+    /// enclosing statement's transaction already makes the operation atomic, and SQLite
+    /// forbids savepoints while a write statement is in progress, so `f` runs inline.
     pub fn tx<T>(&self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
-        if !self.manage_tx || !self.conn.is_autocommit() {
+        if !self.manage_tx {
             return f(self);
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE").map_err(sql_err)?;
+        let (begin, commit, rollback) = if self.conn.is_autocommit() {
+            ("BEGIN IMMEDIATE", "COMMIT", "ROLLBACK")
+        } else {
+            ("SAVEPOINT textdb_op", "RELEASE textdb_op", "ROLLBACK TO textdb_op; RELEASE textdb_op")
+        };
+        self.conn.execute_batch(begin).map_err(sql_err)?;
         match f(self) {
             Ok(v) => {
-                self.conn.execute_batch("COMMIT").map_err(sql_err)?;
+                self.conn.execute_batch(commit).map_err(sql_err)?;
                 Ok(v)
             }
             Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
+                let _ = self.conn.execute_batch(rollback);
                 Err(e)
             }
         }

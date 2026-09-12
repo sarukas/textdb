@@ -131,10 +131,13 @@ CREATE TRIGGER folder_iud INSTEAD OF INSERT OR UPDATE OR DELETE ON kb.folder FOR
 -- Attribute notation (spec §7.2): f.content is the view column; the rest are wrappers.
 CREATE FUNCTION kb.lines(f kb.file, l_from bigint, l_to bigint) RETURNS text LANGUAGE sql STABLE AS $$ SELECT kb.lines(f.path, l_from, l_to) $$;
 CREATE FUNCTION kb.section(f kb.file, heading text) RETURNS text LANGUAGE sql STABLE AS $$ SELECT kb.section(f.path, heading) $$;
-CREATE FUNCTION kb.edit(f kb.file, old text, new text) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb.edit(f.path, old, new, NULL) $$;
-CREATE FUNCTION kb.append(f kb.file, tail text) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb.append(f.path, tail, NULL) $$;
+CREATE FUNCTION kb.edit(f kb.file, old text, new text) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb.edit(f.path, old, new, NULL::text) $$;
+CREATE FUNCTION kb.edit(path text, old text, new text) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb.edit(path, old, new, NULL::text) $$;
+CREATE FUNCTION kb.append(f kb.file, tail text) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb.append(f.path, tail, NULL::text) $$;
+CREATE FUNCTION kb.append(path text, tail text) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb.append(path, tail, NULL::text) $$;
 CREATE FUNCTION kb.diff(f kb.file, v1 bigint, v2 bigint) RETURNS text LANGUAGE sql STABLE AS $$ SELECT kb.diff(f.path, v1, v2) $$;
 CREATE FUNCTION kb.content(f kb.file) RETURNS text LANGUAGE sql STABLE AS $$ SELECT f.content $$;
+CREATE FUNCTION kb.content(path text) RETURNS text LANGUAGE sql STABLE AS $$ SELECT kb.content(path, NULL::bigint) $$;
 "#,
     name = "kb_views",
     finalize
@@ -372,6 +375,10 @@ mod kb {
     /// Strict replace: `old` must occur exactly once in the current content (spec §7.2 `edit`).
     #[pg_extern(volatile)]
     fn edit(path: &str, old: &str, new: &str, author: Option<&str>) -> i64 {
+        edit_impl(path, old, new, author)
+    }
+
+    fn edit_impl(path: &str, old: &str, new: &str, author: Option<&str>) -> i64 {
         let path = ok(normalize_path(path));
         let n = file_by_path(&path);
         let cur = n.root.unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
@@ -408,6 +415,10 @@ mod kb {
 
     #[pg_extern(volatile)]
     fn append(path: &str, tail: &str, author: Option<&str>) -> i64 {
+        append_impl(path, tail, author)
+    }
+
+    fn append_impl(path: &str, tail: &str, author: Option<&str>) -> i64 {
         let path = ok(normalize_path(path));
         let n = file_by_path(&path);
         let cur = n.root.unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
@@ -464,7 +475,7 @@ mod kb {
 
     /// Content of a file at HEAD or at `version` (works for tombstoned files).
     #[pg_extern(stable)]
-    fn content(path: &str, version: default!(Option<i64>, "NULL")) -> String {
+    fn content(path: &str, version: Option<i64>) -> String {
         let path = ok(normalize_path(path));
         let st = SpiStorage::new();
         let bytes = match version {
