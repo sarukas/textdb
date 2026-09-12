@@ -139,7 +139,7 @@ pub fn materialize<S: Storage + ?Sized>(storage: &S, root: &Hash) -> Result<Vec<
 fn materialize_into<S: Storage + ?Sized>(storage: &S, node: &Node, out: &mut Vec<u8>) -> Result<()> {
     for c in &node.children {
         if c.is_leaf {
-            let bytes = storage.chunk(&c.hash)?;
+            let bytes = storage.chunk_shared(&c.hash)?;
             out.extend_from_slice(&bytes);
         } else {
             let child = storage.node(&c.hash)?;
@@ -174,7 +174,7 @@ fn range_into<S: Storage + ?Sized>(
         let end = off + c.nbytes;
         if end > from && off < to {
             if c.is_leaf {
-                let bytes = storage.chunk(&c.hash)?;
+                let bytes = storage.chunk_shared(&c.hash)?;
                 let s = from.saturating_sub(off) as usize;
                 let e = (to.min(end) - off) as usize;
                 out.extend_from_slice(&bytes[s..e]);

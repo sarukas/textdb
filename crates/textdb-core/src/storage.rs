@@ -30,6 +30,16 @@ pub trait Storage {
     fn chunk(&self, h: &Hash) -> Result<Vec<u8>> {
         self.get_chunk(h)?.ok_or(TextdbError::MissingChunk(*h))
     }
+
+    /// Fetch a chunk as a shared buffer.
+    ///
+    /// Materialising a document copies every chunk into the output, so a binding that
+    /// already holds the bytes — from a cache, say — should not have to hand out a fresh
+    /// `Vec` only for the caller to copy out of it and drop it. The default allocates, as
+    /// `chunk` does.
+    fn chunk_shared(&self, h: &Hash) -> Result<std::sync::Arc<Vec<u8>>> {
+        Ok(std::sync::Arc::new(self.chunk(h)?))
+    }
 }
 
 /// In-memory storage used for tests and as the Stage 0 reference implementation.

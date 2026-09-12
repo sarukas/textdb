@@ -1,9 +1,79 @@
 //! `Storage` over the shadow tables. Chunk inserts also feed the FTS5 index, so full-text
 //! indexing is insert-only by construction (spec claim 3).
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use rusqlite::{params, Connection, OptionalExtension};
 use textdb_core::storage::Result;
 use textdb_core::{Hash, Node, Storage, TextdbError};
+
+/// Content-addressed caches for chunks and tree nodes.
+///
+/// Materialising a document walks the tree and reads one row per leaf, so a 1 MiB file
+/// costs ~128 statement round-trips where a single-column baseline costs one. The entries
+/// are keyed by BLAKE3 hash, which *is* the content: an entry can never go stale, needs no
+/// invalidation, and stays valid across connections and databases. Nothing in the schema
+/// deletes a chunk or a node, so a hit can never outlive its row either.
+///
+/// Thread-local because `SqliteStorage` is constructed per operation and a `Connection` is
+/// not shared between threads; each writer thread warms its own.
+const CHUNK_BUDGET: usize = 96 << 20;
+const NODE_BUDGET: usize = 16 << 20;
+
+struct Lru<V> {
+    map: HashMap<Hash, (u64, usize, V)>,
+    bytes: usize,
+    budget: usize,
+    tick: u64,
+}
+
+impl<V: Clone> Lru<V> {
+    fn new(budget: usize) -> Self {
+        Lru {
+            map: HashMap::new(),
+            bytes: 0,
+            budget,
+            tick: 0,
+        }
+    }
+
+    fn get(&mut self, h: &Hash) -> Option<V> {
+        self.tick += 1;
+        let tick = self.tick;
+        let e = self.map.get_mut(h)?;
+        e.0 = tick;
+        Some(e.2.clone())
+    }
+
+    fn put(&mut self, h: Hash, size: usize, v: V) {
+        self.tick += 1;
+        if let Some(old) = self.map.insert(h, (self.tick, size, v)) {
+            self.bytes -= old.1;
+        }
+        self.bytes += size;
+        if self.bytes > self.budget {
+            // Drop the coldest entries in one pass rather than on every insert.
+            let mut by_age: Vec<(u64, Hash)> = self.map.iter().map(|(k, v)| (v.0, *k)).collect();
+            by_age.sort_unstable();
+            let target = self.budget * 3 / 4;
+            for (_, k) in by_age {
+                if self.bytes <= target {
+                    break;
+                }
+                if let Some(old) = self.map.remove(&k) {
+                    self.bytes -= old.1;
+                }
+            }
+        }
+    }
+}
+
+thread_local! {
+    static CHUNKS: RefCell<Lru<Arc<Vec<u8>>>> = RefCell::new(Lru::new(CHUNK_BUDGET));
+    static NODES: RefCell<Lru<Node>> = RefCell::new(Lru::new(NODE_BUDGET));
+}
 
 pub struct SqliteStorage<'c> {
     pub conn: &'c Connection,
@@ -25,6 +95,25 @@ impl<'c> SqliteStorage<'c> {
             chunk_bytes_written: 0,
             node_bytes_written: 0,
         }
+    }
+
+    /// Chunk bytes for `h`, from the thread's cache when present.
+    fn chunk_cached(&self, h: &Hash) -> Result<Option<Arc<Vec<u8>>>> {
+        if let Some(b) = CHUNKS.with(|c| c.borrow_mut().get(h)) {
+            return Ok(Some(b));
+        }
+        let got: Option<Vec<u8>> = self
+            .conn
+            .prepare_cached(&format!("SELECT bytes FROM {}chunk WHERE hash = ?1", self.p))
+            .map_err(sql_err)?
+            .query_row(params![&h[..]], |r| r.get::<_, Vec<u8>>(0))
+            .optional()
+            .map_err(sql_err)?;
+        Ok(got.map(|b| {
+            let a = Arc::new(b);
+            CHUNKS.with(|c| c.borrow_mut().put(*h, a.len(), a.clone()));
+            a
+        }))
     }
 
     pub fn now() -> String {
@@ -66,12 +155,11 @@ fn chrono_free_now() -> String {
 
 impl Storage for SqliteStorage<'_> {
     fn get_chunk(&self, h: &Hash) -> Result<Option<Vec<u8>>> {
-        self.conn
-            .prepare_cached(&format!("SELECT bytes FROM {}chunk WHERE hash = ?1", self.p))
-            .map_err(sql_err)?
-            .query_row(params![&h[..]], |r| r.get::<_, Vec<u8>>(0))
-            .optional()
-            .map_err(sql_err)
+        Ok(self.chunk_cached(h)?.map(|b| (*b).clone()))
+    }
+
+    fn chunk_shared(&self, h: &Hash) -> Result<Arc<Vec<u8>>> {
+        self.chunk_cached(h)?.ok_or(TextdbError::MissingChunk(*h))
     }
 
     fn put_chunk(&mut self, h: &Hash, b: &[u8]) -> Result<()> {
@@ -85,6 +173,7 @@ impl Storage for SqliteStorage<'_> {
             .map_err(sql_err)?
             .execute(params![&h[..], b, nlines])
             .map_err(sql_err)?;
+        CHUNKS.with(|c| c.borrow_mut().put(*h, b.len(), Arc::new(b.to_vec())));
         if inserted == 1 {
             self.chunk_bytes_written += b.len() as u64;
             let id = self.conn.last_insert_rowid();
@@ -99,6 +188,9 @@ impl Storage for SqliteStorage<'_> {
     }
 
     fn get_node(&self, h: &Hash) -> Result<Option<Node>> {
+        if let Some(n) = NODES.with(|c| c.borrow_mut().get(h)) {
+            return Ok(Some(n));
+        }
         let enc: Option<Vec<u8>> = self
             .conn
             .prepare_cached(&format!("SELECT children FROM {}tree_node WHERE hash = ?1", self.p))
@@ -108,9 +200,11 @@ impl Storage for SqliteStorage<'_> {
             .map_err(sql_err)?;
         match enc {
             None => Ok(None),
-            Some(e) => Node::decode(&e)
-                .map(Some)
-                .ok_or_else(|| TextdbError::Storage("corrupt tree node".into())),
+            Some(e) => {
+                let n = Node::decode(&e).ok_or_else(|| TextdbError::Storage("corrupt tree node".into()))?;
+                NODES.with(|c| c.borrow_mut().put(*h, e.len(), n.clone()));
+                Ok(Some(n))
+            }
         }
     }
 
@@ -125,6 +219,7 @@ impl Storage for SqliteStorage<'_> {
             .map_err(sql_err)?
             .execute(params![&h[..], &enc])
             .map_err(sql_err)?;
+        NODES.with(|c| c.borrow_mut().put(*h, enc.len(), n.clone()));
         if inserted == 1 {
             self.node_bytes_written += enc.len() as u64;
         }
