@@ -6,9 +6,11 @@ members = [
     "crates/textdb-sqlite",
     "bench/harness",
 ]
-# textdb-pg is a pgrx extension and is built separately (see crates/textdb-pg/README.md);
-# it is excluded from the default workspace so `cargo test` does not require a Postgres toolchain.
-exclude = ["crates/textdb-pg"]
+# textdb-pg is a pgrx extension and is built separately (see docs/INSTALL.md); it is excluded
+# so `cargo test` does not require a Postgres toolchain. textdb-sqlite-ext is the loadable
+# SQLite extension: it needs rusqlite's `loadable_extension` feature, which cannot coexist
+# with `bundled` in one build graph, so it is built on its own too.
+exclude = ["crates/textdb-pg", "crates/textdb-sqlite-ext"]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,7 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 proptest = "1.11"
 rand = "0.8"
-rusqlite = { version = "0.40", features = ["bundled", "vtab", "functions", "blob"] }
+rusqlite = { version = "0.40", features = ["bundled", "vtab", "functions"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 similar = { version = "2.7", features = ["bytes"] }
 

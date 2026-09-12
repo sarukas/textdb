@@ -4,7 +4,7 @@ Version 0.1 · Draft for review · 2026-09-12 · Source: [issue #2](https://gith
 
 > This file mirrors the specification in issue #2. Implementation notes and deviations
 > decided during the POC are recorded in [`decisions/`](decisions/) and in
-> [`results.md`](results.md).
+> [`../bench/RESULTS.md`](../bench/RESULTS.md).
 
 ---
 
@@ -324,12 +324,12 @@ textdb/
   bench/
     harness/            # workload generator, metrics, all backends (incl. baselines)
     scripts/            # Postgres cluster start script
-    dolt/               # Dolt schema + runner (N/A in this environment, see results.md)
+    dolt/               # Dolt schema + runner (N/A in this environment, see ../bench/RESULTS.md)
   corpora/              # import scripts for test repositories
   docs/
     spec.md             # this file
     test-suite.md       # companion test specification (issue #1)
-    results.md          # measured results
+    ../bench/RESULTS.md # measured results
     decisions/          # ADRs
 ```
 
