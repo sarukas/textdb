@@ -124,7 +124,14 @@ pub fn cut(params: &ChunkParams, buf: &[u8], eof: bool) -> Option<usize> {
 }
 
 /// Move a boundary forward to just after the next `\n` if one occurs within `snap` bytes.
+///
+/// A boundary that already follows a `\n` is kept as is. Consequence (relied upon by the
+/// edit algorithm): a chunk ending in `\n` was cut using only bytes inside it, while a
+/// chunk ending in any other byte was cut knowing that the next `snap` bytes hold no `\n`.
 fn snap(params: &ChunkParams, buf: &[u8], boundary: usize) -> usize {
+    if boundary > 0 && buf[boundary - 1] == b'\n' {
+        return boundary;
+    }
     let end = (boundary + params.snap).min(buf.len());
     if boundary >= end {
         return boundary;

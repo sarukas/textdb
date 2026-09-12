@@ -53,30 +53,34 @@ pub fn changed_runs<S: Storage + ?Sized>(storage: &S, a: &Hash, b: &Hash) -> Res
         let a_to = if h.a_to < al.len() { al[h.a_to].byte_off } else { a_mid_end };
         let b_from = if h.b_from < bl.len() { bl[h.b_from].byte_off } else { b_mid_end };
         let b_to = if h.b_to < bl.len() { bl[h.b_to].byte_off } else { b_mid_end };
-        runs.push(refine(storage, a, b, ChangedRun { a_from, a_to, b_from, b_to })?);
+        runs.extend(refine(storage, a, b, ChangedRun { a_from, a_to, b_from, b_to })?);
     }
     Ok(runs)
 }
 
-/// Tighten a chunk-granular run to the differing bytes (common prefix/suffix trimmed),
+/// Split a chunk-granular run into the line-level differences inside it (byte-trimmed),
 /// so concurrent edits inside the same chunk are still recognised as disjoint.
-fn refine<S: Storage + ?Sized>(storage: &S, a: &Hash, b: &Hash, r: ChangedRun) -> Result<ChangedRun> {
+fn refine<S: Storage + ?Sized>(storage: &S, a: &Hash, b: &Hash, r: ChangedRun) -> Result<Vec<ChangedRun>> {
     let at = materialize_range(storage, a, r.a_from, r.a_to)?;
     let bt = materialize_range(storage, b, r.b_from, r.b_to)?;
-    let mut pre = 0usize;
-    while pre < at.len() && pre < bt.len() && at[pre] == bt[pre] {
-        pre += 1;
+    let edits = crate::myers::byte_edits(&at, &bt);
+    if edits.is_empty() {
+        return Ok(vec![]);
     }
-    let mut suf = 0usize;
-    while suf < at.len() - pre && suf < bt.len() - pre && at[at.len() - 1 - suf] == bt[bt.len() - 1 - suf] {
-        suf += 1;
+    let mut out = Vec::with_capacity(edits.len());
+    let mut delta = 0i64;
+    for e in edits {
+        let b_from = (e.from as i64 + delta) as u64;
+        let b_to = b_from + e.replacement.len() as u64;
+        out.push(ChangedRun {
+            a_from: r.a_from + e.from,
+            a_to: r.a_from + e.to,
+            b_from: r.b_from + b_from,
+            b_to: r.b_from + b_to,
+        });
+        delta += e.delta();
     }
-    Ok(ChangedRun {
-        a_from: r.a_from + pre as u64,
-        a_to: r.a_to - suf as u64,
-        b_from: r.b_from + pre as u64,
-        b_to: r.b_to - suf as u64,
-    })
+    Ok(out)
 }
 
 /// Leaves of `root` overlapping `[from, to)`.

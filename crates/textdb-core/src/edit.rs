@@ -115,11 +115,19 @@ fn apply_one<S: Storage + ?Sized>(
         let n = chunks.len();
         return Ok((r, chunks, n));
     }
-    // The newline snap lets a chunk's cut depend on up to `snap` bytes past its boundary,
-    // so the leaf ending within `snap` bytes before the edit is affected too: start the
-    // re-chunk window at the leaf containing `from - snap`.
-    let window_from = e.from.saturating_sub(params.snap as u64);
-    let (a, a_start) = Cursor::at_byte(storage, root, window_from)?.expect("non-empty");
+    let (mut a, mut a_start) = Cursor::at_byte(storage, root, e.from)?.expect("non-empty");
+    // A chunk that does not end in `\n` was cut knowing the following `snap` bytes hold no
+    // newline (see `chunker::snap`); an edit inside that lookahead can invalidate the cut,
+    // so the previous leaf joins the re-chunk window in that case.
+    if a_start > 0 && e.from - a_start < params.snap as u64 {
+        if let Some((prev, prev_start)) = Cursor::at_byte(storage, root, a_start - 1)? {
+            let bytes = storage.chunk(&prev.entry().hash)?;
+            if bytes.last() != Some(&b'\n') {
+                a = prev;
+                a_start = prev_start;
+            }
+        }
+    }
 
     // Window: [a_start, from) ++ replacement ++ old bytes from `to`.
     let mut buf = materialize_range(storage, root, a_start, e.from)?;

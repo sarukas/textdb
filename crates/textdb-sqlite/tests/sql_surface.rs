@@ -1,0 +1,294 @@
+//! The whole surface through SQL (spec claim 4) plus round-trip checks.
+
+use rusqlite::{params, Connection};
+use textdb_sqlite::{open_in_memory, TextDb};
+
+fn setup() -> Connection {
+    let conn = open_in_memory().unwrap();
+    conn.execute_batch("CREATE VIRTUAL TABLE kb USING textdb(store='kb_');").unwrap();
+    conn
+}
+
+#[test]
+fn create_read_update_history_diff() {
+    let conn = setup();
+    conn.execute(
+        "INSERT INTO kb(path, content, author) VALUES (?1, ?2, 'alice')",
+        params!["/notes/a.md", "# Title\n\nalpha\nbeta\ngamma\n"],
+    )
+    .unwrap();
+    let (content, version, kind, parent): (String, i64, String, String) = conn
+        .query_row(
+            "SELECT content, version, kind, parent_path FROM kb WHERE path = '/notes/a.md'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(content, "# Title\n\nalpha\nbeta\ngamma\n");
+    assert_eq!((version, kind.as_str(), parent.as_str()), (1, "file", "/notes"));
+    // Parent folders were created.
+    let folders: i64 = conn
+        .query_row("SELECT count(*) FROM kb WHERE kind = 'folder'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(folders, 1);
+
+    conn.execute(
+        "UPDATE kb SET content = replace(content, 'beta', 'BETA'), author = 'bob' WHERE path = '/notes/a.md'",
+        [],
+    )
+    .unwrap();
+    let v: i64 = conn
+        .query_row("SELECT version FROM kb WHERE path = '/notes/a.md'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 2);
+    let c1: String = conn
+        .query_row("SELECT textdb_content('/notes/a.md', 1)", [], |r| r.get(0))
+        .unwrap();
+    assert!(c1.contains("beta"));
+    let hist: Vec<(i64, Option<String>)> = conn
+        .prepare("SELECT version, author FROM textdb_history('/notes/a.md')")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(hist, vec![(1, Some("alice".into())), (2, Some("bob".into()))]);
+    let diff: String = conn
+        .query_row("SELECT textdb_diff('/notes/a.md', 1, 2)", [], |r| r.get(0))
+        .unwrap();
+    assert!(diff.contains("-beta\n+BETA\n"), "{}", diff);
+    // No-op update creates no version.
+    conn.execute("UPDATE kb SET content = content WHERE path = '/notes/a.md'", []).unwrap();
+    let v: i64 = conn
+        .query_row("SELECT version FROM kb WHERE path = '/notes/a.md'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 2);
+    // Path rename does not materialize content and does not bump version.
+    conn.execute("UPDATE kb SET path = '/notes/b.md' WHERE path = '/notes/a.md'", []).unwrap();
+    let (v, id): (i64, i64) = conn
+        .query_row("SELECT version, id FROM kb WHERE path = '/notes/b.md'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!(v, 2);
+    assert_eq!(id, 3); // ids: 1 = "/", 2 = "/notes", 3 = the file
+    // History follows the rename.
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM textdb_history('/notes/b.md')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2);
+    // lines / section.
+    let l: String = conn
+        .query_row("SELECT textdb_lines('/notes/b.md', 3, 4)", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(l, "alpha\nBETA\n");
+    let s: String = conn
+        .query_row("SELECT textdb_section('/notes/b.md', 'Title')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(s, "# Title\n\nalpha\nBETA\ngamma\n");
+    // edit() strict replace and append().
+    let v: i64 = conn
+        .query_row("SELECT textdb_edit('/notes/b.md', 'gamma', 'delta')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 3);
+    let err = conn
+        .query_row("SELECT textdb_edit('/notes/b.md', 'nope', 'x')", [], |r| r.get::<_, i64>(0))
+        .unwrap_err();
+    assert!(err.to_string().contains("TX004"), "{}", err);
+    let v: i64 = conn
+        .query_row("SELECT textdb_append('/notes/b.md', 'tail\n')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 4);
+    let c: String = conn.query_row("SELECT textdb_content('/notes/b.md')", [], |r| r.get(0)).unwrap();
+    assert_eq!(c, "# Title\n\nalpha\nBETA\ndelta\ntail\n");
+}
+
+#[test]
+fn rebase_and_conflict_through_base_version() {
+    let conn = setup();
+    conn.execute(
+        "INSERT INTO kb(path, content) VALUES ('/f.md', ?1)",
+        params!["line one\nline two\nline three\nline four\n"],
+    )
+    .unwrap();
+    // Two agents read version 1; agent A changes line one, agent B changes line four.
+    conn.execute(
+        "UPDATE kb SET content = ?1, base_version = 1 WHERE path = '/f.md'",
+        params!["LINE ONE\nline two\nline three\nline four\n"],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE kb SET content = ?1, base_version = 1 WHERE path = '/f.md'",
+        params!["line one\nline two\nline three\nLINE FOUR\n"],
+    )
+    .unwrap();
+    let c: String = conn.query_row("SELECT content FROM kb WHERE path = '/f.md'", [], |r| r.get(0)).unwrap();
+    assert_eq!(c, "LINE ONE\nline two\nline three\nLINE FOUR\n");
+    let v: i64 = conn.query_row("SELECT version FROM kb WHERE path = '/f.md'", [], |r| r.get(0)).unwrap();
+    assert_eq!(v, 3);
+    // Agent C also based on v1 changes line one differently → conflict TX001 with payload.
+    let err = conn
+        .execute(
+            "UPDATE kb SET content = ?1, base_version = 1 WHERE path = '/f.md'",
+            params!["Line 1\nline two\nline three\nline four\n"],
+        )
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("TX001"), "{}", msg);
+    assert!(msg.contains("\"theirs\":\"LINE ONE\\n\""), "{}", msg);
+    // Content unchanged after the failed commit.
+    let c: String = conn.query_row("SELECT content FROM kb WHERE path = '/f.md'", [], |r| r.get(0)).unwrap();
+    assert_eq!(c, "LINE ONE\nline two\nline three\nLINE FOUR\n");
+}
+
+#[test]
+fn folders_rename_delete_ls_export_search() {
+    let conn = setup();
+    for i in 0..20 {
+        conn.execute(
+            "INSERT INTO kb(path, content) VALUES (?1, ?2)",
+            params![
+                format!("/a/sub{}/doc{}.md", i % 3, i),
+                format!("# Doc {}\n\nThe quick brown fox {} jumps.\n\nwikilink [[Doc {}]]\n", i, i, (i + 1) % 20)
+            ],
+        )
+        .unwrap();
+    }
+    let ls: Vec<(String, String)> = conn
+        .prepare("SELECT name, kind FROM textdb_ls('/a')")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        ls,
+        vec![
+            ("sub0".to_string(), "folder".to_string()),
+            ("sub1".to_string(), "folder".to_string()),
+            ("sub2".to_string(), "folder".to_string())
+        ]
+    );
+    // Search: 2-term AND, prefix-restricted.
+    let hits: Vec<(String, i64, String)> = conn
+        .prepare("SELECT path, line, snippet FROM textdb_search('quick fox', '/a/sub1')")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(!hits.is_empty());
+    assert!(hits.iter().all(|h| h.0.starts_with("/a/sub1/") && h.1 == 3 && h.2.contains("quick brown fox")), "{:?}", hits);
+    let one: Vec<String> = conn
+        .prepare("SELECT path FROM textdb_search('\"fox 7\"', '/')")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(one, vec!["/a/sub1/doc7.md".to_string()]);
+    // Folder rename rewrites the subtree and keeps ids/versions.
+    let before: Vec<(i64, i64)> = conn
+        .prepare("SELECT id, version FROM kb WHERE path LIKE '/a/sub1/%' ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    conn.execute("UPDATE kb SET path = '/b/moved' WHERE path = '/a/sub1'", []).unwrap();
+    let after: Vec<(i64, i64)> = conn
+        .prepare("SELECT id, version FROM kb WHERE path LIKE '/b/moved/%' ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(before, after);
+    assert_eq!(before.len(), 7);
+    let gone: i64 = conn
+        .query_row("SELECT count(*) FROM kb WHERE path LIKE '/a/sub1%'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(gone, 0);
+    // Search still finds moved content at the new path.
+    let moved: Vec<String> = conn
+        .prepare("SELECT path FROM textdb_search('\"fox 7\"', '/')")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(moved, vec!["/b/moved/doc7.md".to_string()]);
+    // Delete a folder: tombstoned, history and old versions readable.
+    conn.execute("DELETE FROM kb WHERE path = '/b/moved'", []).unwrap();
+    let n: i64 = conn.query_row("SELECT count(*) FROM kb WHERE path LIKE '/b/moved%'", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 0);
+    let old: String = conn
+        .query_row("SELECT textdb_content('/b/moved/doc7.md', 1)", [], |r| r.get(0))
+        .unwrap();
+    assert!(old.contains("fox 7"));
+    let none: Vec<String> = conn
+        .prepare("SELECT path FROM textdb_search('\"fox 7\"', '/')")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(none.is_empty());
+    // Export the rest.
+    let exported: i64 = conn.query_row("SELECT count(*) FROM textdb_export('/a')", [], |r| r.get(0)).unwrap();
+    assert_eq!(exported, 13);
+    // Re-create at a deleted path works.
+    conn.execute("INSERT INTO kb(path, content) VALUES ('/b/moved/doc7.md', 'new')", []).unwrap();
+}
+
+#[test]
+fn roundtrip_edge_cases_and_reimport() {
+    let conn = setup();
+    let db = TextDb::open(&conn, "kb_").unwrap();
+    let cases: Vec<Vec<u8>> = vec![
+        vec![],
+        b"x".to_vec(),
+        b"no trailing newline".to_vec(),
+        b"crlf\r\nlines\r\n".to_vec(),
+        vec![0xff, 0xfe, 0, 1, 2, b'\n', 0x80],
+        (0..300_000u32).map(|i| (i % 251) as u8).collect(),
+        "ąčę 一二三 😀\n".repeat(5000).into_bytes(),
+    ];
+    for (i, c) in cases.iter().enumerate() {
+        let p = format!("/rt/{}.bin", i);
+        db.create(&p, c, None, None).unwrap();
+        assert_eq!(&db.read(&p).unwrap(), c, "case {}", i);
+        // Re-import identical content: no new version.
+        let r = db.upsert(&p, c, None).unwrap();
+        assert_eq!(r.version, 1, "case {}", i);
+        assert_eq!(db.history(&p).unwrap().len(), 1);
+    }
+    let commits: i64 = conn.query_row("SELECT count(*) FROM kb_commit WHERE version > 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(commits, 0);
+    // Random edits against the reference copy.
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+    let mut reference: Vec<u8> = (0..2000).map(|i| format!("line {} {}\n", i, "x".repeat(i % 50)).into_bytes()).flatten().collect();
+    db.create("/rt/edit.md", &reference, None, None).unwrap();
+    for _ in 0..200 {
+        let a = rng.gen_range(0..=reference.len());
+        let b = (a + rng.gen_range(0..64)).min(reference.len());
+        let repl: Vec<u8> = (0..rng.gen_range(0..80)).map(|_| if rng.gen_bool(0.1) { b'\n' } else { b'y' }).collect();
+        reference.splice(a..b, repl.iter().copied());
+        db.update_content("/rt/edit.md", &reference, None, None, None).unwrap();
+        assert_eq!(db.read("/rt/edit.md").unwrap(), reference);
+    }
+    let hist = db.history("/rt/edit.md").unwrap();
+    assert!(hist.len() > 150);
+    // Every historical version is materializable and the chunk store is shared.
+    let (chunks, _nodes, commits, _files, chunk_bytes) = db.stats().unwrap();
+    let v1 = db.read_version("/rt/edit.md", 1).unwrap();
+    assert!(v1.starts_with(b"line 0 \nline 1 x\n"));
+    eprintln!(
+        "200 edits on {} bytes: {} commits, {} chunks, {} chunk bytes ({}x raw)",
+        reference.len(),
+        commits,
+        chunks,
+        chunk_bytes,
+        chunk_bytes as f64 / reference.len() as f64
+    );
+    assert!((chunk_bytes as f64) < 8.0 * reference.len() as f64);
+}
