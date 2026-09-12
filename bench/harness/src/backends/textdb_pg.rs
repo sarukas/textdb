@@ -214,9 +214,20 @@ impl Backend for TextdbPg {
                     &[&next, &(v as i64), &path, &tag],
                 ) {
                     Ok(_) => {
-                        let mine = c
-                            .query_one("SELECT max(version) FROM kb.history($1) WHERE author = $2", &[&path, &tag])?
-                            .get::<_, Option<i64>>(0);
+                        // The path may be mid-rename (CW-06): retry the lookup briefly.
+                        let mut mine: Option<i64> = None;
+                        for attempt in 0..10 {
+                            match c.query_one("SELECT max(version) FROM kb.history($1) WHERE author = $2", &[&path, &tag]) {
+                                Ok(row) => {
+                                    mine = row.get::<_, Option<i64>>(0);
+                                    break;
+                                }
+                                Err(e) if attempt < 9 && e.as_db_error().map(|d| d.code().code()) == Some("TX003") => {
+                                    std::thread::sleep(std::time::Duration::from_millis(20));
+                                }
+                                Err(e) => return Err(e.into()),
+                            }
+                        }
                         match mine {
                             Some(nv) => Ok(WriteOutcome::Committed {
                                 version: nv as u64,
