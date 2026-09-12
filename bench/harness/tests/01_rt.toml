@@ -1,0 +1,80 @@
+# RT — round-trip accuracy (test spec §7.1). `spec` = sizes the spec asks for; `poc` = what
+# the POC run uses (10 MiB dropped for run time; covered by XL).
+
+[[test]]
+id = "RT-01"
+family = "RT"
+kind = "roundtrip"
+reps = 3
+note = "sizes straddling chunk min/max; create → read; oracle bytes identical"
+[test.spec]
+sizes = [0, 1, 511, 512, 513, 4095, 4096, 4097, 1024, 102400, 1048576, 10485760]
+line_endings = ["lf"]
+charsets = ["mixed"]
+[test.poc]
+sizes = [0, 1, 511, 512, 513, 4095, 4096, 4097, 1024, 102400, 1048576]
+
+[[test]]
+id = "RT-02"
+family = "RT"
+kind = "roundtrip"
+reps = 2
+note = "RT-01 sizes × line endings {lf, crlf, no trailing newline}"
+[test.spec]
+sizes = [0, 1, 511, 512, 513, 4095, 4096, 4097, 1024, 102400, 1048576, 10485760]
+line_endings = ["lf", "crlf", "no_trailing"]
+charsets = ["mixed"]
+[test.poc]
+sizes = [0, 1, 511, 512, 513, 4095, 4096, 4097, 1024, 102400]
+
+[[test]]
+id = "RT-03"
+family = "RT"
+kind = "roundtrip"
+reps = 2
+note = "1 MiB × {ascii, mixed unicode, random bytes}; random bytes may be N/A where TEXT rejects invalid UTF-8"
+[test.spec]
+sizes = [1048576]
+line_endings = ["lf"]
+charsets = ["ascii", "mixed", "random_bytes"]
+
+[[test]]
+id = "RT-04"
+family = "RT"
+kind = "edit_sequence"
+reps = 1
+note = "100 KiB, random replace ops, read after each == reference"
+[test.spec]
+size = 102400
+n_edits = 1000
+pattern = "random_line"
+check_versions = true
+[test.poc]
+n_edits = 300
+
+[[test]]
+id = "RT-05"
+family = "RT"
+kind = "edit_sequence"
+reps = 1
+note = "as RT-04, then read_version(v) for every v == reference history"
+[test.spec]
+size = 102400
+n_edits = 1000
+pattern = "random_bytes"
+check_versions = true
+[test.poc]
+n_edits = 200
+
+[[test]]
+id = "RT-06"
+family = "RT"
+kind = "search"
+reps = 1
+note = "corpus import → export via list+read compared to reference (diff -r equivalent) is checked by SR-01 recall path; import time reported"
+[test.spec]
+n_files = 10000
+file_size = 4096
+n_queries = 0
+[test.poc]
+n_files = 1000

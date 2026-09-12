@@ -720,64 +720,113 @@ impl<'c> TextDb<'c> {
     }
 
     /// Full-text search over chunks, mapped to (path, line, snippet) at HEAD.
-    /// Query syntax: whitespace-separated terms are ANDed; `"a b"` is a phrase; `foo*` is a prefix.
+    /// Query syntax: whitespace-separated terms are ANDed at *document* level; `"a b"` is a
+    /// phrase; `foo*` is a prefix. Each term is looked up in the chunk FTS index, chunk hits
+    /// are mapped to files through `chunk_ref`, and the per-term file sets are intersected.
     pub fn search(&self, query: &str, prefix: &str, limit: usize) -> Result<Vec<Hit>> {
         let prefix = normalize_path(prefix)?;
-        let fts_q = fts5_query(query);
-        if fts_q.is_empty() {
+        let terms = query_terms(query);
+        if terms.is_empty() {
             return Ok(vec![]);
         }
-        let terms = query_terms(query);
-        let mut stmt = self
+        let st = self.storage();
+        // Per term: file_id → (chunk_id, rank) of the best chunk hit.
+        let mut per_term: Vec<std::collections::HashMap<i64, (i64, f64)>> = Vec::new();
+        let mut fts_stmt = self
             .conn
             .prepare_cached(&format!(
                 "SELECT rowid, rank FROM {p}fts WHERE {p}fts MATCH ?1 ORDER BY rank LIMIT ?2",
                 p = self.p
             ))
             .map_err(sql_err)?;
-        let chunk_hits: Vec<(i64, f64)> = stmt
-            .query_map(params![fts_q, (limit * 4) as i64], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(sql_err)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(sql_err)?;
-        let st = self.storage();
-        let mut hits = Vec::new();
-        let mut seen = std::collections::HashSet::new();
         let mut ref_stmt = self
             .conn
             .prepare_cached(&format!(
-                "SELECT n.id, n.path, n.root, c.hash, c.bytes FROM {p}chunk_ref r JOIN {p}node n ON n.id = r.file_id JOIN {p}chunk c ON c.id = r.chunk_id WHERE r.chunk_id = ?1 AND n.deleted_at IS NULL AND n.kind = 1 AND (?2 = '/' OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')",
+                "SELECT r.file_id FROM {p}chunk_ref r JOIN {p}node n ON n.id = r.file_id WHERE r.chunk_id = ?1 AND n.deleted_at IS NULL AND n.kind = 1 AND (?2 = '/' OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')",
                 p = self.p
             ))
             .map_err(sql_err)?;
-        'outer: for (chunk_id, rank) in chunk_hits {
-            let refs: Vec<(i64, String, Vec<u8>, Vec<u8>, Vec<u8>)> = ref_stmt
-                .query_map(params![chunk_id, prefix], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        for t in &terms {
+            let q = fts5_term(t);
+            let chunk_hits: Vec<(i64, f64)> = fts_stmt
+                .query_map(params![q, (limit.max(1) * 50) as i64], |r| Ok((r.get(0)?, r.get(1)?)))
                 .map_err(sql_err)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(sql_err)?;
-            for (_id, path, root, hash, bytes) in refs {
-                let root = to_hash(&root)?;
-                let hash = to_hash(&hash)?;
-                // Verify the chunk is still part of HEAD and find its line offset.
-                let leaf = leaves(&st, &root)?.into_iter().find(|l| l.hash == hash);
-                let leaf = match leaf {
-                    Some(l) => l,
-                    None => continue,
-                };
-                let (line_in_chunk, snippet) = locate_terms(&bytes, &terms);
-                let line = leaf.line_off as i64 + line_in_chunk as i64 + 1;
-                if seen.insert((path.clone(), line)) {
+            let mut files: std::collections::HashMap<i64, (i64, f64)> = Default::default();
+            for (chunk_id, rank) in chunk_hits {
+                let ids: Vec<i64> = ref_stmt
+                    .query_map(params![chunk_id, prefix], |r| r.get(0))
+                    .map_err(sql_err)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(sql_err)?;
+                for id in ids {
+                    files.entry(id).or_insert((chunk_id, rank));
+                }
+            }
+            per_term.push(files);
+        }
+        // Intersect file sets; order by the first term's rank.
+        let mut candidates: Vec<(i64, i64, f64)> = per_term[0]
+            .iter()
+            .filter(|(id, _)| per_term[1..].iter().all(|m| m.contains_key(id)))
+            .map(|(id, (chunk, rank))| (*id, *chunk, *rank))
+            .collect();
+        candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        let mut hits = Vec::new();
+        let mut node_stmt = self
+            .conn
+            .prepare_cached(&format!("SELECT path, root FROM {}node WHERE id = ?1 AND deleted_at IS NULL", self.p))
+            .map_err(sql_err)?;
+        let mut chunk_stmt = self
+            .conn
+            .prepare_cached(&format!("SELECT hash, bytes FROM {}chunk WHERE id = ?1", self.p))
+            .map_err(sql_err)?;
+        for (file_id, chunk_id, rank) in candidates {
+            let (path, root): (String, Vec<u8>) = match node_stmt
+                .query_row(params![file_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()
+                .map_err(sql_err)?
+            {
+                Some(x) => x,
+                None => continue,
+            };
+            let (hash, bytes): (Vec<u8>, Vec<u8>) = chunk_stmt
+                .query_row(params![chunk_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(sql_err)?;
+            let root = to_hash(&root)?;
+            let hash = to_hash(&hash)?;
+            // Verify the chunk is still part of HEAD (chunk_ref is append-only) and get its line.
+            let leaf = match leaves(&st, &root)?.into_iter().find(|l| l.hash == hash) {
+                Some(l) => l,
+                None => {
+                    // The chunk left this file; fall back to a HEAD scan for the first term.
+                    let body = materialize(&st, &root)?;
+                    let (line, snippet) = locate_terms(&body, &terms[..1]);
+                    if snippet.is_empty() {
+                        continue;
+                    }
                     hits.push(Hit {
                         path,
-                        line,
+                        line: line as i64 + 1,
                         snippet,
                         rank,
                     });
                     if hits.len() >= limit {
-                        break 'outer;
+                        break;
                     }
+                    continue;
                 }
+            };
+            let (line_in_chunk, snippet) = locate_terms(&bytes, &terms[..1]);
+            hits.push(Hit {
+                path,
+                line: leaf.line_off as i64 + line_in_chunk as i64 + 1,
+                snippet,
+                rank,
+            });
+            if hits.len() >= limit {
+                break;
             }
         }
         Ok(hits)
@@ -873,18 +922,18 @@ pub fn query_terms(q: &str) -> Vec<String> {
         .collect()
 }
 
+/// FTS5 syntax for one term (phrase or prefix aware).
+pub fn fts5_term(t: &str) -> String {
+    if let Some(stem) = t.strip_suffix('*') {
+        format!("\"{}\" *", stem.replace('"', "\"\""))
+    } else {
+        format!("\"{}\"", t.replace('"', "\"\""))
+    }
+}
+
+/// FTS5 syntax for a whole query (terms ANDed within one document row).
 pub fn fts5_query(q: &str) -> String {
-    query_terms(q)
-        .into_iter()
-        .map(|t| {
-            if let Some(stem) = t.strip_suffix('*') {
-                format!("\"{}\" *", stem.replace('"', "\"\""))
-            } else {
-                format!("\"{}\"", t.replace('"', "\"\""))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" AND ")
+    query_terms(q).iter().map(|t| fts5_term(t)).collect::<Vec<_>>().join(" AND ")
 }
 
 /// Line (0-based, within the chunk) of the first term occurrence and that line as snippet.

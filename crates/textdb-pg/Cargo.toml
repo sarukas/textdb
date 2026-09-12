@@ -1,0 +1,32 @@
+[package]
+name = "textdb_pg"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "textdb Postgres extension (pgrx): kb schema, updatable views, functions"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["pg16"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
+pg_test = []
+
+[dependencies]
+pgrx = "=0.18.1"
+textdb-core = { path = "../textdb-core" }
+textdb-md = { path = "../textdb-md" }
+serde_json = "1"
+
+[dev-dependencies]
+pgrx-tests = "=0.18.1"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1

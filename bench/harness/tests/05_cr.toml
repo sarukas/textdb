@@ -1,0 +1,96 @@
+# CR — concurrent reads (§7.5).
+
+[[test]]
+id = "CR-01"
+family = "CR"
+kind = "concurrent_reads"
+reps = 1
+note = "one 100 KiB file; N readers in a closed loop; throughput, p50/p99"
+[test.spec]
+readers = [1, 10, 100, 1000]
+duration_s = 60
+file_size = 102400
+[test.poc]
+readers = [1, 10, 100]
+duration_s = 4
+
+[[test]]
+id = "CR-02"
+family = "CR"
+kind = "concurrent_reads"
+reps = 1
+note = "corpus of files, N readers, Zipf file choice"
+[test.spec]
+readers = [10, 100]
+duration_s = 60
+n_files = 50000
+file_size = 4096
+[test.poc]
+readers = [10, 100]
+duration_s = 4
+n_files = 2000
+
+[[test]]
+id = "CR-03"
+family = "CR"
+kind = "concurrent_reads"
+reps = 1
+note = "CR-01 with one writer replacing every 10 ms; reader p99 degradation and torn reads (every read must equal some committed version)"
+[test.spec]
+readers = [10, 100]
+duration_s = 60
+file_size = 102400
+writer_every_ms = 10
+[test.poc]
+readers = [10, 100]
+duration_s = 4
+
+[[test]]
+id = "CR-04"
+family = "CR"
+kind = "concurrent_reads"
+reps = 1
+note = "N readers of read_lines (50 lines) on a 100 MiB file — isolates fragment-read cost"
+[test.spec]
+readers = [10, 100, 1000]
+duration_s = 60
+file_size = 104857600
+variant = "read_lines"
+[test.poc]
+readers = [10, 100]
+duration_s = 4
+file_size = 33554432
+
+[[test]]
+id = "CR-05"
+family = "CR"
+kind = "concurrent_reads"
+reps = 1
+note = "100 readers × 2-term AND search over the corpus"
+[test.spec]
+readers = [100]
+duration_s = 60
+n_files = 50000
+file_size = 4096
+variant = "search"
+[test.poc]
+readers = [20]
+duration_s = 4
+n_files = 2000
+
+[[test]]
+id = "CR-06"
+family = "CR"
+kind = "concurrent_reads"
+reps = 1
+note = "N readers × read_version of a random historical version; file with 1000 versions"
+[test.spec]
+readers = [1000]
+duration_s = 60
+file_size = 102400
+variant = "read_version"
+n_versions = 1000
+[test.poc]
+readers = [50]
+duration_s = 4
+n_versions = 200

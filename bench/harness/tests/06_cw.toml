@@ -1,0 +1,105 @@
+# CW — concurrent writes (§7.6). base = "last_seen": each writer edits the version it last
+# read (stale after another writer commits), which is what exercises OCC vs CAS + rebase.
+
+[[test]]
+id = "CW-01"
+family = "CW"
+kind = "concurrent_writes"
+reps = 1
+note = "N writers, one file, disjoint sections (writer i owns line block i); oracle: all last edits present"
+[test.spec]
+writers = [5, 20, 50]
+pattern = "disjoint_sections"
+ops_per_writer = 200
+file_size = 102400
+[test.poc]
+ops_per_writer = 30
+
+[[test]]
+id = "CW-02"
+family = "CW"
+kind = "concurrent_writes"
+reps = 1
+note = "N writers, one file, same section, distinct lines"
+[test.spec]
+writers = [5, 20, 50]
+pattern = "same_section"
+ops_per_writer = 200
+file_size = 102400
+[test.poc]
+ops_per_writer = 30
+
+[[test]]
+id = "CW-03"
+family = "CW"
+kind = "concurrent_writes"
+reps = 1
+note = "N writers, one file, same line (counter); conflicts expected; oracle: no lost updates among committed"
+[test.spec]
+writers = [5, 20, 50]
+pattern = "same_line"
+ops_per_writer = 200
+file_size = 102400
+[test.poc]
+ops_per_writer = 30
+
+[[test]]
+id = "CW-04"
+family = "CW"
+kind = "concurrent_writes"
+reps = 1
+note = "N writers, random files (Zipf s=1.0) from a corpus"
+[test.spec]
+writers = [5, 20, 50]
+pattern = "zipf_files"
+ops_per_writer = 200
+n_files = 50000
+file_size = 8192
+[test.poc]
+ops_per_writer = 30
+n_files = 500
+
+[[test]]
+id = "CW-05"
+family = "CW"
+kind = "concurrent_writes"
+reps = 1
+note = "N writers append to one file; oracle: every committed append present"
+[test.spec]
+writers = [5, 20, 50]
+pattern = "append"
+ops_per_writer = 200
+file_size = 102400
+[test.poc]
+ops_per_writer = 30
+
+[[test]]
+id = "CW-06"
+family = "CW"
+kind = "concurrent_writes"
+reps = 1
+note = "20 writers on files under a folder while another thread renames the folder away and back; oracle: writes not failed by the rename race (errors), latency"
+[test.spec]
+writers = [20]
+pattern = "rename_race"
+ops_per_writer = 100
+n_files = 20
+file_size = 8192
+[test.poc]
+ops_per_writer = 20
+
+[[test]]
+id = "CW-07"
+family = "CW"
+kind = "concurrent_writes"
+reps = 1
+note = "CW-04 for 10 min with fs-git; index.lock failures counted as Contention (POC: 20 s)"
+[test.spec]
+writers = [20]
+pattern = "zipf_files"
+duration_s = 600
+n_files = 50000
+file_size = 8192
+[test.poc]
+duration_s = 20
+n_files = 500

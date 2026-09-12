@@ -1,0 +1,5 @@
+comment = 'textdb: versioned, chunk-shared text documents with CAS + rebase'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/textdb_pg'
+relocatable = false
+superuser = true

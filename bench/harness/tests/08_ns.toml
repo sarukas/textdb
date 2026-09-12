@@ -1,0 +1,56 @@
+# NS — namespace (§7.8).
+
+[[test]]
+id = "NS-01"
+family = "NS"
+kind = "namespace"
+reps = 1
+note = "many files in one folder: list latency; create p99 at the end"
+[test.spec]
+variant = "many_in_folder"
+n_files = 100000
+[test.poc]
+n_files = 10000
+
+[[test]]
+id = "NS-02"
+family = "NS"
+kind = "namespace"
+reps = 1
+note = "folder depth 1000 (/a/a/a/…): create, read, list"
+[test.spec]
+variant = "depth"
+depth = 1000
+
+[[test]]
+id = "NS-03"
+family = "NS"
+kind = "namespace"
+reps = 1
+note = "rename folder with {1k, 10k, 50k} descendants: latency; all paths updated, contents unchanged, versions preserved"
+[test.spec]
+variant = "rename_folder"
+descendants = [1000, 10000, 50000]
+[test.poc]
+descendants = [1000, 10000]
+
+[[test]]
+id = "NS-04"
+family = "NS"
+kind = "namespace"
+reps = 1
+note = "delete folder with 10k descendants, then read a deleted file's last version"
+[test.spec]
+variant = "delete_then_read_version"
+descendants = 10000
+[test.poc]
+descendants = 2000
+
+[[test]]
+id = "NS-05"
+family = "NS"
+kind = "namespace"
+reps = 1
+note = "path characters: spaces, dots, Unicode, 255-byte name, 4 KiB path, % and _"
+[test.spec]
+variant = "path_chars"

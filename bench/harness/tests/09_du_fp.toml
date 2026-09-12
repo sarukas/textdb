@@ -1,0 +1,24 @@
+# DU — durability (§7.9) and FP — footprint over time (§7.10).
+
+[[test]]
+id = "DU-01..03"
+family = "DU"
+kind = "durability"
+reps = 1
+note = "kill -9 / dm-flakey crash tests need an out-of-process supervisor; recorded N/A in the POC harness"
+
+[[test]]
+id = "FP-01/02"
+family = "FP"
+kind = "footprint"
+reps = 1
+note = "corpus; Zipf edits; footprint after every checkpoint; then maintenance (git gc --aggressive / VACUUM FULL / FTS optimize)"
+[test.spec]
+n_files = 50000
+file_size = 8192
+n_edits = 100000
+checkpoint_every = 10000
+[test.poc]
+n_files = 2000
+n_edits = 4000
+checkpoint_every = 1000

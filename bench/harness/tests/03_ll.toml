@@ -1,0 +1,53 @@
+# LL — very long lines (§7.3).
+
+[[test]]
+id = "LL-01..03"
+family = "LL"
+kind = "long_lines"
+reps = 1
+note = "single line of {1 MiB, 100 MiB} ASCII: create → read identical; replace 10 B at middle (leaf count changed); read_lines(1,1) returns whole line"
+[test.spec]
+variant = "single_line"
+sizes = [1048576, 104857600]
+[test.poc]
+sizes = [1048576, 33554432]
+
+[[test]]
+id = "LL-04"
+family = "LL"
+kind = "edit_sequence"
+reps = 1
+note = "10 MiB minified JSON (no newlines, high entropy); 100 replaces; textdb leaf stability (fraction of leaves unchanged per edit, target ≥ 0.99)"
+[test.spec]
+size = 10485760
+content = "json"
+n_edits = 100
+pattern = "random_bytes"
+[test.poc]
+size = 10485760
+n_edits = 40
+
+[[test]]
+id = "LL-05"
+family = "LL"
+kind = "edit_sequence"
+reps = 1
+note = "10 MiB, 1000 lines of 10 KiB; replace in line 500 (compare with XL-04 latency at same size)"
+[test.spec]
+size = 10485760
+content = "fixed_lines"
+fixed_line_len = 10240
+n_edits = 20
+pattern = "zipf_lines"
+
+[[test]]
+id = "LL-06"
+family = "LL"
+kind = "long_lines"
+reps = 1
+note = "single line, mixed Unicode with 4-byte code points; replace across a multibyte boundary; no backend may corrupt UTF-8"
+[test.spec]
+variant = "multibyte"
+sizes = [104857600]
+[test.poc]
+sizes = [8388608]

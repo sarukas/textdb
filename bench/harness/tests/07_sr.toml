@@ -1,0 +1,47 @@
+# SR — search (§7.7). Ground truth: reference tokenizer (word boundary, case-insensitive),
+# equivalent to `rg -w -i -F`. AND is document-level for every backend.
+
+[[test]]
+id = "SR-01/02"
+family = "SR"
+kind = "search"
+reps = 1
+note = "index build / import of the corpus; single-term, 2-term AND, phrase, prefix queries: p50/p99, recall/precision"
+[test.spec]
+n_files = 50000
+file_size = 4096
+n_queries = 1000
+[test.poc]
+n_files = 3000
+n_queries = 100
+
+[[test]]
+id = "SR-04"
+family = "SR"
+kind = "search"
+reps = 1
+note = "search after 10000 edits: index growth per edit and maintenance (VACUUM / optimize / gc) time"
+[test.spec]
+n_files = 50000
+file_size = 4096
+n_queries = 200
+edits_before_search = 10000
+[test.poc]
+n_files = 2000
+n_queries = 50
+edits_before_search = 2000
+
+[[test]]
+id = "SR-05"
+family = "SR"
+kind = "search"
+reps = 1
+note = "search restricted to a prefix (/sr/d07) — prefix + FTS combination"
+[test.spec]
+n_files = 50000
+file_size = 4096
+n_queries = 1000
+prefix = "/sr/d07"
+[test.poc]
+n_files = 3000
+n_queries = 100

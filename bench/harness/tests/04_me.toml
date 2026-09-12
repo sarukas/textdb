@@ -1,0 +1,69 @@
+# ME — many edits, same line / region (§7.4).
+
+[[test]]
+id = "ME-01/02"
+family = "ME"
+kind = "edit_sequence"
+reps = 1
+note = "100 KiB; sequential counter increments on one line; footprint after; read_version at v1, v(n/2), v(n)"
+[test.spec]
+size = 102400
+n_edits = 10000
+pattern = "same_line"
+footprint_every = 2500
+[test.poc]
+n_edits = 2000
+footprint_every = 500
+
+[[test]]
+id = "ME-03"
+family = "ME"
+kind = "edit_sequence"
+reps = 1
+note = "100 KiB; sequential appends of one line; latency trend (last decile / first decile), footprint"
+[test.spec]
+size = 102400
+n_edits = 10000
+pattern = "append"
+[test.poc]
+n_edits = 2000
+
+[[test]]
+id = "ME-04"
+family = "ME"
+kind = "edit_sequence"
+reps = 1
+note = "100 KiB; edits alternating start/end of file; textdb leaves changed per edit ≤ 4"
+[test.spec]
+size = 102400
+n_edits = 10000
+pattern = "alternate_ends"
+[test.poc]
+n_edits = 1000
+
+[[test]]
+id = "ME-05"
+family = "ME"
+kind = "edit_sequence"
+reps = 1
+note = "1 MiB; Zipf-distributed line edits; footprint vs raw; history latency at end"
+[test.spec]
+size = 1048576
+n_edits = 100000
+pattern = "zipf_lines"
+[test.poc]
+n_edits = 3000
+
+[[test]]
+id = "ME-06"
+family = "ME"
+kind = "concurrent_writes"
+reps = 1
+note = "20 concurrent writers incrementing the same counter line, base = last seen version; outcomes histogram + lost updates (final counter vs committed count)"
+[test.spec]
+writers = [20]
+pattern = "same_line"
+ops_per_writer = 500
+file_size = 102400
+[test.poc]
+ops_per_writer = 40

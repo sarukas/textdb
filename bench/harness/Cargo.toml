@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Stress and comparative test suite for textdb and its baselines (issue #1)"
 
 [[bin]]
 name = "textdb-bench"
@@ -11,3 +12,13 @@ path = "src/main.rs"
 
 [dependencies]
 textdb-core = { path = "../../crates/textdb-core" }
+textdb-sqlite = { path = "../../crates/textdb-sqlite" }
+rusqlite = { workspace = true }
+postgres = "0.19"
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+rand = { workspace = true }
+rand_distr = "0.4"
+anyhow = { workspace = true }
+libc = "0.2"
