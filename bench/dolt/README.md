@@ -1,7 +1,7 @@
 # Dolt harness (spec §7.3) — not run in this POC
 
 No Dolt binary was reachable from the build environment (GitHub releases are blocked), so
-the Stage 2 Dolt comparison is recorded as N/A in `docs/results.md` (ADR 0005).
+the Stage 2 Dolt comparison is recorded as N/A in `bench/RESULTS.md` (ADR 0005).
 
 Design kept for when a binary is available:
 

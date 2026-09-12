@@ -85,4 +85,4 @@ cargo build --release -p textdb-bench
 ```
 
 `--profile spec` replays the matrix at the scale issue #1 asks for (50k files, 1 GiB files,
-minutes per N); `poc` is the scaled-down profile used for `docs/results.md`.
+minutes per N); `poc` is the scaled-down profile used for `bench/RESULTS.md`.
