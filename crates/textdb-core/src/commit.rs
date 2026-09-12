@@ -134,6 +134,18 @@ fn shift(off: u64, runs: &[ChangedRun]) -> u64 {
     (off as i64 + delta) as u64
 }
 
+/// Inclusive line range of `[from, to)` in `root`'s coordinates. An empty range (a pure
+/// insertion) is the single line it sits in.
+fn line_span_of<S: Storage + ?Sized>(storage: &S, root: &Hash, from: u64, to: u64, len: u64) -> Result<(u64, u64)> {
+    let a = line_of_byte(storage, root, from.min(len))?;
+    let b = if to > from {
+        line_of_byte(storage, root, (to - 1).min(len))?
+    } else {
+        a
+    };
+    Ok((a, b))
+}
+
 fn overlaps(e: &Edit, r: &ChangedRun) -> bool {
     // Half-open intervals; a pure insertion at exactly a run boundary counts as overlap
     // when the run is an insertion at the same point (ambiguous ordering).
@@ -161,11 +173,28 @@ fn rebase<S: Storage + ?Sized>(
 ) -> Result<(Hash, Vec<Hash>, CommitKind)> {
     let runs = changed_runs(storage, base, rcur)?;
     let (base_len, _) = totals(storage, base)?;
+    // Conflict detection has to match the granularity of the merge below, which is
+    // line-level (`diff3`). A byte-level test misses exactly the case that matters most:
+    // against a base of "count: 18", our "count: 19" is a one-byte replacement of the
+    // final digit while their "count: 188" is a pure insertion just past it. Those byte
+    // intervals are adjacent, not overlapping, so a collision on one line looked disjoint
+    // — and the stale side was then shifted onto the current root and applied verbatim,
+    // rolling the value back. Two changes to the same line cannot be merged textually, so
+    // they must reach `diff3`, which decides between an identical edit and a conflict.
+    let mut run_lines = Vec::with_capacity(runs.len());
+    for r in &runs {
+        run_lines.push(line_span_of(storage, base, r.a_from, r.a_to, base_len)?);
+    }
     // Partition edits into disjoint (shiftable) and overlapping.
     let mut overlapping: Vec<&Edit> = Vec::new();
     let mut shifted: Vec<Edit> = Vec::new();
     for e in edits {
-        if runs.iter().any(|r| overlaps(e, r)) {
+        let el = line_span_of(storage, base, e.from, e.to, base_len)?;
+        let hit = runs
+            .iter()
+            .zip(&run_lines)
+            .any(|(r, rl)| overlaps(e, r) || (el.0 <= rl.1 && rl.0 <= el.1));
+        if hit {
             overlapping.push(e);
         } else {
             shifted.push(Edit::new(shift(e.from, &runs), shift(e.to, &runs), e.replacement.clone()));
