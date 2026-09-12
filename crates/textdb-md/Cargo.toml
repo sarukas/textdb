@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Markdown StructureExtractor plugin for textdb (headings, wikilinks, frontmatter)"
 
 [dependencies]
 textdb-core = { path = "../textdb-core" }
+pulldown-cmark = { workspace = true }
+serde_json = { workspace = true }

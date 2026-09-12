@@ -34,12 +34,12 @@ impl ChunkParams {
 
     /// Mask used before `avg` (more bits set: harder to hit).
     pub const fn mask_s(&self) -> u64 {
-        spread_mask(self.bits() + 1)
+        spread_mask(self.bits())
     }
 
     /// Mask used after `avg` (fewer bits set: easier to hit).
     pub const fn mask_l(&self) -> u64 {
-        spread_mask(self.bits() - 1)
+        spread_mask(self.bits() - 2)
     }
 }
 
