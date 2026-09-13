@@ -64,6 +64,12 @@ pub fn edit_sequence(ctx: &Ctx) -> anyhow::Result<()> {
             let st = textdb_sqlite::SqliteStorage::new(&conn, "kb_");
             return Some(textdb_core::leaves(&st, &n.root?).ok()?.into_iter().map(|l| l.hash).collect());
         }
+        // Postgres answers through `kb.leaf_hashes`, a hook on the extension. Without this
+        // `leaves_changed` was collected for `textdb-sqlite` only, so ME-04 reported nothing
+        // for `textdb-pg` and claim 1 could never pass for it whatever it did.
+        if ctx.backend.id() == "textdb-pg" {
+            return ctx.backend.leaf_hashes(path).ok().flatten();
+        }
         None
     };
     if is_textdb {
