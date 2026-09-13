@@ -141,6 +141,34 @@ impl<'c> SqliteStorage<'c> {
         Ok(entry)
     }
 
+    /// Record bytes the caller already holds as the content of `root`.
+    ///
+    /// A write knows the new content before it builds the tree for it, but nothing used to
+    /// tell the cache, so the very next reader of that root — `record_commit`, extracting
+    /// markdown structure, and then whoever reads the file back — walked the tree and
+    /// concatenated every chunk to rebuild bytes that were in hand a moment earlier.
+    ///
+    /// The caller must pass exactly the bytes `root` was built from. Every caller here does
+    /// so immediately after `build_with_chunks` on the same buffer; `debug_assert` checks it
+    /// in test builds, where the hash is cheap next to the rest of the suite.
+    pub fn remember_document(&self, root: &Hash, bytes: &[u8]) {
+        // Checked against the tree's own totals rather than by re-chunking: one cached node
+        // fetch, no hashing, and it catches the mistake that could actually happen — a
+        // caller passing the buffer for a different root. Debug only; a release build takes
+        // the caller at its word, as `put_chunk` already does.
+        debug_assert!(
+            textdb_core::tree::totals(self, root).map(|(n, _)| n as usize).ok() == Some(bytes.len()),
+            "remember_document: {} bytes do not match the length of the tree under this root",
+            bytes.len()
+        );
+        if bytes.len() > DOC_MAX {
+            return;
+        }
+        let utf8 = std::str::from_utf8(bytes).is_ok();
+        let entry = (Arc::new(bytes.to_vec()), utf8);
+        DOCS.with(|c| c.borrow_mut().put(*root, entry.0.len(), entry));
+    }
+
     pub fn now() -> String {
         // ISO-8601 UTC with milliseconds; computed in SQL so it is identical across paths.
         chrono_free_now()

@@ -339,6 +339,10 @@ impl<'c> TextDb<'c> {
             let id = db.conn.last_insert_rowid();
             let mut st = db.storage();
             let (root, chunks) = textdb_core::build_with_chunks(&mut st, &db.params, content)?;
+            // The caller's buffer *is* this root's content; say so before anything reads it
+            // back (the structure sidecar immediately, and usually the client straight
+            // after) rather than reassembling it from the chunks just written.
+            st.remember_document(&root, content);
             if !st.cas_root(id as u64, None, &root)? {
                 return Err(TextdbError::Storage("initial CAS failed".into()));
             }
@@ -425,55 +429,179 @@ impl<'c> TextDb<'c> {
         if let Some(ex) = &self.extractor {
             let lower = path.to_ascii_lowercase();
             if lower.ends_with(".md") || lower.ends_with(".markdown") {
-                let bytes = (*st.document(&c.root)?.0).clone();
-                let s = ex.extract(&bytes);
-                for t in ["section", "link", "frontmatter"] {
-                    self.conn
-                        .prepare_cached(&format!("DELETE FROM {}{} WHERE file_id = ?1", self.p, t))
-                        .map_err(sql_err)?
-                        .execute(params![file_id])
-                        .map_err(sql_err)?;
-                }
-                for sec in &s.sections {
-                    self.conn
-                        .prepare_cached(&format!(
-                            "INSERT INTO {}section(file_id, version, heading_path, level, line_from, line_to) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                            self.p
-                        ))
-                        .map_err(sql_err)?
-                        .execute(params![
-                            file_id,
-                            c.version as i64,
-                            sec.heading_path,
-                            sec.level as i64,
-                            sec.line_from as i64,
-                            sec.line_to as i64
-                        ])
-                        .map_err(sql_err)?;
-                }
-                for l in &s.links {
-                    self.conn
-                        .prepare_cached(&format!(
-                            "INSERT INTO {}link(file_id, version, target_path, line) VALUES (?1, ?2, ?3, ?4)",
-                            self.p
-                        ))
-                        .map_err(sql_err)?
-                        .execute(params![file_id, c.version as i64, l.target_path, l.line as i64])
-                        .map_err(sql_err)?;
-                }
-                if let Some(fm) = &s.frontmatter {
-                    self.conn
-                        .prepare_cached(&format!(
-                            "INSERT OR REPLACE INTO {}frontmatter(file_id, version, data) VALUES (?1, ?2, ?3)",
-                            self.p
-                        ))
-                        .map_err(sql_err)?
-                        .execute(params![file_id, c.version as i64, fm.to_string()])
-                        .map_err(sql_err)?;
-                }
+                // No `.clone()`: `extract` wants a slice, and the cache already holds the
+                // bytes — seeded by the caller for a whole-content write, materialised once
+                // here otherwise (which also warms the cache for whoever reads next).
+                let doc = st.document(&c.root)?.0;
+                let s = ex.extract(&doc);
+                self.write_structure(file_id, c.version as i64, &s)?;
             }
         }
         Ok(())
+    }
+
+    /// Replace a file's structure rows, writing nothing when they already say the same thing.
+    ///
+    /// These rows are HEAD-only (ADR 0007) and derived, so every commit used to delete them
+    /// and re-insert one statement per section and per link — 339 inserts for a 1 MiB
+    /// document whose headings a one-line body edit had not touched. Structure changes far
+    /// less often than content, so the rows are compared first and rewritten only when they
+    /// differ; when they match, all that is left to do is carry the `version` column
+    /// forward, since `section()` looks rows up at the file's current version.
+    ///
+    /// A rewrite batches its inserts into one multi-`VALUES` statement per table instead of
+    /// one statement per row.
+    fn write_structure(&self, file_id: i64, version: i64, s: &textdb_core::structure::Structure) -> Result<()> {
+        if self.structure_matches(file_id, s)? {
+            for t in ["section", "link"] {
+                self.conn
+                    .prepare_cached(&format!("UPDATE {}{} SET version = ?1 WHERE file_id = ?2 AND version <> ?1", self.p, t))
+                    .map_err(sql_err)?
+                    .execute(params![version, file_id])
+                    .map_err(sql_err)?;
+            }
+            if s.frontmatter.is_some() {
+                self.conn
+                    .prepare_cached(&format!(
+                        "UPDATE {}frontmatter SET version = ?1 WHERE file_id = ?2 AND version <> ?1",
+                        self.p
+                    ))
+                    .map_err(sql_err)?
+                    .execute(params![version, file_id])
+                    .map_err(sql_err)?;
+            }
+            return Ok(());
+        }
+        for t in ["section", "link", "frontmatter"] {
+            self.conn
+                .prepare_cached(&format!("DELETE FROM {}{} WHERE file_id = ?1", self.p, t))
+                .map_err(sql_err)?
+                .execute(params![file_id])
+                .map_err(sql_err)?;
+        }
+        // SQLite's default parameter limit is 32766, so a document with a very large number
+        // of headings is written in several batches rather than one statement.
+        const MAX_ROWS_PER_BATCH: usize = 4000;
+        for batch in s.sections.chunks(MAX_ROWS_PER_BATCH) {
+            let mut sql = format!(
+                "INSERT INTO {}section(file_id, version, heading_path, level, line_from, line_to) VALUES ",
+                self.p
+            );
+            for i in 0..batch.len() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push_str("(?,?,?,?,?,?)");
+            }
+            let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(batch.len() * 6);
+            for sec in batch {
+                vals.push(file_id.into());
+                vals.push(version.into());
+                vals.push(sec.heading_path.clone().into());
+                vals.push((sec.level as i64).into());
+                vals.push((sec.line_from as i64).into());
+                vals.push((sec.line_to as i64).into());
+            }
+            self.conn
+                .prepare_cached(&sql)
+                .map_err(sql_err)?
+                .execute(rusqlite::params_from_iter(vals))
+                .map_err(sql_err)?;
+        }
+        for batch in s.links.chunks(MAX_ROWS_PER_BATCH) {
+            let mut sql = format!("INSERT INTO {}link(file_id, version, target_path, line) VALUES ", self.p);
+            for i in 0..batch.len() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push_str("(?,?,?,?)");
+            }
+            let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(batch.len() * 4);
+            for l in batch {
+                vals.push(file_id.into());
+                vals.push(version.into());
+                vals.push(l.target_path.clone().into());
+                vals.push((l.line as i64).into());
+            }
+            self.conn
+                .prepare_cached(&sql)
+                .map_err(sql_err)?
+                .execute(rusqlite::params_from_iter(vals))
+                .map_err(sql_err)?;
+        }
+        if let Some(fm) = &s.frontmatter {
+            self.conn
+                .prepare_cached(&format!(
+                    "INSERT OR REPLACE INTO {}frontmatter(file_id, version, data) VALUES (?1, ?2, ?3)",
+                    self.p
+                ))
+                .map_err(sql_err)?
+                .execute(params![file_id, version, fm.to_string()])
+                .map_err(sql_err)?;
+        }
+        Ok(())
+    }
+
+    /// Do the stored rows for `file_id` already describe `s`, version aside?
+    fn structure_matches(&self, file_id: i64, s: &textdb_core::structure::Structure) -> Result<bool> {
+        let mut st = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT heading_path, level, line_from, line_to FROM {}section WHERE file_id = ?1 ORDER BY rowid",
+                self.p
+            ))
+            .map_err(sql_err)?;
+        let mut rows = st.query(params![file_id]).map_err(sql_err)?;
+        for sec in &s.sections {
+            let Some(r) = rows.next().map_err(sql_err)? else {
+                return Ok(false);
+            };
+            let stored: (String, i64, i64, i64) = (
+                r.get(0).map_err(sql_err)?,
+                r.get(1).map_err(sql_err)?,
+                r.get(2).map_err(sql_err)?,
+                r.get(3).map_err(sql_err)?,
+            );
+            if stored != (sec.heading_path.clone(), sec.level as i64, sec.line_from as i64, sec.line_to as i64) {
+                return Ok(false);
+            }
+        }
+        if rows.next().map_err(sql_err)?.is_some() {
+            return Ok(false);
+        }
+        drop(rows);
+
+        let mut st = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT target_path, line FROM {}link WHERE file_id = ?1 ORDER BY rowid",
+                self.p
+            ))
+            .map_err(sql_err)?;
+        let mut rows = st.query(params![file_id]).map_err(sql_err)?;
+        for l in &s.links {
+            let Some(r) = rows.next().map_err(sql_err)? else {
+                return Ok(false);
+            };
+            let stored: (String, i64) = (r.get(0).map_err(sql_err)?, r.get(1).map_err(sql_err)?);
+            if stored != (l.target_path.clone(), l.line as i64) {
+                return Ok(false);
+            }
+        }
+        if rows.next().map_err(sql_err)?.is_some() {
+            return Ok(false);
+        }
+        drop(rows);
+
+        let stored_fm: Option<Option<String>> = self
+            .conn
+            .prepare_cached(&format!("SELECT data FROM {}frontmatter WHERE file_id = ?1", self.p))
+            .map_err(sql_err)?
+            .query_row(params![file_id], |r| r.get(0))
+            .optional()
+            .map_err(sql_err)?;
+        let want = s.frontmatter.as_ref().map(|fm| fm.to_string());
+        Ok(stored_fm.flatten() == want)
     }
 
     pub fn read(&self, path: &str) -> Result<Vec<u8>> {
@@ -531,6 +659,12 @@ impl<'c> TextDb<'c> {
             }
             let c = commit(&mut st, &db.params, n.id as u64, &path, &base, &edits, db.retries)?;
             if c.kind != CommitKind::NoOp {
+                // A `Direct` commit landed exactly the caller's bytes, so the cache can be
+                // told what they are. `Rebased` and `Merged` landed something else — the
+                // merge of this write and a concurrent one — so those have to be read back.
+                if c.kind == CommitKind::Direct {
+                    st.remember_document(&c.root, new_content);
+                }
                 db.record_commit(n.id, &path, &c, Some(&cur), author, message)?;
             }
             Ok(WriteResult {

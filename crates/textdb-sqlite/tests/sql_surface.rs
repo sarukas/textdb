@@ -1,6 +1,6 @@
 //! The whole surface through SQL (spec claim 4) plus round-trip checks.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use textdb_sqlite::{open_in_memory, TextDb};
 
 fn setup() -> Connection {
@@ -440,4 +440,65 @@ fn dropping_a_kb_table_removes_the_shadow_tables() {
         .query_row("SELECT count(*) FROM sqlite_master WHERE name LIKE 'kb\\_%' ESCAPE '\\'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(after, 0, "shadow tables should be gone after DROP TABLE");
+}
+
+/// Structure rows are HEAD-only and derived, so a commit that leaves the headings alone
+/// rewrites nothing and only carries the `version` column forward. `textdb_section` looks
+/// rows up at the file's *current* version, so a skipped rewrite that forgot to bump the
+/// version would silently stop finding sections — this walks several edits to catch that.
+#[test]
+fn sections_stay_findable_across_edits_that_do_not_change_structure() {
+    let conn = setup();
+    let body = "---\ntitle: T\n---\n\n# One\n\nalpha\nbeta\n\n## Two\n\ngamma see [[other]]\n";
+    conn.execute("INSERT INTO kb(path, content) VALUES ('/n/a.md', ?1)", params![body]).unwrap();
+
+    let section = |heading: &str| -> Option<String> {
+        conn.query_row("SELECT textdb_section('/n/a.md', ?1)", params![heading], |r| r.get(0))
+            .optional()
+            .unwrap()
+            .flatten()
+    };
+    let counts = || -> (i64, i64, i64) {
+        let q = |t: &str| -> i64 {
+            conn.query_row(&format!("SELECT count(*) FROM kb_{} WHERE version = (SELECT version FROM kb WHERE path = '/n/a.md')", t), [], |r| r.get(0))
+                .unwrap()
+        };
+        (q("section"), q("link"), q("frontmatter"))
+    };
+    assert_eq!(counts(), (2, 1, 1), "two headings, one wikilink, one frontmatter block");
+    assert!(section("Two").unwrap().contains("gamma"));
+
+    // Body-only edits: structure unchanged, so only the version is carried forward.
+    for (old, new) in [("alpha", "ALPHA"), ("ALPHA", "alpha again"), ("beta", "BETA")] {
+        conn.query_row("SELECT textdb_edit('/n/a.md', ?1, ?2)", params![old, new], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(counts(), (2, 1, 1), "rows must follow the new version after editing {}", old);
+        assert!(section("Two").unwrap().contains("gamma"), "sections must stay findable after editing {}", old);
+    }
+
+    // A structural edit must actually rewrite the rows.
+    conn.query_row("SELECT textdb_edit('/n/a.md', '## Two', '## Renamed')", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(counts(), (2, 1, 1));
+    assert!(section("Two").is_none(), "the old heading must be gone");
+    assert!(section("Renamed").unwrap().contains("gamma"));
+
+    // Adding a heading and a link changes the row counts.
+    conn.query_row(
+        "SELECT textdb_edit('/n/a.md', 'gamma see [[other]]', ?1)",
+        params!["gamma see [[other]] and [[third]]\n\n### Deep\n\ndelta"],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap();
+    assert_eq!(counts(), (3, 2, 1));
+    assert!(section("Deep").unwrap().contains("delta"));
+
+    // Removing the frontmatter clears its row rather than leaving a stale one behind.
+    conn.query_row("SELECT textdb_edit('/n/a.md', ?1, '')", params!["---\ntitle: T\n---\n\n"], |r| {
+        r.get::<_, i64>(0)
+    })
+    .unwrap();
+    let (secs, links, fm) = counts();
+    assert_eq!((secs, links, fm), (3, 2, 0), "frontmatter row should be gone");
+    assert!(section("Deep").unwrap().contains("delta"));
 }
