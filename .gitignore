@@ -1,7 +1,12 @@
 /target
 **/target
-/bench/out
-/bench/data
 *.db
 *.db-wal
 *.db-shm
+
+# Benchmark scratch: whatever --out and --work point at, plus run logs. A run worth
+# keeping is copied into bench/results/<id>/ and recorded in bench/RESULTS.md, so nothing
+# under these paths is ever the record of anything.
+/bench/out*
+/bench/data*
+/bench/*.log

@@ -108,7 +108,26 @@ fn body_param(b: &[u8]) -> rusqlite::types::Value {
     }
 }
 
+/// Close and forget this instance's connection on the calling thread. Without this the
+/// thread-local cache keeps the `Connection` — and its file handle — alive for the whole
+/// process, so the next rep's `remove_dir_all` cannot delete the database on Windows.
+fn close_conn(id: u64) {
+    let _ = CONNS.try_with(|m| {
+        drop(m.borrow_mut().remove(&id));
+    });
+}
+
+impl Drop for SqlTextSqlite {
+    fn drop(&mut self) {
+        close_conn(self.id);
+    }
+}
+
 impl Backend for SqlTextSqlite {
+    fn thread_done(&self) {
+        close_conn(self.id);
+    }
+
     fn id(&self) -> &'static str {
         "sql-text-sqlite"
     }
@@ -151,7 +170,7 @@ impl Backend for SqlTextSqlite {
     fn list(&self, prefix: &str) -> R<Vec<Entry>> {
         self.with(|c| {
             let mut st = c.prepare_cached(
-                "SELECT path, length(body) FROM doc WHERE deleted = 0 AND (?1 = '/' OR substr(path, 1, length(?1) + 1) = ?1 || '/') ORDER BY path",
+                "SELECT path, length(CAST(body AS BLOB)) FROM doc WHERE deleted = 0 AND (?1 = '/' OR substr(path, 1, length(?1) + 1) = ?1 || '/') ORDER BY path",
             )?;
             let rows = st
                 .query_map(params![prefix], |r| {

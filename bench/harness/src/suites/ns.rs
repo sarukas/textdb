@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crate::gen::{GenOpts, Generator};
 use crate::metrics::Latencies;
+use crate::ops;
 use crate::runner::Ctx;
 
 pub fn namespace(ctx: &Ctx) -> anyhow::Result<()> {
@@ -16,7 +17,7 @@ pub fn namespace(ctx: &Ctx) -> anyhow::Result<()> {
             let body = g.markdown(512, &GenOpts::default());
             let mut cl = Latencies::default();
             for i in 0..n {
-                if let Err(e) = ctx.timed(&mut cl, || ctx.backend.create(&format!("/wide/f{:07}.md", i), &body)) {
+                if let Err(e) = ctx.op(ops::CREATE, &mut cl, || ctx.backend.create(&format!("/wide/f{:07}.md", i), &body)) {
                     ctx.err("", "create", &e);
                     return Ok(());
                 }
@@ -27,7 +28,7 @@ pub fn namespace(ctx: &Ctx) -> anyhow::Result<()> {
             };
             ctx.cell.lat("", "create_last100", &last);
             let mut ll = Latencies::default();
-            match ctx.timed(&mut ll, || ctx.backend.list("/wide")) {
+            match ctx.op(ops::LIST, &mut ll, || ctx.backend.list("/wide")) {
                 Ok(l) => {
                     let files = l.iter().filter(|e| !e.is_dir).count();
                     if files == n {
@@ -47,11 +48,11 @@ pub fn namespace(ctx: &Ctx) -> anyhow::Result<()> {
             let body = g.markdown(512, &GenOpts::default());
             let path = format!("{}/leaf.md", "/a".repeat(depth));
             let mut cl = Latencies::default();
-            match ctx.timed(&mut cl, || ctx.backend.create(&path, &body)) {
+            match ctx.op(ops::CREATE, &mut cl, || ctx.backend.create(&path, &body)) {
                 Ok(_) => {
                     ctx.cell.lat("", "create", &cl);
                     let mut rl = Latencies::default();
-                    match ctx.timed(&mut rl, || ctx.backend.read(&path)) {
+                    match ctx.op(ops::READ, &mut rl, || ctx.backend.read(&path)) {
                         Ok(got) if got == body => ctx.cell.metric("", "identical", 1.0),
                         Ok(_) => ctx.cell.fail("", "identical", "differs"),
                         Err(e) => {
@@ -61,7 +62,7 @@ pub fn namespace(ctx: &Ctx) -> anyhow::Result<()> {
                     ctx.cell.lat("", "read", &rl);
                     let mut ll = Latencies::default();
                     let parent = "/a".repeat(depth);
-                    if let Err(e) = ctx.timed(&mut ll, || ctx.backend.list(&parent)) {
+                    if let Err(e) = ctx.op(ops::LIST, &mut ll, || ctx.backend.list(&parent)) {
                         ctx.err("", "list", &e);
                     }
                     ctx.cell.lat("", "list", &ll);
@@ -93,7 +94,7 @@ pub fn namespace(ctx: &Ctx) -> anyhow::Result<()> {
                 let _ = ctx.backend.replace(&first, &bodies[0].1[..8].to_vec(), b"RENAMED!", None);
                 let versions_before = ctx.backend.history(&first).map(|h| h.len()).unwrap_or(0);
                 let mut rl = Latencies::default();
-                match ctx.timed(&mut rl, || ctx.backend.rename(&src, &dst)) {
+                match ctx.op(ops::RENAME, &mut rl, || ctx.backend.rename(&src, &dst)) {
                     Ok(()) => {
                         ctx.cell.lat(&case, "rename", &rl);
                         // Oracle: all paths updated, contents unchanged, versions preserved.
@@ -149,7 +150,7 @@ pub fn namespace(ctx: &Ctx) -> anyhow::Result<()> {
                 }
             }
             let mut dl = Latencies::default();
-            if let Err(e) = ctx.timed(&mut dl, || ctx.backend.delete("/del")) {
+            if let Err(e) = ctx.op(ops::DELETE, &mut dl, || ctx.backend.delete("/del")) {
                 ctx.err("", "delete", &e);
                 return Ok(());
             }
@@ -161,7 +162,7 @@ pub fn namespace(ctx: &Ctx) -> anyhow::Result<()> {
                 ctx.cell.fail("", "deleted", "entries still listed");
             }
             let mut vl = Latencies::default();
-            match ctx.timed(&mut vl, || ctx.backend.read_version("/del/d0/f000000.md", 1)) {
+            match ctx.op(ops::READ_VERSION, &mut vl, || ctx.backend.read_version("/del/d0/f000000.md", 1)) {
                 Ok(got) if got == first_body => {
                     ctx.cell.metric("", "read_version_after_delete", 1.0);
                     ctx.cell.lat("", "read_version", &vl);

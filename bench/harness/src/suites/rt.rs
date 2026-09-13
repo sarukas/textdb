@@ -2,6 +2,7 @@
 
 use crate::gen::Generator;
 use crate::metrics::Latencies;
+use crate::ops;
 use crate::runner::Ctx;
 use crate::suites::{charset, line_ending, opts, size_label};
 
@@ -21,7 +22,7 @@ pub fn roundtrip(ctx: &Ctx) -> anyhow::Result<()> {
                 let body = g.markdown(size as usize, &opts(charset(cs), line_ending(le)));
                 let path = format!("/rt/{}/{}/f{}.md", cs, le, i);
                 let mut lat = Latencies::default();
-                match ctx.timed(&mut lat, || ctx.backend.create(&path, &body)) {
+                match ctx.op(ops::CREATE, &mut lat, || ctx.backend.create(&path, &body)) {
                     Ok(_) => {}
                     Err(e) => {
                         ctx.err(&case, "create", &e);
@@ -30,7 +31,7 @@ pub fn roundtrip(ctx: &Ctx) -> anyhow::Result<()> {
                 }
                 create_all.extend(&lat);
                 let mut rl = Latencies::default();
-                match ctx.timed(&mut rl, || ctx.backend.read(&path)) {
+                match ctx.op(ops::READ, &mut rl, || ctx.backend.read(&path)) {
                     Ok(got) => {
                         if got == body {
                             ctx.cell.metric(&case, "identical", 1.0);

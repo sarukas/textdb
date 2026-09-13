@@ -5,6 +5,7 @@ use std::time::Instant;
 use rand::{Rng, SeedableRng};
 
 use crate::reference::Reference;
+use crate::ops;
 use crate::runner::Ctx;
 use crate::suites::{import_corpus, line_edit, n_lines, Zipf};
 
@@ -47,7 +48,7 @@ pub fn footprint(ctx: &Ctx) -> anyhow::Result<()> {
     }
     ctx.cell.metric("", "edits", done as f64);
     let t = Instant::now();
-    match ctx.backend.maintenance() {
+    match ctx.op_only(ops::MAINTENANCE, || ctx.backend.maintenance()) {
         Ok(label) => {
             ctx.cell.metric("", "maintenance_s", t.elapsed().as_secs_f64());
             ctx.cell.note("", "maintenance", label);
@@ -60,5 +61,6 @@ pub fn footprint(ctx: &Ctx) -> anyhow::Result<()> {
             ctx.err("", "maintenance", &e);
         }
     }
+    ctx.set_reference(reference);
     Ok(())
 }

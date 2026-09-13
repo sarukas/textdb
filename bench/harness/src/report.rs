@@ -48,10 +48,13 @@ fn aggregate(rows: &[Row]) -> BTreeMap<(String, String, String, String), BTreeMa
     for ((fam, test, case, metric, backend), rs) in groups {
         let fail = rs.iter().find(|r| r.note.starts_with("FAIL"));
         let na = rs.iter().find(|r| r.note.starts_with("N/A"));
+        let expected = rs.iter().find(|r| r.note.starts_with("EXPECTED"));
         let entry = if let Some(f) = fail {
             (None, f.note.clone())
         } else if let Some(n) = na {
             (None, n.note.clone())
+        } else if let Some(e) = expected {
+            (None, e.note.clone())
         } else {
             let mut vals: Vec<f64> = rs.iter().filter_map(|r| r.value).collect();
             if vals.is_empty() {
@@ -76,6 +79,9 @@ pub fn render(rows: &[Row], manifest: &serde_json::Value, backends: &[String]) -
     md.push_str(&serde_json::to_string_pretty(manifest).unwrap_or_default());
     md.push_str("\n```\n\n");
 
+    md.push_str(&operations_section(rows, backends));
+    md.push_str(&accuracy_section(rows, backends));
+
     // Which tests are N/A for a backend entirely (row with empty case and metric "na").
     let families: BTreeSet<String> = agg.keys().map(|k| k.0.clone()).collect();
     for fam in &families {
@@ -97,6 +103,10 @@ pub fn render(rows: &[Row], manifest: &serde_json::Value, backends: &[String]) -
                 if f != fam || t != test || metric == "wall_s" {
                     continue;
                 }
+                // Per-operation latency has its own section.
+                if case == "ops" {
+                    continue;
+                }
                 // Skip noisy detail metrics in the report (kept in JSONL).
                 if metric.ends_with("_n") || metric.ends_with("_max_us") || metric.ends_with("_p95_us") {
                     continue;
@@ -108,6 +118,7 @@ pub fn render(rows: &[Row], manifest: &serde_json::Value, backends: &[String]) -
                         Some((Some(v), _)) => fmt(metric, *v),
                         Some((None, note)) if note.starts_with("FAIL") => format!("**FAIL** {}", note.trim_start_matches("FAIL: ").chars().take(60).collect::<String>()),
                         Some((None, note)) if note.starts_with("N/A") => format!("N/A ({})", note.trim_start_matches("N/A: ").chars().take(50).collect::<String>()),
+                        Some((None, note)) if note.starts_with("EXPECTED") => format!("_expected_ {}", note.trim_start_matches("EXPECTED: ").chars().take(50).collect::<String>()),
                         Some((None, note)) => note.chars().take(60).collect(),
                         None => "–".into(),
                     };
@@ -158,7 +169,16 @@ pub fn render(rows: &[Row], manifest: &serde_json::Value, backends: &[String]) -
 
     // Failures list.
     let fails: Vec<&Row> = rows.iter().filter(|r| r.note.starts_with("FAIL")).collect();
+    let expected_n = rows.iter().filter(|r| r.note.starts_with("EXPECTED")).count();
     md.push_str(&format!("## Oracle failures ({})\n\n", fails.len()));
+    if expected_n > 0 {
+        md.push_str(&format!(
+            "{} further oracle violations are the documented behaviour of the backend that produced them — a backend \
+             declaring no write guard is expected to lose updates, and that count is the measurement. They appear in \
+             the family tables as _expected_ and do not void any timings.\n\n",
+            expected_n
+        ));
+    }
     if fails.is_empty() {
         md.push_str("None.\n\n");
     } else {
@@ -175,5 +195,137 @@ pub fn render(rows: &[Row], manifest: &serde_json::Value, backends: &[String]) -
         }
         md.push('\n');
     }
+    md
+}
+
+fn median(mut v: Vec<f64>) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    Some(v[v.len() / 2])
+}
+
+/// Per-operation latency, pooled across every test that issued the operation.
+///
+/// Rows come from `Ctx::op`, so an operation appears here only if a suite actually timed a
+/// call to it — the table is a statement about work done, not about the trait surface.
+fn operations_section(rows: &[Row], backends: &[String]) -> String {
+    // (op, stat) -> backend -> values across tests
+    let mut by: BTreeMap<(String, String), BTreeMap<String, Vec<f64>>> = BTreeMap::new();
+    for r in rows.iter().filter(|r| r.case == "ops") {
+        let Some(rest) = r.metric.strip_prefix("op_") else { continue };
+        // metric is op_<name>_<stat>; split on the last two underscores of the stat suffix.
+        let Some((name, stat)) = ["_p50_us", "_p95_us", "_p99_us", "_max_us", "_n"]
+            .iter()
+            .find_map(|s| rest.strip_suffix(s).map(|n| (n.to_string(), s.trim_start_matches('_').to_string())))
+        else {
+            continue;
+        };
+        if let Some(v) = r.value {
+            by.entry((name, stat)).or_default().entry(r.backend.clone()).or_default().push(v);
+        }
+    }
+
+    let mut md = String::from("## Operations — latency by operation\n\n");
+    if by.is_empty() {
+        md.push_str("No operation rows recorded.\n\n");
+        return md;
+    }
+    md.push_str(
+        "Every timed call a suite made, attributed to a named operation. `p50`/`p99` are the median across tests \
+         of each test's percentile; `calls` is the total number of timed calls. A backend that reports no row for \
+         an operation never performed one.\n\n",
+    );
+    md.push_str("| operation | stat |");
+    for b in backends {
+        md.push_str(&format!(" {} |", b));
+    }
+    md.push_str("\n|---|---|");
+    for _ in backends {
+        md.push_str("---|");
+    }
+    md.push('\n');
+
+    for op in crate::ops::ALL {
+        for (stat, label) in [("p50_us", "p50"), ("p99_us", "p99"), ("n", "calls")] {
+            let Some(cols) = by.get(&(op.to_string(), stat.to_string())) else { continue };
+            md.push_str(&format!("| {} | {} |", op, label));
+            for b in backends {
+                let cell = match cols.get(b) {
+                    Some(vs) if stat == "n" => fmt("n", vs.iter().sum::<f64>()),
+                    Some(vs) => median(vs.clone()).map(|v| fmt("x_us", v)).unwrap_or_else(|| "–".into()),
+                    None => "–".into(),
+                };
+                md.push_str(&format!(" {} |", cell));
+            }
+            md.push('\n');
+        }
+    }
+    md.push('\n');
+    md
+}
+
+/// The untimed pre/post accuracy checks, and any timings they voided.
+fn accuracy_section(rows: &[Row], backends: &[String]) -> String {
+    const CHECKS: &[(&str, &str)] = &[
+        ("clean_start", "store empty before the suite ran"),
+        ("canary_roundtrip", "create → read → delete round-trip"),
+        ("listed_readable", "every listed document readable"),
+        ("size_consistent", "listed size equals bytes read"),
+        ("storage_nonzero", "documents stored, storage reported"),
+        ("oracle_match", "every document matches the oracle"),
+    ];
+
+    let mut md = String::from("## Accuracy checks (untimed)\n\n");
+    md.push_str(
+        "These run outside every timed span, before and after each cell. They exist so a backend cannot post good \
+         latencies for work it did not do. **A cell that fails any check publishes no timings at all** — its latency \
+         rows are withheld and counted under `timings voided`.\n\n",
+    );
+    md.push_str("| check | what it proves |");
+    for b in backends {
+        md.push_str(&format!(" {} |", b));
+    }
+    md.push_str("\n|---|---|");
+    for _ in backends {
+        md.push_str("---|");
+    }
+    md.push('\n');
+
+    for (name, what) in CHECKS {
+        let mut cols: BTreeMap<&str, (u64, u64, u64)> = BTreeMap::new(); // pass, fail, na
+        for r in rows.iter().filter(|r| &r.metric == name) {
+            let e = cols.entry(r.backend.as_str()).or_default();
+            if r.note.starts_with("FAIL") {
+                e.1 += 1;
+            } else if r.note.starts_with("N/A") || r.note.starts_with("skipped") {
+                e.2 += 1;
+            } else {
+                e.0 += 1;
+            }
+        }
+        if cols.is_empty() {
+            continue;
+        }
+        md.push_str(&format!("| {} | {} |", name, what));
+        for b in backends {
+            let cell = match cols.get(b.as_str()) {
+                Some((p, 0, 0)) => format!("{} pass", p),
+                Some((p, 0, na)) => format!("{} pass, {} n/a", p, na),
+                Some((p, f, _)) => format!("**{} FAIL** / {} pass", f, p),
+                None => "–".into(),
+            };
+            md.push_str(&format!(" {} |", cell));
+        }
+        md.push('\n');
+    }
+
+    md.push_str("| timings voided | cells whose latencies were withheld |");
+    for b in backends {
+        let n = rows.iter().filter(|r| r.metric == "timings_voided" && &r.backend == b).count();
+        md.push_str(&format!(" {} |", if n == 0 { "0".to_string() } else { format!("**{}**", n) }));
+    }
+    md.push_str("\n\n");
     md
 }

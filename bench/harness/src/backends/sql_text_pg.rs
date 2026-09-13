@@ -173,7 +173,7 @@ impl Backend for SqlTextPg {
     fn list(&self, prefix: &str) -> R<Vec<Entry>> {
         self.with(|c| {
             let rows = c.query(
-                "SELECT path, length(body) FROM sqltext.doc WHERE NOT deleted AND ($1 = '/' OR path LIKE $1 || '/%') ORDER BY path",
+                "SELECT path, octet_length(body) FROM sqltext.doc WHERE NOT deleted AND ($1 = '/' OR path LIKE $1 || '/%') ORDER BY path",
                 &[&prefix],
             )?;
             Ok(rows

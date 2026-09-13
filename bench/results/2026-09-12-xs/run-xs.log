@@ -1,0 +1,159 @@
+39 tests, backends ["fs", "sql-text-sqlite", "textdb-sqlite"], profile poc, size xs (x0.1), mode fast
+== RT-01 (roundtrip) sizes straddling chunk min/max; create → read; oracle bytes identical
+   fs                   0.4s
+   sql-text-sqlite      0.6s
+   textdb-sqlite        0.9s
+== RT-02 (roundtrip) RT-01 sizes × line endings {lf, crlf, no trailing newline}
+   fs                   0.5s
+   sql-text-sqlite      0.5s
+   textdb-sqlite        0.6s
+== RT-03 (roundtrip) 1 MiB × {ascii, mixed unicode, random bytes}; random bytes may be N/A where TEXT rejects invalid UTF-8
+   fs                   0.4s
+   sql-text-sqlite      1.0s
+   textdb-sqlite        1.2s
+== RT-04 (edit_sequence) 100 KiB, random replace ops, read after each == reference
+   fs                   0.1s
+   sql-text-sqlite      0.1s
+   textdb-sqlite        0.2s
+== RT-05 (edit_sequence) as RT-04, then read_version(v) for every v == reference history
+   fs                   0.1s
+   sql-text-sqlite      0.1s
+   textdb-sqlite        0.1s
+== RT-06 (search) corpus import → export via list+read compared to reference (diff -r equivalent) is checked by SR-01 recall path; import time reported
+   fs                   0.4s
+   sql-text-sqlite      0.1s
+   textdb-sqlite        0.2s
+== XL-01..06 (xl) create, full read (MB/s), read_lines at 0/50/100 %, replace 3 lines at 0/50/100 % (write amplification), 100 sequential replaces (footprint growth per edit), history + read_version(v1)
+   fs                   0.3s
+   sql-text-sqlite      0.9s
+   textdb-sqlite        0.4s
+== LL-01..03 (long_lines) single line of {1 MiB, 100 MiB} ASCII: create → read identical; replace 10 B at middle (leaf count changed); read_lines(1,1) returns whole line
+   fs                   1.4s
+   sql-text-sqlite      6.1s
+   textdb-sqlite        9.4s
+== LL-04 (edit_sequence) 10 MiB minified JSON (no newlines, high entropy); 100 replaces; textdb leaf stability (fraction of leaves unchanged per edit, target ≥ 0.99)
+   fs                   0.6s
+   sql-text-sqlite      2.6s
+   textdb-sqlite        0.7s
+== LL-05 (edit_sequence) 10 MiB, 1000 lines of 10 KiB; replace in line 500 (compare with XL-04 latency at same size)
+   fs                   0.7s
+   sql-text-sqlite      1.3s
+   textdb-sqlite        0.6s
+== LL-06 (long_lines) single line, mixed Unicode with 4-byte code points; replace across a multibyte boundary; no backend may corrupt UTF-8
+   fs                   0.1s
+   sql-text-sqlite      0.7s
+   textdb-sqlite        0.2s
+== ME-01/02 (edit_sequence) 100 KiB; sequential counter increments on one line; footprint after; read_version at v1, v(n/2), v(n)
+   fs                   0.7s
+   sql-text-sqlite      0.4s
+   textdb-sqlite        0.6s
+== ME-03 (edit_sequence) 100 KiB; sequential appends of one line; latency trend (last decile / first decile), footprint
+   fs                   0.7s
+   sql-text-sqlite      0.4s
+   textdb-sqlite        0.7s
+== ME-04 (edit_sequence) 100 KiB; edits alternating start/end of file; textdb leaves changed per edit ≤ 4
+   fs                   0.2s
+   sql-text-sqlite      0.1s
+   textdb-sqlite        0.2s
+== ME-05 (edit_sequence) 1 MiB; Zipf-distributed line edits; footprint vs raw; history latency at end
+   fs                   1.4s
+   sql-text-sqlite      2.3s
+   textdb-sqlite        1.6s
+== ME-06 (concurrent_writes) 20 concurrent writers incrementing the same counter line, base = last seen version; outcomes histogram + lost updates (final counter vs committed count)
+   fs                   0.1s
+   sql-text-sqlite      0.9s
+   textdb-sqlite        0.6s
+== CR-01 (concurrent_reads) one 100 KiB file; N readers in a closed loop; throughput, p50/p99
+   fs                   6.1s
+   sql-text-sqlite      6.4s
+   textdb-sqlite        6.1s
+== CR-02 (concurrent_reads) corpus of files, N readers, Zipf file choice
+   fs                   4.6s
+   sql-text-sqlite      4.4s
+   textdb-sqlite        4.3s
+== CR-03 (concurrent_reads) CR-01 with one writer replacing every 10 ms; reader p99 degradation and torn reads (every read must equal some committed version)
+   fs                   4.1s
+   sql-text-sqlite      4.3s
+   textdb-sqlite        4.2s
+== CR-04 (concurrent_reads) N readers of read_lines (50 lines) on a 100 MiB file — isolates fragment-read cost
+   fs                   4.2s
+   sql-text-sqlite      4.5s
+   textdb-sqlite        4.6s
+== CR-05 (concurrent_reads) 100 readers × 2-term AND search over the corpus
+   fs                   2.6s
+   sql-text-sqlite      2.2s
+   textdb-sqlite        2.4s
+== CR-06 (concurrent_reads) N readers × read_version of a random historical version; file with 1000 versions
+   fs                   0.2s
+   sql-text-sqlite      2.1s
+   textdb-sqlite        2.1s
+== CW-01 (concurrent_writes) N writers, one file, disjoint sections (writer i owns line block i); oracle: all last edits present
+   fs                   0.9s
+   sql-text-sqlite      1.7s
+   textdb-sqlite        4.4s
+== CW-02 (concurrent_writes) N writers, one file, same section, distinct lines
+   fs                   0.7s
+   sql-text-sqlite      1.8s
+   textdb-sqlite        3.2s
+== CW-03 (concurrent_writes) N writers, one file, same line (counter); conflicts expected; oracle: no lost updates among committed
+   fs                   0.6s
+   sql-text-sqlite      1.9s
+    FAIL CW-03 textdb-sqlite [N=50] no_lost_updates: 204 lost updates
+   textdb-sqlite        3.3s
+== CW-04 (concurrent_writes) N writers, random files (Zipf s=1.0) from a corpus
+   fs                   0.9s
+   sql-text-sqlite      2.6s
+   textdb-sqlite        3.9s
+== CW-05 (concurrent_writes) N writers append to one file; oracle: every committed append present
+   fs                   0.7s
+   sql-text-sqlite      4.3s
+   textdb-sqlite        5.4s
+== CW-06 (concurrent_writes) 20 writers on files under a folder while another thread renames the folder away and back; oracle: writes not failed by the rename race (errors), latency
+   fs                   0.3s
+   sql-text-sqlite      0.8s
+   textdb-sqlite        1.6s
+== CW-07 (concurrent_writes) CW-04 for 10 min with fs-git; index.lock failures counted as Contention (POC: 20 s)
+   fs                   2.2s
+   sql-text-sqlite      2.3s
+   textdb-sqlite        3.2s
+== SR-01/02 (search) index build / import of the corpus; single-term, 2-term AND, phrase, prefix queries: p50/p99, recall/precision
+   fs                   1.0s
+   sql-text-sqlite      0.2s
+   textdb-sqlite        0.5s
+== SR-04 (search) search after 10000 edits: index growth per edit and maintenance (VACUUM / optimize / gc) time
+   fs                   1.3s
+   sql-text-sqlite      0.2s
+   textdb-sqlite        0.5s
+== SR-05 (search) search restricted to a prefix (/sr/d07) — prefix + FTS combination
+   fs                   1.2s
+   sql-text-sqlite      0.2s
+   textdb-sqlite        0.5s
+== NS-01 (namespace) many files in one folder: list latency; create p99 at the end
+   fs                   1.8s
+   sql-text-sqlite      0.3s
+   textdb-sqlite        0.5s
+== NS-02 (namespace) folder depth 1000 (/a/a/a/…): create, read, list
+   fs                   3.8s
+   sql-text-sqlite      0.1s
+   textdb-sqlite        0.1s
+== NS-03 (namespace) rename folder with {1k, 10k, 50k} descendants: latency; all paths updated, contents unchanged, versions preserved
+   fs                   4.1s
+   sql-text-sqlite      0.1s
+   textdb-sqlite        0.3s
+== NS-04 (namespace) delete folder with 10k descendants, then read a deleted file's last version
+   fs                   0.7s
+   sql-text-sqlite      0.2s
+   textdb-sqlite        0.3s
+== NS-05 (namespace) path characters: spaces, dots, Unicode, 255-byte name, 4 KiB path, % and _
+   fs                   0.1s
+   sql-text-sqlite      0.0s
+   textdb-sqlite        0.0s
+== DU-01..03 (durability) kill -9 / dm-flakey crash tests need an out-of-process supervisor; recorded N/A in the POC harness
+   fs                   0.1s
+   sql-text-sqlite      0.0s
+   textdb-sqlite        0.0s
+== FP-01/02 (footprint) corpus; Zipf edits; footprint after every checkpoint; then maintenance (git gc --aggressive / VACUUM FULL / FTS optimize)
+   fs                   1.7s
+   sql-text-sqlite      0.3s
+   textdb-sqlite        0.6s
+wrote bench/out-run/results.jsonl and report.md

@@ -3,6 +3,7 @@
 use crate::backend::WriteOutcome;
 use crate::gen::{GenOpts, Generator};
 use crate::metrics::Latencies;
+use crate::ops;
 use crate::runner::Ctx;
 use crate::suites::{line_edit, n_lines, size_label};
 
@@ -20,7 +21,7 @@ pub fn xl(ctx: &Ctx) -> anyhow::Result<()> {
         ctx.backend.reset_counters()?;
         let fp0 = ctx.backend.storage_bytes().unwrap_or(0);
         let mut cl = Latencies::default();
-        if let Err(e) = ctx.timed(&mut cl, || ctx.backend.create(&path, &body)) {
+        if let Err(e) = ctx.op(ops::CREATE, &mut cl, || ctx.backend.create(&path, &body)) {
             ctx.err(&case, "create", &e);
             continue;
         }
@@ -31,7 +32,7 @@ pub fn xl(ctx: &Ctx) -> anyhow::Result<()> {
         let mut rl = Latencies::default();
         let mut ok = true;
         for _ in 0..3 {
-            match ctx.timed(&mut rl, || ctx.backend.read(&path)) {
+            match ctx.op(ops::READ, &mut rl, || ctx.backend.read(&path)) {
                 Ok(got) => ok &= got == body,
                 Err(e) => {
                     ctx.err(&case, "read", &e);
@@ -57,7 +58,7 @@ pub fn xl(ctx: &Ctx) -> anyhow::Result<()> {
             let mut fl = Latencies::default();
             let mut good = true;
             for _ in 0..3 {
-                match ctx.timed(&mut fl, || ctx.backend.read_lines(&path, from, to)) {
+                match ctx.op(ops::READ_LINES, &mut fl, || ctx.backend.read_lines(&path, from, to)) {
                     Ok(got) => good &= got == crate::backends::fs::slice_lines(&body, from, to),
                     Err(e) => {
                         ctx.err(&case, "read_lines", &e);
@@ -85,7 +86,7 @@ pub fn xl(ctx: &Ctx) -> anyhow::Result<()> {
             ctx.backend.reset_counters()?;
             let before = ctx.backend.storage_bytes().unwrap_or(0);
             let mut el = Latencies::default();
-            let r = ctx.timed(&mut el, || ctx.backend.replace(&path, &old, &new, None));
+            let r = ctx.op(ops::REPLACE, &mut el, || ctx.backend.replace(&path, &old, &new, None));
             let c = format!("{}@{:.0}%", case, pos * 100.0);
             match r {
                 Ok(WriteOutcome::Committed { .. }) | Ok(WriteOutcome::Absorbed { .. }) => {
@@ -122,7 +123,7 @@ pub fn xl(ctx: &Ctx) -> anyhow::Result<()> {
                     Some(x) => x,
                     None => continue,
                 };
-                match ctx.timed(&mut sl, || ctx.backend.replace(&path, &old, &new, None)) {
+                match ctx.op(ops::REPLACE, &mut sl, || ctx.backend.replace(&path, &old, &new, None)) {
                     Ok(WriteOutcome::Committed { .. }) | Ok(WriteOutcome::Absorbed { .. }) => {
                         body = crate::reference::splice(&body, &old, &new).unwrap();
                         done += 1;
@@ -144,11 +145,11 @@ pub fn xl(ctx: &Ctx) -> anyhow::Result<()> {
             }
             // XL-06 history + read_version(v1) after the edits.
             let mut hl = Latencies::default();
-            if let Ok(h) = ctx.timed(&mut hl, || ctx.backend.history(&path)) {
+            if let Ok(h) = ctx.op(ops::HISTORY, &mut hl, || ctx.backend.history(&path)) {
                 ctx.cell.lat(&case, "history", &hl);
                 ctx.cell.metric(&case, "versions", h.len() as f64);
                 let mut vl = Latencies::default();
-                if let Ok(v1) = ctx.timed(&mut vl, || ctx.backend.read_version(&path, h.first().copied().unwrap_or(1))) {
+                if let Ok(v1) = ctx.op(ops::READ_VERSION, &mut vl, || ctx.backend.read_version(&path, h.first().copied().unwrap_or(1))) {
                     ctx.cell.lat(&case, "read_version_v1", &vl);
                     let mut g2 = Generator::new(ctx.seed.wrapping_add(si as u64));
                     let orig = g2.markdown(size as usize, &GenOpts::default());

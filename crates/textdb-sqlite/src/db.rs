@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use textdb_core::commit::{commit, commit_append, CommitKind, Committed};
 use textdb_core::myers::byte_edits;
 use textdb_core::storage::Result;
-use textdb_core::tree::{leaves, materialize, totals};
+use textdb_core::tree::totals;
 use textdb_core::{unified_diff, ChunkParams, Edit, Hash, Storage, StructureExtractor, TextdbError};
 use textdb_md::MarkdownExtractor;
 
@@ -268,17 +268,37 @@ impl<'c> TextDb<'c> {
             }
             return Ok(n.id);
         }
-        let parent = self.ensure_folder(parent_of(&path))?;
+        // Walk up to the deepest folder that already exists, collecting what is missing,
+        // then create those top down. Recursing per component instead costs one stack
+        // frame per path segment, which overflows on a deeply nested path.
+        let mut missing: Vec<String> = Vec::new();
+        let mut cur = path.clone();
+        let mut parent = loop {
+            if cur == "/" {
+                break self.ensure_root()?;
+            }
+            match self.node_by_path(&cur)? {
+                Some(n) if n.kind != 0 => return Err(TextdbError::InvalidEdit(format!("{} is a file", cur))),
+                Some(n) => break n.id,
+                None => {
+                    let up = parent_of(&cur).to_string();
+                    missing.push(std::mem::replace(&mut cur, up));
+                }
+            }
+        };
         let now = Self::now();
-        self.conn
-            .prepare_cached(&format!(
-                "INSERT INTO {}node(parent_id, name, kind, path, created_at, updated_at) VALUES (?1, ?2, 0, ?3, ?4, ?4)",
-                self.p
-            ))
-            .map_err(sql_err)?
-            .execute(params![parent, name_of(&path), path, now])
-            .map_err(sql_err)?;
-        Ok(self.conn.last_insert_rowid())
+        for p in missing.iter().rev() {
+            self.conn
+                .prepare_cached(&format!(
+                    "INSERT INTO {}node(parent_id, name, kind, path, created_at, updated_at) VALUES (?1, ?2, 0, ?3, ?4, ?4)",
+                    self.p
+                ))
+                .map_err(sql_err)?
+                .execute(params![parent, name_of(p), p, now])
+                .map_err(sql_err)?;
+            parent = self.conn.last_insert_rowid();
+        }
+        Ok(parent)
     }
 
     /// Create a file (parents created), commit version 1.
@@ -387,7 +407,7 @@ impl<'c> TextDb<'c> {
         if let Some(ex) = &self.extractor {
             let lower = path.to_ascii_lowercase();
             if lower.ends_with(".md") || lower.ends_with(".markdown") {
-                let bytes = materialize(&st, &c.root)?;
+                let bytes = (*st.document(&c.root)?.0).clone();
                 let s = ex.extract(&bytes);
                 for t in ["section", "link", "frontmatter"] {
                     self.conn
@@ -442,7 +462,7 @@ impl<'c> TextDb<'c> {
         let path = normalize_path(path)?;
         let n = self.file_by_path(&path)?;
         let root = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
-        materialize(&self.storage(), &root)
+        Ok((*self.storage().document(&root)?.0).clone())
     }
 
     pub fn root_of_version(&self, file_id: i64, version: u64) -> Result<Hash> {
@@ -461,7 +481,7 @@ impl<'c> TextDb<'c> {
         let path = normalize_path(path)?;
         let n = self.node_by_path_any(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let root = self.root_of_version(n.id, version)?;
-        materialize(&self.storage(), &root)
+        Ok((*self.storage().document(&root)?.0).clone())
     }
 
     /// Replace the whole content (`UPDATE kb SET content = …`). The diff OLD→NEW is
@@ -483,7 +503,7 @@ impl<'c> TextDb<'c> {
                 _ => cur,
             };
             let mut st = db.storage();
-            let old = materialize(&st, &base)?;
+            let old = (*st.document(&base)?.0).clone();
             let edits = byte_edits(&old, new_content);
             if edits.is_empty() && base == cur {
                 return Ok(WriteResult {
@@ -538,7 +558,7 @@ impl<'c> TextDb<'c> {
             let n = db.file_by_path(&path)?;
             let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
             let mut st = db.storage();
-            let content = materialize(&st, &cur)?;
+            let content = (*st.document(&cur)?.0).clone();
             let pos = find_unique(&content, old)?;
             let edits = [Edit::new(pos as u64, (pos + old.len()) as u64, new.to_vec())];
             let c = commit(&mut st, &db.params, n.id as u64, &path, &cur, &edits, db.retries)?;
@@ -750,37 +770,28 @@ impl<'c> TextDb<'c> {
         let st = self.storage();
         // Per term: file_id → (chunk_id, rank) of the best chunk hit.
         let mut per_term: Vec<std::collections::HashMap<i64, (i64, f64)>> = Vec::new();
+        // The index is over chunks, so every hit has to be resolved to the files that
+        // contain it. Doing that one chunk at a time meant up to `limit * 50` extra
+        // statements per term; the join does it in one, and `ORDER BY rank` is what makes
+        // the first row seen for a file its best chunk, as before.
         let mut fts_stmt = self
             .conn
             .prepare_cached(&format!(
-                "SELECT rowid, rank FROM {p}fts WHERE {p}fts MATCH ?1 ORDER BY rank LIMIT ?2",
-                p = self.p
-            ))
-            .map_err(sql_err)?;
-        let mut ref_stmt = self
-            .conn
-            .prepare_cached(&format!(
-                "SELECT r.file_id FROM {p}chunk_ref r JOIN {p}node n ON n.id = r.file_id WHERE r.chunk_id = ?1 AND n.deleted_at IS NULL AND n.kind = 1 AND (?2 = '/' OR substr(n.path, 1, length(?2) + 1) = ?2 || '/')",
+                "SELECT r.file_id, f.chunk_id, f.rank                  FROM (SELECT rowid AS chunk_id, rank AS rank FROM {p}fts WHERE {p}fts MATCH ?1 ORDER BY rank LIMIT ?2) f                  JOIN {p}chunk_ref r ON r.chunk_id = f.chunk_id                  JOIN {p}node n ON n.id = r.file_id                  WHERE n.deleted_at IS NULL AND n.kind = 1                    AND (?3 = '/' OR substr(n.path, 1, length(?3) + 1) = ?3 || '/')                  ORDER BY f.rank",
                 p = self.p
             ))
             .map_err(sql_err)?;
         for t in &terms {
             let q = fts5_term(t);
-            let chunk_hits: Vec<(i64, f64)> = fts_stmt
-                .query_map(params![q, (limit.max(1) * 50) as i64], |r| Ok((r.get(0)?, r.get(1)?)))
-                .map_err(sql_err)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(sql_err)?;
             let mut files: std::collections::HashMap<i64, (i64, f64)> = Default::default();
-            for (chunk_id, rank) in chunk_hits {
-                let ids: Vec<i64> = ref_stmt
-                    .query_map(params![chunk_id, prefix], |r| r.get(0))
-                    .map_err(sql_err)?
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .map_err(sql_err)?;
-                for id in ids {
-                    files.entry(id).or_insert((chunk_id, rank));
-                }
+            let rows = fts_stmt
+                .query_map(params![q, (limit.max(1) * 50) as i64, prefix], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?))
+                })
+                .map_err(sql_err)?;
+            for row in rows {
+                let (file_id, chunk_id, rank) = row.map_err(sql_err)?;
+                files.entry(file_id).or_insert((chunk_id, rank));
             }
             per_term.push(files);
         }
@@ -815,11 +826,11 @@ impl<'c> TextDb<'c> {
             let root = to_hash(&root)?;
             let hash = to_hash(&hash)?;
             // Verify the chunk is still part of HEAD (chunk_ref is append-only) and get its line.
-            let leaf = match leaves(&st, &root)?.into_iter().find(|l| l.hash == hash) {
+            let leaf = match textdb_core::tree::find_leaf(&st, &root, &hash)? {
                 Some(l) => l,
                 None => {
                     // The chunk left this file; fall back to a HEAD scan for the first term.
-                    let body = materialize(&st, &root)?;
+                    let body = (*st.document(&root)?.0).clone();
                     let (line, snippet) = locate_terms(&body, &terms[..1]);
                     if snippet.is_empty() {
                         continue;
@@ -855,7 +866,7 @@ impl<'c> TextDb<'c> {
         let mut out = Vec::new();
         for n in self.list_files(prefix)? {
             if let Some(root) = n.root {
-                out.push((n.path, materialize(&st, &root)?));
+                out.push((n.path, (*st.document(&root)?.0).clone()));
             }
         }
         Ok(out)

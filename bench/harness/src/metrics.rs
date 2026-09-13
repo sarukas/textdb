@@ -124,6 +124,18 @@ impl Sink {
     }
 }
 
+/// Shared across every clone of a `Cell`, including the ones handed to writer threads.
+#[derive(Default)]
+struct CellState {
+    /// Set by `fail`, and by a failed accuracy check. Once true the cell publishes no timings.
+    failed: bool,
+    /// Reasons, for the single voiding row the report shows in place of the timings.
+    reasons: Vec<String>,
+    /// Latency rows held back until the cell finishes, because a failure can still arrive
+    /// after them — a backend that errors half way through must not publish a fast p50.
+    pending: Vec<Row>,
+}
+
 /// Context for one (test, backend, mode, cache, rep) cell.
 #[derive(Clone)]
 pub struct Cell<'a> {
@@ -134,9 +146,23 @@ pub struct Cell<'a> {
     pub mode: String,
     pub cache: String,
     pub rep: u32,
+    state: std::sync::Arc<Mutex<CellState>>,
 }
 
-impl Cell<'_> {
+impl<'a> Cell<'a> {
+    pub fn new(sink: &'a Sink, test: String, family: String, backend: String, mode: String, cache: String, rep: u32) -> Self {
+        Cell {
+            sink,
+            test,
+            family,
+            backend,
+            mode,
+            cache,
+            rep,
+            state: std::sync::Arc::new(Mutex::new(CellState::default())),
+        }
+    }
+
     pub fn metric(&self, case: &str, metric: &str, value: f64) {
         self.push(case, metric, Some(value), "ok");
     }
@@ -145,14 +171,64 @@ impl Cell<'_> {
     }
     pub fn fail(&self, case: &str, metric: &str, detail: &str) {
         eprintln!("    FAIL {} {} [{}] {}: {}", self.test, self.backend, case, metric, detail);
+        self.mark_failed(&format!("{} {}: {}", case, metric, detail));
         self.push(case, metric, Some(1.0), &format!("FAIL: {}", detail));
     }
     pub fn na(&self, case: &str, reason: &str) {
         self.push(case, "na", None, &format!("N/A: {}", reason));
     }
+
+    /// An oracle violation that is the expected, documented behaviour of this backend, and
+    /// therefore the measurement rather than a defect — `fs` has no concurrency control,
+    /// so its lost updates are the number the suite exists to report. Recorded and shown,
+    /// but it does not void the cell's timings: voiding them would delete the very
+    /// baseline the other backends are compared against.
+    pub fn expected(&self, case: &str, metric: &str, detail: &str) {
+        self.push(case, metric, Some(1.0), &format!("EXPECTED: {}", detail));
+    }
+
+    /// Void this cell's timings without emitting a per-case FAIL row (the caller has
+    /// already described the problem some other way).
+    pub fn mark_failed(&self, reason: &str) {
+        let mut s = self.state.lock().unwrap();
+        s.failed = true;
+        s.reasons.push(reason.to_string());
+    }
+
+    pub fn has_failed(&self) -> bool {
+        self.state.lock().unwrap().failed
+    }
+
+    /// Publish or void the held-back latency rows. Called once, after the suite and the
+    /// post-run accuracy checks have both had their say.
+    pub fn finish(&self) {
+        let (failed, reasons, pending) = {
+            let mut s = self.state.lock().unwrap();
+            (s.failed, std::mem::take(&mut s.reasons), std::mem::take(&mut s.pending))
+        };
+        if !failed {
+            for row in pending {
+                self.sink.push(row);
+            }
+            return;
+        }
+        let detail = if reasons.len() > 3 {
+            format!("{}; +{} more", reasons[..3].join("; "), reasons.len() - 3)
+        } else {
+            reasons.join("; ")
+        };
+        self.push(
+            "",
+            "timings_voided",
+            Some(pending.len() as f64),
+            &format!("FAIL: {} latency rows withheld: {}", pending.len(), detail),
+        );
+    }
+
+    /// Latency rows are buffered, not written: see `CellState::pending`.
     pub fn lat(&self, case: &str, op: &str, l: &Latencies) {
         for (k, v) in l.summary() {
-            self.metric(case, &format!("{}_{}", op, k), v);
+            self.state.lock().unwrap().pending.push(self.row(case, &format!("{}_{}", op, k), Some(v), "ok"));
         }
     }
     pub fn outcomes(&self, case: &str, o: &Outcomes) {
@@ -160,8 +236,8 @@ impl Cell<'_> {
             self.metric(case, k, v);
         }
     }
-    fn push(&self, case: &str, metric: &str, value: Option<f64>, note: &str) {
-        self.sink.push(Row {
+    fn row(&self, case: &str, metric: &str, value: Option<f64>, note: &str) -> Row {
+        Row {
             test: self.test.clone(),
             family: self.family.clone(),
             backend: self.backend.clone(),
@@ -172,7 +248,11 @@ impl Cell<'_> {
             metric: metric.to_string(),
             value,
             note: note.to_string(),
-        });
+        }
+    }
+
+    fn push(&self, case: &str, metric: &str, value: Option<f64>, note: &str) {
+        self.sink.push(self.row(case, metric, value, note));
     }
 }
 

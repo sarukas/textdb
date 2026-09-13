@@ -84,10 +84,21 @@ retry-budget exhaustion.
 ```sh
 bench/scripts/pg-start.sh                       # throwaway PG16 cluster, prints the URL
 cargo build --release -p textdb-bench
-./target/release/textdb-bench run --profile poc --pg postgres://postgres@localhost:54329/postgres \
+./target/release/textdb-bench run --size s --pg postgres://postgres@localhost:54329/postgres \
     --out bench/out --work bench/data [--backends fs,textdb-sqlite] [--filter CW,ME-06] [--mode durable]
 ./target/release/textdb-bench report --out bench/out     # regenerate report.md from results.jsonl
 ```
 
+`--size xs|s|m|l` scales how much work the matrix does without changing what it tests:
+`s` fits a full matrix on a laptop, `m` is the default. The full-copy-history baselines
+dominate the disk footprint, so size is the knob that decides whether a run costs
+megabytes or gigabytes.
+
 `--profile spec` replays the matrix at the scale issue #1 asks for (50k files, 1 GiB files,
 minutes per N); `poc` is the scaled-down profile used for `bench/RESULTS.md`.
+
+Every cell is bracketed by untimed accuracy checks — the store starts empty, a canary
+survives a create/read/delete round-trip, and afterwards every document is compared
+against a reference model. A cell that fails one publishes no timings at all, so a broken
+backend cannot post a fast number. See [`bench/README.md`](bench/README.md) for the knobs,
+the ten test families and what each measures.

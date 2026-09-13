@@ -3,6 +3,7 @@
 use crate::backend::WriteOutcome;
 use crate::gen::{Charset, Generator};
 use crate::metrics::Latencies;
+use crate::ops;
 use crate::runner::Ctx;
 use crate::suites::size_label;
 
@@ -29,13 +30,13 @@ pub fn long_lines(ctx: &Ctx) -> anyhow::Result<()> {
             _ => g.single_line(size as usize, Charset::Ascii),
         };
         let mut cl = Latencies::default();
-        if let Err(e) = ctx.timed(&mut cl, || ctx.backend.create(&path, &body)) {
+        if let Err(e) = ctx.op(ops::CREATE, &mut cl, || ctx.backend.create(&path, &body)) {
             ctx.err(&case, "create", &e);
             continue;
         }
         ctx.cell.lat(&case, "create", &cl);
         let mut rl = Latencies::default();
-        match ctx.timed(&mut rl, || ctx.backend.read(&path)) {
+        match ctx.op(ops::READ, &mut rl, || ctx.backend.read(&path)) {
             Ok(got) if got == body => ctx.cell.metric(&case, "identical", 1.0),
             Ok(_) => ctx.cell.fail(&case, "identical", "differs"),
             Err(e) => {
@@ -45,7 +46,7 @@ pub fn long_lines(ctx: &Ctx) -> anyhow::Result<()> {
         ctx.cell.lat(&case, "read", &rl);
         // LL-03 read_lines(1,1) must return the whole line.
         let mut ll = Latencies::default();
-        match ctx.timed(&mut ll, || ctx.backend.read_lines(&path, 1, 1)) {
+        match ctx.op(ops::READ_LINES, &mut ll, || ctx.backend.read_lines(&path, 1, 1)) {
             Ok(got) if got == body => ctx.cell.metric(&case, "read_lines_whole_line", 1.0),
             Ok(got) => ctx.cell.fail(&case, "read_lines_whole_line", &format!("{} of {} bytes", got.len(), body.len())),
             Err(e) => {
@@ -85,7 +86,7 @@ pub fn long_lines(ctx: &Ctx) -> anyhow::Result<()> {
         let leaves_before = leaf_hashes(ctx, &path);
         ctx.backend.reset_counters()?;
         let mut el = Latencies::default();
-        match ctx.timed(&mut el, || ctx.backend.replace(&path, &old, &new, None)) {
+        match ctx.op(ops::REPLACE, &mut el, || ctx.backend.replace(&path, &old, &new, None)) {
             Ok(WriteOutcome::Committed { .. }) | Ok(WriteOutcome::Absorbed { .. }) => {
                 body = crate::reference::splice(&body, &old, &new).unwrap();
                 ctx.cell.lat(&case, "replace", &el);

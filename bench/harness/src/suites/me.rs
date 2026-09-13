@@ -9,6 +9,7 @@ use crate::backend::WriteOutcome;
 use crate::gen::{Charset, GenOpts, Generator};
 use crate::metrics::Latencies;
 use crate::reference::Reference;
+use crate::ops;
 use crate::runner::Ctx;
 use crate::suites::{line_edit, line_span, n_lines, Zipf};
 
@@ -142,9 +143,9 @@ pub fn edit_sequence(ctx: &Ctx) -> anyhow::Result<()> {
         };
         bytes_changed += (old.len().max(new.len())) as u64;
         let r = if pattern == "append" {
-            ctx.timed(&mut lat, || ctx.backend.append(path, &new).map(|v| WriteOutcome::Committed { version: v, direct: true }))
+            ctx.op(ops::APPEND, &mut lat, || ctx.backend.append(path, &new).map(|v| WriteOutcome::Committed { version: v, direct: true }))
         } else {
-            ctx.timed(&mut lat, || ctx.backend.replace(path, &old, &new, None))
+            ctx.op(ops::REPLACE, &mut lat, || ctx.backend.replace(path, &old, &new, None))
         };
         match r {
             Ok(WriteOutcome::Committed { .. }) | Ok(WriteOutcome::Absorbed { .. }) => {}
@@ -235,7 +236,7 @@ pub fn edit_sequence(ctx: &Ctx) -> anyhow::Result<()> {
     }
     // History and historical reads (ME-02 / RT-05 / XL-06).
     let mut hl = Latencies::default();
-    match ctx.timed(&mut hl, || ctx.backend.history(path)) {
+    match ctx.op(ops::HISTORY, &mut hl, || ctx.backend.history(path)) {
         Ok(h) => {
             ctx.cell.lat("", "history", &hl);
             ctx.cell.metric("", "versions", h.len() as f64);
@@ -253,7 +254,7 @@ pub fn edit_sequence(ctx: &Ctx) -> anyhow::Result<()> {
             let mut mismatches = 0;
             for &i in &picks {
                 let v = h.get(i).copied().unwrap_or(i as u64 + 1);
-                match ctx.timed(&mut rv, || ctx.backend.read_version(path, v)) {
+                match ctx.op(ops::READ_VERSION, &mut rv, || ctx.backend.read_version(path, v)) {
                     Ok(got) => {
                         if got != reference.history[path][i] {
                             mismatches += 1;
@@ -278,5 +279,6 @@ pub fn edit_sequence(ctx: &Ctx) -> anyhow::Result<()> {
             ctx.err("", "history", &e);
         }
     }
+    ctx.set_reference(reference);
     Ok(())
 }

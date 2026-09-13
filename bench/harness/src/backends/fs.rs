@@ -33,10 +33,32 @@ impl FsBackend {
         self.root.join(path.trim_start_matches('/'))
     }
 
+    /// `std::fs::create_dir_all` recurses once per missing path component, which overflows
+    /// the stack on NS-02's 1000-deep folder — and sooner on Windows, whose 1 MiB main
+    /// stack is a fraction of Linux's 8 MiB. Creating the components in order from the top
+    /// down is depth-independent.
+    fn create_dirs(dir: &Path) -> R<()> {
+        if dir.is_dir() {
+            return Ok(());
+        }
+        let mut acc = PathBuf::new();
+        for part in dir.components() {
+            acc.push(part);
+            match fs::create_dir(&acc) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                // A component that is a prefix/root (e.g. `C:\`) cannot be created.
+                Err(_) if acc.is_dir() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
     pub fn write_atomic(&self, path: &str, body: &[u8]) -> R<()> {
         let full = self.full(path);
         if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent)?;
+            Self::create_dirs(parent)?;
         }
         let tmp = full.with_extension(format!(
             "tmp{}-{}",
@@ -82,7 +104,16 @@ impl FsBackend {
                 cmd.arg("-F").arg("-w").arg("-e").arg(t);
             }
             cmd.arg(&dir);
-            let out = cmd.output()?;
+            // `fs` has no index of its own; search is ripgrep. A missing tool is an
+            // unavailable operation, recorded N/A with the reason — not an oracle
+            // violation, which would also void this cell's unrelated timings.
+            let out = match cmd.output() {
+                Ok(o) => o,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BackendError::NotSupported("ripgrep (rg) is not installed"));
+                }
+                Err(e) => return Err(e.into()),
+            };
             let set: std::collections::BTreeSet<String> =
                 String::from_utf8_lossy(&out.stdout).lines().map(|s| s.to_string()).collect();
             files = Some(match files {
@@ -114,28 +145,35 @@ pub fn regex_escape(s: &str) -> String {
     out
 }
 
+/// Iterative rather than recursive: NS-02 builds a folder 1000 levels deep, and one stack
+/// frame per level (each holding a `ReadDir`, a `PathBuf` and a `Metadata`) overflows the
+/// main thread — sooner on Windows, whose 1 MiB main stack is a fraction of Linux's 8 MiB.
+/// An explicit worklist makes the traversal depth-independent.
 fn walk(dir: &Path, root: &Path, out: &mut Vec<Entry>) -> R<()> {
-    for e in fs::read_dir(dir)? {
-        let e = e?;
-        let p = e.path();
-        let md = e.metadata()?;
-        let rel = format!("/{}", p.strip_prefix(root).unwrap().to_string_lossy());
-        if rel.starts_with("/.git") {
-            continue;
-        }
-        if md.is_dir() {
-            out.push(Entry {
-                path: rel,
-                is_dir: true,
-                nbytes: None,
-            });
-            walk(&p, root, out)?;
-        } else {
-            out.push(Entry {
-                path: rel,
-                is_dir: false,
-                nbytes: Some(md.len()),
-            });
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(d) = pending.pop() {
+        for e in fs::read_dir(&d)? {
+            let e = e?;
+            let p = e.path();
+            let md = e.metadata()?;
+            let rel = format!("/{}", p.strip_prefix(root).unwrap().to_string_lossy());
+            if rel.starts_with("/.git") {
+                continue;
+            }
+            if md.is_dir() {
+                out.push(Entry {
+                    path: rel,
+                    is_dir: true,
+                    nbytes: None,
+                });
+                pending.push(p);
+            } else {
+                out.push(Entry {
+                    path: rel,
+                    is_dir: false,
+                    nbytes: Some(md.len()),
+                });
+            }
         }
     }
     Ok(())
@@ -173,7 +211,7 @@ impl Backend for FsBackend {
     fn rename(&self, from: &str, to: &str) -> R<()> {
         let dst = self.full(to);
         if let Some(p) = dst.parent() {
-            fs::create_dir_all(p)?;
+            Self::create_dirs(p)?;
         }
         fs::rename(self.full(from), dst)?;
         Ok(())

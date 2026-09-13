@@ -14,6 +14,7 @@ pub mod sr;
 pub mod xl;
 
 use crate::gen::{line_starts, Charset, GenOpts, Generator, LineEnding};
+use crate::ops;
 use crate::runner::Ctx;
 use rand::Rng;
 
@@ -144,7 +145,7 @@ pub fn import_corpus(
     for i in 0..n {
         let path = format!("{}/d{:02}/f{:05}.md", prefix, i % 50, i);
         let body = g.markdown(size, &o);
-        ctx.timed(&mut lat, || ctx.backend.create(&path, &body))?;
+        ctx.op(ops::CREATE, &mut lat, || ctx.backend.create(&path, &body))?;
         reference.create(&path, &body);
         paths.push(path);
     }

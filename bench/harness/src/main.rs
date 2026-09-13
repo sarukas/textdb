@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! textdb-bench run  [--tests DIR] [--out DIR] [--backends a,b] [--profile poc|spec]
-//!                   [--mode fast|durable] [--filter RT,XL-01] [--seed N] [--pg URL] [--drop-caches]
+//!                   [--size xs|s|m|l] [--mode fast|durable] [--filter RT,XL-01] [--seed N]
+//!                   [--pg URL] [--drop-caches]
 //! textdb-bench report [--out DIR]
 //! ```
 
@@ -10,7 +11,7 @@ use std::path::PathBuf;
 
 use textdb_bench::backend::Mode;
 use textdb_bench::metrics::Sink;
-use textdb_bench::runner::{load_tests, run_all, RunOpts};
+use textdb_bench::runner::{load_tests, run_all, RunOpts, Size};
 
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
@@ -28,6 +29,10 @@ fn main() -> anyhow::Result<()> {
                 .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
                 .unwrap_or_else(|| textdb_bench::backends::ALL.iter().map(|s| s.to_string()).collect());
             let profile = arg(&args, "--profile").unwrap_or_else(|| "poc".into());
+            let size = match arg(&args, "--size") {
+                Some(s) => Size::parse(&s).ok_or_else(|| anyhow::anyhow!("--size must be one of xs, s, m, l (got {})", s))?,
+                None => Size::M,
+            };
             let mode = match arg(&args, "--mode").as_deref() {
                 Some("durable") => Mode::Durable,
                 _ => Mode::Fast,
@@ -40,12 +45,23 @@ fn main() -> anyhow::Result<()> {
             std::fs::create_dir_all(&work)?;
             std::fs::create_dir_all(&out)?;
             let tests = load_tests(&tests_dir)?;
-            let manifest = textdb_bench::manifest::manifest(&work, seed, &profile, mode.name(), pg_url.as_deref(), &backends);
+            let mut manifest = textdb_bench::manifest::manifest(&work, seed, &profile, mode.name(), pg_url.as_deref(), &backends);
+            manifest["size"] = serde_json::json!(size.name());
+            manifest["scale"] = serde_json::json!(size.scale());
             std::fs::write(out.join("manifest.json"), serde_json::to_string_pretty(&manifest)?)?;
-            eprintln!("{} tests, backends {:?}, profile {}, mode {}", tests.len(), backends, profile, mode.name());
+            eprintln!(
+                "{} tests, backends {:?}, profile {}, size {} (x{}), mode {}",
+                tests.len(),
+                backends,
+                profile,
+                size.name(),
+                size.scale(),
+                mode.name()
+            );
             let sink = Sink::new(&out)?;
             let opts = RunOpts {
                 profile,
+                size,
                 mode,
                 seed,
                 work,

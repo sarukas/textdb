@@ -355,8 +355,15 @@ unsafe impl VTabCursor for KbCursor<'_> {
                     Some(root) if r.kind == 1 => {
                         let conn = unsafe { Connection::from_handle(self.db) }?;
                         let st = crate::storage::SqliteStorage::new(&conn, &self.prefix);
-                        let bytes = textdb_core::materialize(&st, &root).map_err(map_err)?;
-                        ctx.set_result(&bytes_value(bytes))
+                        let (bytes, utf8) = st.document(&root).map_err(map_err)?;
+                        // The UTF-8 check already ran for exactly these bytes, and the
+                        // root hash they are keyed by is derived from them, so the answer
+                        // cannot belong to different content.
+                        ctx.set_result(&if utf8 {
+                            Value::Text(unsafe { String::from_utf8_unchecked(bytes.to_vec()) })
+                        } else {
+                            Value::Blob(bytes.to_vec())
+                        })
                     }
                     _ => ctx.set_result(&Value::Null),
                 }

@@ -11,8 +11,17 @@ use std::path::Path;
 /// Construct a fresh, empty backend instance under `work` for the given id.
 pub fn make(id: &str, work: &Path, mode: Mode, pg_url: Option<&str>) -> anyhow::Result<Option<Box<dyn Backend>>> {
     let dir = work.join(id);
-    let _ = std::fs::remove_dir_all(&dir);
+    // A failed reset must never be silent: it would leave the previous rep's data in place
+    // and every measurement after it would be against the wrong state.
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            anyhow::bail!("could not reset {}: {}", dir.display(), e);
+        }
+    }
     std::fs::create_dir_all(&dir)?;
+    if std::fs::read_dir(&dir)?.next().is_some() {
+        anyhow::bail!("{} is not empty after reset", dir.display());
+    }
     Ok(Some(match id {
         "fs" => Box::new(fs::FsBackend::new(&dir, mode)?),
         "fs-git" => Box::new(fs_git::FsGitBackend::new(&dir, mode)?),
@@ -62,16 +71,20 @@ pub fn col_bytes(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Vec<u8>> {
 }
 
 /// Directory size in bytes (like `du -sb`).
+/// Iterative: NS-02 nests folders 1000 deep, and one frame per level overflows the stack
+/// — sooner on Windows, whose 1 MiB main stack is a fraction of Linux's 8 MiB.
 pub fn du(path: &Path) -> u64 {
     let mut total = 0;
-    if let Ok(rd) = std::fs::read_dir(path) {
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for e in rd.flatten() {
             let md = match e.metadata() {
                 Ok(m) => m,
                 Err(_) => continue,
             };
             if md.is_dir() {
-                total += du(&e.path());
+                pending.push(e.path());
             } else {
                 total += md.len();
             }
