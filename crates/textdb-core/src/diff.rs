@@ -2,7 +2,7 @@
 //! them as unified diff at line granularity.
 
 use crate::hash::Hash;
-use crate::myers::{diff_seq, unified};
+use crate::myers::{diff_seq, line_diff, split_lines, unified};
 use crate::node::{Child, Node};
 use crate::storage::{Result, Storage};
 use crate::tree::{leaves, line_of_byte, locate_line, materialize_range, totals, LeafRef};
@@ -196,15 +196,73 @@ fn common_suffix<S: Storage + ?Sized>(storage: &S, a: &Node, b: &Node, a_budget:
     }
 }
 
+/// A change at line granularity: lines `[old_from, old_from + old_count)` of `a` (0-based)
+/// became lines `[new_from, new_from + new_count)` of `b`. A zero count is a pure insertion
+/// or deletion in front of that line.
+///
+/// This is the diff for callers that patch a document they already display, rather than
+/// print one: each hunk carries the replaced and the replacing text, so applying it needs no
+/// further read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineHunk {
+    pub old_from: u64,
+    pub old_count: u64,
+    pub new_from: u64,
+    pub new_count: u64,
+    pub old_text: Vec<u8>,
+    pub new_text: Vec<u8>,
+}
+
+/// Line hunks between two roots, in ascending order.
+///
+/// Built on the same chunk-granular walk as [`unified_diff`], so the cost follows the size
+/// of the change rather than the size of the document; each changed region is then diffed
+/// line by line so the hunks are as tight as a plain line diff would make them.
+pub fn line_hunks<S: Storage + ?Sized>(storage: &S, a: &Hash, b: &Hash) -> Result<Vec<LineHunk>> {
+    let mut out = Vec::new();
+    for r in changed_line_regions(storage, a, b)? {
+        let at = materialize_range(storage, a, r.a_from, r.a_to)?;
+        let bt = materialize_range(storage, b, r.b_from, r.b_to)?;
+        let a_line = line_of_byte(storage, a, r.a_from)?;
+        let b_line = line_of_byte(storage, b, r.b_from)?;
+        let al = split_lines(&at);
+        let bl = split_lines(&bt);
+        for h in line_diff(&al, &bl) {
+            out.push(LineHunk {
+                old_from: a_line + h.a_from as u64,
+                old_count: (h.a_to - h.a_from) as u64,
+                new_from: b_line + h.b_from as u64,
+                new_count: (h.b_to - h.b_from) as u64,
+                old_text: al[h.a_from..h.a_to].concat(),
+                new_text: bl[h.b_from..h.b_to].concat(),
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Unified diff between two roots at line granularity, with `context` lines.
 pub fn unified_diff<S: Storage + ?Sized>(storage: &S, a: &Hash, b: &Hash, context: usize) -> Result<String> {
+    let regions = changed_line_regions(storage, a, b)?;
+    let mut out = String::new();
+    for r in regions {
+        let at = materialize_range(storage, a, r.a_from, r.a_to)?;
+        let bt = materialize_range(storage, b, r.b_from, r.b_to)?;
+        let a_line = line_of_byte(storage, a, r.a_from)? as usize + 1;
+        let b_line = line_of_byte(storage, b, r.b_from)? as usize + 1;
+        out.push_str(&unified(&at, &bt, context, a_line, b_line));
+    }
+    Ok(out)
+}
+
+/// [`changed_runs`] widened to whole lines on both sides, with runs that touch merged.
+fn changed_line_regions<S: Storage + ?Sized>(storage: &S, a: &Hash, b: &Hash) -> Result<Vec<ChangedRun>> {
     let runs = changed_runs(storage, a, b)?;
     if runs.is_empty() {
-        return Ok(String::new());
+        return Ok(Vec::new());
     }
     let (a_len, _) = totals(storage, a)?;
     let (b_len, _) = totals(storage, b)?;
-    // Expand each run to whole lines and merge runs that touch.
     let mut regions: Vec<ChangedRun> = Vec::new();
     for r in runs {
         let a_line0 = line_of_byte(storage, a, r.a_from)?;
@@ -230,15 +288,7 @@ pub fn unified_diff<S: Storage + ?Sized>(storage: &S, a: &Hash, b: &Hash, contex
         }
         regions.push(nr);
     }
-    let mut out = String::new();
-    for r in regions {
-        let at = materialize_range(storage, a, r.a_from, r.a_to)?;
-        let bt = materialize_range(storage, b, r.b_from, r.b_to)?;
-        let a_line = line_of_byte(storage, a, r.a_from)? as usize + 1;
-        let b_line = line_of_byte(storage, b, r.b_from)? as usize + 1;
-        out.push_str(&unified(&at, &bt, context, a_line, b_line));
-    }
-    Ok(out)
+    Ok(regions)
 }
 
 /// Debug helper: all leaves of a root as children.

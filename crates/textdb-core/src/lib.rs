@@ -17,7 +17,7 @@ pub mod tree;
 
 pub use chunker::ChunkParams;
 pub use commit::{commit, commit_append, CommitKind, Committed, ConflictInfo, DEFAULT_RETRIES};
-pub use diff::{changed_runs, unified_diff, ChangedRun};
+pub use diff::{changed_runs, line_hunks, unified_diff, ChangedRun, LineHunk};
 pub use edit::{apply_edits, Edit, EditResult};
 pub use hash::{hash_chunk, hash_node, Hash};
 pub use node::{Child, Node};

@@ -1,5 +1,6 @@
 //! `CREATE VIRTUAL TABLE kb USING textdb(store='kb_')` (spec §7.1) and the eponymous
-//! table-valued functions `textdb_ls`, `textdb_search`, `textdb_history`, `textdb_export`.
+//! table-valued functions `textdb_ls`, `textdb_search`, `textdb_history`, `textdb_export`,
+//! `textdb_feed`, `textdb_hunks`, `textdb_chunks`.
 
 use std::borrow::Cow;
 use std::ffi::CStr;
@@ -328,7 +329,8 @@ impl UpdateVTab<'_> for KbTab {
         if let Some(new_path) = value_str(args.get::<Value>(2 + COL_PATH as usize)?) {
             let new_path = normalize_path(&new_path).map_err(map_err)?;
             if new_path != path {
-                db.rename(&path, &new_path).map_err(map_err)?;
+                let author = value_str(args.get::<Value>(2 + COL_AUTHOR)?);
+                db.rename_by(&path, &new_path, author.as_deref()).map_err(map_err)?;
                 path = new_path;
             }
         }
@@ -498,6 +500,9 @@ pub enum FnKind {
     Search,
     History,
     Export,
+    Feed,
+    Hunks,
+    Chunks,
 }
 
 pub struct FnSpec {
@@ -510,8 +515,11 @@ impl FnKind {
         match self {
             FnKind::Ls => c"CREATE TABLE x(name TEXT, kind TEXT, nbytes INTEGER, nlines INTEGER, updated_at TEXT, path TEXT, dir TEXT HIDDEN)",
             FnKind::Search => c"CREATE TABLE x(path TEXT, line INTEGER, snippet TEXT, rank REAL, query TEXT HIDDEN, prefix TEXT HIDDEN, lim INTEGER HIDDEN)",
-            FnKind::History => c"CREATE TABLE x(version INTEGER, author TEXT, ts TEXT, message TEXT, nbytes INTEGER, path TEXT HIDDEN)",
+            FnKind::History => c"CREATE TABLE x(version INTEGER, author TEXT, ts TEXT, message TEXT, nbytes INTEGER, kind TEXT, base_version INTEGER, path TEXT HIDDEN)",
             FnKind::Export => c"CREATE TABLE x(path TEXT, content TEXT, prefix TEXT HIDDEN)",
+            FnKind::Feed => c"CREATE TABLE x(seq INTEGER, ts TEXT, op TEXT, path TEXT, old_path TEXT, node_kind TEXT, version INTEGER, base_version INTEGER, commit_kind TEXT, author TEXT, message TEXT, since INTEGER HIDDEN, lim INTEGER HIDDEN)",
+            FnKind::Hunks => c"CREATE TABLE x(old_from INTEGER, old_count INTEGER, new_from INTEGER, new_count INTEGER, old_text TEXT, new_text TEXT, path TEXT HIDDEN, v1 INTEGER HIDDEN, v2 INTEGER HIDDEN)",
+            FnKind::Chunks => c"CREATE TABLE x(ord INTEGER, hash TEXT, byte_from INTEGER, nbytes INTEGER, line_from INTEGER, nlines INTEGER, path TEXT HIDDEN, version INTEGER HIDDEN)",
         }
     }
     /// Number of visible columns; hidden argument columns follow.
@@ -519,8 +527,11 @@ impl FnKind {
         match self {
             FnKind::Ls => 6,
             FnKind::Search => 4,
-            FnKind::History => 5,
+            FnKind::History => 7,
             FnKind::Export => 2,
+            FnKind::Feed => 11,
+            FnKind::Hunks => 6,
+            FnKind::Chunks => 6,
         }
     }
     fn n_hidden(self) -> c_int {
@@ -529,7 +540,20 @@ impl FnKind {
             FnKind::Search => 3,
             FnKind::History => 1,
             FnKind::Export => 1,
+            FnKind::Feed => 2,
+            FnKind::Hunks => 3,
+            FnKind::Chunks => 2,
         }
+    }
+}
+
+/// A hidden argument as an integer, accepting the text form a bound parameter can arrive in.
+fn hidden_i64(v: &Option<Value>) -> Option<i64> {
+    match v {
+        Some(Value::Integer(i)) => Some(*i),
+        Some(Value::Real(f)) => Some(*f as i64),
+        Some(Value::Text(t)) => t.trim().parse().ok(),
+        _ => None,
     }
 }
 
@@ -695,6 +719,82 @@ unsafe impl VTabCursor for FnCursor<'_> {
                             Value::Text(c.ts),
                             c.message.map_or(Value::Null, Value::Text),
                             c.nbytes.map_or(Value::Null, Value::Integer),
+                            c.kind.map_or(Value::Null, Value::Text),
+                            c.base_version.map_or(Value::Null, Value::Integer),
+                        ]
+                    })
+                    .collect()
+            }
+            FnKind::Feed => {
+                let since = hidden_i64(&hidden[0]).unwrap_or(0);
+                let lim = hidden_i64(&hidden[1]).map_or(10_000, |v| v.max(0) as usize);
+                db.feed(since, lim)
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(|c| {
+                        vec![
+                            Value::Integer(c.seq),
+                            Value::Text(c.ts),
+                            Value::Text(c.op),
+                            Value::Text(c.path),
+                            c.old_path.map_or(Value::Null, Value::Text),
+                            Value::Text(if c.node_kind == 1 { "file".into() } else { "folder".into() }),
+                            c.version.map_or(Value::Null, Value::Integer),
+                            c.base_version.map_or(Value::Null, Value::Integer),
+                            c.commit_kind.map_or(Value::Null, Value::Text),
+                            c.author.map_or(Value::Null, Value::Text),
+                            c.message.map_or(Value::Null, Value::Text),
+                        ]
+                    })
+                    .collect()
+            }
+            FnKind::Hunks => {
+                let path = s(&hidden[0]).ok_or_else(|| Error::ModuleError("TX004 path is required".into()))?;
+                // `textdb_hunks(path)` is the latest commit and `textdb_hunks(path, v1)` runs
+                // from `v1` to HEAD, so a client that knows its version needs no other lookup.
+                let (v1, v2) = match (hidden_i64(&hidden[1]), hidden_i64(&hidden[2])) {
+                    (Some(a), Some(b)) => (a, b),
+                    (a, b) => {
+                        let head = db
+                            .node_by_path_any(&normalize_path(&path).map_err(map_err)?)
+                            .map_err(map_err)?
+                            .ok_or_else(|| map_err(TextdbError::NotFound(path.clone())))?
+                            .version;
+                        let b = b.unwrap_or(head);
+                        (a.unwrap_or(b - 1), b)
+                    }
+                };
+                // Line numbers are 1-based here, as in `textdb_lines`.
+                db.hunks(&path, v1.max(0) as u64, v2.max(0) as u64)
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(|h| {
+                        vec![
+                            Value::Integer(h.old_from as i64 + 1),
+                            Value::Integer(h.old_count as i64),
+                            Value::Integer(h.new_from as i64 + 1),
+                            Value::Integer(h.new_count as i64),
+                            bytes_value(h.old_text),
+                            bytes_value(h.new_text),
+                        ]
+                    })
+                    .collect()
+            }
+            FnKind::Chunks => {
+                let path = s(&hidden[0]).ok_or_else(|| Error::ModuleError("TX004 path is required".into()))?;
+                let version = hidden_i64(&hidden[1]).map(|v| v.max(0) as u64);
+                db.chunks(&path, version)
+                    .map_err(map_err)?
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, l)| {
+                        vec![
+                            Value::Integer(i as i64),
+                            Value::Text(textdb_core::hash::hex(&l.hash)),
+                            Value::Integer(l.byte_off as i64),
+                            Value::Integer(l.nbytes as i64),
+                            Value::Integer(l.line_off as i64 + 1),
+                            Value::Integer(l.nlines as i64),
                         ]
                     })
                     .collect()

@@ -15,7 +15,7 @@ pub mod schema;
 pub mod storage;
 pub mod vtab;
 
-pub use db::{normalize_path, CommitRow, Entry, Hit, NodeRow, TextDb, WriteResult, DEFAULT_PREFIX};
+pub use db::{normalize_path, ChangeRow, CommitRow, Entry, Hit, NodeRow, TextDb, WriteResult, DEFAULT_PREFIX};
 pub use storage::SqliteStorage;
 
 use rusqlite::{Connection, Result};
@@ -30,6 +30,9 @@ pub fn register(conn: &Connection, prefix: &str) -> Result<()> {
         ("textdb_search", FnKind::Search),
         ("textdb_history", FnKind::History),
         ("textdb_export", FnKind::Export),
+        ("textdb_feed", FnKind::Feed),
+        ("textdb_hunks", FnKind::Hunks),
+        ("textdb_chunks", FnKind::Chunks),
     ] {
         conn.create_module(
             name,

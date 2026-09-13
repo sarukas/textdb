@@ -133,6 +133,49 @@ proptest! {
         let back = byte_edits(&other, &bytes);
         prop_assert_eq!(apply_ref(&other, &back), bytes);
     }
+
+    /// P8: line hunks patch one version into the next. Splicing each hunk's new text over
+    /// its old line range turns `a` into `b`, each hunk's old text is what `a` holds at those
+    /// lines, and `new_from` is `old_from` shifted by the hunks before it — which is what a
+    /// viewer relies on when it patches the lines it is showing instead of reloading.
+    #[test]
+    fn p8_line_hunks_patch_versions(
+        bytes in text_strategy(30_000),
+        seed in any::<u64>(),
+        every in 1usize..9,
+        scatter in any::<bool>(),
+    ) {
+        let mut s = MemStorage::new();
+        let a = build(&mut s, &P, &bytes).unwrap();
+        let target = if scatter {
+            scatter_lines(&bytes, every, seed)
+        } else {
+            apply_ref(&bytes, &random_edits(bytes.len(), 2, seed))
+        };
+        let b = build(&mut s, &P, &target).unwrap();
+        let hunks = textdb_core::line_hunks(&s, &a, &b).unwrap();
+        let old_lines: Vec<&[u8]> = bytes.split_inclusive(|&c| c == b'\n').collect();
+        let mut out = Vec::new();
+        let mut next = 0usize;
+        let mut shift = 0i64;
+        for h in &hunks {
+            let from = h.old_from as usize;
+            let to = from + h.old_count as usize;
+            prop_assert!(next <= from && to <= old_lines.len(), "hunk {:?} out of order or range", (h.old_from, h.old_count));
+            for l in &old_lines[next..from] {
+                out.extend_from_slice(l);
+            }
+            prop_assert_eq!(old_lines[from..to].concat(), h.old_text.clone());
+            prop_assert_eq!(h.new_from as i64, h.old_from as i64 + shift);
+            out.extend_from_slice(&h.new_text);
+            shift += h.new_count as i64 - h.old_count as i64;
+            next = to;
+        }
+        for l in &old_lines[next..] {
+            out.extend_from_slice(l);
+        }
+        prop_assert_eq!(out, target);
+    }
 }
 
 /// Change every `every`-th line of `bytes`, leaving the rest alone.

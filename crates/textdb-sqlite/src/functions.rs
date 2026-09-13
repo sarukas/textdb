@@ -46,6 +46,33 @@ fn text_or_blob_checked(b: &[u8], utf8: bool) -> Value {
     }
 }
 
+/// Argument `i` as an integer, `None` when absent or NULL.
+fn opt_i64(ctx: &Context, i: usize) -> Result<Option<i64>> {
+    if i >= ctx.len() {
+        return Ok(None);
+    }
+    Ok(match ctx.get_raw(i) {
+        ValueRef::Integer(n) => Some(n),
+        ValueRef::Real(f) => Some(f as i64),
+        ValueRef::Text(t) => std::str::from_utf8(t).ok().and_then(|s| s.trim().parse().ok()),
+        ValueRef::Null | ValueRef::Blob(_) => None,
+    })
+}
+
+/// Argument `i` as text, `None` when absent or NULL.
+fn opt_str(ctx: &Context, i: usize) -> Result<Option<String>> {
+    if i >= ctx.len() || ctx.get_raw(i) == ValueRef::Null {
+        return Ok(None);
+    }
+    arg_str(ctx, i).map(Some)
+}
+
+/// A write's outcome as JSON, `{"version":3,"kind":"rebased"}`. A caller showing how its
+/// commit landed needs the kind as well as the version, and a scalar returns one value.
+fn write_json(r: &crate::db::WriteResult) -> String {
+    serde_json::json!({ "version": r.version, "kind": r.kind.as_str() }).to_string()
+}
+
 /// Run `f` against the store, on the best handle available.
 ///
 /// Prefer the handle a `textdb` virtual table registered on this connection: everything
@@ -148,6 +175,46 @@ pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
         let name = arg_str(ctx, 0)?;
         let n = with_db(ctx, h, &p, |db| db.checkpoint(&name))?;
         Ok(n as i64)
+    })?;
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_write", -1, flags, move |ctx| {
+        if ctx.len() < 2 {
+            return Err(Error::UserFunctionError(
+                "textdb_write(path, content[, base_version[, author[, message]]])".into(),
+            ));
+        }
+        let path = arg_str(ctx, 0)?;
+        let content = arg_bytes(ctx, 1)?;
+        let base = opt_i64(ctx, 2)?.map(|v| v.max(0) as u64);
+        let author = opt_str(ctx, 3)?;
+        let message = opt_str(ctx, 4)?;
+        let r = with_db(ctx, h, &p, |db| db.write(&path, &content, base, author.as_deref(), message.as_deref()))?;
+        Ok(write_json(&r))
+    })?;
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_replace_lines", -1, flags, move |ctx| {
+        if ctx.len() < 4 {
+            return Err(Error::UserFunctionError(
+                "textdb_replace_lines(path, from, to, text[, base_version[, author]])".into(),
+            ));
+        }
+        let path = arg_str(ctx, 0)?;
+        let from: i64 = ctx.get(1)?;
+        let to: i64 = ctx.get(2)?;
+        let text = arg_bytes(ctx, 3)?;
+        let base = opt_i64(ctx, 4)?.map(|v| v.max(0) as u64);
+        let author = opt_str(ctx, 5)?;
+        let r = with_db(ctx, h, &p, |db| {
+            db.replace_lines(&path, from.max(0) as u64, to.max(0) as u64, &text, base, author.as_deref())
+        })?;
+        Ok(write_json(&r))
+    })?;
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_last_seq", 0, flags, move |ctx| with_db(ctx, h, &p, |db| db.last_seq()))?;
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_migrate", 0, flags, move |ctx| {
+        let added = with_db(ctx, h, &p, |db| crate::schema::migrate(db.conn, &db.p).map_err(crate::storage::sql_err))?;
+        Ok(added as i64)
     })?;
     Ok(())
 }

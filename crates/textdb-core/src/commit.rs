@@ -25,6 +25,18 @@ pub enum CommitKind {
     NoOp,
 }
 
+impl CommitKind {
+    /// Lower-case name, as recorded in commit rows and the change feed.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommitKind::Direct => "direct",
+            CommitKind::Rebased => "rebased",
+            CommitKind::Merged => "merged",
+            CommitKind::NoOp => "noop",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Committed {
     pub version: u64,

@@ -11,6 +11,11 @@
 /bench/data*
 /bench/*.log
 
+# Node
+node_modules/
+/node/**/dist/
+*.tsbuildinfo
+
 # Python
 __pycache__/
 *.py[cod]

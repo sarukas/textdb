@@ -6,7 +6,7 @@ use textdb_core::commit::{commit, commit_append, CommitKind, Committed};
 use textdb_core::myers::byte_edits;
 use textdb_core::storage::Result;
 use textdb_core::tree::totals;
-use textdb_core::{unified_diff, ChunkParams, Edit, Hash, Storage, StructureExtractor, TextdbError};
+use textdb_core::{unified_diff, ChunkParams, Edit, Hash, LeafRef, LineHunk, Storage, StructureExtractor, TextdbError};
 use textdb_md::MarkdownExtractor;
 
 use crate::storage::{sql_err, SqliteStorage};
@@ -47,6 +47,34 @@ pub struct CommitRow {
     pub message: Option<String>,
     pub nbytes: Option<i64>,
     pub root: Hash,
+    /// How the commit landed: `direct`, `rebased` or `merged`. `None` for commits written
+    /// before the column existed.
+    pub kind: Option<String>,
+    /// The version the writer started from; `None` for a file's first version.
+    pub base_version: Option<i64>,
+}
+
+/// One entry of the change feed: a commit, folder creation, move or delete, in the order
+/// they were made. `seq` only grows, so a reader that remembers the last one it saw can ask
+/// for exactly what came after.
+#[derive(Clone, Debug)]
+pub struct ChangeRow {
+    pub seq: i64,
+    pub ts: String,
+    /// `create`, `commit`, `mkdir`, `move` or `delete`.
+    pub op: String,
+    pub node_id: i64,
+    /// 0 folder, 1 file.
+    pub node_kind: i64,
+    /// The path after the change.
+    pub path: String,
+    /// For a move, the path before it.
+    pub old_path: Option<String>,
+    pub version: Option<i64>,
+    pub base_version: Option<i64>,
+    pub commit_kind: Option<String>,
+    pub author: Option<String>,
+    pub message: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -135,7 +163,7 @@ pub fn subtree_bounds(path: &str) -> Option<(String, String)> {
 impl<'c> TextDb<'c> {
     /// Create the shadow tables if missing and return a handle.
     pub fn open(conn: &'c Connection, prefix: &str) -> Result<Self> {
-        conn.execute_batch(&crate::schema::create_sql(prefix)).map_err(sql_err)?;
+        crate::schema::migrate(conn, prefix).map_err(sql_err)?;
         let db = Self::attach(conn, prefix, true);
         db.ensure_root()?;
         Ok(db)
@@ -315,6 +343,7 @@ impl<'c> TextDb<'c> {
                 .execute(params![parent, name_of(p), p, now])
                 .map_err(sql_err)?;
             parent = self.conn.last_insert_rowid();
+            self.record_change("mkdir", parent, 0, p, None, None, None, None, None, None)?;
         }
         Ok(parent)
     }
@@ -353,7 +382,7 @@ impl<'c> TextDb<'c> {
                 new_chunks: chunks,
                 retries: 0,
             };
-            db.record_commit(id, &path, &c, None, author, message)?;
+            db.record_commit(id, &path, &c, None, None, author, message)?;
             Ok(1)
         })
     }
@@ -371,12 +400,14 @@ impl<'c> TextDb<'c> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_commit(
         &self,
         file_id: i64,
         path: &str,
         c: &Committed,
         parent_root: Option<&Hash>,
+        base_version: Option<i64>,
         author: Option<&str>,
         message: Option<&str>,
     ) -> Result<()> {
@@ -385,7 +416,7 @@ impl<'c> TextDb<'c> {
         let now = Self::now();
         self.conn
             .prepare_cached(&format!(
-                "INSERT INTO {}commit(file_id, version, root, parent_root, author, ts, message, nbytes, nlines) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO {}commit(file_id, version, root, parent_root, author, ts, message, nbytes, nlines, kind, base_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 self.p
             ))
             .map_err(sql_err)?
@@ -398,9 +429,24 @@ impl<'c> TextDb<'c> {
                 now,
                 message,
                 nbytes as i64,
-                nlines as i64
+                nlines as i64,
+                c.kind.as_str(),
+                base_version
             ])
             .map_err(sql_err)?;
+        let op = if c.version == 1 { "create" } else { "commit" };
+        self.record_change(
+            op,
+            file_id,
+            1,
+            path,
+            None,
+            Some(c.version as i64),
+            base_version,
+            Some(c.kind.as_str()),
+            author,
+            message,
+        )?;
         self.conn
             .prepare_cached(&format!(
                 "UPDATE {}node SET nbytes = ?1, nlines = ?2, updated_by = ?3 WHERE id = ?4",
@@ -690,7 +736,8 @@ impl<'c> TextDb<'c> {
                 if c.kind == CommitKind::Direct {
                     st.remember_document(&c.root, new_content);
                 }
-                db.record_commit(n.id, &path, &c, Some(&cur), author, message)?;
+                let base_v = base_version.map_or(n.version, |v| v as i64);
+                db.record_commit(n.id, &path, &c, Some(&cur), Some(base_v), author, message)?;
             }
             Ok(WriteResult {
                 version: c.version,
@@ -719,7 +766,8 @@ impl<'c> TextDb<'c> {
             let mut st = db.storage();
             let c = commit(&mut st, &db.params, n.id as u64, &path, &base, edits, db.retries)?;
             if c.kind != CommitKind::NoOp {
-                db.record_commit(n.id, &path, &c, Some(&cur), author, message)?;
+                let base_v = base_version.map_or(n.version, |v| v as i64);
+                db.record_commit(n.id, &path, &c, Some(&cur), Some(base_v), author, message)?;
             }
             Ok(WriteResult {
                 version: c.version,
@@ -740,7 +788,7 @@ impl<'c> TextDb<'c> {
             let edits = [Edit::new(pos as u64, (pos + old.len()) as u64, new.to_vec())];
             let c = commit(&mut st, &db.params, n.id as u64, &path, &cur, &edits, db.retries)?;
             if c.kind != CommitKind::NoOp {
-                db.record_commit(n.id, &path, &c, Some(&cur), author, Some("edit"))?;
+                db.record_commit(n.id, &path, &c, Some(&cur), Some(n.version), author, Some("edit"))?;
             }
             Ok(WriteResult {
                 version: c.version,
@@ -757,7 +805,7 @@ impl<'c> TextDb<'c> {
             let mut st = db.storage();
             let c = commit_append(&mut st, &db.params, n.id as u64, &path, tail, db.retries)?;
             if c.kind != CommitKind::NoOp {
-                db.record_commit(n.id, &path, &c, Some(&cur), author, Some("append"))?;
+                db.record_commit(n.id, &path, &c, Some(&cur), Some(n.version), author, Some("append"))?;
             }
             Ok(WriteResult {
                 version: c.version,
@@ -768,6 +816,11 @@ impl<'c> TextDb<'c> {
 
     /// Rename/move a file or folder (subtree path rewrite, ids stable).
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
+        self.rename_by(from, to, None)
+    }
+
+    /// As [`rename`](Self::rename), attributing the move in the change feed.
+    pub fn rename_by(&self, from: &str, to: &str, author: Option<&str>) -> Result<()> {
         let from = normalize_path(from)?;
         let to = normalize_path(to)?;
         self.tx(|db| {
@@ -802,18 +855,24 @@ impl<'c> TextDb<'c> {
                 .map_err(sql_err)?
                 .execute(params![to, name_of(&to), parent, now, src.id])
                 .map_err(sql_err)?;
+            db.record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, None)?;
             Ok(())
         })
     }
 
     /// Tombstone a file or folder subtree. Content and history are retained.
     pub fn delete(&self, path: &str) -> Result<()> {
+        self.delete_by(path, None)
+    }
+
+    /// As [`delete`](Self::delete), attributing the change in the feed.
+    pub fn delete_by(&self, path: &str, author: Option<&str>) -> Result<()> {
         let path = normalize_path(path)?;
         self.tx(|db| {
             if path == "/" {
                 return Err(TextdbError::InvalidEdit("cannot delete the root".into()));
             }
-            db.node_by_path(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
+            let n = db.node_by_path(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
             let now = Self::now();
             let (lo, hi) = subtree_bounds(&path).expect("delete rejects the root above");
             db.conn
@@ -825,6 +884,7 @@ impl<'c> TextDb<'c> {
                 .map_err(sql_err)?
                 .execute(params![path, now, lo, hi])
                 .map_err(sql_err)?;
+            db.record_change("delete", n.id, n.kind, &path, None, None, None, None, author, None)?;
             Ok(())
         })
     }
@@ -894,7 +954,7 @@ impl<'c> TextDb<'c> {
         let mut stmt = self
             .conn
             .prepare_cached(&format!(
-                "SELECT version, author, ts, message, nbytes, root FROM {}commit WHERE file_id = ?1 ORDER BY version",
+                "SELECT version, author, ts, message, nbytes, root, kind, base_version FROM {}commit WHERE file_id = ?1 ORDER BY version",
                 self.p
             ))
             .map_err(sql_err)?;
@@ -908,6 +968,8 @@ impl<'c> TextDb<'c> {
                     message: r.get(3)?,
                     nbytes: r.get(4)?,
                     root: to_hash(&root).unwrap_or([0u8; 32]),
+                    kind: r.get(6)?,
+                    base_version: r.get(7)?,
                 })
             })
             .map_err(sql_err)?;
@@ -956,6 +1018,213 @@ impl<'c> TextDb<'c> {
             return Ok(String::new());
         }
         Ok(format!("--- {p}@{v1}\n+++ {p}@{v2}\n{body}", p = path, v1 = v1, v2 = v2, body = body))
+    }
+
+    /// Line hunks that turn version `v1` of a file into version `v2`, for a client patching
+    /// what it already displays. Version 0 is the empty document before the file existed,
+    /// so `hunks(path, 0, 1)` is the whole first version as one insertion.
+    pub fn hunks(&self, path: &str, v1: u64, v2: u64) -> Result<Vec<LineHunk>> {
+        let path = normalize_path(path)?;
+        let n = self.node_by_path_any(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
+        let st = self.storage();
+        if v1 == v2 {
+            return Ok(Vec::new());
+        }
+        if v1 == 0 || v2 == 0 {
+            // There is no stored root for "nothing" to diff against, and a read should not
+            // write one. One side is empty, so the hunk is the other side, whole.
+            let root = self.root_of_version(n.id, v1.max(v2))?;
+            let text = (*st.document(&root)?.0).clone();
+            if text.is_empty() {
+                return Ok(Vec::new());
+            }
+            let count = textdb_core::myers::split_lines(&text).len() as u64;
+            let (old_count, new_count, old_text, new_text) =
+                if v1 == 0 { (0, count, Vec::new(), text) } else { (count, 0, text, Vec::new()) };
+            return Ok(vec![LineHunk {
+                old_from: 0,
+                old_count,
+                new_from: 0,
+                new_count,
+                old_text,
+                new_text,
+            }]);
+        }
+        let a = self.root_of_version(n.id, v1)?;
+        let b = self.root_of_version(n.id, v2)?;
+        textdb_core::line_hunks(&st, &a, &b)
+    }
+
+    /// The chunks of a file at `version` (HEAD when `None`), in document order, with where
+    /// each one sits. Unchanged content keeps its hash from one version to the next, so a
+    /// client comparing two listings knows which parts of a document it can leave alone.
+    pub fn chunks(&self, path: &str, version: Option<u64>) -> Result<Vec<LeafRef>> {
+        let path = normalize_path(path)?;
+        let root = match version {
+            None => self.file_by_path(&path)?.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?,
+            Some(v) => {
+                let n = self.node_by_path_any(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
+                self.root_of_version(n.id, v)?
+            }
+        };
+        textdb_core::leaves(&self.storage(), &root)
+    }
+
+    /// Create the file, or replace its content exactly as [`update_content`](Self::update_content) does.
+    pub fn write(
+        &self,
+        path: &str,
+        content: &[u8],
+        base_version: Option<u64>,
+        author: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<WriteResult> {
+        let path = normalize_path(path)?;
+        self.tx(|db| match db.node_by_path(&path)? {
+            None => Ok(WriteResult {
+                version: db.create(&path, content, author, message)?,
+                kind: CommitKind::Direct,
+            }),
+            Some(_) => db.update_content(&path, content, base_version, author, message),
+        })
+    }
+
+    /// Replace lines `[from, to]` (1-based, inclusive) with `text`, where the numbers refer
+    /// to `base_version` (HEAD when `None`). `to = from - 1` inserts in front of line `from`
+    /// without replacing anything, and `from` one past the last line appends.
+    ///
+    /// The range is resolved against the version the caller read and committed with that
+    /// version as its base, so a commit that landed elsewhere in the file in the meantime
+    /// does not shift it: the edit is rebased like any other write, or conflicts if the same
+    /// lines changed.
+    pub fn replace_lines(
+        &self,
+        path: &str,
+        from: u64,
+        to: u64,
+        text: &[u8],
+        base_version: Option<u64>,
+        author: Option<&str>,
+    ) -> Result<WriteResult> {
+        let path = normalize_path(path)?;
+        if from == 0 || to + 1 < from {
+            return Err(TextdbError::InvalidEdit(format!("invalid line range {}-{}", from, to)));
+        }
+        let n = self.file_by_path(&path)?;
+        let base_v = base_version.unwrap_or(n.version as u64);
+        let root = match n.root {
+            Some(r) if base_v as i64 == n.version => r,
+            _ => self.root_of_version(n.id, base_v)?,
+        };
+        let st = self.storage();
+        let (len, newlines) = totals(&st, &root)?;
+        let unterminated = len > 0 && textdb_core::materialize_range(&st, &root, len - 1, len)? != b"\n";
+        let nlines = newlines + unterminated as u64;
+        if from - 1 > nlines || to > nlines {
+            return Err(TextdbError::InvalidEdit(format!(
+                "lines {}-{} are outside {}, which has {} lines at version {}",
+                from, to, path, nlines, base_v
+            )));
+        }
+        let mut replacement = text.to_vec();
+        let start = match textdb_core::locate_line(&st, &root, from - 1)? {
+            Some(off) => off,
+            // Appending after a last line with no newline: supply one, or the new text
+            // would run on from that line instead of following it.
+            None => {
+                replacement.insert(0, b'\n');
+                len
+            }
+        };
+        let end = if to < from {
+            start
+        } else {
+            textdb_core::locate_line(&st, &root, to)?.unwrap_or(len)
+        };
+        let edits = [Edit::new(start, end, replacement)];
+        self.commit_edits(&path, &edits, Some(base_v), author, Some("replace-lines"))
+    }
+
+    /// Append one row to the change feed. Callers run it inside the operation's own
+    /// transaction, so a watcher can never see a change the store does not have, nor miss
+    /// one it does.
+    #[allow(clippy::too_many_arguments)]
+    fn record_change(
+        &self,
+        op: &str,
+        node_id: i64,
+        node_kind: i64,
+        path: &str,
+        old_path: Option<&str>,
+        version: Option<i64>,
+        base_version: Option<i64>,
+        commit_kind: Option<&str>,
+        author: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<()> {
+        self.conn
+            .prepare_cached(&format!(
+                "INSERT INTO {}change(ts, op, node_id, node_kind, path, old_path, version, base_version, commit_kind, author, message) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                self.p
+            ))
+            .map_err(sql_err)?
+            .execute(params![
+                Self::now(),
+                op,
+                node_id,
+                node_kind,
+                path,
+                old_path,
+                version,
+                base_version,
+                commit_kind,
+                author,
+                message
+            ])
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    /// Change-feed rows with `seq > since`, oldest first, at most `limit` of them.
+    pub fn feed(&self, since: i64, limit: usize) -> Result<Vec<ChangeRow>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT seq, ts, op, node_id, node_kind, path, old_path, version, base_version, commit_kind, author, message \
+                 FROM {}change WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+                self.p
+            ))
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![since, limit.min(i64::MAX as usize) as i64], |r| {
+                Ok(ChangeRow {
+                    seq: r.get(0)?,
+                    ts: r.get(1)?,
+                    op: r.get(2)?,
+                    node_id: r.get(3)?,
+                    node_kind: r.get(4)?,
+                    path: r.get(5)?,
+                    old_path: r.get(6)?,
+                    version: r.get(7)?,
+                    base_version: r.get(8)?,
+                    commit_kind: r.get(9)?,
+                    author: r.get(10)?,
+                    message: r.get(11)?,
+                })
+            })
+            .map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+    }
+
+    /// The newest sequence number in the change feed, 0 when it is empty. A watcher that
+    /// starts from here reports only what happens after it attached.
+    pub fn last_seq(&self) -> Result<i64> {
+        self.conn
+            .prepare_cached(&format!("SELECT coalesce(max(seq), 0) FROM {}change", self.p))
+            .map_err(sql_err)?
+            .query_row([], |r| r.get(0))
+            .map_err(sql_err)
     }
 
     /// Full-text search over chunks, mapped to (path, line, snippet) at HEAD.
