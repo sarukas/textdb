@@ -67,6 +67,9 @@ class SqliteBackend(Backend):
         self.conn.execute("PRAGMA synchronous = NORMAL")
         self.conn.execute("PRAGMA busy_timeout = 30000")
         self.conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS kb USING textdb(store='{store}')")
+        # A store written by an older build lacks the change feed and the commit columns
+        # this one records; bring it up to date before the first write needs them.
+        self.conn.execute("SELECT textdb_migrate()")
 
     def close(self) -> None:
         self.conn.close()

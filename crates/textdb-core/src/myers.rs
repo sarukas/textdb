@@ -196,6 +196,13 @@ fn myers<T: PartialEq>(a: &[T], b: &[T], max_d: usize) -> Option<Vec<Hunk>> {
     Some(hunks)
 }
 
+/// Line hunks between two line sequences, as produced by [`split_lines`].
+pub fn line_diff(a: &[&[u8]], b: &[&[u8]]) -> Vec<Hunk> {
+    let ah: Vec<u64> = a.iter().map(|l| hash_line(l)).collect();
+    let bh: Vec<u64> = b.iter().map(|l| hash_line(l)).collect();
+    diff_seq(&ah, &bh, 4096)
+}
+
 /// Byte-range edits that transform `a` into `b`, computed as a line diff refined by
 /// trimming common bytes inside each hunk (spec O3: line + byte refinement).
 pub fn byte_edits(a: &[u8], b: &[u8]) -> Vec<crate::edit::Edit> {

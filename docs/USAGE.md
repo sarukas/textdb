@@ -43,7 +43,7 @@ SELECT kb.edit('/clients/acme/notes.md', '- kickoff done', '- kickoff done ✔',
 SELECT kb.edit(f, 'SOW sent', 'SOW signed') FROM kb.file f WHERE f.path = '/clients/acme/notes.md';
 SELECT kb.append('/clients/acme/notes.md', E'- next: pricing\n', 'agent-7');   -- never conflicts
 
--- history
+-- history: version, author, ts, message, kind (direct|rebased|merged), base_version
 SELECT * FROM kb.history('/clients/acme/notes.md');
 SELECT kb.content('/clients/acme/notes.md', 1);
 SELECT kb.diff('/clients/acme/notes.md', 1, 3);                -- unified diff between versions
@@ -62,6 +62,50 @@ SELECT kb.checkpoint('before-migration');                                    -- 
 SELECT * FROM kb.export('/clients');                                         -- (path, content) rows
 ```
 
+### Live clients: change feed, hunks, attributed writes
+
+These mirror the SQLite binding's `textdb_feed`, `textdb_hunks`, … (see
+[`live-app.md`](live-app.md)); names and semantics are the same.
+
+| Function | Returns |
+|---|---|
+| `kb.write(path text, content text, base_version bigint DEFAULT NULL, author text DEFAULT NULL, message text DEFAULT NULL)` | `jsonb` `{"version": n, "kind": "direct"\|"rebased"\|"merged"\|"noop"}`. Creates the file if missing (`kind` `direct`, version 1); otherwise diffs against `base_version` (HEAD when NULL) and commits with rebase |
+| `kb.replace_lines(path text, l_from bigint, l_to bigint, body text, base_version bigint DEFAULT NULL, author text DEFAULT NULL)` | same `jsonb`. Lines are 1-based inclusive and refer to `base_version` (HEAD when NULL); `l_to = l_from - 1` inserts in front of `l_from`; `l_from` one past the last line appends (a newline is supplied after an unterminated last line); out of range is `TX004`. Committed against `base_version`, so it rebases over commits that landed meanwhile |
+| `kb.hunks(path text, v1 bigint DEFAULT NULL, v2 bigint DEFAULT NULL)` | `TABLE(old_from, old_count, new_from, new_count, old_text, new_text)` — line hunks turning `v1` into `v2`, 1-based lines, a zero count is an insertion/deletion in front of that line. Defaults: `v2` = HEAD, `v1` = `v2 - 1`. Version 0 is the empty document |
+| `kb.chunks(path text, version bigint DEFAULT NULL)` | `TABLE(ord, hash, byte_from, nbytes, line_from, nlines)` — the document's chunks in order (`ord` from 0, `line_from` 1-based, `hash` hex); unchanged content keeps its hash across versions |
+| `kb.feed(since bigint DEFAULT 0, lim bigint DEFAULT 10000)` | `TABLE(seq, ts, op, path, old_path, node_kind, version, base_version, commit_kind, author, message)` for every change with `seq > since`, ordered by `seq`. `op` ∈ `create, commit, mkdir, move, delete`; `node_kind` ∈ `file, folder` |
+| `kb.last_seq()` | newest `seq`, 0 when the feed is empty |
+| `kb.move(from_path text, to_path text, author text DEFAULT NULL)` | `void` — `_rename` with the move attributed in the feed |
+| `kb.remove(path text, author text DEFAULT NULL)` | `void` — `_delete` (tombstone) attributed in the feed |
+
+```sql
+SELECT kb.write('/guides/intro.md', $body, 6, 'agent-7', 'rewrite intro');   -- {"version": 7, "kind": "rebased"}
+SELECT kb.replace_lines('/guides/intro.md', 12, 12, E'new line 12\nand 13\n', 7, 'agent-7');
+SELECT * FROM kb.hunks('/guides/intro.md', 7, 8);
+SELECT * FROM kb.feed(kb.last_seq() - 100);
+SELECT kb.move('/drafts/x.md', '/guides/x.md', 'agent-7');
+```
+
+Every create, commit, mkdir, move and delete writes one `kb.change` row **in the same
+transaction** as the change, and sends `pg_notify('textdb_change', seq::text)`. A watcher
+therefore needs no polling:
+
+```sql
+LISTEN textdb_change;       -- payload = the new row's seq (as text), delivered at COMMIT
+-- on each notification (or on reconnect): SELECT * FROM kb.feed(:last_seen_seq);
+```
+
+Notifications are coalesced per transaction and are lost while disconnected, so treat the
+payload as a hint and always read `kb.feed(last_seen_seq)`; the feed itself is the source of
+truth. Versions of a file are consecutive, so the hunks for a `commit` row at version `v` are
+`kb.hunks(path, v - 1, v)`. The `kb.file` / `kb.folder` view triggers go through `kb.move` and
+`kb.remove`; a file rename via `UPDATE kb.file SET path = …` is attributed to `NEW.updated_by`.
+
+> **Fresh install required.** This release adds `kb.change` and the `kind` / `base_version`
+> columns of `kb.commit`. There is no upgrade script: `DROP EXTENSION textdb_pg CASCADE;
+> CREATE EXTENSION textdb_pg;` into an empty `kb` schema (reload content with `kb.write` or the
+> Python loader).
+
 ### Errors
 
 | SQLSTATE | Meaning | What to do |
@@ -69,7 +113,7 @@ SELECT * FROM kb.export('/clients');                                         -- 
 | `TX001` | Conflict: someone changed the same lines since your base version. `DETAIL` is JSON: `{path, region_line_from, region_line_to, base, theirs, ours, current_version}` where `theirs` is the **current** text of the region | Re-derive your change from `theirs` (no extra read needed) and write again with `base_version = current_version` |
 | `TX002` | Contention: the retry budget (8 CAS attempts) was exhausted on a very hot file | Back off a few ms and retry |
 | `TX003` | Not found (path or version) | Check the path; folders may have been moved |
-| `TX004` | Invalid edit: `old` text absent or not unique, invalid path segment | Read the current content and pick a unique anchor |
+| `TX004` | Invalid edit: `old` text absent or not unique, invalid path segment, `kb.replace_lines` range outside the document | Read the current content and pick a unique anchor |
 
 On the subtree listing above: `LIKE '/clients/%'` is fine with a literal prefix — `node_path`
 is a `text_pattern_ops` index, so the planner extracts the prefix and seeks. When the prefix

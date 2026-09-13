@@ -22,15 +22,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS {p}node_path ON {p}node(path) WHERE deleted_at
 CREATE UNIQUE INDEX IF NOT EXISTS {p}node_parent_name ON {p}node(parent_id, name) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS {p}node_parent ON {p}node(parent_id);
 CREATE TABLE IF NOT EXISTS {p}commit (
-  file_id     INTEGER NOT NULL,
-  version     INTEGER NOT NULL,
-  root        BLOB    NOT NULL,
-  parent_root BLOB    NULL,
-  author      TEXT,
-  ts          TEXT    NOT NULL,
-  message     TEXT,
-  nbytes      INTEGER,
-  nlines      INTEGER,
+  file_id      INTEGER NOT NULL,
+  version      INTEGER NOT NULL,
+  root         BLOB    NOT NULL,
+  parent_root  BLOB    NULL,
+  author       TEXT,
+  ts           TEXT    NOT NULL,
+  message      TEXT,
+  nbytes       INTEGER,
+  nlines       INTEGER,
+  kind         TEXT,                          -- direct, rebased, merged
+  base_version INTEGER,                       -- the version the writer started from
   PRIMARY KEY (file_id, version)
 );
 CREATE TABLE IF NOT EXISTS {p}chunk (
@@ -68,15 +70,59 @@ CREATE TABLE IF NOT EXISTS {p}checkpoint (
   name TEXT NOT NULL, file_id INTEGER NOT NULL, path TEXT NOT NULL, root BLOB NOT NULL, version INTEGER NOT NULL,
   PRIMARY KEY (name, file_id)
 );
+-- Change feed: one row per commit, folder creation, move and delete, written in the same
+-- transaction as the change. SQLite cannot notify another process, so a watcher polls
+-- `PRAGMA data_version` and reads the rows after the last `seq` it saw. AUTOINCREMENT so a
+-- sequence number is never reused, even after rows are pruned.
+CREATE TABLE IF NOT EXISTS {p}change (
+  seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts           TEXT    NOT NULL,
+  op           TEXT    NOT NULL,              -- create, commit, mkdir, move, delete
+  node_id      INTEGER NOT NULL,
+  node_kind    INTEGER NOT NULL,              -- 0 folder, 1 file
+  path         TEXT    NOT NULL,              -- the path after the change
+  old_path     TEXT    NULL,                  -- move: the path before
+  version      INTEGER NULL,                  -- create, commit: the new version
+  base_version INTEGER NULL,                  -- commit: the version the writer started from
+  commit_kind  TEXT    NULL,                  -- create, commit: direct, rebased, merged
+  author       TEXT    NULL,
+  message      TEXT    NULL
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS {p}fts USING fts5(text, content='', tokenize='unicode61');
 "#,
         p = p
     )
 }
 
+/// Columns added to existing tables after their first release, as `(table, column, type)`.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[("commit", "kind", "TEXT"), ("commit", "base_version", "INTEGER")];
+
+/// Bring a store created by an earlier build up to this schema. Idempotent; returns the
+/// number of columns it had to add.
+///
+/// New tables come from `create_sql`, which is all `IF NOT EXISTS`. A column added to an
+/// existing table needs `ALTER TABLE … ADD COLUMN`, which has no such clause, so each one is
+/// checked against `pragma_table_info` first.
+pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> {
+    conn.execute_batch(&create_sql(p))?;
+    let mut added = 0;
+    for (table, column, decl) in ADDED_COLUMNS {
+        let present: bool = conn.query_row(
+            &format!("SELECT count(*) > 0 FROM pragma_table_info('{p}{table}') WHERE name = ?1"),
+            [column],
+            |r| r.get(0),
+        )?;
+        if !present {
+            conn.execute_batch(&format!("ALTER TABLE {p}{table} ADD COLUMN {column} {decl}"))?;
+            added += 1;
+        }
+    }
+    Ok(added)
+}
+
 pub fn drop_sql(p: &str) -> String {
     [
-        "node", "commit", "chunk", "tree_node", "chunk_ref", "section", "link", "frontmatter", "checkpoint", "fts",
+        "node", "commit", "chunk", "tree_node", "chunk_ref", "section", "link", "frontmatter", "checkpoint", "change", "fts",
     ]
     .iter()
     .map(|t| format!("DROP TABLE IF EXISTS {}{};", p, t))
