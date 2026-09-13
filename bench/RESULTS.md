@@ -4,6 +4,10 @@ A **manually maintained** log of benchmark runs. Newest first. The harness gener
 `report.md`; this file is where a human records which runs are worth keeping, what they
 showed, and what changed since the last one.
 
+[`OPTIMISATION-CANDIDATES.md`](OPTIMISATION-CANDIDATES.md) takes the remaining gaps from the
+newest entry apart operation by operation and ranks what to try next; it also corrects two
+of that entry's conclusions.
+
 Each entry links to the run's artefacts under [`results/`](results/). Add an entry only
 for a run whose numbers you would quote — a run that crashed, or one taken on a machine
 with a known measurement problem, is worth recording precisely because someone will

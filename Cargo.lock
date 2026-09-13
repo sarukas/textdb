@@ -1032,6 +1032,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "textdb-core",
  "textdb-sqlite",
  "toml",
