@@ -323,6 +323,26 @@ pub enum Merge {
 /// Line-level diff3: merge `ours` and `theirs` against `base`. Conflicts when both sides
 /// change overlapping line ranges differently.
 pub fn diff3(base: &[u8], ours: &[u8], theirs: &[u8]) -> Merge {
+    match merge3(base, ours, theirs, None) {
+        Some((merged, _)) => Merge::Clean(merged),
+        None => Merge::Conflict,
+    }
+}
+
+/// [`diff3`] that carries on where both sides changed the same lines differently: each such
+/// region is written between git-style markers — `<<<<<<< ours_label`, our lines, `=======`,
+/// their lines, `>>>>>>> theirs_label` — and counted. Marker lines end in CRLF when either side
+/// uses CRLF.
+pub fn diff3_marked(base: &[u8], ours: &[u8], theirs: &[u8], ours_label: &str, theirs_label: &str) -> (Vec<u8>, usize) {
+    merge3(base, ours, theirs, Some((ours_label, theirs_label))).unwrap_or_default()
+}
+
+/// The merge behind [`diff3`] and [`diff3_marked`]: `None` on a conflict when there are no
+/// labels to mark it with.
+fn merge3(base: &[u8], ours: &[u8], theirs: &[u8], labels: Option<(&str, &str)>) -> Option<(Vec<u8>, usize)> {
+    let crlf = |b: &[u8]| b.windows(2).any(|w| w == b"\r\n");
+    let eol: &[u8] = if crlf(ours) || crlf(theirs) { b"\r\n" } else { b"\n" };
+    let mut conflicts = 0usize;
     let bl = split_lines(base);
     let ol = split_lines(ours);
     let tl = split_lines(theirs);
@@ -423,14 +443,59 @@ pub fn diff3(base: &[u8], ours: &[u8], theirs: &[u8]) -> Merge {
         } else if t_text == base_text {
             out.extend_from_slice(&o_text);
         } else {
-            return Merge::Conflict;
+            let (ours_label, theirs_label) = labels?;
+            let marker = |out: &mut Vec<u8>, sign: &[u8], label: &str| {
+                out.extend_from_slice(sign);
+                out.extend_from_slice(label.as_bytes());
+                out.extend_from_slice(eol);
+            };
+            marker(&mut out, b"<<<<<<< ", ours_label);
+            push_text(&mut out, &o_text, eol);
+            marker(&mut out, b"=======", "");
+            push_text(&mut out, &t_text, eol);
+            marker(&mut out, b">>>>>>> ", theirs_label);
+            conflicts += 1;
         }
         bi = hi;
     }
     for l in &bl[bi..] {
         out.extend_from_slice(l);
     }
-    Merge::Clean(out)
+    Some((out, conflicts))
+}
+
+/// `text` followed by a line end if it does not already end with one, so a marker after it
+/// starts on its own line.
+fn push_text(out: &mut Vec<u8>, text: &[u8], eol: &[u8]) {
+    out.extend_from_slice(text);
+    if !text.is_empty() && !text.ends_with(b"\n") {
+        out.extend_from_slice(eol);
+    }
+}
+
+#[cfg(test)]
+mod marked_tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_changes_are_marked_and_the_rest_merged() {
+        let base = b"one\ntwo\nthree\nfour\nfive\n";
+        let ours = b"ONE\ntwo\nthree (ours)\nfour\nfive\n";
+        let theirs = b"one\ntwo\nthree (theirs)\nfour\nFIVE\n";
+        let (out, n) = diff3_marked(base, ours, theirs, "textdb", "disk");
+        assert_eq!(n, 1);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "ONE\ntwo\n<<<<<<< textdb\nthree (ours)\n=======\nthree (theirs)\n>>>>>>> disk\nfour\nFIVE\n"
+        );
+        assert_eq!(diff3(base, ours, theirs), Merge::Conflict);
+
+        let clean = diff3_marked(base, ours, b"one\ntwo\nthree\nfour\nFIVE\n", "a", "b");
+        assert_eq!(clean, (b"ONE\ntwo\nthree (ours)\nfour\nFIVE\n".to_vec(), 0));
+
+        let (crlf, _) = diff3_marked(b"a\r\n", b"b\r\n", b"c", "x", "y");
+        assert_eq!(crlf, b"<<<<<<< x\r\nb\r\n=======\r\nc\r\n>>>>>>> y\r\n".to_vec());
+    }
 }
 
 fn concat(lines: &[&[u8]]) -> Vec<u8> {

@@ -9,11 +9,54 @@ use postgres::fallible_iterator::FallibleIterator;
 use postgres::{Client, NoTls, Row};
 use textdb_sqlite::normalize_path;
 
-use super::{Change, Chunk, Commit, Entry, Hit, Hunk, ImportStats, PathEvent, Result, Stat, Store, StoreError, Written};
+use super::{
+    BaseFile, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, PathEvent, Result, Stat, Store, StoreError,
+    SyncBase, Written,
+};
+
+/// The sync base tables, as the extension defines them, for stores installed before they were.
+const SYNC_TABLES: &str = "\
+CREATE TABLE IF NOT EXISTS kb.sync (
+  id bigserial PRIMARY KEY, prefix text NOT NULL, dir text NOT NULL, seq bigint NOT NULL,
+  synced_at timestamptz NOT NULL DEFAULT now(), author text,
+  git_commit text, git_branch text, git_remote text, git_clean boolean,
+  UNIQUE (prefix, dir)
+);
+CREATE TABLE IF NOT EXISTS kb.sync_file (
+  sync_id bigint NOT NULL REFERENCES kb.sync(id) ON DELETE CASCADE, rel text NOT NULL,
+  version bigint, blob text NOT NULL, disk_size bigint, disk_mtime bigint,
+  conflict boolean NOT NULL DEFAULT false,
+  PRIMARY KEY (sync_id, rel)
+);";
+
+const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at::text, author, git_commit, git_branch, git_remote, git_clean";
+
+fn sync_row(r: &Row) -> (i64, SyncBase) {
+    let clean: Option<bool> = r.get(9);
+    (
+        r.get(0),
+        SyncBase {
+            prefix: r.get(1),
+            dir: r.get(2),
+            seq: r.get(3),
+            synced_at: r.get(4),
+            author: r.get(5),
+            git: clean.map(|clean| GitState {
+                commit: r.get(6),
+                branch: r.get(7),
+                remote: r.get(8),
+                clean,
+            }),
+            files: Vec::new(),
+        },
+    )
+}
 
 pub struct PgStore {
     client: Client,
     listening: bool,
+    /// The sync base tables are known to exist.
+    sync_ready: bool,
 }
 
 /// Keep the extension's `TX00n` SQLSTATEs, and the conflict payload it puts in `DETAIL`.
@@ -85,7 +128,16 @@ impl PgStore {
         Ok(PgStore {
             client: Client::connect(url, NoTls).map_err(pg)?,
             listening: false,
+            sync_ready: false,
         })
+    }
+
+    fn ensure_sync_tables(&mut self) -> Result<()> {
+        if !self.sync_ready {
+            self.client.batch_execute(SYNC_TABLES).map_err(pg)?;
+            self.sync_ready = true;
+        }
+        Ok(())
     }
 
     /// `kb.edit` and `kb.append` return only the version; the commit row says how it landed.
@@ -413,6 +465,102 @@ impl Store for PgStore {
 
     fn last_seq(&mut self) -> Result<i64> {
         Ok(self.client.query_one("SELECT kb.last_seq()", &[]).map_err(pg)?.get(0))
+    }
+
+    fn file_heads(&mut self, prefix: &str) -> Result<Vec<FileHead>> {
+        let prefix = normalize_path(prefix)?;
+        let rows = self
+            .client
+            .query(
+                "SELECT path, version, updated_by FROM kb.node \
+                 WHERE deleted_at IS NULL AND kind = 1 AND ($1 = '/' OR path LIKE kb._subtree_like($1))",
+                &[&prefix],
+            )
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| FileHead {
+                path: r.get(0),
+                version: r.get(1),
+                updated_by: r.get(2),
+            })
+            .collect())
+    }
+
+    fn sync_bases(&mut self, prefix: &str) -> Result<Vec<SyncBase>> {
+        self.ensure_sync_tables()?;
+        let rows = self
+            .client
+            .query(&format!("SELECT {SYNC_COLS} FROM kb.sync WHERE prefix = $1 ORDER BY synced_at DESC"), &[&prefix])
+            .map_err(pg)?;
+        Ok(rows.iter().map(|r| sync_row(r).1).collect())
+    }
+
+    fn sync_base(&mut self, prefix: &str, dir: &str) -> Result<Option<SyncBase>> {
+        self.ensure_sync_tables()?;
+        let Some(row) = self
+            .client
+            .query_opt(&format!("SELECT {SYNC_COLS} FROM kb.sync WHERE prefix = $1 AND dir = $2"), &[&prefix, &dir])
+            .map_err(pg)?
+        else {
+            return Ok(None);
+        };
+        let (id, mut base) = sync_row(&row);
+        base.files = self
+            .client
+            .query(
+                "SELECT rel, version, blob, disk_size, disk_mtime, conflict FROM kb.sync_file WHERE sync_id = $1",
+                &[&id],
+            )
+            .map_err(pg)?
+            .iter()
+            .map(|r| BaseFile {
+                rel: r.get(0),
+                version: r.get(1),
+                blob: r.get(2),
+                disk_size: r.get(3),
+                disk_mtime: r.get(4),
+                conflict: r.get(5),
+            })
+            .collect();
+        Ok(Some(base))
+    }
+
+    fn save_sync_base(&mut self, base: &SyncBase) -> Result<()> {
+        self.ensure_sync_tables()?;
+        let git = base.git.as_ref();
+        let (commit, branch, remote) = (
+            git.and_then(|g| g.commit.clone()),
+            git.and_then(|g| g.branch.clone()),
+            git.and_then(|g| g.remote.clone()),
+        );
+        let clean = git.map(|g| g.clean);
+        let mut tx = self.client.transaction().map_err(pg)?;
+        let id: i64 = tx
+            .query_one(
+                "INSERT INTO kb.sync(prefix, dir, seq, author, git_commit, git_branch, git_remote, git_clean) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 ON CONFLICT (prefix, dir) DO UPDATE SET seq = excluded.seq, synced_at = now(), author = excluded.author, \
+                 git_commit = excluded.git_commit, git_branch = excluded.git_branch, git_remote = excluded.git_remote, \
+                 git_clean = excluded.git_clean RETURNING id",
+                &[&base.prefix, &base.dir, &base.seq, &base.author, &commit, &branch, &remote, &clean],
+            )
+            .map_err(pg)?
+            .get(0);
+        tx.execute("DELETE FROM kb.sync_file WHERE sync_id = $1", &[&id]).map_err(pg)?;
+        let rels: Vec<&str> = base.files.iter().map(|f| f.rel.as_str()).collect();
+        let versions: Vec<Option<i64>> = base.files.iter().map(|f| f.version).collect();
+        let blobs: Vec<&str> = base.files.iter().map(|f| f.blob.as_str()).collect();
+        let sizes: Vec<Option<i64>> = base.files.iter().map(|f| f.disk_size).collect();
+        let mtimes: Vec<Option<i64>> = base.files.iter().map(|f| f.disk_mtime).collect();
+        let conflicts: Vec<bool> = base.files.iter().map(|f| f.conflict).collect();
+        tx.execute(
+            "INSERT INTO kb.sync_file(sync_id, rel, version, blob, disk_size, disk_mtime, conflict) \
+             SELECT $1, * FROM unnest($2::text[], $3::bigint[], $4::text[], $5::bigint[], $6::bigint[], $7::bool[])",
+            &[&id, &rels, &versions, &blobs, &sizes, &mtimes, &conflicts],
+        )
+        .map_err(pg)?;
+        tx.commit().map_err(pg)
     }
 
     fn feed(&mut self, since: i64, limit: i64) -> Result<Vec<Change>> {

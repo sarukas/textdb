@@ -108,6 +108,8 @@ environment and its own author name, and the instructions in
 | `config` | Show settings and their sources |
 | `import DIR [--prefix /p] [--ext md,markdown,mdx,txt] [--batch 500]` | Load matching files; unchanged files make no new version. Hidden directories and `node_modules` are skipped |
 | `export PREFIX DIR [--dry-run]` | Write the files under a folder to disk, byte for byte (line endings, BOM). Only new and changed files are written and nothing on disk is deleted, so exporting over a git checkout shows only real changes; an existing file is overwritten in place and keeps its permissions, a symbolic link is left alone. Names that cannot coexist on this computer (differing only in letter case on Windows and macOS, or in Unicode normalization on macOS; Windows reserved names, forbidden characters, trailing dot or space; clashes with what is on disk) stop the export before anything is written, with exit code 6 and the list; problems only on other systems are warnings. `--dry-run` lists what would be written. `--json` gives `{ new, changed, unchanged, skipped, problems, stopped, written, bytes }` |
+| `sync PREFIX DIR [--dry-run] [--commit] [--base REV] [--ext md,markdown,mdx,txt]` | Reconcile a folder with a directory both ways against what both held at the last sync (recorded in the store): changes, new files, deletes and moves on either side are carried across; edits on both sides are merged line by line, and where they overlap the file on disk gets `<<<<<<< textdb` / `>>>>>>> disk` markers (exit code 3) and the store keeps its version until they are resolved. Files never synced are left alone. In a git checkout, changes that came from git are committed to the store under their git author and subject; `--commit` commits what sync wrote to disk with `Textdb-*` trailers. See [Syncing with a git checkout](#syncing-with-a-git-checkout) |
+| `git-status PREFIX DIR [--rev REV]` | When the folder was synced and with which commit, what changed in the store since, and how it compares with a commit (`HEAD` by default) by git blob id: same (CRLF-only differences noted), differ, only in textdb, only in git |
 | `ls [PATH] [-l] [-S KEY] [-r] [-R]` | One folder: folders first, then files with size and line count. `-l` adds words, versions, last update, and a file's authors (commits each) or a folder's contents; a folder's size, lines, words and versions are totals of everything below it. `--sort` by `name`, `type`, `size`, `lines`, `words`, `versions`, `created`, `updated` or `authors`; `-r` reverses; `-R` lists everything below the folder by path |
 | `tree [PATH] [-L DEPTH] [-d]` | The folder tree with file counts and sizes; `--json` gives a flat, path-sorted list |
 | `stat PATH` | Kind, version, size, lines, last update and author |
@@ -125,6 +127,49 @@ environment and its own author name, and the instructions in
 | `setting [KEY [VALUE]]` | Show or change a store setting. `path_history` is `on` (default) or `off`; `default` clears it. `--path-history` overrides it for one command |
 | `log [--since SEQ] [--limit N]` | The change log: every create, commit, mkdir, move and delete, in order |
 | `watch [--since SEQ] [-p PREFIX]` | Follow the change log live — one line per change, JSON lines with `--json` |
+
+## Syncing with a git checkout
+
+`sync` keeps a folder in the store and a directory reconciled, typically a git checkout that
+others change too:
+
+```sh
+git -C ~/src/handbook pull                     # the checkout moves on: files added, edited, removed
+textdb sync /handbook ~/src/handbook --dry-run # what would change on each side
+textdb sync /handbook ~/src/handbook --commit  # carry changes both ways, commit what landed on disk
+git -C ~/src/handbook push
+```
+
+- **The sync base.** After each sync the store records, per folder and directory, every file's
+  version and git blob id, plus the checkout's commit, branch and remote. The next sync compares
+  both sides with it, so it knows which side changed a file, and that a file missing on one side
+  was deleted there rather than added on the other.
+- **Both sides changed a file:** the edits are merged line by line (the base content comes from
+  the store's history). Overlapping edits get conflict markers in the file on disk; the store
+  keeps its version. Resolve the file and sync again; while markers remain it is reported as
+  `unresolved` and not taken in. Deleting the marked file writes the store's version back.
+- **Deleted on one side:** deleted on the other, unless it changed there, in which case the
+  changed file is kept. A delete and an identical new file on disk become a move in the store,
+  keeping the file's history. Only files the base or the store knows can be deleted: images,
+  other types and anything `.gitignore` excludes are never touched.
+- **Git authors.** Changes that came in with commits since the last sync are committed to the
+  store as their git author, with a message like `git 1a2b3c4: Fix the intro`.
+- **`--commit`** stages and commits only the files sync wrote or deleted on disk, leaving your
+  other uncommitted work alone. The message says who changed them in textdb and ends with
+  trailers: `Textdb-Store`, `Textdb-Prefix`, `Textdb-Seq` (the store's change number) and one
+  `Textdb-Author` per author.
+- **The first sync** of a store that was imported earlier has no base, so a file that differs on
+  the two sides is a conflict. Pass `--base REV`, the commit the import was made from, and git
+  supplies the base instead: `textdb sync /handbook ~/src/handbook --base 3f9c2e1`.
+- **Line endings.** Content stays byte-exact. With `core.autocrlf` the checkout has CRLF while git
+  stores LF; `git-status` counts such files as the same and says how many differ only by line
+  endings.
+- **Names** that cannot exist side by side on this computer stop the sync before anything is
+  written, as for `export`.
+
+`textdb git-status /handbook ~/src/handbook` shows when the folder was last synced (commit,
+branch, clean or not), what changed in the store since, and how the store compares with `HEAD`
+or `--rev REV`.
 
 ## Exit status
 

@@ -2,12 +2,15 @@
 
 use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use textdb_core::CommitKind;
 use textdb_sqlite::db::subtree_bounds;
 use textdb_sqlite::{normalize_path, NodeRow, TextDb, DEFAULT_PREFIX};
 
-use super::{Author, Change, Chunk, Commit, Entry, Hit, Hunk, ImportStats, PathEvent, Result, Stat, Store, StoreError, Written};
+use super::{
+    Author, BaseFile, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, PathEvent, Result, Stat, Store,
+    StoreError, SyncBase, Written,
+};
 
 pub struct SqliteStore {
     conn: Connection,
@@ -433,4 +436,149 @@ impl Store for SqliteStore {
         progress(&stats);
         Ok(stats)
     }
+
+    fn file_heads(&mut self, prefix: &str) -> Result<Vec<FileHead>> {
+        let prefix = normalize_path(prefix)?;
+        let cols = "path, version, updated_by";
+        let map = |r: &rusqlite::Row| -> rusqlite::Result<FileHead> {
+            Ok(FileHead {
+                path: r.get(0)?,
+                version: r.get(1)?,
+                updated_by: r.get(2)?,
+            })
+        };
+        let rows = match subtree_bounds(&prefix) {
+            None => self
+                .conn
+                .prepare_cached(&format!("SELECT {cols} FROM {DEFAULT_PREFIX}node WHERE deleted_at IS NULL AND kind = 1"))
+                .map_err(sql)?
+                .query_map([], map)
+                .map_err(sql)?
+                .collect::<rusqlite::Result<Vec<_>>>(),
+            Some((lo, hi)) => self
+                .conn
+                .prepare_cached(&format!(
+                    "SELECT {cols} FROM {DEFAULT_PREFIX}node WHERE deleted_at IS NULL AND kind = 1 AND path >= ?1 AND path < ?2"
+                ))
+                .map_err(sql)?
+                .query_map([lo, hi], map)
+                .map_err(sql)?
+                .collect::<rusqlite::Result<Vec<_>>>(),
+        };
+        rows.map_err(sql)
+    }
+
+    fn sync_bases(&mut self, prefix: &str) -> Result<Vec<SyncBase>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT {SYNC_COLS} FROM {DEFAULT_PREFIX}sync WHERE prefix = ?1 ORDER BY synced_at DESC"
+            ))
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([prefix], sync_row)
+            .map_err(sql)?
+            .map(|r| r.map(|(_, base)| base))
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql)?;
+        Ok(rows)
+    }
+
+    fn sync_base(&mut self, prefix: &str, dir: &str) -> Result<Option<SyncBase>> {
+        let found = self
+            .conn
+            .query_row(
+                &format!("SELECT {SYNC_COLS} FROM {DEFAULT_PREFIX}sync WHERE prefix = ?1 AND dir = ?2"),
+                [prefix, dir],
+                sync_row,
+            )
+            .optional()
+            .map_err(sql)?;
+        let Some((id, mut base)) = found else {
+            return Ok(None);
+        };
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT rel, version, blob, disk_size, disk_mtime, conflict FROM {DEFAULT_PREFIX}sync_file WHERE sync_id = ?1"
+            ))
+            .map_err(sql)?;
+        base.files = stmt
+            .query_map([id], |r| {
+                Ok(BaseFile {
+                    rel: r.get(0)?,
+                    version: r.get(1)?,
+                    blob: r.get(2)?,
+                    disk_size: r.get(3)?,
+                    disk_mtime: r.get(4)?,
+                    conflict: r.get(5)?,
+                })
+            })
+            .map_err(sql)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql)?;
+        Ok(Some(base))
+    }
+
+    fn save_sync_base(&mut self, base: &SyncBase) -> Result<()> {
+        let p = DEFAULT_PREFIX;
+        let git = base.git.as_ref();
+        let tx = self.conn.transaction().map_err(sql)?;
+        let id: i64 = tx
+            .query_row(
+                &format!(
+                    "INSERT INTO {p}sync(prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean) \
+                     VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4, ?5, ?6, ?7, ?8) \
+                     ON CONFLICT(prefix, dir) DO UPDATE SET seq = excluded.seq, synced_at = excluded.synced_at, \
+                     author = excluded.author, git_commit = excluded.git_commit, git_branch = excluded.git_branch, \
+                     git_remote = excluded.git_remote, git_clean = excluded.git_clean RETURNING id"
+                ),
+                rusqlite::params![
+                    base.prefix,
+                    base.dir,
+                    base.seq,
+                    base.author,
+                    git.and_then(|g| g.commit.as_deref()),
+                    git.and_then(|g| g.branch.as_deref()),
+                    git.and_then(|g| g.remote.as_deref()),
+                    git.map(|g| g.clean),
+                ],
+                |r| r.get(0),
+            )
+            .map_err(sql)?;
+        tx.execute(&format!("DELETE FROM {p}sync_file WHERE sync_id = ?1"), [id]).map_err(sql)?;
+        {
+            let mut insert = tx
+                .prepare(&format!(
+                    "INSERT INTO {p}sync_file(sync_id, rel, version, blob, disk_size, disk_mtime, conflict) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                ))
+                .map_err(sql)?;
+            for f in &base.files {
+                insert
+                    .execute(rusqlite::params![id, f.rel, f.version, f.blob, f.disk_size, f.disk_mtime, f.conflict])
+                    .map_err(sql)?;
+            }
+        }
+        tx.commit().map_err(sql)
+    }
+}
+
+const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean";
+
+fn sync_row(r: &rusqlite::Row) -> rusqlite::Result<(i64, SyncBase)> {
+    let clean: Option<bool> = r.get(9)?;
+    let (commit, branch, remote): (Option<String>, Option<String>, Option<String>) = (r.get(6)?, r.get(7)?, r.get(8)?);
+    Ok((
+        r.get(0)?,
+        SyncBase {
+            prefix: r.get(1)?,
+            dir: r.get(2)?,
+            seq: r.get(3)?,
+            synced_at: r.get(4)?,
+            author: r.get(5)?,
+            git: clean.map(|clean| GitState { commit, branch, remote, clean }),
+            files: Vec::new(),
+        },
+    ))
 }

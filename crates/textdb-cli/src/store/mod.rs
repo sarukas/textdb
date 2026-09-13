@@ -42,6 +42,10 @@ impl StoreError {
         Self::new("TX004", message)
     }
 
+    pub fn conflict(message: impl std::fmt::Display) -> Self {
+        Self::new("TX001", message)
+    }
+
     /// Process exit status, distinct per code so a script can branch without parsing output.
     pub fn exit_code(&self) -> i32 {
         match self.code.as_str() {
@@ -202,6 +206,57 @@ pub struct Written {
     pub kind: String,
 }
 
+/// A live file's current version, as `sync` compares it with the sync base.
+#[derive(Debug, Clone)]
+pub struct FileHead {
+    pub path: String,
+    pub version: i64,
+    pub updated_by: Option<String>,
+}
+
+/// The git checkout a directory was in when it was synced.
+#[derive(Debug, Clone, Serialize)]
+pub struct GitState {
+    pub commit: Option<String>,
+    pub branch: Option<String>,
+    /// `origin`'s URL, without credentials.
+    pub remote: Option<String>,
+    /// No uncommitted changes below the directory.
+    pub clean: bool,
+}
+
+/// What a store folder and a directory held when `sync` last reconciled them.
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncBase {
+    pub prefix: String,
+    pub dir: String,
+    /// The store's last change number after the sync.
+    pub seq: i64,
+    /// Set by the store when saved.
+    pub synced_at: Option<String>,
+    pub author: Option<String>,
+    /// `None` when the directory is not in a git checkout.
+    pub git: Option<GitState>,
+    #[serde(skip)]
+    pub files: Vec<BaseFile>,
+}
+
+/// One file both sides agreed on at the last sync.
+#[derive(Debug, Clone)]
+pub struct BaseFile {
+    /// Relative to the folder and the directory, `/`-separated.
+    pub rel: String,
+    /// The store's version of that content; `None` when unknown (a write was rebased).
+    pub version: Option<i64>,
+    /// Git blob id of the content.
+    pub blob: String,
+    /// Size and modification time on disk (nanoseconds), when recent enough to trust.
+    pub disk_size: Option<i64>,
+    pub disk_mtime: Option<i64>,
+    /// Conflict markers were written to the file on disk.
+    pub conflict: bool,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct ImportStats {
     pub files: usize,
@@ -279,6 +334,14 @@ pub trait Store {
         progress: &mut dyn FnMut(&ImportStats),
         on_error: &mut dyn FnMut(&str, &StoreError),
     ) -> Result<ImportStats>;
+    /// Every live file under `prefix` (which need not exist) with its current version.
+    fn file_heads(&mut self, prefix: &str) -> Result<Vec<FileHead>>;
+    /// The directories `prefix` has been synced with, newest first, without their files.
+    fn sync_bases(&mut self, prefix: &str) -> Result<Vec<SyncBase>>;
+    /// The base of `prefix` synced with `dir`, with its files.
+    fn sync_base(&mut self, prefix: &str, dir: &str) -> Result<Option<SyncBase>>;
+    /// Replace the base of `base.prefix` and `base.dir`, files included, in one transaction.
+    fn save_sync_base(&mut self, base: &SyncBase) -> Result<()>;
 }
 
 pub fn open(store: &str) -> Result<Box<dyn Store>> {

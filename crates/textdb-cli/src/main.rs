@@ -24,7 +24,9 @@ use store::{Change, Commit, Entry, ImportStats, PathEvent, Store, StoreError, Wr
 
 type Result<T> = std::result::Result<T, StoreError>;
 
+mod git;
 mod portable;
+mod sync;
 
 #[derive(Parser)]
 #[command(
@@ -104,6 +106,41 @@ enum Cmd {
         /// List what would be written, and any name problems, without writing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Reconcile a store folder with a directory, both ways: changes on either side since the
+    /// last sync are copied across, deletes included; edits on both sides are merged, and where
+    /// they overlap the file on disk gets conflict markers. In a git checkout, changes that came
+    /// from git are attributed to their git authors, and --commit commits what sync wrote.
+    Sync {
+        #[arg(value_parser = store_path)]
+        prefix: String,
+        dir: PathBuf,
+        /// Files found only on disk to take in, by extension (`*` for all). Files already synced
+        /// are followed whatever their type.
+        #[arg(long, default_value = "md,markdown,mdx,txt")]
+        ext: String,
+        /// First sync only: the git commit the store's content came from, so changes made since
+        /// on either side are merged instead of conflicting.
+        #[arg(long, value_name = "REV")]
+        base: Option<String>,
+        /// Show what would change on each side without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Commit the files sync changed on disk, with Textdb-* trailers.
+        #[arg(long)]
+        commit: bool,
+    },
+    /// When a store folder was last synced, what changed in it since, and how it compares with a
+    /// git commit (by git blob id).
+    GitStatus {
+        #[arg(value_parser = store_path)]
+        prefix: String,
+        dir: PathBuf,
+        #[arg(long, default_value = "HEAD")]
+        rev: String,
+        /// Which of the commit's files count as missing from the store.
+        #[arg(long, default_value = "md,markdown,mdx,txt")]
+        ext: String,
     },
     /// List one folder.
     Ls {
@@ -325,6 +362,28 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
         }
         Cmd::Import { dir, prefix, ext, batch } => import(st, &dir, &prefix, &ext, batch, author, json),
         Cmd::Export { prefix, dir, dry_run } => export(st, &prefix, &dir, dry_run, json),
+        Cmd::Sync {
+            prefix,
+            dir,
+            ext,
+            base,
+            dry_run,
+            commit,
+        } => sync::sync(
+            st,
+            sync::Options {
+                prefix,
+                dir,
+                exts: sync::parse_exts(&ext),
+                base_rev: base,
+                dry_run,
+                commit,
+                author: cli.author.clone(),
+                store: config::redact(&cli.store),
+            },
+            json,
+        ),
+        Cmd::GitStatus { prefix, dir, rev, ext } => sync::git_status(st, &prefix, &dir, &rev, &sync::parse_exts(&ext), json),
         Cmd::Ls {
             path,
             long,

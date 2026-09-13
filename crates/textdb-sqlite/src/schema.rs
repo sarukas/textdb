@@ -132,6 +132,33 @@ CREATE TABLE IF NOT EXISTS {p}file_author (
   last_ts  TEXT    NOT NULL,
   PRIMARY KEY (file_id, author)
 ) WITHOUT ROWID;
+-- textdb sync: what a store folder and a directory held when they were last reconciled, one row
+-- per (folder, directory), with the git commit the directory's checkout was at.
+CREATE TABLE IF NOT EXISTS {p}sync (
+  id         INTEGER PRIMARY KEY,
+  prefix     TEXT    NOT NULL,
+  dir        TEXT    NOT NULL,
+  seq        INTEGER NOT NULL,              -- the store's last change number after the sync
+  synced_at  TEXT    NOT NULL,
+  author     TEXT,
+  git_commit TEXT,
+  git_branch TEXT,
+  git_remote TEXT,
+  git_clean  INTEGER,                       -- 1: no uncommitted changes; NULL: not a git checkout
+  UNIQUE (prefix, dir)
+);
+-- Each file both sides agreed on at that sync: its version in the store, the git blob id of its
+-- content, and its size and modification time on disk (NULL when too recent to trust).
+CREATE TABLE IF NOT EXISTS {p}sync_file (
+  sync_id    INTEGER NOT NULL,
+  rel        TEXT    NOT NULL,
+  version    INTEGER,
+  blob       TEXT    NOT NULL,
+  disk_size  INTEGER,
+  disk_mtime INTEGER,
+  conflict   INTEGER NOT NULL DEFAULT 0,    -- 1: conflict markers were written to the file on disk
+  PRIMARY KEY (sync_id, rel)
+) WITHOUT ROWID;
 CREATE VIRTUAL TABLE IF NOT EXISTS {p}fts USING fts5(text, content='', tokenize='unicode61');
 "#,
         p = p
@@ -201,7 +228,7 @@ pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> 
 pub fn drop_sql(p: &str) -> String {
     [
         "node", "commit", "chunk", "tree_node", "chunk_ref", "section", "link", "frontmatter", "checkpoint", "change", "path_event",
-        "setting", "file_author", "fts",
+        "setting", "file_author", "sync", "sync_file", "fts",
     ]
     .iter()
     .map(|t| format!("DROP TABLE IF EXISTS {}{};", p, t))

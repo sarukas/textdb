@@ -43,6 +43,17 @@ textdb export guides ./checkout --dry-run # what writing /guides to disk would c
 lists the names that cannot exist side by side on this OS (e.g. `README.md` and `readme.md` on
 Windows/macOS); rename those in the store, then export again.
 
+To keep a folder reconciled with a git checkout both ways, use `sync` rather than export/import:
+
+```sh
+textdb sync guides ~/src/repo/guides --dry-run   # changes each way, merges, conflicts
+textdb sync guides ~/src/repo/guides --commit    # apply; commit what changed on disk (Textdb-* trailers)
+textdb git-status guides ~/src/repo/guides       # last synced commit; store vs HEAD by blob id
+```
+
+Exit code 3 from `sync` means conflict markers were written to files on disk: resolve them there
+(or ask the user), then run `sync` again.
+
 ## Read before you edit
 
 ```sh

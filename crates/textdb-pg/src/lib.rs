@@ -126,6 +126,21 @@ CREATE TABLE kb.folder_delta (
   ts        timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX folder_delta_folder ON kb.folder_delta(folder_id);
+-- textdb sync (the CLI): what a store folder and a directory held when they were last
+-- reconciled, with the git commit the checkout was at, and each file both sides agreed on.
+-- The CLI also creates these IF NOT EXISTS, for stores installed before they were added.
+CREATE TABLE kb.sync (
+  id bigserial PRIMARY KEY, prefix text NOT NULL, dir text NOT NULL, seq bigint NOT NULL,
+  synced_at timestamptz NOT NULL DEFAULT now(), author text,
+  git_commit text, git_branch text, git_remote text, git_clean boolean,
+  UNIQUE (prefix, dir)
+);
+CREATE TABLE kb.sync_file (
+  sync_id bigint NOT NULL REFERENCES kb.sync(id) ON DELETE CASCADE, rel text NOT NULL,
+  version bigint, blob text NOT NULL, disk_size bigint, disk_mtime bigint,
+  conflict boolean NOT NULL DEFAULT false,
+  PRIMARY KEY (sync_id, rel)
+);
 
 -- Custom SQLSTATEs (spec §7.2): TX001 conflict, TX002 contention, TX003 not found, TX004 invalid edit.
 CREATE FUNCTION kb._raise(code text, msg text, detail text) RETURNS void LANGUAGE plpgsql AS $$
