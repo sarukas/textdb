@@ -1,0 +1,45 @@
+## ops — textdb vs sql-text-sqlite, same process, unique content per document
+
+   size     n      td .md     td .txt    baseline   md/base  operation
+   8KiB   300       0.876       0.809       0.380     2.30x  create
+   8KiB   300       0.699       0.639       0.426     1.64x  replace (one line)
+   8KiB  3000      0.0143           -      0.0050     2.87x  read (warm)
+   8KiB   500      0.0295           -      0.0077     3.83x  read_version(1)
+ 100KiB    80       5.310       5.964       3.088     1.72x  create
+ 100KiB    80       2.053       1.087       3.693     0.56x  replace (one line)
+ 100KiB  3000      0.0251           -      0.0298     0.84x  read (warm)
+ 100KiB   500      0.0498           -      0.0323     1.54x  read_version(1)
+   1MiB    20      56.576      60.970      33.711     1.68x  create
+   1MiB    20      17.942      10.456      48.941     0.37x  replace (one line)
+   1MiB   200      0.2527           -      0.1951     1.30x  read (warm)
+   1MiB   200      0.3309           -      0.2274     1.46x  read_version(1)
+
+## statements — 8 KiB document, warm caches
+
+  read through the virtual table          0.0141 ms
+  read from the plain-text baseline       0.0049 ms
+  node-row lookup, prepare_cached         0.0021 ms
+  node-row lookup, prepare (as today)     0.0097 ms
+  -> compilation is 0.0075 ms of the 0.0092 ms gap (82%)
+
+## prefix — 2000 files plus one path of depth 1000
+
+  shallow ('/wide/d00')   substr scan    0.789 ms | indexed range    0.010 ms  (75x)
+  deep (depth 1000)       substr scan    1.429 ms | indexed range    0.010 ms  (140x)
+  create at depth 1000 (1000 folder rows)    19.53 ms
+
+## writepath — one 1 MiB document, 652 chunks
+
+  chunk + hash + tree build, in memory      2.39 ms
+  chunk inserts                             3.08 ms
+  fts inserts                              12.02 ms
+  chunk_ref (hash -> rowid, insert)         2.19 ms
+
+## diff — byte_edits over scattered one-line changes
+
+  1MiB document, 14219 lines
+    ~    7 changed lines ->     8 edits        3.8 ms  peak RSS +0 KiB
+    ~   28 changed lines ->    29 edits        6.6 ms  peak RSS +0 KiB
+    ~  142 changed lines ->   143 edits       20.0 ms  peak RSS +0 KiB
+    ~  568 changed lines ->   569 edits     1538.7 ms  peak RSS +260060 KiB
+

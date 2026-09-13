@@ -29,8 +29,8 @@ Postgres extension: absolute `/` paths, folders on demand, tombstone deletes, fu
 | Shell habit | textdb SQL (SQLite) |
 |---|---|
 | `ls /clients` | `SELECT * FROM textdb_ls('/clients');` |
-| `find /clients -name '*.md'` | `SELECT path FROM kb WHERE kind = 'file' AND path LIKE '/clients/%' AND path LIKE '%.md';` |
-| `du -sb /clients` | `SELECT sum(nbytes) FROM kb WHERE kind = 'file' AND path LIKE '/clients/%';` |
+| `find /clients -name '*.md'` | `SELECT path FROM kb WHERE kind = 'file' AND path >= '/clients/' AND path < '/clients0' AND path LIKE '%.md';` |
+| `du -sb /clients` | `SELECT sum(nbytes) FROM kb WHERE kind = 'file' AND path >= '/clients/' AND path < '/clients0';` |
 | `cat notes.md` | `SELECT content FROM kb WHERE path = '/clients/acme/notes.md';` or `SELECT textdb_content('/clients/acme/notes.md');` |
 | `sed -n '40,60p' notes.md` | `SELECT textdb_lines('/clients/acme/notes.md', 40, 60);` |
 | `head -20` / `tail -20` | `SELECT textdb_lines(p, 1, 20)` / `SELECT textdb_lines(path, nlines - 19, nlines) FROM kb WHERE path = p` |
@@ -58,7 +58,9 @@ Postgres extension: absolute `/` paths, folders on demand, tombstone deletes, fu
 ## Read
 
 ```sql
-SELECT id, path, kind, version, nbytes, nlines FROM kb WHERE path LIKE '/clients/%';
+-- A subtree as a range on `path`, not `LIKE` or `substr(...)`: only a range reaches the index
+-- behind `kb`, and `'0'` is the byte after `'/'`, so `prefix || '0'` ends the subtree exactly.
+SELECT id, path, kind, version, nbytes, nlines FROM kb WHERE path >= '/clients/' AND path < '/clients0';
 SELECT content, version FROM kb WHERE path = '/clients/acme/notes.md';
 SELECT textdb_lines('/clients/acme/notes.md', 40, 60);
 SELECT textdb_section('/clients/acme/notes.md', 'Open questions');
