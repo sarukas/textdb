@@ -42,11 +42,13 @@ for a `commit` row at version `v` are `textdb_hunks(path, v - 1, v)`.
 
 Base URL `http://localhost:4317`. JSON bodies, UTF-8. Errors are
 `{ "code": "TX00n", "message": "…", "conflict"?: {…} }` with status 409 (TX001), 503 (TX002),
-404 (TX003), 400 (TX004), 500 (other).
+404 (TX003), 400 (TX004), 500 (other). A malformed request (missing parameter, non-integer
+version, body that is not JSON) is a 400 with code TX004.
 
 Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./kb.db`),
 `TEXTDB_SQLITE_EXT` (path of the loadable extension; otherwise found under
-`crates/textdb-sqlite-ext/target/release`), `PORT` (default 4317).
+`crates/textdb-sqlite-ext/target/release`), `PORT` (default 4317), `HOST` (default
+`127.0.0.1` — the API has no authentication, so it listens on loopback unless told otherwise).
 
 | Method & path | Request | Response |
 |---|---|---|
@@ -65,7 +67,8 @@ Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./
 ### `GET /api/events`
 
 `text/event-stream`. Without `since` (and without `Last-Event-ID`) the stream starts at the
-current `last_seq`. Each change is one event:
+current `last_seq`. When both are present `Last-Event-ID` wins, because a reconnecting
+`EventSource` repeats its original URL. Each change is one event:
 
 ```
 id: 1042
