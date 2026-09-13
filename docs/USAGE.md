@@ -28,7 +28,7 @@ SELECT content, version FROM kb.file WHERE path = '/clients/acme/notes.md';
 SELECT kb.lines('/clients/acme/notes.md', 3, 3);              -- 1-based inclusive line range
 SELECT kb.section('/clients/acme/notes.md', 'Acme');           -- text of a heading's section (markdown)
 SELECT * FROM kb.ls('/clients');                                -- one folder level
-SELECT path, nbytes FROM kb.file WHERE path LIKE '/clients/%'; -- subtree
+SELECT path, nbytes FROM kb.file WHERE path LIKE '/clients/%'; -- subtree (see the note below)
 
 -- write whole content (the trigger diffs OLD → NEW and commits the edit set)
 UPDATE kb.file SET content = replace(content, 'kickoff done', 'kickoff done, SOW sent'), updated_by = 'agent-7'
@@ -71,6 +71,11 @@ SELECT * FROM kb.export('/clients');                                         -- 
 | `TX003` | Not found (path or version) | Check the path; folders may have been moved |
 | `TX004` | Invalid edit: `old` text absent or not unique, invalid path segment | Read the current content and pick a unique anchor |
 
+On the subtree listing above: `LIKE '/clients/%'` is fine with a literal prefix — `node_path`
+is a `text_pattern_ops` index, so the planner extracts the prefix and seeks. When the prefix
+is a **parameter**, escape it or use `kb._subtree_like($1)`, because a folder whose name
+contains `%` or `_` would otherwise match siblings as well.
+
 Plain `UPDATE kb.file SET content = …` without `base_version` diffs against the current
 version and therefore never conflicts — it is "last writer wins" at line level, exactly like
 editing a file. Pass `base_version` when the new content was derived from an earlier read.
@@ -100,6 +105,11 @@ SELECT textdb_content('/a.md'), textdb_content('/a.md', 1);
 SELECT textdb_lines('/a.md', 2, 2), textdb_section('/a.md', 'A'), textdb_diff('/a.md', 1, 2);
 SELECT * FROM textdb_history('/a.md');
 SELECT * FROM textdb_ls('/');
+-- A whole subtree: give `kb` a range on `path` and it seeks the index. Write it as a range
+-- rather than `substr(path, 1, length(?) + 1) = ? || '/'` or `path LIKE ? || '/%'`: those are
+-- functions of the column, so they cost a full scan of the store. `'0'` is the byte after
+-- `'/'`, which makes `prefix || '0'` the exclusive end of the subtree.
+SELECT path, kind, nbytes FROM kb WHERE path >= '/notes/' AND path < '/notes0' ORDER BY path;
 SELECT path, line, snippet FROM textdb_search('beta', '/', 50);
 SELECT * FROM textdb_export('/');
 UPDATE kb SET path = '/archive/a.md' WHERE path = '/a.md';  -- also works for folders (subtree move)

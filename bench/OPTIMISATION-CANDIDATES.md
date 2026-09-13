@@ -1,0 +1,257 @@
+# Optimisation candidates
+
+Companion to [`RESULTS.md`](RESULTS.md). That log records what the matrix measured;
+this file records where the time goes when a gap is taken apart, what has been done about
+it, and what is left — including the things that were tried and turned out not to work, so
+nobody pays for them twice.
+
+Reproduce every figure here with
+
+```sh
+cargo build --release --workspace
+./target/release/textdb-probe all        # ops, statements, scalar, prefix, writepath, tree, diff
+./target/release/textdb-probe diff-big   # allocates several GiB; can be OOM-killed
+```
+
+The probes compare `textdb-sqlite` against a copy of the `sql-text-sqlite` schema in the
+same process, at three document sizes, with distinct content for every document — a probe
+that writes the same body twice measures chunk sharing, not the write path. The matrix
+runner measures whole operations, which is the right unit for "is textdb competitive" and
+the wrong one for "where does the time go": one cell mixes the engine, the SQL surface, the
+structure sidecar and the index writes into a single number.
+
+Absolute numbers are host-specific. Ratios inside one run are the part to trust, and a
+before/after pair should come from one quiet machine, back to back.
+
+## Why the matrix alone was misleading
+
+Three things the published `2026-09-12` entry concluded do not survive decomposition.
+
+**`read` was never uniformly 1.62x — the gap was fixed cost per call, not cost per byte.**
+Measured per document size it was 2.9x at 8 KiB, 0.85x at 100 KiB and 1.3x at 1 MiB. At
+100 KiB textdb already won. The matrix averages those into one figure, and the million-call
+block that dominates the run comes from the CR/CW/SR families, which use 8 KiB documents —
+so the published number was mostly a measurement of per-call overhead. `create` told the
+same story: 2.3x at 8 KiB, 1.7x at 100 KiB, 1.0x at 1 MiB. **Always read a ratio here next
+to the document size it came from.**
+
+**The statement-compilation hypothesis was right and bigger than it read.** It was recorded
+as "the remaining measurable overhead" with the fix reverted. At 8 KiB, compiling the
+virtual table's node lookup cost 9.7 us against 2.1 us from the cache — 82% of the whole
+read gap.
+
+**Nothing published separated the markdown structure sidecar, and every document the matrix
+generates is `.md`.** `record_commit` extracts sections, links and frontmatter for
+`.md`/`.markdown` only, so writing the same body as `.txt` isolates it: a one-line replace
+in a 1 MiB document cost 21.5 ms as `.md` against 11.0 ms as `.txt`. Half the write was
+derived-index maintenance, inside every published write number.
+
+---
+
+## Landed
+
+Measured with `textdb-probe`, before and after, on one host back to back. Artefacts for the
+matrix pair are in [`results/2026-09-13-s-linux/`](results/2026-09-13-s-linux/).
+
+### 1. `myers` sized its working arrays by the input, not by the distance bound
+
+The one that was also a crash. `myers` allocated its furthest-reaching array at
+`2 * (n + m) + 3` and pushed a full-width clone of it into the trace once per diagonal,
+where only diagonals in `[-d, d]` can have been reached — so memory and memory traffic were
+`O(D * (N + M))` even when `D` was tiny next to the inputs. `diff_seq` trims the common
+prefix and suffix first, so one contiguous edit stayed cheap; scattered edits defeat the
+trim and paid the full width per diagonal.
+
+`byte_edits` runs on every `UPDATE kb SET content = …`, the main write path through the
+virtual table and the one the Python library and the CLI use, so an agent rewriting a large
+page with many scattered changes could take the process down.
+
+| document | changed lines | before | after |
+|---|---|---|---|
+| 1 MiB | 143 | 20 ms | 3.0 ms |
+| 1 MiB | 569 | 1539 ms, +254 MiB RSS | 7.2 ms, no measurable RSS |
+| 8 MiB | 1182 | 42 s, +6.9 GiB RSS | 41 ms |
+| 8 MiB | ~5900 | **OOM-killed** | 116 ms (bounded fallback) |
+
+The `max_d` fallback never saved it: it fires only *after* `max_d` full-width rows have been
+allocated. Banded, the trace is `O(D^2)` whatever the document size — 134 MB at the
+`max_d = 4096` ceiling, independent of input length. Hunks are unchanged.
+
+### 2. Subtree queries scanned instead of seeking
+
+Every prefix test was a function of the column — `substr(path, 1, length(?1) + 1) = ?1 || '/'`
+in SQLite, `left(path, length($1) + 1) = $1 || '/'` in Postgres — so no index could serve it.
+55x–143x against an equivalent range over 2000 files and at path depth 1000, and 62x–159x
+for the same listing through the virtual table, which now accepts bounds on `path` in
+`best_index`.
+
+Two Postgres bugs fell out of the same review: `p || '/%'` treats a path's own `%` and `_`
+as wildcards, so `kb.folder.nbytes_total` for `/100%_done` counted `/100XXXdone`'s files, and
+`kb.search('y', '/100%_done')` returned a document from `/100XXXdone` — a search scoped to a
+folder did not actually scope it.
+
+### 3. The virtual tables recompiled their statements on every call
+
+`KbCursor::filter` called `prepare` per read, and `FnCursor::filter` built a whole
+`Connection` per call and handed it to `TextDb`, whose every statement goes through
+`prepare_cached` — so `textdb_search` recompiled all of its statements every time and the
+cache never hit at all. Both tables now hold the handle themselves. 8 KiB read through `kb`:
+14.1 us → 7.1 us.
+
+This is the optimisation that was previously reverted for leaving the database file
+unreleasable. What sank it was *where* the cache lived. `Connection::from_handle` marks the
+handle not owned, so dropping it never calls `sqlite3_close`; and the cached statements are
+finalized when the table struct is dropped, which is `xDisconnect` — and `sqlite3_close`
+calls `disconnectAllVtab` before it checks for unfinalized statements, with a comment in
+SQLite's own source saying why: "the v-table implementation may be storing some prepared
+statements internally".
+
+### 4. The scalar functions could not reuse a statement cache at all
+
+A scalar SQL function gets a fresh `Connection` per call, and cannot safely keep one: a
+`Connection` captured by a function closure is released only *after* `sqlite3_close` checks
+for unfinalized statements, so its cached statements would make `close` return SQLITE_BUSY.
+`storage::shared` is a thread-local registry keyed by SQLite handle — the virtual tables
+register when they connect and release when they disconnect, and the scalar functions borrow
+the handle when one is registered, falling back to a per-call handle when none is.
+
+`textdb_content(path, 1)` on an 8 KiB document: 29.5 us → 9.9 us. `read_shared` and
+`read_version_shared` also hand back the cached buffer and the UTF-8 flag computed with it,
+so the functions stop re-validating a megabyte to learn what the cache already recorded and
+stop copying the document an extra time on the way out.
+
+### 5. The markdown sidecar rebuilt what the write already knew
+
+It materialised the document from the root it had just built — a full tree walk and
+concatenation of chunks written moments earlier — then cloned the result to pass a slice.
+Writes that hold the whole new content now call `remember_document`. Structure rows were
+deleted and re-inserted one statement per row on every commit, 339 inserts for a 1 MiB
+document whose headings a one-line body edit had not touched; they are now compared first
+and rewritten only on a difference, and a rewrite batches its inserts.
+
+### Net effect on the probe, per document size
+
+`.md` against the plain-text baseline, lower is better:
+
+| operation | 8 KiB | 100 KiB | 1 MiB |
+|---|---|---|---|
+| read (warm) | 2.87x → **1.15x** | 0.84x → **0.63x** | 1.30x → **1.23x** |
+| read_version | 3.83x → **0.94x** | 1.54x → **0.61x** | 1.46x → **1.25x** |
+| replace (one line) | 1.64x → 1.77x* | 0.56x → **0.45x** | 0.37x → **0.34x** |
+| create | 2.30x → 2.38x* | 1.72x → **1.47x** | 1.68x → **1.57x** |
+
+\* The 8 KiB write cells moved the wrong way in this pair, which was taken while another
+matrix run had the machine; an earlier quiet pair had 8 KiB replace at 1.55x → 1.23x and
+create at 2.16x → 1.92x. Neither pair is decisive for a sub-millisecond cell on a 4-CPU
+container — see the caveat at the top.
+
+---
+
+## What is left, ranked
+
+### 1. `search` — 11.4x against the plain-text baseline, the largest gap remaining
+
+Untouched by this pass: the statement-cache fix helped its compilation but its p50 is 19.5 ms,
+dominated by the FTS query and the per-candidate work. Two hypotheses are already tested and
+rejected (below); three have not been tried.
+
+- **The `limit * 50` hit window is fixed.** For `limit = 20` that ranks and joins up to 1000
+  chunk hits per term to produce at most 20 files. Start at `limit * 4` and widen only when
+  the intersection comes up short — a pure win whenever a term matches many chunks in few
+  files, which is the common case for a knowledge base.
+- **Two statements per candidate.** Each surviving file costs a `node` lookup and a `chunk`
+  lookup. The node columns could come from the FTS join that already joins `node`; only the
+  chosen chunk's bytes need a second fetch.
+- **`find_leaf` walks the tree per hit** to turn a chunk into a line number. `chunk_ref`
+  already stores `(chunk_id, file_id, version)`; adding the chunk's line offset in that
+  version would make it O(1). The complication: a chunk can occur twice in a document and
+  the table is append-only, so a stored offset is only valid for the version that wrote it —
+  and the current `find_leaf` call doubles as the "is this chunk still in HEAD" check, which
+  anything replacing it has to keep.
+
+### 2. The concurrent write path — `replace` 3.1x in the matrix, where the probe says 0.34x
+
+The single-writer probe has `replace` beating the baseline at every size above 8 KiB, and the
+matrix has it at 3.1x. The difference is the CW family: the baseline rejects a stale write
+outright, where textdb diffs and rebases. Some of that is the feature working as designed.
+The part that may not be:
+
+`TextDb::tx` opens `BEGIN IMMEDIATE` and holds the write lock across the whole operation —
+materialising the base document, `byte_edits`, chunking, every `chunk` and `fts` insert,
+`chunk_ref`, the commit row and the structure sidecar. But chunk and node writes are
+append-only, idempotent and content-addressed: they are safe to perform *outside* the
+transaction that does the CAS. Only the `node.root` CAS, the commit row and `chunk_ref` need
+the lock. A chunk written by an attempt that then loses its CAS becomes unreferenced garbage,
+which `maintenance` already has to handle, and FTS rows for such chunks cannot cause a false
+hit because `chunk_ref` — written under the lock — is what maps a chunk to a file.
+
+**How to test it before building it:** `--filter CW-04,CW-06,CW-07 --backends
+sql-text-sqlite,textdb-sqlite` at `--size s`, at N=20 and N=50. If the gap is lock-hold time,
+per-op write latency should fall with N. If it does not move, this candidate is wrong and the
+cost is per-operation work, which the probe is the better tool for.
+
+### 3. The CommonMark parse in the write path — about 4.7 ms per MiB
+
+What is left of the sidecar after candidate 5 above. Structure rows are derived and
+recomputable by [ADR 0007](../docs/decisions/0007-structure-rows-head-only.md), so the parse
+could move out of the commit transaction entirely — rebuilt lazily on the first structural
+query, or in `maintenance`. That is a semantic change (a `textdb_section` call straight after
+a write would have to trigger the rebuild), so it needs a decision rather than a patch.
+Making the parse incremental is the other option and the harder one: a heading's
+`line_from`/`line_to` shift whenever the line count before it changes, so any edit that adds
+or removes a line changes most rows regardless of what it touched.
+
+### 4. Per-chunk SQL on the write path
+
+A 1 MiB document is ~650 chunks:
+
+| | per MiB |
+|---|---|
+| chunk + hash + tree build (no SQL) | 2.4 ms |
+| `chunk` inserts | 3.1–4.1 ms |
+| `fts` inserts | **11.6–12.0 ms** |
+| `chunk_ref` (hash → rowid, then insert) | 2.2–2.3 ms |
+
+FTS at chunk granularity is the largest item and a deliberate design choice — it is what
+makes the index insert-only and shareable. Worth asking whether it has to be synchronous:
+chunk rows are append-only, so indexing could defer to `maintenance` with search falling
+back to a scan for not-yet-indexed chunks. That is a semantic change and needs the
+recall/precision checks to confirm it is invisible.
+
+`chunk_ref` resolves each hash back to a rowid with one statement per chunk, when `put_chunk`
+already saw `last_insert_rowid()` for every chunk it inserted. Thread the ids out of
+`put_chunk`, or key `chunk_ref` by hash (it is `WITHOUT ROWID` already) and drop the lookup;
+the second costs 24 bytes a row, which FP-01/02 can price. `put_chunk` also recounts newlines
+that `build_with_chunks` already counted for the same bytes, and copies every chunk into the
+cache on write even when the chunk already existed.
+
+### 5. Deep paths cost a round trip per component
+
+`ensure_folder` walks up one lookup at a time and inserts one row per missing component:
+~17 ms to create a file at depth 1000, against 224 us for the baseline, which stores no
+folder rows at all. Both loops are iterative since the stack-overflow fix, so this is a
+round-trip count, not a correctness risk. One recursive CTE to find the deepest existing
+ancestor plus one batched insert would collapse it. Low value — NS-02 is a one-cell
+pathological case — but cheap, and it is the worst ratio in the matrix, which invites
+misreading.
+
+---
+
+## Tried and rejected — do not pay for these twice
+
+- **Batching search hit resolution through `json_each`** (previous pass): worse. The
+  table-valued scan costs more than the few queries it saves when a query matches few files.
+- **Moving `ORDER BY rank` out of SQL into Rust** (previous pass): worse.
+- **Folding `read_version`'s two lookups into one statement**: ten times slower.
+  `{p}node_path` is a partial index over live rows only, and a historical read has to find
+  tombstoned files too, so expressing "live row first, else the most recently deleted" as an
+  `ORDER BY` loses the index. Over 300 files: two statements 3.6 us, correlated subquery
+  17.4 us (scans `node`), join 39.4 us (scans `commit`, whose primary key starts at `file_id`
+  and cannot serve a filter on `version` alone).
+- **Sharing tree nodes behind an `Arc` instead of cloning them.** `Storage::get_node` returns
+  `Node` by value and `tree::Cursor` holds nodes by value, so cloning a cursor deep-copies its
+  path — `apply_one` does that once per suffix leaf in the re-chunk window. Measured, there is
+  nothing there: a document has far more leaves than internal nodes (4698 against 154 at
+  8 MiB), and the edit path is flat in document size — one 10-byte edit costs 21 us at 1 MiB,
+  25 us at 8 MiB and 30 us at 32 MiB. Cost that does not grow with the file is not cost spent
+  walking the file's tree. The `tree` probe keeps the measurement.

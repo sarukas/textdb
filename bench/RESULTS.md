@@ -4,6 +4,10 @@ A **manually maintained** log of benchmark runs. Newest first. The harness gener
 `report.md`; this file is where a human records which runs are worth keeping, what they
 showed, and what changed since the last one.
 
+[`OPTIMISATION-CANDIDATES.md`](OPTIMISATION-CANDIDATES.md) takes the remaining gaps from the
+newest entry apart operation by operation and ranks what to try next; it also corrects two
+of that entry's conclusions.
+
 Each entry links to the run's artefacts under [`results/`](results/). Add an entry only
 for a run whose numbers you would quote — a run that crashed, or one taken on a machine
 with a known measurement problem, is worth recording precisely because someone will
@@ -43,6 +47,142 @@ interrupted run.
 
 Findings — what changed, what is new, what is still open.
 ```
+
+---
+
+## 2026-09-13 — s, Linux, optimisation pass 2 (+ the Postgres and Python surfaces made buildable)
+
+**Artefacts:** [`results/2026-09-13-s-linux/`](results/2026-09-13-s-linux/) — `results.jsonl`
+and `results-before.jsonl`, `hotspots.md` and `hotspots-before.md`, `probe-after.txt` and
+`probe-before.txt`, `manifest.json`, `report.md`, `run.log`
+**Manifest:** size `s` (scale 0.3) · profile `poc` · mode `fast` · seed 20260912 ·
+4 CPUs, 15.7 GiB, Linux container, ext4 · SQLite 3.53.2 · ripgrep 14.1.0 · PostgreSQL 16
+**Status:** complete — 39 tests, `fs` + `sql-text-sqlite` + `textdb-sqlite`, run twice on a
+quiet machine: once with the binary from `ba598a5`, once with `182a64b`
+
+| check | outcome (both runs, identical) |
+|---|---|
+| accuracy checks | **834 pass, 0 fail** (96 n/a) |
+| timings voided | **0 cells** |
+
+First run on Linux rather than Windows, and the first where every surface in the repository
+could actually be built — see *What was broken* below. CW-03, the lost-update failure from
+the `xs` run, did not reproduce in either run here; it was intermittent on that host and is
+not resolved by anything in this pass, so treat it as open.
+
+### Against `sql-text-sqlite` (ratio, lower is better; 1.00 is parity)
+
+| operation | calls | before | after | |
+|---|---|---|---|---|
+| `read` | 2.2M → 4.2M | 1.12x | **0.61x** | 16 us → 9 us; now beats the baseline |
+| `create` | 4849 | 1.71x | **1.55x** | |
+| `replace` | 10.5k | 3.74x | **3.12x** | dominated by the CW family, see below |
+| `append` | 1275 | 0.49x | **0.38x** | |
+| `list` | 2 | 6.76x | **3.35x** | not comparable: the harness query changed too |
+| `read_version` | 17–19k | 2.95x | 2.97x | unchanged here, 4x better at 8 KiB — see below |
+| `search` | ~1.9k | 11.24x | 11.41x | untouched; the largest gap left |
+| `history` | 9 | 2.71x | 2.83x | 9 calls |
+| `read_lines` | 52–60k | 0.08x | **0.07x** | |
+| `delete` | 1 | 0.04x | 0.04x | |
+| `rename` | 1 | 0.13x | 0.19x | one sample; not a signal |
+| `maintenance` | 1 | 0.73x | 0.83x | |
+
+**Read the matrix numbers with care this time.** Several tests are duration-bounded, so a
+faster engine performs *more* operations: `read` went from 2.2M to 4.2M calls between the two
+runs. That changes cache pressure and makes cross-run `p50` comparison weak for anything
+whose cost depends on the caches — which is exactly why `read_version` looks flat here while
+the controlled probe has it 4x better at 8 KiB. The matrix's `read_version` p50 is 5.7 ms,
+i.e. the XL and LL cells, where the cost is materialising megabytes rather than per-call
+overhead.
+
+### The controlled A/B, per document size
+
+`textdb-probe ops`, same process, same work, distinct content per document. This is the
+measurement to trust for per-operation cost; the matrix is the measurement to trust for
+"does the whole suite still pass".
+
+| operation | 8 KiB | 100 KiB | 1 MiB |
+|---|---|---|---|
+| `read` (warm) | 2.87x → **1.15x** | 0.84x → **0.63x** | 1.30x → **1.23x** |
+| `read_version` | 3.83x → **0.94x** | 1.54x → **0.61x** | 1.46x → **1.25x** |
+| `replace` (one line) | 1.64x → 1.77x | 0.56x → **0.45x** | 0.37x → **0.34x** |
+| `create` | 2.30x → 2.38x | 1.72x → **1.47x** | 1.68x → **1.57x** |
+
+The two 8 KiB write cells moved the wrong way in the archived pair, which was taken while
+another matrix run had the machine; an earlier quiet pair had 8 KiB `replace` 1.55x → 1.23x
+and `create` 2.16x → 1.92x. Sub-millisecond cells on a 4-CPU container are not decisive
+either way, and saying so is cheaper than pretending the pair is clean.
+
+### What changed, and what it was worth
+
+Five things, each measured before it was believed; full detail and the rejected alternatives
+are in [`OPTIMISATION-CANDIDATES.md`](OPTIMISATION-CANDIDATES.md).
+
+1. **`myers` sized its working arrays by the input instead of the distance bound** — the only
+   one that was a crash rather than a slowdown. A 1 MiB document with 569 scattered one-line
+   changes took 1539 ms and 254 MiB of resident memory; 8 MiB with 1182 changes took 42
+   seconds and 6.9 GiB; a little more than that was **killed by the OOM reaper**, because the
+   `max_d` fallback only fires after `max_d` full-width rows are already allocated. This runs
+   on every `UPDATE kb SET content = …`. Now 7.2 ms, 41 ms, and a bounded fallback; the trace
+   is O(D²) whatever the document size, and the hunks are unchanged.
+2. **Subtree queries could not use the path index** — 55x–143x against an equivalent range,
+   62x–159x through the virtual table, which now accepts bounds on `path`.
+3. **The virtual tables recompiled their statements on every call** — 8 KiB read through `kb`
+   14.1 us → 7.1 us. This is the optimisation the last pass reverted; what sank it was where
+   the cache lived, not caching.
+4. **The scalar functions could not reuse a statement cache at all** —
+   `textdb_content(path, 1)` on 8 KiB, 29.5 us → 9.9 us.
+5. **The markdown sidecar rebuilt what the write already knew** — it re-materialised the
+   document from the root just built, and rewrote every structure row on every commit even
+   when a body edit had not touched a heading.
+
+One idea in the middle of (4) was wrong and is recorded rather than buried: folding
+`read_version`'s two lookups into one statement made it **ten times slower**, because
+`{p}node_path` is a partial index over live rows and a historical read must find tombstoned
+files too.
+
+### Footprint, unchanged by this pass
+
+The design's clearest win, and none of the above touches it.
+
+| test | textdb-sqlite | sql-text-sqlite |
+|---|---|---|
+| LL-04 (many versions of one file) | 14.6 MB, **4.66x raw** | 84.4 MB, 26.83x raw |
+| LL-05 | 12.2 MB, **4.10x raw** | 83.0 MB, 27.85x raw |
+| ME-05 (1 MiB, Zipf edits) | 9.4 MB, **31.9x raw** | 186.7 MB, 629.7x raw |
+| FP-01/02 after maintenance | 10.3 MB, **7.14x raw** | 16.8 MB, 11.71x raw |
+| XL-01..06 growth per edit | **0 B** | 10.5 MB |
+
+### What was broken before any of this could be measured
+
+Three defects stood between a fresh clone and a working install; all three were invisible to
+CI, which built `--workspace` and nothing else.
+
+| # | Where | Effect |
+|---|---|---|
+| 1 | `crates/textdb-sqlite` | Took rusqlite with `default-features = false` and never re-enabled `cache`, so every `prepare_cached` call failed to resolve: 46 errors. The workspace unified the feature from a sibling, hiding it. |
+| 2 | `crates/textdb-sqlite-ext` | Written against a pre-0.40 rusqlite entry point (`extension_init2` signature, `ffi::sqlite3_mprintf`). **The loadable extension — what INSTALL.md and the Python library use — could not be built at all.** |
+| 3 | `python/textdb/backends/{sqlite,postgres}.py` | Raised a bare `TextdbError` with `code = "TX003"` where they meant `NotFound`, so `except NotFound` never matched a missing path. Caught by the Python suite the moment the extension could be loaded. |
+
+And two in the Postgres binding, found while replacing its prefix predicates: `p || '/%'`
+treats a path's own `%` and `_` as wildcards, so `kb.folder.nbytes_total` for `/100%_done`
+counted `/100XXXdone`'s files, and **`kb.search('y', '/100%_done')` returned a document from
+`/100XXXdone`** — scoping a search to a folder did not actually scope it.
+
+CI now builds both SQLite crates on their own, runs the Python suite, and runs a new
+`load_extension_smoke.py` that loads the `.so` into a stock `sqlite3` and checks every
+surface answers. Verified by hand here as well: the Postgres extension installs and answers,
+all four Python examples run, the CLI loads and searches a folder, and the `sqlite3` shell
+invocation in INSTALL.md works as written.
+
+### What is left
+
+`search` at 11.4x is the largest remaining gap and was not touched. `replace` at 3.1x in the
+matrix against 0.34x in the single-writer probe is the CW family: the baseline rejects a stale
+write outright where textdb diffs and rebases, which is the feature working — but the write
+transaction also holds the lock across chunk and FTS inserts that are append-only and
+content-addressed and need not be inside the CAS. Both, with the measurement that would
+decide the second, are in `OPTIMISATION-CANDIDATES.md`.
 
 ---
 

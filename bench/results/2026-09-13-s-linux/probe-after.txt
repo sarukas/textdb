@@ -1,0 +1,64 @@
+## ops — textdb vs sql-text-sqlite, same process, unique content per document
+
+   size     n      td .md     td .txt    baseline   md/base  operation
+   8KiB   300       0.937       0.740       0.394     2.38x  create
+   8KiB   300       0.845       0.567       0.478     1.77x  replace (one line)
+   8KiB  3000      0.0080           -      0.0069     1.15x  read (warm)
+   8KiB   500      0.0099           -      0.0105     0.94x  read_version(1)
+ 100KiB    80       6.205       6.680       4.235     1.47x  create
+ 100KiB    80       1.882       1.822       4.194     0.45x  replace (one line)
+ 100KiB  3000      0.0180           -      0.0288     0.63x  read (warm)
+ 100KiB   500      0.0203           -      0.0334     0.61x  read_version(1)
+   1MiB    20      62.715      64.960      39.948     1.57x  create
+   1MiB    20      15.587       6.605      45.463     0.34x  replace (one line)
+   1MiB   200      0.2548           -      0.2076     1.23x  read (warm)
+   1MiB   200      0.2633           -      0.2098     1.25x  read_version(1)
+
+## statements — 8 KiB document, warm caches
+
+  read through the virtual table          0.0071 ms
+  read from the plain-text baseline       0.0048 ms  (1.48x)
+  node-row lookup, prepare_cached         0.0020 ms
+  node-row lookup, prepare each time      0.0077 ms
+  -> compile cost 0.0057 ms/call; gap to the baseline 0.0023 ms
+
+## scalar — per-call cost of the scalar function entry point
+
+    8KiB  textdb_content(path, 1)   0.0108 ms | textdb_content(path)   0.0074 | kb content column   0.0082 | baseline   0.0083 (1.30x) | bare scalar fn   0.0014
+    1MiB  textdb_content(path, 1)   0.2674 ms | textdb_content(path)   0.2623 | kb content column   0.2695 | baseline   0.2162 (1.24x) | bare scalar fn   0.0015
+
+## prefix — 2000 files plus one path of depth 1000
+
+  shallow ('/wide/d00')   substr scan    0.773 ms | indexed range    0.014 ms  (55x)
+  deep (depth 1000)       substr scan    1.410 ms | indexed range    0.010 ms  (143x)
+  via kb shallow ('/wide/d00')   substr scan    5.025 ms | pushed-down range    0.081 ms  (62x)
+  via kb deep (depth 1000)       substr scan    5.622 ms | pushed-down range    0.035 ms  (159x)
+  create at depth 1000 (1000 folder rows)    16.58 ms
+
+## writepath — one 1 MiB document, 652 chunks
+
+  chunk + hash + tree build, in memory      2.39 ms
+  chunk inserts                             4.10 ms
+  fts inserts                              11.58 ms
+  chunk_ref (hash -> rowid, insert)         2.30 ms
+
+## tree — walk overhead against the cost of the bytes themselves
+
+  (materialize over MemStorage, whose default chunk_shared copies per leaf: an upper bound)
+    1MiB     568 leaves, depth 3,   22 internal nodes | materialize    0.168 ms (6233 MB/s) | plain copy    0.066 ms (15848 MB/s) | 2.54x
+    8MiB    4698 leaves, depth 3,  154 internal nodes | materialize    2.140 ms (3920 MB/s) | plain copy    0.644 ms (13022 MB/s) | 3.32x
+   32MiB   18704 leaves, depth 4,  607 internal nodes | materialize   23.477 ms (1429 MB/s) | plain copy   23.086 ms (1453 MB/s) | 1.02x
+
+  one 10-byte edit in the middle, by document size (claim O1: cost of the edit, not the file)
+      1MiB  depth 3  apply_edits   0.0205 ms
+      8MiB  depth 3  apply_edits   0.0252 ms
+     32MiB  depth 3  apply_edits   0.0302 ms
+
+## diff — byte_edits over scattered one-line changes
+
+  1MiB document, 14219 lines
+    ~    7 changed lines ->     8 edits        2.8 ms  peak RSS +0 KiB
+    ~   28 changed lines ->    29 edits        2.6 ms  peak RSS +0 KiB
+    ~  142 changed lines ->   143 edits        3.0 ms  peak RSS +0 KiB
+    ~  568 changed lines ->   569 edits        7.2 ms  peak RSS +0 KiB
+

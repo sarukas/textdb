@@ -6,12 +6,14 @@ Everything about measuring textdb against the baselines from the test specificat
 | Path | What |
 |---|---|
 | [`RESULTS.md`](RESULTS.md) | **The benchmark results** of the POC run: claim verdicts, key metric tables, findings |
+| [`OPTIMISATION-CANDIDATES.md`](OPTIMISATION-CANDIDATES.md) | Where the remaining gaps come from when taken apart, and what to try next |
 | `results/` | Raw artefacts of that run: `results.jsonl`, `manifest.json`, the full generated `report.md` |
 | `harness/` | The runner and the six backends ([`harness/README.md`](harness/README.md)) |
 | `harness/tests/*.toml` | The test matrix as data (`spec` and `poc` parameter sets) |
 | `scripts/pg-start.sh` | Throwaway PostgreSQL 16 cluster for the harness |
 | `scripts/verdict.py` | Claim verdicts from `results.jsonl` |
 | `scripts/key-metrics.py` | Compact metric tables from `results.jsonl` |
+| `harness/src/bin/textdb-probe.rs` | Micro-probes behind `OPTIMISATION-CANDIDATES.md`: one cost at a time, against the baseline schema in-process |
 | `dolt/` | Dolt harness design (not run: no binary available, see ADR 0005) |
 
 ## Quick start

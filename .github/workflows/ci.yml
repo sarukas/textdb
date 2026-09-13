@@ -9,6 +9,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release
       - run: cargo test --workspace --release
+      # The workspace build unifies Cargo features across its members, which hides a
+      # member whose own feature list is incomplete. Build the two SQLite crates on their
+      # own so a missing feature fails here rather than in someone's install.
+      - run: cargo build --release -p textdb-sqlite
+      - run: cd crates/textdb-sqlite-ext && cargo build --release
+      # The loadable extension is the artefact INSTALL.md and the Python library use, so
+      # check it actually loads and answers, not just that it links.
+      - run: python3 python/tests/load_extension_smoke.py
+      - run: python3 -m pip install --quiet pytest
+      - run: python3 -m pytest tests -q
+        working-directory: python
   pg-extension:
     runs-on: ubuntu-latest
     steps:

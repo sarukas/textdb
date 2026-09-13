@@ -16,7 +16,7 @@ loadable_extension = ["rusqlite/loadable_extension"]
 [dependencies]
 textdb-core = { path = "../textdb-core" }
 textdb-md = { path = "../textdb-md" }
-rusqlite = { version = "0.40", default-features = false, features = ["vtab", "functions"] }
+rusqlite = { version = "0.40", default-features = false, features = ["cache", "vtab", "functions"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]

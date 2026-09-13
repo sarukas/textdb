@@ -302,7 +302,15 @@ impl Backend for TextdbPg {
     }
     fn maintenance(&self) -> R<&'static str> {
         self.with(|c| {
-            c.batch_execute("VACUUM FULL kb.chunk; VACUUM FULL kb.tree_node; VACUUM FULL kb.node; SELECT gin_clean_pending_list('kb.chunk_tsv');")?;
+            crate::backends::run_each(
+                c,
+                &[
+                    "VACUUM FULL kb.chunk",
+                    "VACUUM FULL kb.tree_node",
+                    "VACUUM FULL kb.node",
+                    "SELECT gin_clean_pending_list('kb.chunk_tsv')",
+                ],
+            )?;
             Ok("VACUUM FULL + gin_clean_pending_list (GC stub: none)")
         })
     }

@@ -22,3 +22,4 @@ rand = { workspace = true }
 rand_distr = "0.4"
 anyhow = { workspace = true }
 libc = "0.2"
+tempfile = "3"

@@ -56,6 +56,20 @@ CREATE TABLE kb.checkpoint (name text NOT NULL, file_id bigint NOT NULL, path te
 -- Custom SQLSTATEs (spec §7.2): TX001 conflict, TX002 contention, TX003 not found, TX004 invalid edit.
 CREATE FUNCTION kb._raise(code text, msg text, detail text) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN RAISE EXCEPTION USING ERRCODE = code, MESSAGE = msg, DETAIL = coalesce(detail, ''); END $$;
+
+-- LIKE pattern matching every path strictly under the folder `p`.
+--
+-- `p || '/%'` on its own is wrong whenever a folder name contains a LIKE wildcard: for
+-- `/100%_done` the pattern `/100%_done/%` also matches `/100XXXdone/b.md`, so a folder's
+-- byte total counted other folders' files and a search scoped to one folder returned
+-- documents from another. Escaping the prefix makes the match literal.
+--
+-- It stays a prefix test rather than a `>= … < …` range on purpose. `node_path` is a
+-- `text_pattern_ops` index, which serves `LIKE 'literal%'` under any database collation,
+-- where a range comparison would need the database's collation to agree with byte order.
+-- IMMUTABLE so the planner folds it and can still extract the literal prefix.
+CREATE FUNCTION kb._subtree_like(p text) RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$$ SELECT replace(replace(replace(p, '\', '\\'), '%', '\%'), '_', '\_') || '/%' $$;
 "#,
     name = "kb_tables",
     bootstrap
@@ -70,7 +84,7 @@ CREATE INDEX chunk_tsv ON kb.chunk USING gin(tsv);
 CREATE VIEW kb.folder AS
   SELECT n.id, n.path, n.name, p.path AS parent_path,
          (SELECT count(*) FROM kb.node c WHERE c.parent_id = n.id AND c.deleted_at IS NULL) AS n_children,
-         (SELECT coalesce(sum(f.nbytes), 0) FROM kb.node f WHERE f.kind = 1 AND f.deleted_at IS NULL AND (f.path LIKE n.path || '/%')) AS nbytes_total,
+         (SELECT coalesce(sum(f.nbytes), 0) FROM kb.node f WHERE f.kind = 1 AND f.deleted_at IS NULL AND f.path LIKE kb._subtree_like(n.path)) AS nbytes_total,
          n.updated_at
   FROM kb.node n LEFT JOIN kb.node p ON p.id = n.parent_id
   WHERE n.kind = 0 AND n.deleted_at IS NULL AND n.path <> '/';
@@ -510,7 +524,7 @@ mod kb {
         }
         let parent = ensure_folder(parent_of(&to));
         Spi::run_with_args(
-            "UPDATE kb.node SET path = $2 || substr(path, length($1) + 1), updated_at = now() WHERE left(path, length($1) + 1) = $1 || '/' AND deleted_at IS NULL",
+            "UPDATE kb.node SET path = $2 || substr(path, length($1) + 1), updated_at = now() WHERE path LIKE kb._subtree_like($1) AND deleted_at IS NULL",
             &[from.as_str().into(), to.as_str().into()],
         )
         .unwrap_or_else(|e| spi_err(e));
@@ -530,7 +544,7 @@ mod kb {
         }
         node_by_path(&path).unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
         Spi::run_with_args(
-            "UPDATE kb.node SET deleted_at = now() WHERE (path = $1 OR left(path, length($1) + 1) = $1 || '/') AND deleted_at IS NULL",
+            "UPDATE kb.node SET deleted_at = now() WHERE (path = $1 OR path LIKE kb._subtree_like($1)) AND deleted_at IS NULL",
             &[path.as_str().into()],
         )
         .unwrap_or_else(|e| spi_err(e));
@@ -710,7 +724,7 @@ mod kb {
             let files: std::collections::HashMap<i64, (i64, f32)> = Spi::connect(|client| {
                 let t = client
                     .select(
-                        "SELECT r.file_id, c.id, ts_rank(c.tsv, q) FROM kb.chunk c JOIN kb.chunk_ref r ON r.chunk_id = c.id JOIN kb.node n ON n.id = r.file_id, to_tsquery('simple', $1) q WHERE c.tsv @@ q AND n.deleted_at IS NULL AND n.kind = 1 AND ($2 = '/' OR n.path LIKE $2 || '/%') ORDER BY 3 DESC LIMIT $3",
+                        "SELECT r.file_id, c.id, ts_rank(c.tsv, q) FROM kb.chunk c JOIN kb.chunk_ref r ON r.chunk_id = c.id JOIN kb.node n ON n.id = r.file_id, to_tsquery('simple', $1) q WHERE c.tsv @@ q AND n.deleted_at IS NULL AND n.kind = 1 AND ($2 = '/' OR n.path LIKE kb._subtree_like($2)) ORDER BY 3 DESC LIMIT $3",
                         None,
                         &[tsq.as_str().into(), prefix.as_str().into(), ((limit.saturating_mul(50)).min(500_000) as i64).into()],
                     )

@@ -1,6 +1,6 @@
 //! The whole surface through SQL (spec claim 4) plus round-trip checks.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use textdb_sqlite::{open_in_memory, TextDb};
 
 fn setup() -> Connection {
@@ -291,4 +291,262 @@ fn roundtrip_edge_cases_and_reimport() {
         chunk_bytes as f64 / reference.len() as f64
     );
     assert!((chunk_bytes as f64) < 8.0 * reference.len() as f64);
+}
+
+/// A bound on `path` is pushed into the shadow table so a subtree listing seeks through
+/// `{p}node_path` instead of scanning every row. The bounds the cursor applies are widened
+/// to `>=` / `<=` whatever the caller wrote, so the exact comparison has to come back from
+/// SQLite — these cases are the ones that catch it if it does not.
+#[test]
+fn path_range_listing_is_exact() {
+    let conn = setup();
+    for p in [
+        "/a.md",
+        "/notes/a.md",
+        "/notes/b.md",
+        "/notes/sub/c.md",
+        "/notes0/d.md", // sorts immediately after "/notes/…" and must never be included
+        "/nz.md",
+    ] {
+        conn.execute("INSERT INTO kb(path, content) VALUES (?1, 'x')", params![p]).unwrap();
+    }
+    let paths = |sql: &str, args: &[&str]| -> Vec<String> {
+        let mut st = conn.prepare(sql).unwrap();
+        st.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+
+    // The subtree of /notes, as the engine itself spells it.
+    let under = paths(
+        "SELECT path FROM kb WHERE path >= ?1 AND path < ?2 ORDER BY path",
+        &["/notes/", "/notes0"],
+    );
+    assert_eq!(under, ["/notes/a.md", "/notes/b.md", "/notes/sub", "/notes/sub/c.md"]);
+
+    // Strict lower bound: "/notes/a.md" itself must drop out.
+    let strict = paths(
+        "SELECT path FROM kb WHERE path > ?1 AND path < ?2 ORDER BY path",
+        &["/notes/a.md", "/notes0"],
+    );
+    assert_eq!(strict, ["/notes/b.md", "/notes/sub", "/notes/sub/c.md"]);
+
+    // Inclusive upper bound: "/notes/b.md" must be kept.
+    let inclusive = paths(
+        "SELECT path FROM kb WHERE path >= ?1 AND path <= ?2 ORDER BY path",
+        &["/notes/", "/notes/b.md"],
+    );
+    assert_eq!(inclusive, ["/notes/a.md", "/notes/b.md"]);
+
+    // One-sided bounds still work, and the root folder row stays hidden as in a full scan.
+    let from = paths("SELECT path FROM kb WHERE path >= ?1 ORDER BY path", &["/notes0"]);
+    assert_eq!(from, ["/notes0", "/notes0/d.md", "/nz.md"]);
+    let upto = paths("SELECT path FROM kb WHERE path <= ?1 ORDER BY path", &["/a.md"]);
+    assert_eq!(upto, ["/a.md"]);
+
+    // A range and an equality on the same column: equality wins and is still exact.
+    let eq: String = conn
+        .query_row(
+            "SELECT path FROM kb WHERE path = '/notes/b.md' AND path >= '/notes/' AND path < '/notes0'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(eq, "/notes/b.md");
+
+    // And the full scan is unchanged.
+    let all = conn
+        .prepare("SELECT path FROM kb ORDER BY path")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        all,
+        [
+            "/a.md",
+            "/notes",
+            "/notes/a.md",
+            "/notes/b.md",
+            "/notes/sub",
+            "/notes/sub/c.md",
+            "/notes0",
+            "/notes0/d.md",
+            "/nz.md"
+        ]
+    );
+}
+
+/// The virtual table keeps a long-lived handle with a statement cache, so the statements it
+/// caches are unfinalized for as long as the table exists. `sqlite3_close` tears virtual
+/// tables down *before* it checks for unfinalized statements, so this is safe — but an
+/// earlier attempt at the same optimisation was reverted for leaving the database file
+/// unreleasable, and nothing caught it. This does.
+#[test]
+fn closing_a_connection_with_a_kb_table_releases_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kb.db");
+    let conn = Connection::open(&file).unwrap();
+    textdb_sqlite::register(&conn, "kb_").unwrap();
+    conn.execute_batch("CREATE VIRTUAL TABLE kb USING textdb(store='kb_');").unwrap();
+    conn.execute("INSERT INTO kb(path, content) VALUES ('/a.md', 'x')", []).unwrap();
+    // Read twice: the first read populates the statement cache, the second uses it. Closing
+    // with a cold cache would not exercise anything.
+    for _ in 0..2 {
+        let s: String = conn
+            .query_row("SELECT content FROM kb WHERE path = '/a.md'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(s, "x");
+    }
+    // A range read too, so the other cached statement shape is live as well.
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM kb WHERE path >= '/' AND path < '0'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+    // The scalar and table-valued functions prepare through the *same* shared handle, so
+    // they add statements to the cache the table's teardown is responsible for. Warm each
+    // kind, or the close below would only be testing the table's own statements.
+    for _ in 0..2 {
+        let _: String = conn
+            .query_row("SELECT textdb_content('/a.md', 1)", [], |r| r.get(0))
+            .unwrap();
+        let _: String = conn.query_row("SELECT textdb_lines('/a.md', 1, 1)", [], |r| r.get(0)).unwrap();
+        let _: i64 = conn
+            .query_row("SELECT count(*) FROM textdb_history('/a.md')", [], |r| r.get(0))
+            .unwrap();
+        let _: i64 = conn.query_row("SELECT count(*) FROM textdb_ls('/')", [], |r| r.get(0)).unwrap();
+        let _: i64 = conn
+            .query_row("SELECT count(*) FROM textdb_search('x', '/')", [], |r| r.get(0))
+            .unwrap();
+    }
+    // A write through a scalar function too: those take a transaction on the shared handle.
+    let _: i64 = conn
+        .query_row("SELECT textdb_edit('/a.md', 'x', 'xy')", [], |r| r.get(0))
+        .unwrap();
+
+    // This is the assertion: `close` must succeed, not return SQLITE_BUSY.
+    conn.close().expect("connection with a kb table must close cleanly");
+
+    // And the file must be releasable afterwards — the symptom the reverted attempt had.
+    std::fs::remove_file(&file).expect("database file must be deletable after close");
+    assert!(!file.exists());
+
+    // Reopening the same store still works, which catches a teardown that closed too much.
+    let conn = Connection::open(dir.path().join("kb2.db")).unwrap();
+    textdb_sqlite::register(&conn, "kb_").unwrap();
+    conn.execute_batch("CREATE VIRTUAL TABLE kb USING textdb(store='kb_');").unwrap();
+    conn.execute("INSERT INTO kb(path, content) VALUES ('/b.md', 'y')", []).unwrap();
+    let s: String = conn
+        .query_row("SELECT content FROM kb WHERE path = '/b.md'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(s, "y");
+    conn.close().unwrap();
+}
+
+/// `DROP TABLE` on a `textdb` table runs `xDestroy`, which drops the shadow tables through
+/// the same long-lived handle the statement cache lives on.
+#[test]
+fn dropping_a_kb_table_removes_the_shadow_tables() {
+    let conn = setup();
+    conn.execute("INSERT INTO kb(path, content) VALUES ('/a.md', 'x')", []).unwrap();
+    let before: i64 = conn
+        .query_row("SELECT count(*) FROM sqlite_master WHERE name LIKE 'kb\\_%' ESCAPE '\\'", [], |r| r.get(0))
+        .unwrap();
+    assert!(before > 0, "shadow tables should exist");
+    conn.execute_batch("DROP TABLE kb;").unwrap();
+    let after: i64 = conn
+        .query_row("SELECT count(*) FROM sqlite_master WHERE name LIKE 'kb\\_%' ESCAPE '\\'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, 0, "shadow tables should be gone after DROP TABLE");
+}
+
+/// Structure rows are HEAD-only and derived, so a commit that leaves the headings alone
+/// rewrites nothing and only carries the `version` column forward. `textdb_section` looks
+/// rows up at the file's *current* version, so a skipped rewrite that forgot to bump the
+/// version would silently stop finding sections — this walks several edits to catch that.
+#[test]
+fn sections_stay_findable_across_edits_that_do_not_change_structure() {
+    let conn = setup();
+    let body = "---\ntitle: T\n---\n\n# One\n\nalpha\nbeta\n\n## Two\n\ngamma see [[other]]\n";
+    conn.execute("INSERT INTO kb(path, content) VALUES ('/n/a.md', ?1)", params![body]).unwrap();
+
+    let section = |heading: &str| -> Option<String> {
+        conn.query_row("SELECT textdb_section('/n/a.md', ?1)", params![heading], |r| r.get(0))
+            .optional()
+            .unwrap()
+            .flatten()
+    };
+    let counts = || -> (i64, i64, i64) {
+        let q = |t: &str| -> i64 {
+            conn.query_row(&format!("SELECT count(*) FROM kb_{} WHERE version = (SELECT version FROM kb WHERE path = '/n/a.md')", t), [], |r| r.get(0))
+                .unwrap()
+        };
+        (q("section"), q("link"), q("frontmatter"))
+    };
+    assert_eq!(counts(), (2, 1, 1), "two headings, one wikilink, one frontmatter block");
+    assert!(section("Two").unwrap().contains("gamma"));
+
+    // Body-only edits: structure unchanged, so only the version is carried forward.
+    for (old, new) in [("alpha", "ALPHA"), ("ALPHA", "alpha again"), ("beta", "BETA")] {
+        conn.query_row("SELECT textdb_edit('/n/a.md', ?1, ?2)", params![old, new], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(counts(), (2, 1, 1), "rows must follow the new version after editing {}", old);
+        assert!(section("Two").unwrap().contains("gamma"), "sections must stay findable after editing {}", old);
+    }
+
+    // A structural edit must actually rewrite the rows.
+    conn.query_row("SELECT textdb_edit('/n/a.md', '## Two', '## Renamed')", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(counts(), (2, 1, 1));
+    assert!(section("Two").is_none(), "the old heading must be gone");
+    assert!(section("Renamed").unwrap().contains("gamma"));
+
+    // Adding a heading and a link changes the row counts.
+    conn.query_row(
+        "SELECT textdb_edit('/n/a.md', 'gamma see [[other]]', ?1)",
+        params!["gamma see [[other]] and [[third]]\n\n### Deep\n\ndelta"],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap();
+    assert_eq!(counts(), (3, 2, 1));
+    assert!(section("Deep").unwrap().contains("delta"));
+
+    // Removing the frontmatter clears its row rather than leaving a stale one behind.
+    conn.query_row("SELECT textdb_edit('/n/a.md', ?1, '')", params!["---\ntitle: T\n---\n\n"], |r| {
+        r.get::<_, i64>(0)
+    })
+    .unwrap();
+    let (secs, links, fm) = counts();
+    assert_eq!((secs, links, fm), (3, 2, 0), "frontmatter row should be gone");
+    assert!(section("Deep").unwrap().contains("delta"));
+}
+
+/// The scalar functions borrow a handle a `textdb` table registered. With no table on the
+/// connection there is nothing to borrow, and they must still work on their own — this is
+/// the fallback path in `with_db`, which nothing else exercises.
+#[test]
+fn scalar_functions_work_without_a_virtual_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kb.db");
+    let conn = Connection::open(&file).unwrap();
+    // The shadow tables through the Rust API, so no virtual table is ever created and
+    // nothing registers the handle; then the functions on their own.
+    let db = TextDb::open(&conn, "kb_").unwrap();
+    db.create("/a.md", b"alpha\nbeta\n", None, None).unwrap();
+    drop(db);
+    textdb_sqlite::functions::register_functions(&conn, "kb_").unwrap();
+    let content: String = conn
+        .query_row("SELECT textdb_content('/a.md')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(content, "alpha\nbeta\n");
+    let lines: String = conn.query_row("SELECT textdb_lines('/a.md', 2, 2)", [], |r| r.get(0)).unwrap();
+    assert_eq!(lines, "beta\n");
+    let v: i64 = conn
+        .query_row("SELECT textdb_edit('/a.md', 'beta', 'BETA')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 2);
+    conn.close().unwrap();
+    std::fs::remove_file(&file).expect("file must be deletable with no table registered either");
 }

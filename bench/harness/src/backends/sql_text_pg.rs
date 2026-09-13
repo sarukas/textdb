@@ -317,7 +317,14 @@ impl Backend for SqlTextPg {
     }
     fn maintenance(&self) -> R<&'static str> {
         self.with(|c| {
-            c.batch_execute("VACUUM FULL sqltext.doc; VACUUM FULL sqltext.doc_rev; SELECT gin_clean_pending_list('sqltext.doc_tsv');")?;
+            crate::backends::run_each(
+                c,
+                &[
+                    "VACUUM FULL sqltext.doc",
+                    "VACUUM FULL sqltext.doc_rev",
+                    "SELECT gin_clean_pending_list('sqltext.doc_tsv')",
+                ],
+            )?;
             Ok("VACUUM FULL + gin_clean_pending_list")
         })
     }

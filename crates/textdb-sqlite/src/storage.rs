@@ -86,6 +86,90 @@ thread_local! {
     static DOCS: RefCell<Lru<(Arc<Vec<u8>>, bool)>> = RefCell::new(Lru::new(DOC_BUDGET));
 }
 
+/// Connections whose statement cache may be shared, keyed by SQLite handle.
+///
+/// Scalar SQL functions get a fresh `Connection` from `sqlite3_context_db_handle` on every
+/// call, so everything they prepare is compiled from scratch: 13 us of the 20 us
+/// `textdb_content` took on an 8 KiB document, against 7 us for the same read through the
+/// virtual table, which keeps its own handle. They cannot simply hold one themselves —
+/// a `Connection` captured by a function closure is released only *after* `sqlite3_close`
+/// checks for unfinalized statements, so its cached statements would make `close` return
+/// SQLITE_BUSY and leave the database file locked.
+///
+/// A virtual table's handle has no such problem: `sqlite3_close` calls `disconnectAllVtab`
+/// before that check, explicitly so a vtab implementation can hold statements. So the
+/// tables register their handle here when they connect and unregister when they disconnect,
+/// and the scalar functions borrow it when one is registered — which is whenever a `kb`
+/// table exists, the only way the shadow tables are meant to be reached. With no table
+/// registered they fall back to a per-call handle and merely stay slow.
+///
+/// Thread-local, because a `Connection` is not shared between threads: a handle driven from
+/// a thread that did not register it finds nothing and takes the fallback.
+mod shared {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use rusqlite::{ffi, Connection};
+
+    struct Entry {
+        handle: *mut ffi::sqlite3,
+        conn: Rc<Connection>,
+        /// Number of live registrants; two `kb` tables with different prefixes on one
+        /// connection both register, and the handle stays shared until the last disconnects.
+        holders: usize,
+    }
+
+    thread_local! {
+        static CONNS: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Register `handle` and return the shared connection for it.
+    ///
+    /// # Safety
+    /// `handle` must be an open SQLite connection, and the caller must call `release` with
+    /// the same handle before that connection closes. Virtual tables satisfy this by
+    /// registering in `xConnect` and releasing in `xDisconnect`.
+    pub unsafe fn register(handle: *mut ffi::sqlite3) -> rusqlite::Result<Rc<Connection>> {
+        CONNS.with(|c| {
+            let mut v = c.borrow_mut();
+            if let Some(e) = v.iter_mut().find(|e| e.handle == handle) {
+                e.holders += 1;
+                return Ok(Rc::clone(&e.conn));
+            }
+            let conn = Rc::new(unsafe { Connection::from_handle(handle) }?);
+            v.push(Entry {
+                handle,
+                conn: Rc::clone(&conn),
+                holders: 1,
+            });
+            Ok(conn)
+        })
+    }
+
+    /// Drop one registration. At zero the shared connection goes, finalizing its statements.
+    pub fn release(handle: *mut ffi::sqlite3) {
+        let _ = CONNS.try_with(|c| {
+            let mut v = c.borrow_mut();
+            if let Some(i) = v.iter().position(|e| e.handle == handle) {
+                v[i].holders -= 1;
+                if v[i].holders == 0 {
+                    v.swap_remove(i);
+                }
+            }
+        });
+    }
+
+    /// The shared connection for `handle`, if a virtual table has registered it.
+    pub fn get(handle: *mut ffi::sqlite3) -> Option<Rc<Connection>> {
+        CONNS
+            .try_with(|c| c.borrow().iter().find(|e| e.handle == handle).map(|e| Rc::clone(&e.conn)))
+            .ok()
+            .flatten()
+    }
+}
+
+pub use shared::{get as shared_conn, register as register_shared_conn, release as release_shared_conn};
+
 pub struct SqliteStorage<'c> {
     pub conn: &'c Connection,
     pub p: String,
@@ -139,6 +223,34 @@ impl<'c> SqliteStorage<'c> {
             DOCS.with(|c| c.borrow_mut().put(*root, entry.0.len(), entry.clone()));
         }
         Ok(entry)
+    }
+
+    /// Record bytes the caller already holds as the content of `root`.
+    ///
+    /// A write knows the new content before it builds the tree for it, but nothing used to
+    /// tell the cache, so the very next reader of that root — `record_commit`, extracting
+    /// markdown structure, and then whoever reads the file back — walked the tree and
+    /// concatenated every chunk to rebuild bytes that were in hand a moment earlier.
+    ///
+    /// The caller must pass exactly the bytes `root` was built from. Every caller here does
+    /// so immediately after `build_with_chunks` on the same buffer; `debug_assert` checks it
+    /// in test builds, where the hash is cheap next to the rest of the suite.
+    pub fn remember_document(&self, root: &Hash, bytes: &[u8]) {
+        // Checked against the tree's own totals rather than by re-chunking: one cached node
+        // fetch, no hashing, and it catches the mistake that could actually happen — a
+        // caller passing the buffer for a different root. Debug only; a release build takes
+        // the caller at its word, as `put_chunk` already does.
+        debug_assert!(
+            textdb_core::tree::totals(self, root).map(|(n, _)| n as usize).ok() == Some(bytes.len()),
+            "remember_document: {} bytes do not match the length of the tree under this root",
+            bytes.len()
+        );
+        if bytes.len() > DOC_MAX {
+            return;
+        }
+        let utf8 = std::str::from_utf8(bytes).is_ok();
+        let entry = (Arc::new(bytes.to_vec()), utf8);
+        DOCS.with(|c| c.borrow_mut().put(*root, entry.0.len(), entry));
     }
 
     pub fn now() -> String {

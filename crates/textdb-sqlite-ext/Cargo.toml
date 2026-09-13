@@ -11,4 +11,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 textdb-sqlite = { path = "../textdb-sqlite", default-features = false, features = ["loadable_extension"] }
-rusqlite = { version = "0.40", default-features = false, features = ["vtab", "functions", "loadable_extension"] }
+rusqlite = { version = "0.40", default-features = false, features = ["cache", "vtab", "functions", "loadable_extension"] }
