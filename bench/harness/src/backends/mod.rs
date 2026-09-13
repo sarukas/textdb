@@ -110,3 +110,17 @@ pub fn subtree_bounds(prefix: &str) -> Option<(String, String)> {
     }
     Some((format!("{}/", prefix), format!("{}0", prefix)))
 }
+
+/// Run each statement on its own, outside any transaction block.
+///
+/// `batch_execute` sends everything as one simple-query batch, which PostgreSQL wraps in an
+/// implicit transaction — and `VACUUM` refuses to run inside one ("25001: VACUUM cannot run
+/// inside a transaction block"). Both Postgres backends hit this, so the maintenance step and
+/// every footprint-after-maintenance figure for either of them was an error rather than a
+/// measurement.
+pub fn run_each(c: &mut postgres::Client, stmts: &[&str]) -> Result<(), postgres::Error> {
+    for s in stmts {
+        c.simple_query(s)?;
+    }
+    Ok(())
+}
