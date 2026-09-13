@@ -290,14 +290,18 @@ fn probe_statements() -> anyhow::Result<()> {
     });
     println!("## statements — 8 KiB document, warm caches\n");
     println!("  read through the virtual table        {:8.4} ms", vtab);
-    println!("  read from the plain-text baseline     {:8.4} ms", base);
+    println!("  read from the plain-text baseline     {:8.4} ms  ({:.2}x)", base, vtab / base);
     println!("  node-row lookup, prepare_cached       {:8.4} ms", cached);
-    println!("  node-row lookup, prepare (as today)   {:8.4} ms", fresh);
+    println!("  node-row lookup, prepare each time    {:8.4} ms", fresh);
+    // The last two lines are what the virtual table's `filter` pays per call for its one
+    // statement. While it called `prepare`, that difference *was* most of the gap above; it
+    // now prepares through the table's own connection, so what remains of the gap is the
+    // rest of the path. If `gap` ever creeps back up towards `compile` again, the statement
+    // cache has stopped being reused.
     println!(
-        "  -> compilation is {:.4} ms of the {:.4} ms gap ({:.0}%)\n",
+        "  -> compile cost {:.4} ms/call; gap to the baseline {:.4} ms\n",
         fresh - cached,
-        vtab - base,
-        100.0 * (fresh - cached) / (vtab - base)
+        vtab - base
     );
     Ok(())
 }

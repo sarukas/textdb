@@ -378,3 +378,66 @@ fn path_range_listing_is_exact() {
         ]
     );
 }
+
+/// The virtual table keeps a long-lived handle with a statement cache, so the statements it
+/// caches are unfinalized for as long as the table exists. `sqlite3_close` tears virtual
+/// tables down *before* it checks for unfinalized statements, so this is safe — but an
+/// earlier attempt at the same optimisation was reverted for leaving the database file
+/// unreleasable, and nothing caught it. This does.
+#[test]
+fn closing_a_connection_with_a_kb_table_releases_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kb.db");
+    let conn = Connection::open(&file).unwrap();
+    textdb_sqlite::register(&conn, "kb_").unwrap();
+    conn.execute_batch("CREATE VIRTUAL TABLE kb USING textdb(store='kb_');").unwrap();
+    conn.execute("INSERT INTO kb(path, content) VALUES ('/a.md', 'x')", []).unwrap();
+    // Read twice: the first read populates the statement cache, the second uses it. Closing
+    // with a cold cache would not exercise anything.
+    for _ in 0..2 {
+        let s: String = conn
+            .query_row("SELECT content FROM kb WHERE path = '/a.md'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(s, "x");
+    }
+    // A range read too, so the other cached statement shape is live as well.
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM kb WHERE path >= '/' AND path < '0'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+
+    // This is the assertion: `close` must succeed, not return SQLITE_BUSY.
+    conn.close().expect("connection with a kb table must close cleanly");
+
+    // And the file must be releasable afterwards — the symptom the reverted attempt had.
+    std::fs::remove_file(&file).expect("database file must be deletable after close");
+    assert!(!file.exists());
+
+    // Reopening the same store still works, which catches a teardown that closed too much.
+    let conn = Connection::open(dir.path().join("kb2.db")).unwrap();
+    textdb_sqlite::register(&conn, "kb_").unwrap();
+    conn.execute_batch("CREATE VIRTUAL TABLE kb USING textdb(store='kb_');").unwrap();
+    conn.execute("INSERT INTO kb(path, content) VALUES ('/b.md', 'y')", []).unwrap();
+    let s: String = conn
+        .query_row("SELECT content FROM kb WHERE path = '/b.md'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(s, "y");
+    conn.close().unwrap();
+}
+
+/// `DROP TABLE` on a `textdb` table runs `xDestroy`, which drops the shadow tables through
+/// the same long-lived handle the statement cache lives on.
+#[test]
+fn dropping_a_kb_table_removes_the_shadow_tables() {
+    let conn = setup();
+    conn.execute("INSERT INTO kb(path, content) VALUES ('/a.md', 'x')", []).unwrap();
+    let before: i64 = conn
+        .query_row("SELECT count(*) FROM sqlite_master WHERE name LIKE 'kb\\_%' ESCAPE '\\'", [], |r| r.get(0))
+        .unwrap();
+    assert!(before > 0, "shadow tables should exist");
+    conn.execute_batch("DROP TABLE kb;").unwrap();
+    let after: i64 = conn
+        .query_row("SELECT count(*) FROM sqlite_master WHERE name LIKE 'kb\\_%' ESCAPE '\\'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, 0, "shadow tables should be gone after DROP TABLE");
+}

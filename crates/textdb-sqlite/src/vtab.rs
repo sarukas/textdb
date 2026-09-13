@@ -3,7 +3,6 @@
 
 use std::borrow::Cow;
 use std::ffi::CStr;
-use std::marker::PhantomData;
 use std::os::raw::c_int;
 
 use rusqlite::ffi;
@@ -74,6 +73,10 @@ const KB_SCHEMA: &CStr = c"CREATE TABLE x(id INTEGER, path TEXT, name TEXT, pare
 
 const COL_ID: c_int = 0;
 const COL_PATH: c_int = 1;
+const COL_CONTENT: c_int = 5;
+const COL_BASE_VERSION: usize = 11;
+const COL_AUTHOR: usize = 12;
+const COL_MESSAGE: usize = 13;
 
 /// `idx_num` values agreed between `best_index` and `filter`.
 const IDX_SCAN: c_int = 0;
@@ -83,21 +86,35 @@ const IDX_ID_EQ: c_int = 2;
 const IDX_PATH_RANGE: c_int = 4;
 const IDX_RANGE_LOWER: c_int = 1;
 const IDX_RANGE_UPPER: c_int = 2;
-const COL_CONTENT: c_int = 5;
-const COL_BASE_VERSION: usize = 11;
-const COL_AUTHOR: usize = 12;
-const COL_MESSAGE: usize = 13;
 
 #[repr(C)]
 pub struct KbTab {
     base: ffi::sqlite3_vtab,
     db: *mut ffi::sqlite3,
     prefix: String,
+    /// A long-lived non-owning handle whose statement cache outlives one `filter` call.
+    ///
+    /// `filter` runs on every read through the table and used to `prepare` its statement
+    /// each time: 9.2 us against 2.2 us from the cache, which was 74% of the gap to the
+    /// plain-text baseline on an 8 KiB document. Caching the statements on a `Connection`
+    /// built per call achieves nothing, because the cache dies with the call.
+    ///
+    /// Putting the handle here is safe in both directions. `Connection::from_handle` marks
+    /// it not owned, so dropping it never calls `sqlite3_close` — it cannot outlive or
+    /// interfere with the connection SQLite gave us. And the cached statements are
+    /// finalized when this struct is dropped, which is `xDisconnect`: `sqlite3_close` calls
+    /// `disconnectAllVtab` *before* it checks for unfinalized statements, precisely so that
+    /// "the v-table implementation may be storing some prepared statements internally".
+    /// An earlier attempt at this was reverted for leaving the database file unreleasable;
+    /// `closing_a_connection_with_a_kb_table_releases_the_file` is the regression test it
+    /// did not have.
+    conn: Connection,
 }
 
 impl KbTab {
-    fn conn(&self) -> Result<Connection> {
-        unsafe { Connection::from_handle(self.db) }
+    /// The table's own handle. Use this wherever a statement is worth caching.
+    fn conn(&self) -> &Connection {
+        &self.conn
     }
 }
 
@@ -126,12 +143,14 @@ unsafe impl<'vtab> VTab<'vtab> for KbTab {
     ) -> Result<(Cow<'static, CStr>, Self)> {
         let prefix = parse_prefix(&args[3.min(args.len())..])?;
         let handle = unsafe { db.handle() };
+        let conn = unsafe { Connection::from_handle(handle) }?;
         Ok((
             Cow::Borrowed(KB_SCHEMA),
             KbTab {
                 base: ffi::sqlite3_vtab::default(),
                 db: handle,
                 prefix,
+                conn,
             },
         ))
     }
@@ -216,9 +235,11 @@ unsafe impl<'vtab> VTab<'vtab> for KbTab {
             base: ffi::sqlite3_vtab_cursor::default(),
             rows: Vec::new(),
             i: 0,
-            prefix: self.prefix.clone(),
-            db: self.db,
-            phantom: PhantomData,
+            // Shared borrow of the table: the cursor reads its prefix and, more to the
+            // point, prepares through the table's connection so the statement cache
+            // survives the call. Several cursors can be open at once, which is why this is
+            // a shared reference and why `prepare_cached` taking `&self` matters.
+            tab: &*self,
         })
     }
 }
@@ -235,21 +256,19 @@ impl CreateVTab<'_> for KbTab {
         args: &[&[u8]],
     ) -> Result<(Cow<'static, CStr>, Self)> {
         let (schema, tab) = Self::connect(db, aux, module_name, database_name, table_name, args)?;
-        let conn = tab.conn()?;
-        TextDb::open(&conn, &tab.prefix).map_err(map_err)?;
+        TextDb::open(tab.conn(), &tab.prefix).map_err(map_err)?;
         Ok((schema, tab))
     }
 
     fn destroy(&self) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute_batch(&crate::schema::drop_sql(&self.prefix))
+        self.conn().execute_batch(&crate::schema::drop_sql(&self.prefix))
     }
 }
 
 impl UpdateVTab<'_> for KbTab {
     fn delete(&mut self, arg: ValueRef<'_>) -> Result<()> {
         let id = ref_i64(arg).ok_or_else(|| Error::ModuleError("bad rowid".into()))?;
-        let conn = self.conn()?;
+        let conn = self.conn();
         let db = TextDb::attach(&conn, &self.prefix, false);
         let n = db
             .node_by_id(id)
@@ -259,7 +278,7 @@ impl UpdateVTab<'_> for KbTab {
     }
 
     fn insert(&mut self, args: &Inserts<'_>) -> Result<i64> {
-        let conn = self.conn()?;
+        let conn = self.conn();
         let db = TextDb::attach(&conn, &self.prefix, false);
         let path = value_str(args.get::<Value>(2 + COL_PATH as usize)?)
             .ok_or_else(|| Error::ModuleError("TX004 path is required".into()))?;
@@ -285,7 +304,7 @@ impl UpdateVTab<'_> for KbTab {
     }
 
     fn update(&mut self, args: &Updates<'_>) -> Result<()> {
-        let conn = self.conn()?;
+        let conn = self.conn();
         let db = TextDb::attach(&conn, &self.prefix, false);
         let id = value_i64(args.get::<Value>(0)?).ok_or_else(|| Error::ModuleError("bad rowid".into()))?;
         let n = db
@@ -331,24 +350,22 @@ pub struct KbCursor<'vtab> {
     base: ffi::sqlite3_vtab_cursor,
     rows: Vec<KbRow>,
     i: usize,
-    prefix: String,
-    db: *mut ffi::sqlite3,
-    phantom: PhantomData<&'vtab KbTab>,
+    tab: &'vtab KbTab,
 }
 
 unsafe impl VTabCursor for KbCursor<'_> {
     fn filter(&mut self, idx_num: c_int, _idx_str: Option<&str>, args: &Filters<'_>) -> Result<()> {
-        let conn = unsafe { Connection::from_handle(self.db) }?;
+        let prefix = &self.tab.prefix;
         let cols = "id, path, name, kind, root, version, nbytes, nlines, updated_at, updated_by";
         let (sql, params): (String, Vec<Value>) = match idx_num {
             IDX_PATH_EQ => (
-                format!("SELECT {} FROM {}node WHERE path = ?1 AND deleted_at IS NULL", cols, self.prefix),
+                format!("SELECT {} FROM {}node WHERE path = ?1 AND deleted_at IS NULL", cols, prefix),
                 vec![Value::Text(
                     normalize_path(&value_str(args.get::<Value>(0)?).unwrap_or_default()).unwrap_or_default(),
                 )],
             ),
             IDX_ID_EQ => (
-                format!("SELECT {} FROM {}node WHERE id = ?1 AND deleted_at IS NULL", cols, self.prefix),
+                format!("SELECT {} FROM {}node WHERE id = ?1 AND deleted_at IS NULL", cols, prefix),
                 vec![Value::Integer(value_i64(args.get::<Value>(0)?).unwrap_or(-1))],
             ),
             n if n & IDX_PATH_RANGE != 0 => {
@@ -367,19 +384,22 @@ unsafe impl VTabCursor for KbCursor<'_> {
                     vals.push(Value::Text(value_str(args.get::<Value>(arg)?).unwrap_or_default()));
                 }
                 (
-                    format!("SELECT {} FROM {}node WHERE {} ORDER BY path", cols, self.prefix, where_),
+                    format!("SELECT {} FROM {}node WHERE {} ORDER BY path", cols, prefix, where_),
                     vals,
                 )
             }
             _ => (
                 format!(
                     "SELECT {} FROM {}node WHERE deleted_at IS NULL AND path <> '/' ORDER BY path",
-                    cols, self.prefix
+                    cols, prefix
                 ),
                 Vec::new(),
             ),
         };
-        let mut stmt = conn.prepare(&sql)?;
+        // `prepare_cached` on the *table's* connection: the cache lives as long as the
+        // table, so the second and later reads through it compile nothing. There are only
+        // ever a handful of distinct statements here — one per idx_num shape.
+        let mut stmt = self.tab.conn().prepare_cached(&sql)?;
         let map = |r: &rusqlite::Row| -> rusqlite::Result<KbRow> {
             let root: Option<Vec<u8>> = r.get(4)?;
             Ok(KbRow {
@@ -425,8 +445,7 @@ unsafe impl VTabCursor for KbCursor<'_> {
                 }
                 match r.root {
                     Some(root) if r.kind == 1 => {
-                        let conn = unsafe { Connection::from_handle(self.db) }?;
-                        let st = crate::storage::SqliteStorage::new(&conn, &self.prefix);
+                        let st = crate::storage::SqliteStorage::new(self.tab.conn(), &self.tab.prefix);
                         let (bytes, utf8) = st.document(&root).map_err(map_err)?;
                         // The UTF-8 check already ran for exactly these bytes, and the
                         // root hash they are keyed by is derived from them, so the answer
@@ -507,6 +526,11 @@ pub struct FnTab {
     db: *mut ffi::sqlite3,
     prefix: String,
     kind: FnKind,
+    /// Same long-lived non-owning handle as `KbTab` holds, for the same reason: `db.rs` and
+    /// `storage.rs` prepare everything through `prepare_cached`, and a `Connection` built
+    /// per call throws that cache away before it can be used twice. `textdb_search` runs
+    /// several statements per call, so it was recompiling all of them every time.
+    conn: Connection,
 }
 
 unsafe impl<'vtab> VTab<'vtab> for FnTab {
@@ -523,6 +547,7 @@ unsafe impl<'vtab> VTab<'vtab> for FnTab {
     ) -> Result<(Cow<'static, CStr>, Self)> {
         let spec = aux.ok_or_else(|| Error::ModuleError("missing function spec".into()))?;
         let handle = unsafe { db.handle() };
+        let conn = unsafe { Connection::from_handle(handle) }?;
         Ok((
             Cow::Borrowed(spec.kind.schema()),
             FnTab {
@@ -530,6 +555,7 @@ unsafe impl<'vtab> VTab<'vtab> for FnTab {
                 db: handle,
                 prefix: spec.prefix.clone(),
                 kind: spec.kind,
+                conn,
             },
         ))
     }
@@ -561,11 +587,16 @@ unsafe impl<'vtab> VTab<'vtab> for FnTab {
             base: ffi::sqlite3_vtab_cursor::default(),
             rows: Vec::new(),
             i: 0,
-            db: self.db,
-            prefix: self.prefix.clone(),
             kind: self.kind,
-            phantom: PhantomData,
+            tab: &*self,
         })
+    }
+}
+
+impl FnTab {
+    /// The table's own handle; see the field comment for why it lives here.
+    fn conn(&self) -> &Connection {
+        &self.conn
     }
 }
 
@@ -578,10 +609,8 @@ pub struct FnCursor<'vtab> {
     base: ffi::sqlite3_vtab_cursor,
     rows: Vec<Vec<Value>>,
     i: usize,
-    db: *mut ffi::sqlite3,
-    prefix: String,
     kind: FnKind,
-    phantom: PhantomData<&'vtab FnTab>,
+    tab: &'vtab FnTab,
 }
 
 unsafe impl VTabCursor for FnCursor<'_> {
@@ -603,8 +632,7 @@ unsafe impl VTabCursor for FnCursor<'_> {
                 _ => None,
             }
         };
-        let conn = unsafe { Connection::from_handle(self.db) }?;
-        let db = TextDb::attach(&conn, &self.prefix, false);
+        let db = TextDb::attach(self.tab.conn(), &self.tab.prefix, false);
         self.rows = match self.kind {
             FnKind::Ls => {
                 let dir = s(&hidden[0]).unwrap_or_else(|| "/".into());
