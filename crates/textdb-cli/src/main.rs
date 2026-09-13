@@ -851,15 +851,17 @@ fn tree(st: &mut dyn Store, path: &str, depth: Option<usize>, dirs_only: bool, j
     let root = normalize_path(path)?;
     let base_len = if root == "/" { 0 } else { root.len() };
     let mut entries = st.nodes(&root)?;
-    entries.retain(|e| {
-        let rel = e.path[base_len.min(e.path.len())..].trim_start_matches('/');
-        let level = if rel.is_empty() { 1 } else { rel.split('/').count() };
-        depth.is_none_or(|d| level <= d) && (!dirs_only || e.kind == "folder")
-    });
     if json {
+        entries.retain(|e| {
+            let rel = e.path[base_len.min(e.path.len())..].trim_start_matches('/');
+            let level = if rel.is_empty() { 1 } else { rel.split('/').count() };
+            depth.is_none_or(|d| level <= d) && (!dirs_only || e.kind == "folder")
+        });
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         return emit_json(&entries);
     }
+    // The text tree is built from everything under `root`, so a folder's counts cover its
+    // whole subtree however little of it `--depth` lets through.
     let mut top = TreeNode::default();
     for e in entries {
         let rel = e.path[base_len.min(e.path.len())..].trim_start_matches('/').to_string();
@@ -881,7 +883,7 @@ fn tree(st: &mut dyn Store, path: &str, depth: Option<usize>, dirs_only: bool, j
         node.entry = Some(e);
     }
     let mut s = format!("{root}  ({}, {})\n", count_files(top.files), human_bytes(top.bytes));
-    render_tree(&top, "", &mut s);
+    render_tree(&top, "", depth, dirs_only, &mut s);
     out(s.as_bytes())
 }
 
@@ -889,15 +891,20 @@ fn count_files(n: usize) -> String {
     if n == 1 { "1 file".to_string() } else { format!("{n} files") }
 }
 
-fn render_tree(node: &TreeNode, indent: &str, s: &mut String) {
-    let mut kids: Vec<(&String, &TreeNode)> = node.children.iter().collect();
+/// Draw `node`'s children, and their children down to `depth` more levels (all when `None`).
+fn render_tree(node: &TreeNode, indent: &str, depth: Option<usize>, dirs_only: bool, s: &mut String) {
+    if depth == Some(0) {
+        return;
+    }
+    let mut kids: Vec<(&String, &TreeNode)> = node.children.iter().filter(|(_, n)| !dirs_only || n.is_folder()).collect();
     kids.sort_by_key(|(name, n)| (!n.is_folder(), name.to_lowercase()));
     for (i, (name, kid)) in kids.iter().enumerate() {
         let last = i + 1 == kids.len();
         let branch = if last { "└── " } else { "├── " };
         if kid.is_folder() {
             s.push_str(&format!("{indent}{branch}{name}/  ({}, {})\n", count_files(kid.files), human_bytes(kid.bytes)));
-            render_tree(kid, &format!("{indent}{}", if last { "    " } else { "│   " }), s);
+            let indent = format!("{indent}{}", if last { "    " } else { "│   " });
+            render_tree(kid, &indent, depth.map(|d| d - 1), dirs_only, s);
         } else {
             let size = kid.entry.as_ref().and_then(|e| e.nbytes).unwrap_or(0);
             s.push_str(&format!("{indent}{branch}{name}  {}\n", human_bytes(size)));

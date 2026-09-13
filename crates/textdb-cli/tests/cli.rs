@@ -74,6 +74,9 @@ fn import_browse_edit_by_line_and_handle_conflicts() {
 
     let tree = ok(textdb(&store).args(["tree", "/docs"]), None).stdout;
     assert!(tree.contains("guide/") && tree.contains("notes.md") && tree.contains("readme.txt"), "{tree}");
+    // A shallow tree still counts everything below each folder it shows.
+    let top = ok(textdb(&store).args(["tree", "/docs", "-L", "1"]), None).stdout;
+    assert!(top.contains("guide/  (2 files,") && !top.contains("intro.md"), "{top}");
     let shallow = ok(textdb(&store).args(["--json", "tree", "/docs", "-L", "1"]), None).json();
     let paths: Vec<&str> = shallow.as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
     assert_eq!(paths, ["/docs/guide", "/docs/readme.txt"]);
