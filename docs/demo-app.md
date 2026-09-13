@@ -20,6 +20,7 @@ The HTTP API and the client semantics are specified in [`live-app.md`](live-app.
 | **Activity** | Every change in the store, newest first; *Others only* hides your own; an import collapses to one row |
 | **Search** | `/` focuses it: terms are ANDed per document, `"phrases"` and `prefix*` work; results jump to the line |
 | **Import folder** | Pick a folder (Chrome and Edge read it lazily with the directory picker; other browsers take a whole-folder file input), choose the destination folder, tick the file types to import from those actually found in the folder (with file counts and sizes, likely-binary types flagged; or type extensions), and watch progress. Unchanged files make no new version; binary, non-UTF-8, unreadable (for example online-only cloud files) and oversized files are skipped with the reason |
+| **Export** | *Export…* in the folder view, or *Export to disk…* on a folder's menu. Chrome and Edge write into a folder you pick: a plan first lists what is new, changed and already identical on disk (same size, then SHA-256), and only new and changed files are written, byte for byte, with progress and *Stop*. Nothing on disk is deleted, so exporting over a git checkout that was imported shows only the real changes. Names that cannot coexist on your system — differing only in letter case (Windows, macOS) or Unicode normalization (macOS), Windows reserved names or characters, clashes with what is already on disk — stop the export and are listed; problems only on other systems are warnings. Other browsers download a zip, after the same name check |
 | **Rename, move, delete** | Files and whole folders. A delete shows what it takes and, past 50 files, asks for the folder's name |
 | **Trash** | A system folder at the bottom of the tree. Deleted files and folders stay browsable, a deleted file readable at any of its versions and downloadable; *Permanently remove* an entry or *Permanently clean trash*, both confirmed. Purging frees content no other file or version shares |
 | **Download / replace** | Download a file (the version shown). Replace a file with one from your computer: the dialog shows how many lines it adds and removes, then commits it as the next version |
@@ -144,6 +145,9 @@ TEXTDB_DB=../../kb.db npm start
    the rename appear between the versions.
 5. Delete a folder, open *Trash*, read a file in it, then *Permanently remove* it.
 6. *Import folder…* in the header: pick a folder of markdown and watch the progress.
+7. Edit one of the imported files, then *Export…* in that folder's view into the original
+   folder: the plan shows one changed file and the rest identical; `git status` there shows
+   just that file.
 
 ## Limits and behaviour worth knowing
 
@@ -151,6 +155,11 @@ TEXTDB_DB=../../kb.db npm start
   files; eight files are read at a time, a file not read within 60 s or larger than 64 MiB is
   skipped, and the server accepts at most 5000 files per request. Nothing is sent until you
   confirm the destination.
+- **Export** round-trips bytes exactly: textdb stores what the import read, CRLF and BOM
+  included, and never converts. Git settings that convert line endings on checkout
+  (`core.autocrlf`, `.gitattributes` `eol=`) apply as for any edit made on disk. Files deleted or
+  renamed in textdb are not removed from the target folder, and the executable bit and symbolic
+  links are not something textdb stores: overwritten files keep their permissions.
 - **Deletes are soft** until purged: a deleted file keeps its content and every version in the
   trash. Purging removes them for good and frees the content no remaining file or version
   shares; the SQLite file does not shrink, its free pages are reused.

@@ -1170,6 +1170,7 @@ dependencies = [
  "tempfile",
  "textdb-core",
  "textdb-sqlite",
+ "unicode-normalization",
 ]
 
 [[package]]

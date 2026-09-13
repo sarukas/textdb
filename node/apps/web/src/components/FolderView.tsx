@@ -372,7 +372,7 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
     const items: MenuItem[] = [
       { label: folder ? "Open folder" : "Open", hint: "Enter", run: () => open(e) },
       ...(folder
-        ? []
+        ? [{ label: "Export to disk…", run: () => onAction(actionFor("export", e)) }]
         : [
             { label: "Download", run: () => onAction(actionFor("download", e)) },
             { label: "Replace with a file…", run: () => onAction(actionFor("replace", e)) },
@@ -707,6 +707,14 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
             Subfolders
           </label>
           <ColumnChooser columns={columns} onChange={changeColumns} />
+          <button
+            type="button"
+            className="btn btn-small"
+            onClick={() => onAction({ op: "export", path, kind: "folder" })}
+            title={`Write the files in ${label} to a folder on this computer`}
+          >
+            Export…
+          </button>
         </div>
       </div>
 

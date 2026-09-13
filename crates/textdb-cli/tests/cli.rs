@@ -162,6 +162,57 @@ fn import_browse_edit_by_line_and_handle_conflicts() {
 }
 
 #[test]
+fn export_writes_only_what_differs_and_stops_on_clashing_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    corpus(&src);
+    let store = tmp.path().join("kb.db");
+    ok(textdb(&store).arg("import").arg(&src).args(["--prefix", "/docs"]), None);
+    ok(textdb(&store).args(["write", "/docs/crlf.md"]), Some("\u{feff}one\r\ntwo\r\n"));
+
+    // A first export writes everything, a second nothing: every file is already identical.
+    let out = tmp.path().join("checkout");
+    let first = ok(textdb(&store).args(["--json", "export", "/docs"]).arg(&out), None).json();
+    assert_eq!((first["new"].as_array().unwrap().len(), first["written"].as_i64()), (4, Some(4)), "{first}");
+    assert_eq!(std::fs::read(out.join("crlf.md")).unwrap(), "\u{feff}one\r\ntwo\r\n".as_bytes());
+    let again = ok(textdb(&store).args(["--json", "export", "/docs"]).arg(&out), None).json();
+    assert_eq!((again["unchanged"].as_i64(), again["written"].as_i64()), (Some(4), Some(0)), "{again}");
+
+    // Change one file in the store and one on disk; add a file only on disk.
+    ok(textdb(&store).args(["write", "/docs/readme.txt"]), Some("hello again\n"));
+    std::fs::write(out.join("guide/deep/notes.md"), "edited on disk\n").unwrap();
+    std::fs::write(out.join("untracked.md"), "only on disk\n").unwrap();
+    let dry = ok(textdb(&store).args(["--json", "export", "--dry-run", "/docs"]).arg(&out), None).json();
+    assert_eq!(dry["changed"], serde_json::json!(["guide/deep/notes.md", "readme.txt"]), "{dry}");
+    assert_eq!((dry["written"].as_i64(), dry["unchanged"].as_i64()), (Some(0), Some(2)));
+    assert_eq!(std::fs::read_to_string(out.join("readme.txt")).unwrap(), "hello\n");
+
+    let text = ok(textdb(&store).args(["export", "/docs"]).arg(&out), None).stdout;
+    assert!(text.contains("0 new, 2 changed, 2 unchanged; wrote 2 files"), "{text}");
+    assert_eq!(std::fs::read_to_string(out.join("readme.txt")).unwrap(), "hello again\n");
+    assert_eq!(std::fs::read_to_string(out.join("untracked.md")).unwrap(), "only on disk\n");
+
+    // Names that differ only in case are one file on Windows and macOS: nothing is written there.
+    ok(textdb(&store).args(["write", "/docs/README.TXT"]), Some("shouting\n"));
+    let clash = run(textdb(&store).args(["--json", "export", "/docs"]).arg(&out), None);
+    let report = clash.json();
+    let kinds: Vec<&str> = report["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["path"] == "README.TXT")
+        .map(|p| p["kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"case"), "{report}");
+    if cfg!(any(windows, target_os = "macos")) {
+        assert_eq!((clash.status, report["stopped"].as_bool(), report["written"].as_i64()), (6, Some(true), Some(0)));
+        assert_eq!(std::fs::read_to_string(out.join("readme.txt")).unwrap(), "hello again\n");
+    } else {
+        assert_eq!((clash.status, report["written"].as_i64()), (0, Some(1)));
+    }
+}
+
+#[test]
 fn renames_moves_and_deletes_show_in_history_unless_turned_off() {
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("kb.db");

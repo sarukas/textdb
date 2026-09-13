@@ -4,6 +4,7 @@ export {
   type BulkOptions,
   type BulkResult,
   Corpus,
+  type ExportFile,
   type OpenOptions,
   type PathEvent,
   type PurgeStats,

@@ -510,24 +510,4 @@ impl Store for PgStore {
         progress(&stats);
         Ok(stats)
     }
-
-    fn export(&mut self, prefix: &str, sink: &mut dyn FnMut(&str, &[u8]) -> std::io::Result<()>) -> Result<usize> {
-        let prefix = normalize_path(prefix)?;
-        let paths: Vec<String> = self
-            .client
-            .query(
-                "SELECT path FROM kb.node WHERE kind = 1 AND deleted_at IS NULL \
-                 AND ($1 = '/' OR path LIKE kb._subtree_like($1)) ORDER BY path",
-                &[&prefix],
-            )
-            .map_err(pg)?
-            .iter()
-            .map(|r| r.get(0))
-            .collect();
-        for path in &paths {
-            let (body, _) = self.read(path, None)?;
-            sink(path, &body)?;
-        }
-        Ok(paths.len())
-    }
 }

@@ -433,13 +433,4 @@ impl Store for SqliteStore {
         progress(&stats);
         Ok(stats)
     }
-
-    fn export(&mut self, prefix: &str, sink: &mut dyn FnMut(&str, &[u8]) -> std::io::Result<()>) -> Result<usize> {
-        let db = self.db();
-        let files = db.list_files(prefix)?;
-        for n in &files {
-            sink(&n.path, &db.read(&n.path)?)?;
-        }
-        Ok(files.len())
-    }
 }

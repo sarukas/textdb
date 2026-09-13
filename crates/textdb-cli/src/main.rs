@@ -8,7 +8,7 @@
 mod config;
 mod store;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -23,6 +23,8 @@ use config::StoreUrl;
 use store::{Change, Commit, Entry, ImportStats, PathEvent, Store, StoreError, Written};
 
 type Result<T> = std::result::Result<T, StoreError>;
+
+mod portable;
 
 #[derive(Parser)]
 #[command(
@@ -92,11 +94,16 @@ enum Cmd {
         #[arg(long, default_value_t = 500)]
         batch: usize,
     },
-    /// Write every file under a folder to a local directory.
+    /// Write the files under a folder to a local directory: only new and changed ones (compared
+    /// byte for byte), and nothing on disk is deleted, so a git checkout shows exactly what changed
+    /// in the store. Stops before writing when names cannot coexist on this computer.
     Export {
         #[arg(value_parser = store_path)]
         prefix: String,
         dir: PathBuf,
+        /// List what would be written, and any name problems, without writing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List one folder.
     Ls {
@@ -107,7 +114,7 @@ enum Cmd {
         #[arg(long, short = 'l')]
         long: bool,
         /// Order by this; folders stay before files.
-        #[arg(long, short = 's', value_enum, default_value_t = SortKey::Name)]
+        #[arg(long, short = 'S', value_enum, default_value_t = SortKey::Name)]
         sort: SortKey,
         /// Reverse the order.
         #[arg(long, short = 'r')]
@@ -317,22 +324,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             }
         }
         Cmd::Import { dir, prefix, ext, batch } => import(st, &dir, &prefix, &ext, batch, author, json),
-        Cmd::Export { prefix, dir } => {
-            let prefix = normalize_path(&prefix)?;
-            let n = st.export(&prefix, &mut |path: &str, body: &[u8]| {
-                let rel = if prefix == "/" { path } else { &path[prefix.len()..] };
-                let target = dir.join(rel.trim_start_matches('/'));
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(target, body)
-            })?;
-            if json {
-                emit_json(&json!({ "exported": n, "dir": dir.display().to_string() }))
-            } else {
-                line(format!("exported {n} files to {}", dir.display()))
-            }
-        }
+        Cmd::Export { prefix, dir, dry_run } => export(st, &prefix, &dir, dry_run, json),
         Cmd::Ls {
             path,
             long,
@@ -679,6 +671,184 @@ fn report(e: &StoreError, json: bool) {
         eprintln!("--- base\n{}--- theirs (current text)\n{}--- ours\n{}", text("base"), text("theirs"), text("ours"));
         eprintln!("Rebuild the change on 'theirs' and write again with --base-version {}.", c["current_version"]);
     }
+}
+
+#[derive(Serialize, Default)]
+struct ExportReport {
+    prefix: String,
+    dir: String,
+    dry_run: bool,
+    new: Vec<String>,
+    changed: Vec<String>,
+    unchanged: usize,
+    skipped: Vec<ExportSkip>,
+    problems: Vec<portable::Problem>,
+    /// Blocking problems: nothing was written.
+    stopped: bool,
+    written: usize,
+    bytes: u64,
+}
+
+#[derive(Serialize)]
+struct ExportSkip {
+    path: String,
+    reason: String,
+}
+
+/// The names in `dir`, keyed as the file system on `here` compares them; `None` when unreadable.
+fn names_in(dir: &Path, here: portable::Platform) -> Option<HashMap<String, String>> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    Some(
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                (portable::fold(&name, here), name)
+            })
+            .collect(),
+    )
+}
+
+/// `textdb export`: plan against what is in `dir`, then write only new and changed files.
+fn export(st: &mut dyn Store, prefix: &str, dir: &Path, dry_run: bool, json: bool) -> Result<()> {
+    let prefix = normalize_path(prefix)?;
+    let here = portable::Platform::current();
+    let files: Vec<Entry> = st.nodes(&prefix)?.into_iter().filter(|e| e.kind == "file").collect();
+    let base = if prefix == "/" { 0 } else { prefix.len() };
+    let rels: Vec<String> = files
+        .iter()
+        .map(|f| if f.path == prefix { f.name.clone() } else { f.path[base..].trim_start_matches('/').to_string() })
+        .collect();
+    let mut problems = portable::Problems::new(here);
+    portable::check_names(&rels, &mut problems);
+    let mut report = ExportReport {
+        prefix: prefix.clone(),
+        dir: dir.display().to_string(),
+        dry_run,
+        ..Default::default()
+    };
+
+    let mut listings: HashMap<PathBuf, Option<HashMap<String, String>>> = HashMap::new();
+    let mut to_write: Vec<usize> = Vec::new();
+    'files: for (i, f) in files.iter().enumerate() {
+        let rel = &rels[i];
+        let segs: Vec<&str> = rel.split('/').collect();
+        let mut target = dir.to_path_buf();
+        for (k, seg) in segs.iter().enumerate() {
+            let last = k + 1 == segs.len();
+            let shown = if last { rel.clone() } else { format!("{}/", segs[..=k].join("/")) };
+            // Where case does not count, `README.md` would overwrite a `Readme.md` already there.
+            if here.case_insensitive() {
+                let names = listings.entry(target.clone()).or_insert_with(|| names_in(&target, here));
+                if let Some(on_disk) = names.as_ref().and_then(|n| n.get(&portable::fold(seg, here))) {
+                    if on_disk != seg {
+                        problems.add(shown, "disk-case", format!("exists on disk as “{on_disk}”"), &[here]);
+                        continue 'files;
+                    }
+                }
+            }
+            target.push(seg);
+            if !last && target.exists() && !target.is_dir() {
+                problems.add(shown, "disk-kind", "is a file on disk; the export needs a folder here".into(), &portable::ALL);
+                continue 'files;
+            }
+        }
+        match std::fs::symlink_metadata(&target) {
+            Err(_) => {
+                report.new.push(rel.clone());
+                to_write.push(i);
+            }
+            Ok(meta) if meta.is_dir() => {
+                problems.add(rel.clone(), "disk-kind", "is a folder on disk; the export needs a file here".into(), &portable::ALL)
+            }
+            Ok(meta) => {
+                let disk_len = std::fs::metadata(&target).map(|m| m.len()).ok();
+                let same = disk_len.is_some()
+                    && disk_len == f.nbytes.map(|n| n as u64)
+                    && std::fs::read(&target).ok() == Some(st.read(&f.path, None)?.0);
+                if same {
+                    report.unchanged += 1;
+                } else if meta.file_type().is_symlink() {
+                    report.skipped.push(ExportSkip {
+                        path: rel.clone(),
+                        reason: "a symbolic link on disk, left as it is".into(),
+                    });
+                } else {
+                    report.changed.push(rel.clone());
+                    to_write.push(i);
+                }
+            }
+        }
+    }
+    report.problems = problems.into_vec();
+    let blocking = report.problems.iter().filter(|p| p.blocking).count();
+    report.stopped = blocking > 0;
+
+    if !report.stopped && !dry_run {
+        for &i in &to_write {
+            let (body, _) = st.read(&files[i].path, None)?;
+            let target = dir.join(&rels[i]);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // An existing file is truncated in place rather than replaced, so it keeps its
+            // permissions: an executable script stays executable.
+            let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&target)?;
+            file.write_all(&body)?;
+            report.written += 1;
+            report.bytes += body.len() as u64;
+        }
+    }
+
+    if json {
+        emit_json(&report)?;
+        if report.stopped {
+            std::process::exit(6);
+        }
+        return Ok(());
+    }
+    let mut s = String::new();
+    if dry_run {
+        for r in &report.new {
+            s.push_str(&format!("new      {r}\n"));
+        }
+        for r in &report.changed {
+            s.push_str(&format!("changed  {r}\n"));
+        }
+    }
+    for k in &report.skipped {
+        s.push_str(&format!("skipped  {}: {}\n", k.path, k.reason));
+    }
+    for p in &report.problems {
+        if p.blocking {
+            s.push_str(&format!("problem  {}: {}\n", p.path, p.detail));
+        } else {
+            let on: Vec<&str> = p.platforms.iter().map(|x| x.name()).collect();
+            s.push_str(&format!("warning  {}: {} (on {})\n", p.path, p.detail, on.join(", ")));
+        }
+    }
+    let counts = format!("{} new, {} changed, {} unchanged", report.new.len(), report.changed.len(), report.unchanged);
+    if report.stopped {
+        s.push_str(&format!("nothing written: {counts}\n"));
+    } else if dry_run {
+        s.push_str(&format!("dry run: {counts}; nothing written\n"));
+    } else {
+        s.push_str(&format!(
+            "exported {prefix} to {}: {counts}; wrote {} files, {}\n",
+            dir.display(),
+            report.written,
+            human_bytes(report.bytes as i64)
+        ));
+    }
+    out(s.as_bytes())?;
+    if report.stopped {
+        return Err(StoreError::invalid(format!(
+            "export stopped: {blocking} {} cannot be written on this computer; rename {} in the store",
+            if blocking == 1 { "name" } else { "names" },
+            if blocking == 1 { "it" } else { "them" }
+        )));
+    }
+    Ok(())
 }
 
 /// What `ls --sort` orders by.

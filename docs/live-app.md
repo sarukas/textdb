@@ -72,6 +72,10 @@ Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./
 | `GET /api/list?path=/a[&sort=name][&order=asc][&offset=0][&limit=200][&recursive=1][&name=…][&author=…][&type=md][&kind=file]` | | `{ path, total, offset, entries: [entry] }` — one page, sorted and filtered in the store. `sort` ∈ `name, type, size, lines, words, versions, created, updated, authors`; folders come first except when `recursive`. `name` matches names containing it, or as a glob with `*`/`?`; `author` keeps files that author committed to (`''` for commits without one); `type` is an extension. `limit` ≤ 1000; `total` counts every match |
 | `GET /api/entry?path=…` | | one `entry`, the root included |
 | `POST /api/bulk` | `{ op: "move" \| "delete", paths: [...], to?, author? }` (at most 10000 paths) | `{ op, to, done, skipped }` — one transaction: all move (into folder `to`, keeping names) or delete, or none do. A path inside another listed folder goes with it and is `skipped`, as is a move to where a path already is |
+| `GET /api/export/files?path=/a` | | `{ path, files: [{ rel, nbytes, updated_at }] }` — every file below the folder (the whole store without `path`), by path, `rel` relative to it |
+| `POST /api/export/hashes` | `{ paths: [...] }` (at most 1000) | `{ hashes: [{ path, sha256 }] }` — SHA-256 of each file's stored bytes, so a client can compare with a file on disk without downloading it |
+| `GET /api/export/file?path=/a/b.md` | | the file's stored bytes, unchanged (`application/octet-stream`): line endings and byte-order mark as imported |
+| `GET /api/export/zip?path=/a` | | a zip of every file below the folder, entries named relative to it, streamed as it is built |
 | `GET /api/file?path=/a/b.md[&version=n]` | | `{ path, version, head_version, content, nbytes, nlines, updated_at, updated_by }` |
 | `GET /api/chunks?path=…[&version=n]` | | `[{ ord, hash, byte_from, nbytes, line_from, nlines }]` |
 | `GET /api/history?path=…` | | `[{ version, author, ts, message, nbytes, kind, base_version }]` oldest first |

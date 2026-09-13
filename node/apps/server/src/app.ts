@@ -1,5 +1,8 @@
+import { createHash } from 'node:crypto';
+import { Readable } from 'node:stream';
 import { type Corpus, NotFound, SORT_KEYS, type SortKey } from '@textdb/node';
 import { Hono } from 'hono';
+import { ZipFile } from 'yazl';
 import { cors } from 'hono/cors';
 import { badRequest, errorResponse } from './errors.ts';
 import { eventStream } from './events.ts';
@@ -23,6 +26,8 @@ export interface AppOptions {
 }
 
 const MAX_BULK_PATHS = 10_000;
+/** Files hashed per export comparison request. */
+const MAX_HASH_PATHS = 1000;
 
 const LOCAL_ORIGIN =/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
 
@@ -103,6 +108,49 @@ export function createApp(corpus: Corpus, hub: ChangeHub, options: AppOptions): 
 
   app.get('/api/stat', (c) => c.json(corpus.stat(queryString(c, 'path'))));
   app.get('/api/entry', (c) => c.json(corpus.entry(queryString(c, 'path'))));
+
+  // Export. A client compares what is on its disk with these, then fetches only what differs.
+  app.get('/api/export/files', (c) => {
+    const dir = c.req.query('path') || '/';
+    const files = corpus.exportFiles(dir).map(({ rel, nbytes, updated_at }) => ({ rel, nbytes, updated_at }));
+    return c.json({ path: dir, files });
+  });
+  app.post('/api/export/hashes', async (c) => {
+    const body = await jsonBody(c);
+    const paths = body.paths;
+    if (!Array.isArray(paths) || paths.some((p) => typeof p !== 'string')) throw badRequest('paths must be an array of strings');
+    if (paths.length > MAX_HASH_PATHS) throw badRequest(`at most ${MAX_HASH_PATHS} paths per request`);
+    const hashes = (paths as string[]).map((p) => ({ path: p, sha256: createHash('sha256').update(corpus.readBytes(p)).digest('hex') }));
+    return c.json({ hashes });
+  });
+  app.get('/api/export/file', (c) =>
+    c.body(new Uint8Array(corpus.readBytes(queryString(c, 'path'))), 200, {
+      'Content-Type': 'application/octet-stream',
+      'Cache-Control': 'no-store',
+    }),
+  );
+  app.get('/api/export/zip', (c) => {
+    const dir = c.req.query('path') || '/';
+    const files = corpus.exportFiles(dir);
+    const zip = new ZipFile();
+    for (const f of files) {
+      // Each entry is read from the store only when the archive reaches it, so a large folder
+      // streams out without being held in memory.
+      const lazy = Readable.from(
+        (function* () {
+          yield Buffer.from(corpus.readBytes(f.path));
+        })(),
+      );
+      zip.addReadStream(lazy, f.rel, { mtime: new Date(f.updated_at) });
+    }
+    zip.end();
+    const name = `${dir === '/' ? 'corpus' : dir.slice(dir.lastIndexOf('/') + 1)}.zip`;
+    return c.body(Readable.toWeb(zip.outputStream as Readable) as unknown as ReadableStream, 200, {
+      'Content-Type': 'application/zip',
+      'Content-Disposition': `attachment; filename="${name.replace(/[^\x20-\x7e]|["\\]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(name)}`,
+      'Cache-Control': 'no-store',
+    });
+  });
   app.post('/api/bulk', async (c) => {
     const body = await jsonBody(c);
     const op = bodyString(body, 'op');

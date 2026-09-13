@@ -10,6 +10,7 @@ import {
 } from "./api";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { DocumentPane, type Mode, type OpenDoc } from "./components/DocumentPane";
+import { ExportDialog } from "./components/ExportDialog";
 import { FolderView } from "./components/FolderView";
 import { Header } from "./components/Header";
 import { ImportDialog } from "./components/ImportDialog";
@@ -62,6 +63,8 @@ export function App() {
   const [lastSeq, setLastSeq] = useState(0);
   const [feed, setFeed] = useState<FeedItem[]>([]);
   const [importing, setImporting] = useState(false);
+  /** The folder being exported. */
+  const [exporting, setExporting] = useState<string | null>(null);
   const [pathAction, setPathAction] = useState<PathAction | null>(null);
   const [trashAction, setTrashAction] = useState<TrashAction | null>(null);
   const [trashDoc, setTrashDoc] = useState<number | null>(initial?.type === "trash" ? initial.id : null);
@@ -82,6 +85,8 @@ export function App() {
           (f) => downloadText(baseName(f.path), f.content),
           (e: unknown) => toast(`Could not download ${action.path}: ${e instanceof Error ? e.message : String(e)}`, "error"),
         );
+      } else if (action.op === "export") {
+        setExporting(action.path);
       } else if (action.op === "replace") {
         replaceTarget.current = action.path;
         fileInput.current?.click();
@@ -243,6 +248,7 @@ export function App() {
         onImport={() => setImporting(true)}
       />
       {importing && <ImportDialog author={author} onClose={() => setImporting(false)} onOpen={openFile} />}
+      {exporting !== null && <ExportDialog key={exporting} path={exporting} onClose={() => setExporting(null)} />}
       {pathAction?.op === "move" && (
         <MoveDialog
           key={pathAction.path}

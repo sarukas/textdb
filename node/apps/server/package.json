@@ -19,10 +19,12 @@
     "@hono/node-server": "^2.1.1",
     "@textdb/node": "file:../../packages/textdb",
     "hono": "^4.13.7",
-    "tsx": "^4.23.13"
+    "tsx": "^4.23.13",
+    "yazl": "^3.3.1"
   },
   "devDependencies": {
     "@types/node": "^24.13.4",
+    "@types/yazl": "^3.3.1",
     "typescript": "^7.0.2"
   }
 }

@@ -376,6 +376,7 @@ export function FileTree({
               ? [
                   { label: "Open folder", hint: "Enter", run: () => onOpenFolder(row.entry.path) },
                   { label: row.open ? "Collapse" : "Expand", hint: row.open ? "←" : "→", run: () => toggle(row.entry.path) },
+                  { label: "Export to disk…", run: () => onAction(actionFor("export", row.entry)) },
                 ]
               : [expandOrOpen(false)]),
             ...(folder

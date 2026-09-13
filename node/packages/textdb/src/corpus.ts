@@ -104,6 +104,15 @@ export interface PurgeStats {
   bytes: number;
 }
 
+/** A file an export writes, relative to the exported folder. */
+export interface ExportFile {
+  path: string;
+  /** `/`-separated, below the exported folder. */
+  rel: string;
+  nbytes: number;
+  updated_at: string;
+}
+
 export interface BulkOptions extends AuthorOptions {
   /** A move's destination folder; created when missing. */
   to?: string;
@@ -400,6 +409,32 @@ export class Corpus {
   /** One file or folder as a listing shows it; the root too. */
   entry(target: string): Entry {
     return JSON.parse(String(this.sql.value('SELECT textdb_entry(?)', target))) as Entry;
+  }
+
+  /** Every live file below the folder `dir`, by path, with its size and last change: what an export writes. */
+  exportFiles(dir = '/'): ExportFile[] {
+    const folder = this.entry(dir);
+    if (folder.kind !== 'folder') throw new InvalidEdit(`${folder.path} is a file, not a folder`);
+    const base = folder.path === '/' ? '' : folder.path;
+    // Everything strictly below the folder sorts between "<folder>/" and "<folder>0".
+    return this.sql
+      .all<{ path: string; nbytes: number; updated_at: string }>(
+        "SELECT path, nbytes, updated_at FROM kb WHERE kind = 'file' AND path > ? AND path < ? ORDER BY path",
+        `${base}/`,
+        `${base}0`,
+      )
+      .map((f) => ({ ...f, rel: f.path.slice(base.length + 1) }));
+  }
+
+  /**
+   * A file's content exactly as stored — the bytes an import read, line endings and byte-order
+   * mark included — whatever their encoding.
+   */
+  readBytes(filePath: string): Uint8Array {
+    const row = this.sql.get<{ content: unknown }>("SELECT content FROM kb WHERE path = ? AND kind = 'file'", filePath);
+    if (!row) throw new NotFound(`not found: ${filePath}`);
+    if (row.content instanceof Uint8Array) return row.content;
+    return new TextEncoder().encode(typeof row.content === 'string' ? row.content : '');
   }
 
   /**

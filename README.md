@@ -18,7 +18,8 @@ This repository is the proof of concept described in [`docs/spec.md`](docs/spec.
   server and web UI where an agent's edits appear in the open viewer or editor as they land, attributed, with
   history and diffs. A GitHub-style folder view lists any folder with infinite scroll, sortable by name, type,
   size, lines, words, versions, created, updated and authors, with filters, content search and bulk move/delete;
-  plus folder import, rename/move/delete, a trash, download and replace. HTTP API and client semantics:
+  plus folder import, export back to disk (only changed files, so a git checkout shows real changes; names that
+  clash on Windows or macOS are caught first), rename/move/delete, a trash, download and replace. HTTP API and client semantics:
   [`docs/live-app.md`](docs/live-app.md).
 - **Python library:** [`python/`](python/README.md) — `Corpus.open("sqlite:///kb.db" | "postgresql://…")`,
   file/folder loaders, anchored edits, conflict handling, CLI.

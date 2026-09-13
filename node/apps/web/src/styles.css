@@ -1431,6 +1431,50 @@ kbd {
   text-overflow: ellipsis;
 }
 
+/* ---- export ---- */
+.export-points {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+}
+.export-dialog .stats {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.export-problems ul,
+.export-dialog .failures ul {
+  max-height: 220px;
+  margin: 6px 0 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+  font-size: 12px;
+}
+.export-problems li {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.export-dialog .failures summary:not(.error-text) {
+  color: var(--muted);
+}
+.export-change {
+  display: inline-block;
+  min-width: 5.5em;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.export-new {
+  color: var(--accent);
+}
+a.btn.disabled {
+  opacity: 0.5;
+  cursor: default;
+  pointer-events: none;
+}
+
 /* ---- rename, move, delete ---- */
 .dialog-narrow {
   width: min(500px, calc(100vw - 32px));

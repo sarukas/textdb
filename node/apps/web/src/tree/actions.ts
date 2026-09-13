@@ -4,7 +4,7 @@ import { formatBytes } from "../import/select";
 import { isWithin } from "../live/paths";
 
 export interface PathAction {
-  op: "move" | "delete" | "download" | "replace";
+  op: "move" | "delete" | "download" | "replace" | "export";
   path: string;
   kind: "file" | "folder";
   /** download: the version to save; HEAD when absent. */

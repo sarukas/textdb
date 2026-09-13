@@ -279,8 +279,6 @@ pub trait Store {
         progress: &mut dyn FnMut(&ImportStats),
         on_error: &mut dyn FnMut(&str, &StoreError),
     ) -> Result<ImportStats>;
-    /// Hand every file under `prefix` to `sink`; returns how many.
-    fn export(&mut self, prefix: &str, sink: &mut dyn FnMut(&str, &[u8]) -> std::io::Result<()>) -> Result<usize>;
 }
 
 pub fn open(store: &str) -> Result<Box<dyn Store>> {

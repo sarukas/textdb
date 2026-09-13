@@ -36,7 +36,12 @@ textdb ls -R -l --sort updated -r guides # everything below /guides, most recent
 textdb ls -l --sort words guides --json  # machine-readable, with authors and folder file counts
 textdb search 'rate limit' -p guides     # path:line: snippet — terms ANDed, "phrase", prefix*
 textdb stat guides/api/index.md          # version, size, lines, last author
+textdb export guides ./checkout --dry-run # what writing /guides to disk would change; drop --dry-run to write
 ```
+
+`export` writes only new and changed files and deletes nothing. It stops with exit code 6 and
+lists the names that cannot exist side by side on this OS (e.g. `README.md` and `readme.md` on
+Windows/macOS); rename those in the store, then export again.
 
 ## Read before you edit
 

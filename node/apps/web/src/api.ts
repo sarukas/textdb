@@ -61,6 +61,13 @@ export interface ListPage {
   entries: LsEntry[];
 }
 
+/** A file an export writes, relative to the exported folder. */
+export interface ExportFileInfo {
+  rel: string;
+  nbytes: number;
+  updated_at: string;
+}
+
 export interface BulkResult {
   op: "move" | "delete";
   to: string | null;
@@ -200,6 +207,26 @@ export const api = {
   entry: (path: string, signal?: AbortSignal) => request<LsEntry>("GET", `/api/entry?${qs({ path })}`, undefined, signal),
   bulk: (body: { op: "move" | "delete"; paths: string[]; to?: string; author?: string }) =>
     request<BulkResult>("POST", "/api/bulk", body),
+  exportFiles: (path: string, signal?: AbortSignal) =>
+    request<{ path: string; files: ExportFileInfo[] }>("GET", `/api/export/files?${qs({ path })}`, undefined, signal),
+  exportHashes: (paths: string[], signal?: AbortSignal) =>
+    request<{ hashes: { path: string; sha256: string }[] }>("POST", "/api/export/hashes", { paths }, signal),
+  /** A file's stored bytes, unchanged. */
+  exportBytes: async (path: string, signal?: AbortSignal): Promise<Uint8Array> => {
+    const res = await fetch(`/api/export/file?${qs({ path })}`, signal ? { signal } : {});
+    if (!res.ok) {
+      const text = await res.text();
+      let e: { code?: string; message?: string } = {};
+      try {
+        e = JSON.parse(text) as typeof e;
+      } catch {
+        // not JSON
+      }
+      throw new ApiError(res.status, e.code ?? `HTTP${res.status}`, e.message ?? (text.slice(0, 200) || res.statusText));
+    }
+    return new Uint8Array(await res.arrayBuffer());
+  },
+  exportZipUrl: (path: string) => `/api/export/zip?${qs({ path })}`,
   file: (path: string, version?: number) => request<FileDoc>("GET", `/api/file?${qs({ path, version })}`),
   chunks: (path: string, version?: number) => request<Chunk[]>("GET", `/api/chunks?${qs({ path, version })}`),
   history: (path: string) => request<HistoryEntry[]>("GET", `/api/history?${qs({ path })}`),
