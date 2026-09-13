@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, ApiError, type HistoryEntry, type TrashEntry, type TrashFile } from "../api";
+import { api, ApiError, type HistoryEntry, type PathEvent, type TrashEntry, type TrashFile } from "../api";
 import { md } from "../doc/markdown";
 import { downloadText } from "../doc/transfer";
 import { formatBytes } from "../import/select";
 import { authorStyle } from "../live/color";
 import { relativeTime } from "../live/time";
+import { describePathEvent, timeline } from "../live/timeline";
 import type { FeedHub } from "../state/hub";
 import { useNow } from "../state/useNow";
 
@@ -31,6 +32,7 @@ export function TrashDocument({ id, hub, onPurge, onClose }: Props) {
   const [version, setVersion] = useState<number | null>(null);
   const [file, setFile] = useState<TrashFile | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [events, setEvents] = useState<PathEvent[]>([]);
   const [failure, setFailure] = useState<{ gone: boolean; message: string } | null>(null);
   const [view, setView] = useState<View>("preview");
   const [rev, setRev] = useState(0);
@@ -38,11 +40,12 @@ export function TrashDocument({ id, hub, onPurge, onClose }: Props) {
 
   useEffect(() => {
     let live = true;
-    Promise.all([api.trashFile(id, version ?? undefined), api.trashHistory(id)]).then(
-      ([f, h]) => {
+    Promise.all([api.trashFile(id, version ?? undefined), api.trashHistory(id), api.pathHistory({ id }).catch(() => [])]).then(
+      ([f, h, moves]) => {
         if (!live) return;
         setFile(f);
         setHistory(h);
+        setEvents(moves);
         setFailure(null);
       },
       (e: unknown) => {
@@ -164,28 +167,53 @@ export function TrashDocument({ id, hub, onPurge, onClose }: Props) {
         {view === "source" && source}
         {view === "history" && (
           <ol className="trash-history" aria-label="Versions">
-            {[...history].reverse().map((h) => (
-              <li key={h.version}>
-                <button
-                  type="button"
-                  className={`trash-version${h.version === file.version ? " current" : ""}`}
-                  onClick={() => {
-                    setVersion(h.version === entry.version ? null : h.version);
-                    setView("preview");
-                  }}
-                >
-                  <span className="mono">v{h.version}</span>
-                  <span className="chip" style={authorStyle(h.author ?? "unknown")} aria-hidden="true" />
-                  <span>{h.author ?? "unknown"}</span>
-                  {h.kind && h.kind !== "direct" && <span className={`badge kind-${h.kind}`}>{h.kind}</span>}
-                  {h.message && <span className="muted">{h.message}</span>}
-                  <span className="muted trash-when" title={h.ts}>
-                    {h.nbytes !== null ? `${formatBytes(h.nbytes)} · ` : ""}
-                    {relativeTime(h.ts, now)}
-                  </span>
-                </button>
-              </li>
-            ))}
+            {timeline(history, events)
+              .reverse()
+              .map((item) => {
+                if (item.kind === "path") {
+                  const e = item.event;
+                  return (
+                    <li
+                      key={`path-${e.id}`}
+                      className={`path-row path-${e.op}`}
+                      title={e.new_path ? `${e.old_path} → ${e.new_path}` : e.old_path}
+                    >
+                      <span className="path-glyph" aria-hidden="true">
+                        {e.op === "delete" ? "−" : "→"}
+                      </span>
+                      <span className="path-what">{describePathEvent(e)}</span>
+                      <span className="chip" style={authorStyle(e.author ?? "unknown")} aria-hidden="true" />
+                      <span>{e.author ?? "unknown"}</span>
+                      <span className="muted trash-when" title={e.ts}>
+                        {relativeTime(e.ts, now)}
+                      </span>
+                    </li>
+                  );
+                }
+                const h = item.entry;
+                return (
+                  <li key={h.version}>
+                    <button
+                      type="button"
+                      className={`trash-version${h.version === file.version ? " current" : ""}`}
+                      onClick={() => {
+                        setVersion(h.version === entry.version ? null : h.version);
+                        setView("preview");
+                      }}
+                    >
+                      <span className="mono">v{h.version}</span>
+                      <span className="chip" style={authorStyle(h.author ?? "unknown")} aria-hidden="true" />
+                      <span>{h.author ?? "unknown"}</span>
+                      {h.kind && h.kind !== "direct" && <span className={`badge kind-${h.kind}`}>{h.kind}</span>}
+                      {h.message && <span className="muted">{h.message}</span>}
+                      <span className="muted trash-when" title={h.ts}>
+                        {h.nbytes !== null ? `${formatBytes(h.nbytes)} · ` : ""}
+                        {relativeTime(h.ts, now)}
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
           </ol>
         )}
       </div>

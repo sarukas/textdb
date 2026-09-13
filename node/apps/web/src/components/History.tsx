@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { api, type HistoryEntry } from "../api";
+import { api, type HistoryEntry, type PathEvent } from "../api";
 import type { DocState } from "../doc/controller";
 import { authorStyle } from "../live/color";
 import { relativeTime } from "../live/time";
+import { describePathEvent, timeline } from "../live/timeline";
 import { useNow } from "../state/useNow";
 import { DiffView } from "./DiffView";
 import { VersionView } from "./VersionView";
@@ -16,6 +17,7 @@ export type DiffLayout = "unified" | "split";
 export function History({ state }: Props) {
   const { path, feedRev, version } = state;
   const [entries, setEntries] = useState<HistoryEntry[] | null>(null);
+  const [events, setEvents] = useState<PathEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [compare, setCompare] = useState<number[]>([]);
@@ -26,10 +28,12 @@ export function History({ state }: Props) {
     let cancelled = false;
     const t = setTimeout(
       () =>
-        api.history(path).then(
-          (list) => {
+        // A server older than path history has no endpoint for it; versions still show.
+        Promise.all([api.history(path), api.pathHistory({ path }).catch(() => [])]).then(
+          ([list, moves]) => {
             if (cancelled) return;
             setEntries(list);
+            setEvents(moves);
             setError(null);
           },
           (err: unknown) => !cancelled && setError(err instanceof Error ? err.message : String(err)),
@@ -43,8 +47,8 @@ export function History({ state }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path, feedRev, version]);
 
-  const newestFirst = entries ? [...entries].reverse() : [];
-  const head = newestFirst[0]?.version ?? null;
+  const newestFirst = entries ? timeline(entries, events).reverse() : [];
+  const head = entries?.at(-1)?.version ?? null;
   const shown = selected ?? head;
 
   const toggleCompare = (v: number) =>
@@ -60,7 +64,25 @@ export function History({ state }: Props) {
         </div>
         {error && <div className="error-text pad">{error}</div>}
         {!entries && !error && <div className="muted pad">Loading history…</div>}
-        {newestFirst.map((h) => {
+        {newestFirst.map((item) => {
+          if (item.kind === "path") {
+            const e = item.event;
+            const author = e.author ?? "unknown";
+            return (
+              <div key={`path-${e.id}`} role="listitem" className={`path-row path-${e.op}`} title={e.new_path ? `${e.old_path} → ${e.new_path}` : e.old_path}>
+                <span className="path-glyph" aria-hidden="true">
+                  {e.op === "delete" ? "−" : "→"}
+                </span>
+                <span className="path-what">{describePathEvent(e)}</span>
+                <span className="chip" style={authorStyle(author)} aria-hidden="true" />
+                <span className="version-author">{author}</span>
+                <span className="version-time" title={e.ts}>
+                  {relativeTime(e.ts, now)}
+                </span>
+              </div>
+            );
+          }
+          const h = item.entry;
           const author = h.author ?? "unknown";
           const isShown = !pair && h.version === shown;
           const inCompare = compare.includes(h.version);

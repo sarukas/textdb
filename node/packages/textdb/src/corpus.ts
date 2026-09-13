@@ -53,6 +53,21 @@ export interface ImportStats {
   failures: ImportFailure[];
 }
 
+/** A rename, move or delete as it touched one file or folder. */
+export interface PathEvent {
+  id: number;
+  ts: string;
+  op: 'rename' | 'move' | 'delete';
+  old_path: string;
+  /** Where it went; null for a delete. */
+  new_path: string | null;
+  /** The folder the operation named, when this file or folder went along with it. */
+  via: string | null;
+  /** A file's version when it happened. */
+  version: number | null;
+  author: string | null;
+}
+
 /** Something a delete left behind, readable until it is purged. */
 export interface TrashEntry {
   id: number;
@@ -184,6 +199,32 @@ export class Corpus {
       'SELECT version, author, ts, message, nbytes, kind, base_version FROM textdb_history(?)',
       filePath,
     );
+  }
+
+  /** Renames, moves and deletes of the file or folder at `filePath`, oldest first. */
+  pathHistory(filePath: string): PathEvent[] {
+    return this.sql.all<PathEvent>(
+      'SELECT id, ts, op, old_path, new_path, via, version, author FROM textdb_path_history(?)',
+      filePath,
+    );
+  }
+
+  /** As `pathHistory`, for the node with this id (a trash entry). */
+  pathHistoryOf(id: number): PathEvent[] {
+    return this.sql.all<PathEvent>(
+      'SELECT id, ts, op, old_path, new_path, via, version, author FROM textdb_path_history(NULL, ?)',
+      id,
+    );
+  }
+
+  /** A store setting (`path_history`); null at its default. */
+  setting(key: string): string | null {
+    return (this.sql.value('SELECT textdb_setting(?)', key) as string | null) ?? null;
+  }
+
+  /** Sets a store setting, or returns it to its default with null; answers the stored value. */
+  setSetting(key: string, value: string | null): string | null {
+    return (this.sql.value('SELECT textdb_setting(?, ?)', key, value) as string | null) ?? null;
   }
 
   /** Line hunks turning `from` into `to`; `to` defaults to HEAD and `from` to `to - 1`. */

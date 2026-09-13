@@ -106,6 +106,21 @@ describe('corpus', () => {
     kb.move('/feed/a.md', '/moved/a.md', { author: 'carol' });
     kb.remove('/moved', { author: 'dave' });
 
+    assert.deepEqual(
+      kb.pathHistory('/moved/a.md').map((e) => [e.op, e.old_path, e.new_path, e.via, e.version, e.author]),
+      [
+        ['move', '/feed/a.md', '/moved/a.md', null, 2, 'carol'],
+        ['delete', '/moved/a.md', null, '/moved', 2, 'dave'],
+      ],
+    );
+    const [first] = kb.pathHistory('/moved/a.md');
+    assert.equal(kb.pathHistoryOf(kb.trash(Number(kb.trash()[0]!.id))[0]!.id).length, 2);
+    assert.match(first!.ts, /^\d{4}-\d\d-\d\dT/);
+    assert.equal(kb.setting('path_history'), null);
+    assert.equal(kb.setSetting('path_history', 'off'), 'off');
+    assert.equal(kb.setSetting('path_history', null), null);
+    assert.throws(() => kb.setting('colour'), InvalidEdit);
+
     const rows = kb.feed(since);
     assert.deepEqual(
       rows.map((r) => [r.op, r.path, r.old_path, r.node_kind, r.version, r.base_version, r.commit_kind, r.author]),

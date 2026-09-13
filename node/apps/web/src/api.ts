@@ -156,12 +156,29 @@ export const api = {
   move: (from: string, to: string, author?: string) =>
     request<{ from: string; to: string }>("POST", "/api/move", { from, to, author }),
   remove: (path: string, author?: string) => request<{ path: string }>("POST", "/api/delete", { path, author }),
+  pathHistory: (target: { path: string } | { id: number }) =>
+    request<PathEvent[]>("GET", `/api/path-history?${"path" in target ? qs({ path: target.path }) : qs({ id: target.id })}`),
   trash: (parent?: number) => request<TrashEntry[]>("GET", `/api/trash?${qs({ parent })}`),
   trashFile: (id: number, version?: number) => request<TrashFile>("GET", `/api/trash/file?${qs({ id, version })}`),
   trashHistory: (id: number) => request<HistoryEntry[]>("GET", `/api/trash/history?${qs({ id })}`),
   purge: (id: number, author?: string) => request<PurgeStats>("POST", "/api/trash/purge", { id, author }),
   emptyTrash: (author?: string) => request<PurgeStats>("POST", "/api/trash/empty", { author }),
 };
+
+/** A rename, move or delete as it touched one file or folder. */
+export interface PathEvent {
+  id: number;
+  ts: string;
+  op: "rename" | "move" | "delete";
+  old_path: string;
+  /** Where it went; null for a delete. */
+  new_path: string | null;
+  /** The folder the operation named, when this file or folder went along with it. */
+  via: string | null;
+  /** A file's version when it happened. */
+  version: number | null;
+  author: string | null;
+}
 
 /** Something a delete left behind, readable until it is purged. */
 export interface TrashEntry {

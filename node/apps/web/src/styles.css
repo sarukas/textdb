@@ -1528,6 +1528,34 @@ kbd {
   cursor: default;
 }
 
+/* A rename, move or delete between versions in a history list. */
+.path-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 2px 10px 2px 12px;
+  color: var(--muted);
+  font-size: 12px;
+  list-style: none;
+}
+.path-glyph {
+  flex: none;
+  width: 18px;
+  text-align: center;
+  font-family: var(--mono);
+}
+.path-delete .path-glyph {
+  color: var(--danger);
+}
+.path-what {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .line-add,
 .line-del {
   font-family: var(--mono);

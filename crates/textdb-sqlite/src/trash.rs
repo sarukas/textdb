@@ -327,6 +327,7 @@ impl<'c> TextDb<'c> {
         for table in ["section", "link", "frontmatter", "checkpoint", "chunk_ref"] {
             run(format!("DELETE FROM {p}{table} WHERE file_id IN (SELECT value FROM json_each(?1))"), &files_json)?;
         }
+        run(format!("DELETE FROM {p}path_event WHERE node_id IN (SELECT value FROM json_each(?1))"), &all_json)?;
         // A tombstone left inside a purged folder (deleted earlier, on its own) stays in the
         // trash as its own item, now without a parent.
         run(format!("UPDATE {p}node SET parent_id = NULL WHERE parent_id IN (SELECT value FROM json_each(?1))"), &folders_json)?;

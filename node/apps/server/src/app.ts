@@ -80,6 +80,19 @@ export function createApp(corpus: Corpus, hub: ChangeHub, options: AppOptions): 
   });
 
   app.get('/api/stat', (c) => c.json(corpus.stat(queryString(c, 'path'))));
+  app.get('/api/path-history', (c) => {
+    const id = queryInt(c, 'id');
+    return c.json(id === undefined ? corpus.pathHistory(queryString(c, 'path')) : corpus.pathHistoryOf(id));
+  });
+  app.get('/api/setting', (c) => {
+    const key = queryString(c, 'key');
+    return c.json({ key, value: corpus.setting(key) });
+  });
+  app.put('/api/setting', async (c) => {
+    const body = await jsonBody(c);
+    const key = bodyString(body, 'key');
+    return c.json({ key, value: corpus.setSetting(key, bodyOptionalString(body, 'value') ?? null) });
+  });
   app.post('/api/move', async (c) => {
     const body = await jsonBody(c);
     const from = bodyString(body, 'from');

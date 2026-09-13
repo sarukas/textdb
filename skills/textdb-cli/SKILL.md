@@ -90,7 +90,7 @@ three-way merge was clean), `unchanged` (nothing to do).
 ## History and other people's changes
 
 ```sh
-textdb history guides/api/index.md       # who changed it, when, and how each change landed
+textdb history guides/api/index.md       # who changed it, when, how each change landed, and renames/moves/deletes
 textdb diff guides/api/index.md 10 12    # unified diff between versions
 textdb hunks guides/api/index.md         # what the latest commit changed, line by line
 textdb cat guides/api/index.md -v 10     # an old version

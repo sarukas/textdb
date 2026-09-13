@@ -7,10 +7,12 @@ use textdb_core::CommitKind;
 use textdb_sqlite::db::subtree_bounds;
 use textdb_sqlite::{normalize_path, NodeRow, TextDb, DEFAULT_PREFIX};
 
-use super::{Change, Chunk, Commit, Entry, Hit, Hunk, ImportStats, Result, Stat, Store, StoreError, Written};
+use super::{Change, Chunk, Commit, Entry, Hit, Hunk, ImportStats, PathEvent, Result, Stat, Store, StoreError, Written};
 
 pub struct SqliteStore {
     conn: Connection,
+    /// `--path-history`: this process's choice, or `None` to follow the store's setting.
+    path_history: Option<bool>,
     /// `PRAGMA data_version` as of the last `wait`. It moves only when another connection
     /// commits, which is exactly the event a watcher is waiting for.
     data_version: Option<i64>,
@@ -66,11 +68,15 @@ impl SqliteStore {
         ))
         .map_err(sql)?;
         textdb_sqlite::schema::migrate(&conn, DEFAULT_PREFIX).map_err(sql)?;
-        Ok(SqliteStore { conn, data_version: None })
+        Ok(SqliteStore {
+            conn,
+            path_history: None,
+            data_version: None,
+        })
     }
 
     fn db(&self) -> TextDb<'_> {
-        TextDb::attach(&self.conn, DEFAULT_PREFIX, true)
+        TextDb::attach(&self.conn, DEFAULT_PREFIX, true).with_path_history(self.path_history)
     }
 
     /// Run reads that must agree with each other — content and the version it is — in one
@@ -294,6 +300,43 @@ impl Store for SqliteStore {
 
     fn rm(&mut self, path: &str, author: Option<&str>) -> Result<()> {
         Ok(self.db().delete_by(path, author)?)
+    }
+
+    fn path_history(&mut self, path: &str) -> Result<Vec<PathEvent>> {
+        Ok(self
+            .db()
+            .path_history(path)?
+            .into_iter()
+            .map(|e| PathEvent {
+                id: e.id,
+                ts: e.ts,
+                op: e.op,
+                old_path: e.old_path,
+                new_path: e.new_path,
+                via: e.via,
+                version: e.version,
+                author: e.author,
+            })
+            .collect())
+    }
+
+    fn set_session_path_history(&mut self, on: Option<bool>) -> Result<()> {
+        self.path_history = on;
+        Ok(())
+    }
+
+    fn path_history_enabled(&mut self) -> Result<bool> {
+        Ok(self.db().path_history_enabled()?)
+    }
+
+    fn setting(&mut self, key: &str) -> Result<Option<String>> {
+        Ok(self.db().setting(key)?)
+    }
+
+    fn set_setting(&mut self, key: &str, value: Option<&str>) -> Result<Option<String>> {
+        let db = self.db();
+        db.set_setting(key, value)?;
+        Ok(db.setting(key)?)
     }
 
     fn last_seq(&mut self) -> Result<i64> {

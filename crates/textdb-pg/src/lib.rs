@@ -72,6 +72,24 @@ CREATE TABLE kb.link (file_id bigint NOT NULL, version bigint NOT NULL, target_p
 CREATE INDEX link_file ON kb.link(file_id, version);
 CREATE TABLE kb.frontmatter (file_id bigint NOT NULL, version bigint NOT NULL, data jsonb, PRIMARY KEY (file_id, version));
 CREATE TABLE kb.checkpoint (name text NOT NULL, file_id bigint NOT NULL, path text NOT NULL, root bytea NOT NULL, version bigint NOT NULL, PRIMARY KEY (name, file_id));
+-- Path history (textdb_core::path): one row per node a rename, move or delete touched — the
+-- node it named and everything below a folder — next to the versions in kb.commit.
+CREATE TABLE kb.path_event (
+  id          bigserial PRIMARY KEY,
+  node_id     bigint NOT NULL,
+  node_kind   smallint NOT NULL,     -- 0 folder, 1 file
+  op          text NOT NULL,         -- rename, move, delete
+  ts          timestamptz NOT NULL DEFAULT now(),
+  author      text,
+  old_path    text NOT NULL,
+  new_path    text,                  -- rename, move: the path after
+  via         text,                  -- the folder the operation named, when this node went with it
+  version     bigint,                -- a file's version when it happened
+  change_seq  bigint                 -- the kb.change row of the operation
+);
+CREATE INDEX path_event_node ON kb.path_event(node_id, id);
+-- Store settings, e.g. path_history = on | off. A missing row means the default.
+CREATE TABLE kb.setting (key text PRIMARY KEY, value text NOT NULL);
 
 -- Custom SQLSTATEs (spec §7.2): TX001 conflict, TX002 contention, TX003 not found, TX004 invalid edit.
 CREATE FUNCTION kb._raise(code text, msg text, detail text) RETURNS void LANGUAGE plpgsql AS $$
@@ -90,6 +108,43 @@ BEGIN RAISE EXCEPTION USING ERRCODE = code, MESSAGE = msg, DETAIL = coalesce(det
 -- IMMUTABLE so the planner folds it and can still extract the literal prefix.
 CREATE FUNCTION kb._subtree_like(p text) RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
 $$ SELECT replace(replace(replace(p, '\', '\\'), '%', '\%'), '_', '\_') || '/%' $$;
+
+-- An on/off value: on, true, yes, 1 / off, false, no, 0 in any case; NULL for anything else.
+CREATE FUNCTION kb._switch(v text) RETURNS boolean LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT CASE lower(trim(v)) WHEN 'on' THEN true WHEN 'true' THEN true WHEN 'yes' THEN true WHEN '1' THEN true
+                             WHEN 'off' THEN false WHEN 'false' THEN false WHEN 'no' THEN false WHEN '0' THEN false END
+$$;
+
+-- Store settings. kb.setting(key) is NULL at the default; kb.set_setting(key, NULL) returns a
+-- setting to its default. The only setting so far is path_history.
+CREATE FUNCTION kb.setting(k text) RETURNS text LANGUAGE sql STABLE AS $$
+  SELECT s.value FROM kb.setting s WHERE s.key = k
+$$;
+CREATE FUNCTION kb.set_setting(k text, v text) RETURNS text LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+  IF k IS DISTINCT FROM 'path_history' THEN
+    PERFORM kb._raise('TX004', format('unknown setting ''%s'' (known: path_history)', k), NULL);
+  END IF;
+  IF v IS NULL THEN
+    DELETE FROM kb.setting s WHERE s.key = k;
+    RETURN NULL;
+  END IF;
+  IF kb._switch(v) IS NULL THEN
+    PERFORM kb._raise('TX004', format('%s is on or off, not ''%s''', k, v), NULL);
+  END IF;
+  INSERT INTO kb.setting AS s (key, value) VALUES (k, CASE WHEN kb._switch(v) THEN 'on' ELSE 'off' END)
+    ON CONFLICT ON CONSTRAINT setting_pkey DO UPDATE SET value = EXCLUDED.value;
+  RETURN kb.setting(k);
+END $$;
+
+-- Whether renames, moves and deletes are recorded: this session's textdb.path_history
+-- (SET textdb.path_history = off, or ALTER ROLE / ALTER DATABASE … SET for a default), else the
+-- store's path_history setting, else on.
+CREATE FUNCTION kb.path_history_enabled() RETURNS boolean LANGUAGE sql STABLE AS $$
+  SELECT coalesce(kb._switch(nullif(current_setting('textdb.path_history', true), '')),
+                  kb._switch(kb.setting('path_history')),
+                  true)
+$$;
 "#,
     name = "kb_tables",
     bootstrap
@@ -211,7 +266,7 @@ mod kb {
     use textdb_core::commit::{commit, commit_append, CommitKind, Committed};
     use textdb_core::myers::byte_edits;
     use textdb_core::tree::{leaves, locate_line, materialize, materialize_range, totals};
-    use textdb_core::{unified_diff, ChunkParams, Edit, Hash, LineHunk, Storage, StructureExtractor, TextdbError};
+    use textdb_core::{unified_diff, ChunkParams, Edit, Hash, LineHunk, PathOp, Storage, StructureExtractor, TextdbError};
     use textdb_md::MarkdownExtractor;
 
     use crate::store::{normalize_path, parent_of, name_of, raise, spi_err, to_hash, NodeRow, SpiStorage};
@@ -335,8 +390,8 @@ mod kb {
     }
 
     /// Append one row to the change feed and announce its `seq` on the `textdb_change`
-    /// channel. Runs inside the calling statement's transaction, so the row and the
-    /// notification exist exactly when the change commits.
+    /// channel; returns the `seq`. Runs inside the calling statement's transaction, so the row
+    /// and the notification exist exactly when the change commits.
     #[allow(clippy::too_many_arguments)]
     fn record_change(
         op: &str,
@@ -349,7 +404,7 @@ mod kb {
         commit_kind: Option<&str>,
         author: Option<&str>,
         message: Option<&str>,
-    ) {
+    ) -> i64 {
         Spi::run_with_args(
             "WITH c AS (INSERT INTO kb.change(op, node_id, node_kind, path, old_path, version, base_version, commit_kind, author, message) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING seq) SELECT pg_notify('textdb_change', seq::text) FROM c",
             &[
@@ -366,6 +421,50 @@ mod kb {
             ],
         )
         .unwrap_or_else(|e| spi_err(e));
+        Spi::get_one::<i64>("SELECT currval(pg_get_serial_sequence('kb.change', 'seq'))")
+            .unwrap_or_else(|e| spi_err(e))
+            .unwrap_or(0)
+    }
+
+    fn path_history_enabled() -> Result<bool, TextdbError> {
+        Ok(Spi::get_one::<bool>("SELECT kb.path_history_enabled()").map_err(storage_err)?.unwrap_or(true))
+    }
+
+    /// Record `op` in kb.path_event for `node` and, for a folder, every live node below it.
+    /// Call before the paths change: the rows keep the paths as they were.
+    fn record_path_events(
+        op: PathOp,
+        node: &NodeRow,
+        to: Option<&str>,
+        author: Option<&str>,
+        change_seq: i64,
+    ) -> Result<(), TextdbError> {
+        if node.kind == 0 {
+            Spi::run_with_args(
+                "INSERT INTO kb.path_event(node_id, node_kind, op, author, old_path, new_path, via, version, change_seq) \
+                 SELECT id, kind, $1, $2, path, CASE WHEN $3::text IS NULL THEN NULL ELSE $3::text || substr(path, length($4) + 1) END, \
+                        $4, CASE WHEN kind = 1 THEN version END, $5 \
+                 FROM kb.node WHERE path LIKE kb._subtree_like($4) AND deleted_at IS NULL",
+                &[op.as_str().into(), author.into(), to.into(), node.path.as_str().into(), change_seq.into()],
+            )
+            .map_err(storage_err)?;
+        }
+        Spi::run_with_args(
+            "INSERT INTO kb.path_event(node_id, node_kind, op, author, old_path, new_path, version, change_seq) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                node.id.into(),
+                node.kind.into(),
+                op.as_str().into(),
+                author.into(),
+                node.path.as_str().into(),
+                to.into(),
+                (node.kind == 1).then_some(node.version).into(),
+                change_seq.into(),
+            ],
+        )
+        .map_err(storage_err)?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -700,6 +799,10 @@ mod kb {
             return Err(TextdbError::InvalidEdit(format!("{} already exists", to)));
         }
         let parent = ensure_folder(parent_of(&to))?;
+        let seq = record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, None);
+        if path_history_enabled()? {
+            record_path_events(PathOp::classify(&from, &to), &src, Some(&to), author, seq)?;
+        }
         Spi::run_with_args(
             "UPDATE kb.node SET path = $2 || substr(path, length($1) + 1), updated_at = now() WHERE path LIKE kb._subtree_like($1) AND deleted_at IS NULL",
             &[from.as_str().into(), to.as_str().into()],
@@ -710,7 +813,6 @@ mod kb {
             &[to.as_str().into(), name_of(&to).into(), parent.into(), src.id.into()],
         )
         .map_err(storage_err)?;
-        record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, None);
         Ok(())
     }
 
@@ -732,12 +834,15 @@ mod kb {
             return Err(TextdbError::InvalidEdit("cannot delete the root".into()));
         }
         let n = node_by_path(&path).ok_or_else(|| TextdbError::NotFound(path.clone()))?;
+        let seq = record_change("delete", n.id, n.kind, &path, None, None, None, None, author, None);
+        if path_history_enabled()? {
+            record_path_events(PathOp::Delete, &n, None, author, seq)?;
+        }
         Spi::run_with_args(
             "UPDATE kb.node SET deleted_at = now() WHERE (path = $1 OR path LIKE kb._subtree_like($1)) AND deleted_at IS NULL",
             &[path.as_str().into()],
         )
         .map_err(storage_err)?;
-        record_change("delete", n.id, n.kind, &path, None, None, None, None, author, None);
         Ok(())
     }
 
@@ -866,6 +971,52 @@ mod kb {
                     r.get::<String>(4).unwrap_or_else(|e| spi_err(e)),
                     r.get::<String>(5).unwrap_or_else(|e| spi_err(e)),
                     r.get::<i64>(6).unwrap_or_else(|e| spi_err(e)),
+                ));
+            }
+            v
+        });
+        TableIterator::new(rows)
+    }
+
+    /// Renames, moves and deletes of the file or folder at `path` (the live one, else the one
+    /// most recently deleted there), oldest first. See `kb.path_history_enabled()`.
+    #[pg_extern(stable)]
+    fn path_history(
+        path: &str,
+    ) -> TableIterator<
+        'static,
+        (
+            name!(id, i64),
+            name!(ts, pgrx::datum::TimestampWithTimeZone),
+            name!(op, String),
+            name!(old_path, String),
+            name!(new_path, Option<String>),
+            name!(via, Option<String>),
+            name!(version, Option<i64>),
+            name!(author, Option<String>),
+        ),
+    > {
+        let path = ok(normalize_path(path));
+        let n = NodeRow::by_path(&path, true).unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
+        let rows: Vec<_> = Spi::connect(|client| {
+            let t = client
+                .select(
+                    "SELECT id, ts, op, old_path, new_path, via, version, author FROM kb.path_event WHERE node_id = $1 ORDER BY id",
+                    None,
+                    &[n.id.into()],
+                )
+                .unwrap_or_else(|e| spi_err(e));
+            let mut v = Vec::new();
+            for r in t {
+                v.push((
+                    r.get::<i64>(1).unwrap_or_else(|e| spi_err(e)).unwrap_or(0),
+                    r.get::<pgrx::datum::TimestampWithTimeZone>(2).unwrap_or_else(|e| spi_err(e)).expect("ts"),
+                    r.get::<String>(3).unwrap_or_else(|e| spi_err(e)).unwrap_or_default(),
+                    r.get::<String>(4).unwrap_or_else(|e| spi_err(e)).unwrap_or_default(),
+                    r.get::<String>(5).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<String>(6).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<i64>(7).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<String>(8).unwrap_or_else(|e| spi_err(e)),
                 ));
             }
             v

@@ -503,6 +503,7 @@ pub enum FnKind {
     Feed,
     Hunks,
     Chunks,
+    PathHistory,
 }
 
 pub struct FnSpec {
@@ -520,6 +521,7 @@ impl FnKind {
             FnKind::Feed => c"CREATE TABLE x(seq INTEGER, ts TEXT, op TEXT, path TEXT, old_path TEXT, node_kind TEXT, version INTEGER, base_version INTEGER, commit_kind TEXT, author TEXT, message TEXT, since INTEGER HIDDEN, lim INTEGER HIDDEN)",
             FnKind::Hunks => c"CREATE TABLE x(old_from INTEGER, old_count INTEGER, new_from INTEGER, new_count INTEGER, old_text TEXT, new_text TEXT, path TEXT HIDDEN, v1 INTEGER HIDDEN, v2 INTEGER HIDDEN)",
             FnKind::Chunks => c"CREATE TABLE x(ord INTEGER, hash TEXT, byte_from INTEGER, nbytes INTEGER, line_from INTEGER, nlines INTEGER, path TEXT HIDDEN, version INTEGER HIDDEN)",
+            FnKind::PathHistory => c"CREATE TABLE x(id INTEGER, ts TEXT, op TEXT, old_path TEXT, new_path TEXT, via TEXT, version INTEGER, author TEXT, path TEXT HIDDEN, node_id INTEGER HIDDEN)",
         }
     }
     /// Number of visible columns; hidden argument columns follow.
@@ -532,6 +534,7 @@ impl FnKind {
             FnKind::Feed => 11,
             FnKind::Hunks => 6,
             FnKind::Chunks => 6,
+            FnKind::PathHistory => 8,
         }
     }
     fn n_hidden(self) -> c_int {
@@ -543,6 +546,7 @@ impl FnKind {
             FnKind::Feed => 2,
             FnKind::Hunks => 3,
             FnKind::Chunks => 2,
+            FnKind::PathHistory => 2,
         }
     }
 }
@@ -795,6 +799,33 @@ unsafe impl VTabCursor for FnCursor<'_> {
                             Value::Integer(l.nbytes as i64),
                             Value::Integer(l.line_off as i64 + 1),
                             Value::Integer(l.nlines as i64),
+                        ]
+                    })
+                    .collect()
+            }
+            FnKind::PathHistory => {
+                // `textdb_path_history(path)`, or `textdb_path_history(NULL, node_id)` for a
+                // node no path names any more (a trash entry).
+                let events = match hidden_i64(&hidden[1]) {
+                    Some(id) => db.path_history_of(id),
+                    None => {
+                        let path = s(&hidden[0]).ok_or_else(|| Error::ModuleError("TX004 path is required".into()))?;
+                        db.path_history(&path)
+                    }
+                }
+                .map_err(map_err)?;
+                events
+                    .into_iter()
+                    .map(|e| {
+                        vec![
+                            Value::Integer(e.id),
+                            Value::Text(e.ts),
+                            Value::Text(e.op),
+                            Value::Text(e.old_path),
+                            e.new_path.map_or(Value::Null, Value::Text),
+                            e.via.map_or(Value::Null, Value::Text),
+                            e.version.map_or(Value::Null, Value::Integer),
+                            e.author.map_or(Value::Null, Value::Text),
                         ]
                     })
                     .collect()

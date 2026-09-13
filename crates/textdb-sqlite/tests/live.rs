@@ -136,6 +136,76 @@ fn trash_lists_reads_and_purges_what_deletes_left() {
     );
 }
 
+#[test]
+fn renames_moves_and_deletes_are_recorded_for_every_node_they_touch() {
+    let conn = setup();
+    let run = |sql: &str| conn.query_row(sql, [], |_| Ok(())).unwrap();
+    let one = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+    let write = |path: &str, content: &str| {
+        conn.query_row("SELECT textdb_write(?1, ?2)", [path, content], |_| Ok(())).unwrap();
+    };
+    type Event = (String, String, Option<String>, Option<String>, Option<i64>, Option<String>);
+    let events = |sql: &str| -> Vec<Event> {
+        conn.prepare(sql)
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let history = |path: &str| events(&format!("SELECT op, old_path, new_path, via, version, author FROM textdb_path_history('{path}')"));
+    let s = |v: &str| Some(v.to_string());
+
+    write("/a/x.md", "x\n");
+    write("/a/x.md", "x2\n");
+    write("/a/sub/y.md", "y\n");
+    run("SELECT textdb_move('/a/x.md', '/a/renamed.md', 'human')");
+    run("SELECT textdb_move('/a', '/b/a2', 'agent-7')");
+    run("SELECT textdb_delete('/b/a2/sub', 'ops')");
+
+    // A file's history follows it through its own rename and its folder's move.
+    assert_eq!(
+        history("/b/a2/renamed.md"),
+        vec![
+            ("rename".into(), "/a/x.md".into(), s("/a/renamed.md"), None, Some(2), s("human")),
+            ("move".into(), "/a/renamed.md".into(), s("/b/a2/renamed.md"), s("/a"), Some(2), s("agent-7")),
+        ]
+    );
+    assert_eq!(history("/b/a2"), vec![("move".into(), "/a".into(), s("/b/a2"), None, None, s("agent-7"))]);
+    // A deleted file is found at the path it was deleted from, or by id.
+    assert_eq!(
+        history("/b/a2/sub/y.md"),
+        vec![
+            ("move".into(), "/a/sub/y.md".into(), s("/b/a2/sub/y.md"), s("/a"), Some(1), s("agent-7")),
+            ("delete".into(), "/b/a2/sub/y.md".into(), None, s("/b/a2/sub"), Some(1), s("ops")),
+        ]
+    );
+    let y = one("SELECT id FROM kb_node WHERE path = '/b/a2/sub/y.md'");
+    assert_eq!(one(&format!("SELECT count(*) FROM textdb_path_history(NULL, {y})")), 2);
+    // Versions are untouched: a path event is not a version.
+    assert_eq!(one("SELECT version FROM kb WHERE path = '/b/a2/renamed.md'"), 2);
+
+    // The store setting turns it off; a handle can decide for itself.
+    let text = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, Option<String>>(0));
+    assert_eq!(text("SELECT textdb_setting('path_history')").unwrap(), None);
+    assert_eq!(text("SELECT textdb_setting('path_history', 'OFF')").unwrap().as_deref(), Some("off"));
+    let before = one("SELECT count(*) FROM kb_path_event");
+    run("SELECT textdb_move('/b/a2/renamed.md', '/b/a2/quiet.md')");
+    assert_eq!(one("SELECT count(*) FROM kb_path_event"), before);
+    let db = TextDb::attach(&conn, "kb_", true).with_path_history(Some(true));
+    db.rename_by("/b/a2/quiet.md", "/b/a2/loud.md", Some("cli")).unwrap();
+    assert_eq!(one("SELECT count(*) FROM kb_path_event"), before + 1);
+    assert_eq!(text("SELECT textdb_setting('path_history', NULL)").unwrap(), None);
+    for bad in ["SELECT textdb_setting('colour')", "SELECT textdb_setting('path_history', 'maybe')"] {
+        let err = text(bad).unwrap_err().to_string();
+        assert!(err.starts_with("TX004"), "{err}");
+    }
+
+    // Purging removes the events with the node.
+    run("SELECT textdb_empty_trash()");
+    assert_eq!(one(&format!("SELECT count(*) FROM kb_path_event WHERE node_id = {y}")), 0);
+}
+
 type FeedRow = (i64, String, String, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>);
 
 fn feed(conn: &Connection, since: i64) -> Vec<FeedRow> {

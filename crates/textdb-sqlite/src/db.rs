@@ -6,7 +6,7 @@ use textdb_core::commit::{commit, commit_append, CommitKind, Committed};
 use textdb_core::myers::byte_edits;
 use textdb_core::storage::Result;
 use textdb_core::tree::totals;
-use textdb_core::{unified_diff, ChunkParams, Edit, Hash, LeafRef, LineHunk, Storage, StructureExtractor, TextdbError};
+use textdb_core::{unified_diff, ChunkParams, Edit, Hash, LeafRef, LineHunk, PathOp, Storage, StructureExtractor, TextdbError};
 use textdb_md::MarkdownExtractor;
 
 use crate::storage::{sql_err, SqliteStorage};
@@ -100,6 +100,9 @@ pub struct TextDb<'c> {
     /// autocommit mode. Disabled when running inside a virtual-table callback.
     pub manage_tx: bool,
     pub retries: usize,
+    /// Record renames, moves and deletes (`Some`), or leave it to the store's `path_history`
+    /// setting (`None`). See [`TextDb::path_history_enabled`].
+    pub path_history: Option<bool>,
 }
 
 fn to_hash(v: &[u8]) -> Result<Hash> {
@@ -178,7 +181,15 @@ impl<'c> TextDb<'c> {
             extractor: Some(Box::new(MarkdownExtractor)),
             manage_tx,
             retries: textdb_core::DEFAULT_RETRIES,
+            path_history: None,
         }
+    }
+
+    /// This handle's own choice about recording renames, moves and deletes; `None` follows the
+    /// store's setting.
+    pub fn with_path_history(mut self, on: Option<bool>) -> Self {
+        self.path_history = on;
+        self
     }
 
     pub(crate) fn storage(&self) -> SqliteStorage<'c> {
@@ -836,6 +847,10 @@ impl<'c> TextDb<'c> {
             }
             let parent = db.ensure_folder(parent_of(&to))?;
             let now = Self::now();
+            let seq = db.record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, None)?;
+            if db.path_history_enabled()? {
+                db.record_path_events(PathOp::classify(&from, &to), &src, Some(&to), author, seq, &now)?;
+            }
             // `from` is never "/" here, so the subtree always has bounds.
             let (lo, hi) = subtree_bounds(&from).expect("rename rejects the root above");
             db.conn
@@ -855,7 +870,6 @@ impl<'c> TextDb<'c> {
                 .map_err(sql_err)?
                 .execute(params![to, name_of(&to), parent, now, src.id])
                 .map_err(sql_err)?;
-            db.record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, None)?;
             Ok(())
         })
     }
@@ -874,6 +888,10 @@ impl<'c> TextDb<'c> {
             }
             let n = db.node_by_path(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
             let now = Self::now();
+            let seq = db.record_change("delete", n.id, n.kind, &path, None, None, None, None, author, None)?;
+            if db.path_history_enabled()? {
+                db.record_path_events(PathOp::Delete, &n, None, author, seq, &now)?;
+            }
             let (lo, hi) = subtree_bounds(&path).expect("delete rejects the root above");
             db.conn
                 .prepare_cached(&format!(
@@ -884,7 +902,6 @@ impl<'c> TextDb<'c> {
                 .map_err(sql_err)?
                 .execute(params![path, now, lo, hi])
                 .map_err(sql_err)?;
-            db.record_change("delete", n.id, n.kind, &path, None, None, None, None, author, None)?;
             Ok(())
         })
     }
@@ -1166,7 +1183,7 @@ impl<'c> TextDb<'c> {
         commit_kind: Option<&str>,
         author: Option<&str>,
         message: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         self.conn
             .prepare_cached(&format!(
                 "INSERT INTO {}change(ts, op, node_id, node_kind, path, old_path, version, base_version, commit_kind, author, message) \
@@ -1188,7 +1205,7 @@ impl<'c> TextDb<'c> {
                 message
             ])
             .map_err(sql_err)?;
-        Ok(())
+        Ok(self.conn.last_insert_rowid())
     }
 
     /// Change-feed rows with `seq > since`, oldest first, at most `limit` of them.

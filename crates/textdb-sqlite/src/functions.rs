@@ -271,6 +271,22 @@ pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
         let author = opt_str(ctx, 1)?.filter(|a| !a.is_empty());
         with_db(ctx, h, &p, |db| db.delete_by(&path, author.as_deref()).map(|()| 1i64))
     })?;
+    // Store settings: `textdb_setting(key)` reads (NULL at the default), `textdb_setting(key,
+    // value)` sets and `textdb_setting(key, NULL)` returns it to its default.
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_setting", -1, flags, move |ctx| {
+        if ctx.is_empty() || ctx.len() > 2 {
+            return Err(Error::UserFunctionError("textdb_setting(key[, value])".into()));
+        }
+        let key = arg_str(ctx, 0)?;
+        let value = if ctx.len() == 2 { Some(opt_str(ctx, 1)?) } else { None };
+        with_db(ctx, h, &p, |db| {
+            if let Some(v) = &value {
+                db.set_setting(&key, v.as_deref())?;
+            }
+            db.setting(&key)
+        })
+    })?;
     // The trash: what deletes left behind, readable until purged. Entries are addressed by
     // id, since a path may have been deleted more than once or reused since.
     let p = prefix.to_string();

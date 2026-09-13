@@ -107,6 +107,23 @@ pub struct Commit {
     pub base_version: Option<i64>,
 }
 
+/// A rename, move or delete as it touched one file or folder.
+#[derive(Debug, Serialize)]
+pub struct PathEvent {
+    pub id: i64,
+    pub ts: String,
+    /// `rename`, `move` or `delete`.
+    pub op: String,
+    pub old_path: String,
+    /// Where it went; absent for a delete.
+    pub new_path: Option<String>,
+    /// The folder the operation named, when this file or folder went along with it.
+    pub via: Option<String>,
+    /// A file's version when it happened.
+    pub version: Option<i64>,
+    pub author: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Hit {
     pub path: String,
@@ -206,6 +223,17 @@ pub trait Store {
     fn chunks(&mut self, path: &str, version: Option<i64>) -> Result<Vec<Chunk>>;
     fn mv(&mut self, from: &str, to: &str, author: Option<&str>) -> Result<()>;
     fn rm(&mut self, path: &str, author: Option<&str>) -> Result<()>;
+    /// Renames, moves and deletes of the file or folder at `path`, oldest first.
+    fn path_history(&mut self, path: &str) -> Result<Vec<PathEvent>>;
+    /// Record renames, moves and deletes on this connection (`Some(true)`), don't
+    /// (`Some(false)`), or follow the store's `path_history` setting (`None`).
+    fn set_session_path_history(&mut self, on: Option<bool>) -> Result<()>;
+    /// Whether this connection records renames, moves and deletes.
+    fn path_history_enabled(&mut self) -> Result<bool>;
+    /// A store setting's value; `None` at its default.
+    fn setting(&mut self, key: &str) -> Result<Option<String>>;
+    /// Set a store setting, or return it to its default with `None`; answers the stored value.
+    fn set_setting(&mut self, key: &str, value: Option<&str>) -> Result<Option<String>>;
     fn last_seq(&mut self) -> Result<i64>;
     fn feed(&mut self, since: i64, limit: i64) -> Result<Vec<Change>>;
     /// Return once another writer may have committed, or after `timeout`; waking early for

@@ -229,6 +229,37 @@ describe('move and delete', () => {
     res = await api('POST', '/api/delete', { path: '/' });
     assert.deepEqual([res.status, res.body.code], [400, 'TX004']);
 
+    res = await api('GET', '/api/path-history?path=/elsewhere/sub2/deep/c.md');
+    assert.deepEqual(
+      res.body.map((e: { op: string; old_path: string; new_path: string | null; via: string | null; author: string }) => [
+        e.op,
+        e.old_path,
+        e.new_path,
+        e.via,
+        e.author,
+      ]),
+      [
+        ['move', '/tree/sub/deep/c.md', '/elsewhere/sub2/deep/c.md', '/tree/sub', 'human'],
+        ['delete', '/elsewhere/sub2/deep/c.md', null, '/elsewhere', 'agent-7'],
+      ],
+    );
+    res = await api('GET', '/api/path-history?path=/tree/a.md');
+    assert.equal(res.status, 404, 'renamed away, so nothing is at the old path');
+    res = await api('GET', '/api/path-history?path=/tree/renamed.md');
+    assert.deepEqual(
+      res.body.map((e: { op: string; old_path: string }) => [e.op, e.old_path]),
+      [['rename', '/tree/a.md']],
+    );
+
+    res = await api('GET', '/api/setting?key=path_history');
+    assert.deepEqual(res.body, { key: 'path_history', value: null });
+    res = await api('PUT', '/api/setting', { key: 'path_history', value: 'off' });
+    assert.deepEqual(res.body, { key: 'path_history', value: 'off' });
+    res = await api('PUT', '/api/setting', { key: 'path_history', value: null });
+    assert.deepEqual(res.body, { key: 'path_history', value: null });
+    res = await api('PUT', '/api/setting', { key: 'colour', value: 'blue' });
+    assert.deepEqual([res.status, res.body.code], [400, 'TX004']);
+
     const moves = server.corpus
       .feed(since)
       .filter((c) => c.op === 'move' || c.op === 'delete')

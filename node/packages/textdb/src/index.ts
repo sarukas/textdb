@@ -3,6 +3,7 @@ export {
   type AuthorOptions,
   Corpus,
   type OpenOptions,
+  type PathEvent,
   type PurgeStats,
   type Stat,
   type TrashEntry,

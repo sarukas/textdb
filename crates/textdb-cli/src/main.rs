@@ -20,7 +20,7 @@ use serde_json::json;
 use textdb_sqlite::normalize_path;
 
 use config::StoreUrl;
-use store::{Change, Entry, ImportStats, Store, StoreError, Written};
+use store::{Change, Commit, Entry, ImportStats, PathEvent, Store, StoreError, Written};
 
 type Result<T> = std::result::Result<T, StoreError>;
 
@@ -42,6 +42,11 @@ struct Cli {
     /// Answer in JSON (errors too, on stdout).
     #[arg(long, global = true)]
     json: bool,
+    /// Record renames, moves and deletes in the history of what they touch: `on` or `off` for
+    /// this command. Without it the store's `path_history` setting decides, which is on unless
+    /// changed with `textdb setting path_history off`.
+    #[arg(long, global = true, env = "TEXTDB_PATH_HISTORY", value_name = "on|off", value_parser = switch)]
+    path_history: Option<bool>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -61,6 +66,11 @@ fn store_path(s: &str) -> std::result::Result<String, String> {
         ));
     }
     Ok(s.to_string())
+}
+
+/// An on/off value: `on`, `off`, and also `true`/`false`, `yes`/`no`, `1`/`0`.
+fn switch(s: &str) -> std::result::Result<bool, String> {
+    textdb_core::parse_switch(s).ok_or_else(|| format!("'{s}' is not on or off"))
 }
 
 #[derive(Subcommand)]
@@ -194,6 +204,9 @@ enum Cmd {
     History {
         #[arg(value_parser = store_path)]
         path: String,
+        /// Versions only, without the renames, moves and deletes that touched the file.
+        #[arg(long)]
+        versions_only: bool,
     },
     /// Unified diff between two versions; V2 defaults to the current version.
     Diff {
@@ -227,6 +240,12 @@ enum Cmd {
     Rm {
         #[arg(value_parser = store_path)]
         path: String,
+    },
+    /// Show or change a store setting: `setting`, `setting path_history`,
+    /// `setting path_history off` (`on`, or `default` to clear it).
+    Setting {
+        key: Option<String>,
+        value: Option<String>,
     },
     /// Changes after a sequence number, oldest first.
     Log {
@@ -268,6 +287,9 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
     }
     let mut store = store::open(&cli.store)?;
     let st = store.as_mut();
+    if cli.path_history.is_some() {
+        st.set_session_path_history(cli.path_history)?;
+    }
     let author = Some(cli.author.as_str());
     match cli.cmd {
         Cmd::Config => unreachable!("handled above"),
@@ -428,27 +450,20 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             let w = st.append(&path, &tail, author)?;
             emit_written(&path, &w, json)
         }
-        Cmd::History { path } => {
+        Cmd::History { path, versions_only } => {
             let commits = st.history(&path)?;
-            if json {
+            if versions_only && json {
                 return emit_json(&commits);
             }
-            let mut s = String::new();
-            for c in &commits {
-                let mut how = c.kind.clone().unwrap_or_default();
-                if let Some(b) = c.base_version.filter(|b| *b != c.version - 1) {
-                    how.push_str(&format!(" from v{b}"));
-                }
-                s.push_str(&format!(
-                    "v{:<5} {}  {:<14} {:<16} {}\n",
-                    c.version,
-                    c.ts,
-                    c.author.as_deref().unwrap_or("-"),
-                    how,
-                    c.message.as_deref().unwrap_or("")
-                ));
+            let events = if versions_only { Vec::new() } else { st.path_history(&path)? };
+            let mut items: Vec<HistoryItem> =
+                commits.iter().map(HistoryItem::Version).chain(events.iter().map(HistoryItem::Path)).collect();
+            // Stable, so a version and a path event at the same instant keep the version first.
+            items.sort_by(|a, b| a.ts().cmp(b.ts()));
+            if json {
+                return emit_json(&items);
             }
-            out(s.as_bytes())
+            out(history_text(&items).as_bytes())
         }
         Cmd::Diff { path, v1, v2 } => {
             let v2 = match v2 {
@@ -523,6 +538,24 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
                 line(format!("deleted {path}"))
             }
         }
+        Cmd::Setting { key, value } => {
+            let key = key.unwrap_or_else(|| textdb_core::PATH_HISTORY_SETTING.to_string());
+            if let Some(v) = &value {
+                st.set_setting(&key, if v == "default" { None } else { Some(v.as_str()) })?;
+            }
+            let stored = st.setting(&key)?;
+            let effective = st.path_history_enabled()?;
+            if json {
+                return emit_json(&json!({ key.as_str(): { "value": stored, "effective": effective } }));
+            }
+            let default = if textdb_core::PATH_HISTORY_DEFAULT { "on" } else { "off" };
+            let shown = stored.map_or_else(|| format!("{default} (default)"), |v| v);
+            let session = match cli.path_history {
+                Some(on) => format!("; {} for this command (--path-history / TEXTDB_PATH_HISTORY)", if on { "on" } else { "off" }),
+                None => String::new(),
+            };
+            line(format!("{key}  {shown}{session}"))
+        }
         Cmd::Log { since, limit } => {
             let changes = st.feed(since, limit)?;
             if json {
@@ -533,6 +566,62 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
         }
         Cmd::Watch { since, prefix } => watch(st, since, &prefix, json),
     }
+}
+
+/// One entry of a file's history: a version, or a rename, move or delete that touched it.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum HistoryItem<'a> {
+    Version(&'a Commit),
+    Path(&'a PathEvent),
+}
+
+impl HistoryItem<'_> {
+    fn ts(&self) -> &str {
+        match self {
+            HistoryItem::Version(c) => &c.ts,
+            HistoryItem::Path(e) => &e.ts,
+        }
+    }
+}
+
+fn history_text(items: &[HistoryItem]) -> String {
+    let mut s = String::new();
+    for item in items {
+        match item {
+            HistoryItem::Version(c) => {
+                let mut how = c.kind.clone().unwrap_or_default();
+                if let Some(b) = c.base_version.filter(|b| *b != c.version - 1) {
+                    how.push_str(&format!(" from v{b}"));
+                }
+                s.push_str(&format!(
+                    "v{:<5} {}  {:<14} {:<16} {}\n",
+                    c.version,
+                    c.ts,
+                    c.author.as_deref().unwrap_or("-"),
+                    how,
+                    c.message.as_deref().unwrap_or("")
+                ));
+            }
+            HistoryItem::Path(e) => {
+                let what = match e.op.as_str() {
+                    "rename" => "renamed",
+                    "move" => "moved",
+                    "delete" => "deleted",
+                    other => other,
+                };
+                let mut detail = match &e.new_path {
+                    Some(to) => format!("{} -> {to}", e.old_path),
+                    None => e.old_path.clone(),
+                };
+                if let Some(via) = &e.via {
+                    detail.push_str(&format!("  (with {via})"));
+                }
+                s.push_str(&format!("{:<6} {}  {:<14} {:<16} {}\n", "", e.ts, e.author.as_deref().unwrap_or("-"), what, detail));
+            }
+        }
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------------------
@@ -955,14 +1044,19 @@ fn show_config(cli: &Cli, matches: &ArgMatches) -> Result<()> {
         StoreUrl::Postgres(_) => "postgres".to_string(),
     };
     let store = config::redact(&cli.store);
+    let (path_history, path_history_source) = match cli.path_history {
+        Some(on) => (if on { "on" } else { "off" }, source("path_history")),
+        None => ("the store's path_history setting (on unless turned off)", "default"),
+    };
     if cli.json {
         return emit_json(&json!({
             "store": { "value": store, "source": source("store"), "backend": backend },
             "author": { "value": cli.author, "source": source("author") },
+            "path_history": { "value": cli.path_history, "source": path_history_source },
         }));
     }
     line(format!(
-        "store   {store}  [{}] -> {backend}\nauthor  {}  [{}]",
+        "store         {store}  [{}] -> {backend}\nauthor        {}  [{}]\npath history  {path_history}  [{path_history_source}]",
         source("store"),
         cli.author,
         source("author")

@@ -27,6 +27,8 @@ learns about the CLI's commits from the store's change feed.
 | `textdb_replace_lines(path, from, to, text[, base_version[, author]])` | same JSON; lines refer to `base_version` (HEAD if NULL); `to = from - 1` inserts |
 | `textdb_move(from, to[, author])` | `1`; moves or renames a file, or a folder with everything below it (missing parent folders are created). History moves with the files. TX003 when `from` is missing, TX004 when `to` exists, is inside `from`, or either is the root |
 | `textdb_delete(path[, author])` | `1`; deletes a file, or a folder with everything below it. History stays in the store. TX003 when missing, TX004 for the root |
+| `textdb_path_history(path[, node_id])` | `id, ts, op, old_path, new_path, via, version, author` — the renames, moves and deletes that touched the file or folder at `path` (live, else the one most recently deleted there), or with `textdb_path_history(NULL, id)` a trash entry; oldest first. One row per node an operation touched: a folder's rename gives each file inside a row with `via` = the folder. `op` ∈ `rename` (same folder), `move`, `delete`; `version` is a file's version at the time. Path events are not versions |
+| `textdb_setting(key[, value])` | a store setting, NULL at its default; `textdb_setting(key, value)` sets it, `textdb_setting(key, NULL)` clears it. `path_history` (`on`/`off`, default on) decides whether renames, moves and deletes are recorded |
 | `textdb_trash([parent_id])` | JSON array of trash entries `{id, name, kind, path, version, nbytes, nlines, files, updated_at, updated_by, deleted_at, deleted_by}`: without an argument the trash items (one per delete, newest first), with a trashed folder's id what was deleted inside it. `path` is where the entry was when deleted; a folder's `files`/`nbytes` total what was deleted with it |
 | `textdb_trash_entry(id)` | one entry as JSON |
 | `textdb_trash_content(id[, version])` | a trashed file's content, at the version it was deleted with by default |
@@ -73,6 +75,9 @@ Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./
 | `GET /api/stat?path=…` | | `{ path, kind, files, folders, nbytes }` — for a folder, everything below it (`folders` does not count the folder itself) |
 | `POST /api/move` | `{ from, to, author? }` | `{ from, to }` — a file or a whole folder; one `move` change for the moved node |
 | `POST /api/delete` | `{ path, author? }` | `{ path }` — a file or a whole folder; one `delete` change for the deleted node |
+| `GET /api/path-history?path=…` or `?id=…` | | `[{ id, ts, op, old_path, new_path, via, version, author }]`, see `textdb_path_history` |
+| `GET /api/setting?key=…` | | `{ key, value }` (`value` null at the default) |
+| `PUT /api/setting` | `{ key, value }` (`value` null clears) | `{ key, value }` |
 | `GET /api/trash[?parent=id]` | | trash entries, see `textdb_trash` |
 | `GET /api/trash/file?id=…[&version=n]` | | `{ entry, version, content }` |
 | `GET /api/trash/history?id=…` | | `[{ version, author, ts, message, nbytes, kind, base_version }]` |

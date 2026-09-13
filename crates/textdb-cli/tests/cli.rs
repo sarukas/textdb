@@ -23,7 +23,11 @@ impl Output {
 
 fn textdb(store: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_textdb"));
-    cmd.env_remove("TEXTDB_STORE").env_remove("TEXTDB_AUTHOR").arg("--store").arg(store);
+    cmd.env_remove("TEXTDB_STORE")
+        .env_remove("TEXTDB_AUTHOR")
+        .env_remove("TEXTDB_PATH_HISTORY")
+        .arg("--store")
+        .arg(store);
     cmd
 }
 
@@ -155,6 +159,69 @@ fn import_browse_edit_by_line_and_handle_conflicts() {
     ok(textdb(&store).args(["export", "/docs"]).arg(&exported), None);
     let intro = std::fs::read_to_string(exported.join("guide/intro.md")).unwrap();
     assert!(intro.contains("line 1, rewritten by the agent\n") && intro.contains("LINE 390 of"));
+}
+
+#[test]
+fn renames_moves_and_deletes_show_in_history_unless_turned_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let path_ops = |path: &str| -> Vec<(String, Option<i64>, Option<String>, Option<String>)> {
+        ok(textdb(&store).args(["--json", "history", path]), None)
+            .json()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| {
+                (
+                    i["type"].as_str().unwrap().to_string(),
+                    i["version"].as_i64(),
+                    i["op"].as_str().map(String::from),
+                    i["author"].as_str().map(String::from),
+                )
+            })
+            .collect()
+    };
+    let s = |v: &str| Some(v.to_string());
+
+    ok(textdb(&store).args(["write", "/a/x.md"]), Some("one\n"));
+    ok(textdb(&store).args(["--author", "human", "mv", "/a/x.md", "/a/y.md"]), None);
+    ok(textdb(&store).args(["--author", "agent-7", "mv", "/a", "/b"]), None);
+    assert_eq!(
+        path_ops("/b/y.md"),
+        vec![
+            ("version".into(), Some(1), None, s("cli")),
+            ("path".into(), Some(1), s("rename"), s("human")),
+            // /a and /b are both in the root folder: the folder was renamed, and y.md went with it.
+            ("path".into(), Some(1), s("rename"), s("agent-7")),
+        ]
+    );
+    let text = ok(textdb(&store).args(["history", "b/y.md"]), None).stdout;
+    assert!(text.contains("renamed") && text.contains("/a/x.md -> /a/y.md"), "{text}");
+    assert!(text.contains("/a/y.md -> /b/y.md  (with /a)"), "{text}");
+    let versions = ok(textdb(&store).args(["--json", "history", "/b/y.md", "--versions-only"]), None).json();
+    assert_eq!(versions.as_array().unwrap().len(), 1);
+    assert!(versions[0].get("type").is_none(), "{versions}");
+
+    // Off in the store: nothing recorded, unless one command asks for it.
+    ok(textdb(&store).args(["setting", "path_history", "off"]), None);
+    let shown = ok(textdb(&store).args(["--json", "setting"]), None).json();
+    assert_eq!(shown["path_history"], serde_json::json!({ "value": "off", "effective": false }));
+    ok(textdb(&store).args(["mv", "/b/y.md", "/b/z.md"]), None);
+    assert_eq!(path_ops("/b/z.md").len(), 3);
+    ok(textdb(&store).args(["--path-history", "on", "mv", "/b/z.md", "/b/w.md"]), None);
+    assert_eq!(path_ops("/b/w.md").len(), 4);
+    ok(textdb(&store).args(["setting", "path_history", "default"]), None);
+    let shown = ok(textdb(&store).args(["--json", "setting", "path_history"]), None).json();
+    assert_eq!(shown["path_history"], serde_json::json!({ "value": null, "effective": true }));
+
+    // A delete is the last entry, found at the path it was deleted from.
+    ok(textdb(&store).args(["--author", "ops", "rm", "/b"]), None);
+    let last = ok(textdb(&store).args(["--json", "history", "/b/w.md"]), None).json();
+    let last = last.as_array().unwrap().last().unwrap().clone();
+    assert_eq!((last["op"].as_str(), last["via"].as_str(), last["author"].as_str()), (Some("delete"), Some("/b"), Some("ops")));
+
+    assert_eq!(run(textdb(&store).args(["setting", "colour"]), None).status, 6);
+    assert_eq!(run(textdb(&store).args(["--path-history", "maybe", "ls"]), None).status, 2);
 }
 
 #[test]

@@ -90,6 +90,27 @@ CREATE TABLE IF NOT EXISTS {p}change (
   message      TEXT    NULL
 );
 CREATE INDEX IF NOT EXISTS {p}change_node ON {p}change(node_id);
+-- Path history (textdb_core::path): one row per node a rename, move or delete touched — the
+-- node it named and everything below a folder — next to the versions in `commit`.
+CREATE TABLE IF NOT EXISTS {p}path_event (
+  id           INTEGER PRIMARY KEY,
+  node_id      INTEGER NOT NULL,
+  node_kind    INTEGER NOT NULL,              -- 0 folder, 1 file
+  op           TEXT    NOT NULL,              -- rename, move, delete
+  ts           TEXT    NOT NULL,
+  author       TEXT    NULL,
+  old_path     TEXT    NOT NULL,
+  new_path     TEXT    NULL,                  -- rename, move: the path after
+  via          TEXT    NULL,                  -- the folder the operation named, when this node went with it
+  version      INTEGER NULL,                  -- a file's version when it happened
+  change_seq   INTEGER NULL                   -- the change feed row of the operation
+);
+CREATE INDEX IF NOT EXISTS {p}path_event_node ON {p}path_event(node_id, id);
+-- Store settings, e.g. `path_history` = on | off. A missing row means the default.
+CREATE TABLE IF NOT EXISTS {p}setting (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS {p}fts USING fts5(text, content='', tokenize='unicode61');
 "#,
         p = p
@@ -124,7 +145,8 @@ pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> 
 
 pub fn drop_sql(p: &str) -> String {
     [
-        "node", "commit", "chunk", "tree_node", "chunk_ref", "section", "link", "frontmatter", "checkpoint", "change", "fts",
+        "node", "commit", "chunk", "tree_node", "chunk_ref", "section", "link", "frontmatter", "checkpoint", "change", "path_event",
+        "setting", "fts",
     ]
     .iter()
     .map(|t| format!("DROP TABLE IF EXISTS {}{};", p, t))

@@ -25,6 +25,7 @@ extension built from this repository (see [INSTALL.md](INSTALL.md)).
 | Store | `--store`, `-s` | `TEXTDB_STORE` | `kb.db` |
 | Author of writes | `--author`, `-a` | `TEXTDB_AUTHOR` | `cli` |
 | JSON output | `--json` | | off |
+| Record renames, moves and deletes | `--path-history on\|off` | `TEXTDB_PATH_HISTORY` | the store's `path_history` setting, which is on unless changed with `textdb setting path_history off` |
 
 A store is a SQLite path (`kb.db`, `C:\data\kb.db`, `sqlite:kb.db`, `sqlite:///kb.db` relative,
 `sqlite:////srv/kb.db` absolute) or a Postgres URL (`postgres://user@host:5432/db`).
@@ -60,11 +61,12 @@ reporting it as not found.
 | `edit PATH --old TEXT --new TEXT` | Replace the one occurrence of `old`. Also `--old-file`/`--new-file`, or `--stdin-json` reading `{"old": …, "new": …}` |
 | `replace-lines PATH FROM TO [-b V] [--text T \| -f FILE \| stdin]` | Replace lines `FROM..TO` (1-based, inclusive) as numbered in version `V`; `TO = FROM-1` inserts before `FROM` |
 | `append PATH [TEXT]` | Append the argument (as a line) or stdin; never conflicts |
-| `history PATH` | Versions: time, author, how each landed (`direct`, `rebased`, `merged`) and its base |
+| `history PATH [--versions-only]` | Versions — time, author, how each landed (`direct`, `rebased`, `merged`) and its base — and, between them, the renames, moves and deletes that touched the file, including those of a folder it was in. A deleted file is found at the path it was deleted from |
 | `diff PATH V1 [V2]` | Unified diff; `V2` defaults to the current version |
 | `hunks PATH [V1 [V2]]` | Line hunks; defaults to the latest commit |
 | `chunks PATH [--version V]` | The content-defined chunks the file is stored as |
-| `mv FROM TO`, `rm PATH` | Move/rename and delete files or folders (history stays readable) |
+| `mv FROM TO`, `rm PATH` | Move/rename and delete files or folders. History stays readable, and each file or folder touched gets a `rename`, `move` or `delete` entry in its history while path history is on |
+| `setting [KEY [VALUE]]` | Show or change a store setting. `path_history` is `on` (default) or `off`; `default` clears it. `--path-history` overrides it for one command |
 | `log [--since SEQ] [--limit N]` | The change log: every create, commit, mkdir, move and delete, in order |
 | `watch [--since SEQ] [-p PREFIX]` | Follow the change log live — one line per change, JSON lines with `--json` |
 
@@ -110,7 +112,8 @@ EOF
 | `cat` | `{"path", "version", "nlines", "from", "to", "content"}` |
 | `ls`, `tree` | `[{"path", "name", "kind", "nbytes", "nlines", "updated_at"}]` |
 | `stat` | `{"path", "kind", "version", "nbytes", "nlines", "updated_at", "updated_by"}` |
-| `history` | `[{"version", "author", "ts", "message", "nbytes", "kind", "base_version"}]` |
+| `history` | time-ordered `[{"type": "version", "version", "author", "ts", "message", "nbytes", "kind", "base_version"} \| {"type": "path", "id", "ts", "op", "old_path", "new_path", "via", "version", "author"}]`; `op` is `rename`, `move` or `delete`, `via` the folder the operation named when the file went along with it, `version` the file's version at the time. With `--versions-only`, the version objects without `type` |
+| `setting` | `{"path_history": {"value": "on" \| "off" \| null, "effective": true \| false}}` |
 | `hunks` | `{"path", "from", "to", "hunks": [{"old_from", "old_count", "new_from", "new_count", "old_text", "new_text"}]}` |
 | `log`, `watch` | `{"seq", "ts", "op", "path", "old_path", "node_kind", "version", "base_version", "commit_kind", "author", "message"}` |
 | `search` | `[{"path", "line", "snippet", "rank"}]` |
