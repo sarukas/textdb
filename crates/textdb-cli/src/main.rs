@@ -1,0 +1,960 @@
+//! `textdb`: read, search and edit a textdb store from the command line.
+//!
+//! One binary for SQLite files and Postgres databases, built for agents as much as for
+//! people: every command can answer in JSON, a failed write exits with a status that says
+//! why, and a conflict carries the current text of the contested lines so the caller can
+//! retry without reading the file again. See `docs/cli.md`.
+
+mod config;
+mod store;
+
+use std::collections::BTreeMap;
+use std::io::{IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use textdb_sqlite::normalize_path;
+
+use config::StoreUrl;
+use store::{Change, Entry, ImportStats, Store, StoreError, Written};
+
+type Result<T> = std::result::Result<T, StoreError>;
+
+#[derive(Parser)]
+#[command(
+    name = "textdb",
+    version,
+    about = "Read, search and edit a versioned text corpus stored in textdb (SQLite or Postgres)",
+    after_help = "Exit status: 0 ok, 1 error, 2 usage, 3 conflict (TX001), 4 contention (TX002), \
+                  5 not found (TX003), 6 invalid edit (TX004)."
+)]
+struct Cli {
+    /// Store: a SQLite file (`kb.db`, `sqlite:kb.db`) or a Postgres URL (`postgres://user@host/db`).
+    #[arg(long, short = 's', global = true, env = "TEXTDB_STORE", default_value = "kb.db")]
+    store: String,
+    /// Name recorded as the author of writes.
+    #[arg(long, short = 'a', global = true, env = "TEXTDB_AUTHOR", default_value = "cli")]
+    author: String,
+    /// Answer in JSON (errors too, on stdout).
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+/// A path inside the store, as given on the command line.
+///
+/// Git Bash rewrites an argument that starts with `/` into a Windows path under its install
+/// directory (`/guides/a.md` becomes `C:/Program Files/Git/guides/a.md`) before the program
+/// sees it. A drive-letter path can never name something in the store, so it is refused with
+/// the two ways around the rewrite rather than reported later as "not found".
+fn store_path(s: &str) -> std::result::Result<String, String> {
+    let b = s.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\') {
+        return Err(format!(
+            "'{s}' is a Windows path, not a path in the store. If your shell rewrote a path starting \
+             with '/' (Git Bash does), leave out the leading slash or set MSYS_NO_PATHCONV=1"
+        ));
+    }
+    Ok(s.to_string())
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Create the store if it does not exist, or upgrade one an older build wrote.
+    Init,
+    /// Show each setting and where it came from.
+    Config,
+    /// Load every matching file under a directory; unchanged files make no new version.
+    Import {
+        dir: PathBuf,
+        /// Folder in the store to load into.
+        #[arg(long, default_value = "/", value_parser = store_path)]
+        prefix: String,
+        /// File extensions to load, comma separated (`*` for all).
+        #[arg(long, default_value = "md,markdown,mdx,txt")]
+        ext: String,
+        /// Files per transaction.
+        #[arg(long, default_value_t = 500)]
+        batch: usize,
+    },
+    /// Write every file under a folder to a local directory.
+    Export {
+        #[arg(value_parser = store_path)]
+        prefix: String,
+        dir: PathBuf,
+    },
+    /// List one folder.
+    Ls {
+        #[arg(default_value = "/", value_parser = store_path)]
+        path: String,
+    },
+    /// Show the folder tree.
+    Tree {
+        #[arg(default_value = "/", value_parser = store_path)]
+        path: String,
+        /// Levels to show (all when omitted).
+        #[arg(long, short = 'L')]
+        depth: Option<usize>,
+        /// Folders only.
+        #[arg(long, short = 'd')]
+        dirs: bool,
+    },
+    /// Version, size and last author of a file or folder.
+    Stat {
+        #[arg(value_parser = store_path)]
+        path: String,
+    },
+    /// Print a file or part of it.
+    Cat {
+        #[arg(value_parser = store_path)]
+        path: String,
+        /// Number the lines, under a header naming the version — pass that version as
+        /// --base-version when editing by line number.
+        #[arg(long, short = 'n')]
+        number: bool,
+        /// Lines `A:B` (1-based, inclusive); `A:` to the end, `:B` from the start, `A` alone.
+        #[arg(long, short = 'l')]
+        lines: Option<String>,
+        /// A past version instead of the current one.
+        #[arg(long = "version", short = 'v', value_name = "VERSION")]
+        at: Option<i64>,
+        /// Only the section under this markdown heading (`Heading` or `Parent / Heading`).
+        #[arg(long, conflicts_with = "at")]
+        section: Option<String>,
+    },
+    /// Full-text search: terms are ANDed per document, "quoted phrases", prefix*.
+    Search {
+        query: String,
+        #[arg(long, short = 'p', default_value = "/", value_parser = store_path)]
+        prefix: String,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+    /// Create a file or replace its content, from --file or stdin.
+    Write {
+        #[arg(value_parser = store_path)]
+        path: String,
+        /// The version the new content was derived from. Commits that landed since are
+        /// rebased under it; a change to the same lines is a conflict.
+        #[arg(long, short = 'b')]
+        base_version: Option<i64>,
+        #[arg(long, short = 'f')]
+        file: Option<PathBuf>,
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+        /// Allow writing empty content (otherwise refused, as it is usually a missing pipe).
+        #[arg(long)]
+        allow_empty: bool,
+    },
+    /// Replace the one occurrence of the old text with the new text.
+    Edit {
+        #[arg(value_parser = store_path)]
+        path: String,
+        #[arg(long, conflicts_with_all = ["old_file", "stdin_json"])]
+        old: Option<String>,
+        #[arg(long, conflicts_with_all = ["new_file", "stdin_json"])]
+        new: Option<String>,
+        #[arg(long, conflicts_with = "stdin_json")]
+        old_file: Option<PathBuf>,
+        #[arg(long, conflicts_with = "stdin_json")]
+        new_file: Option<PathBuf>,
+        /// Read `{"old": "…", "new": "…"}` from stdin: no shell quoting for multi-line text.
+        #[arg(long)]
+        stdin_json: bool,
+    },
+    /// Replace lines FROM..TO (1-based, inclusive) with --text, --file or stdin. TO = FROM-1 inserts before FROM.
+    ReplaceLines {
+        #[arg(value_parser = store_path)]
+        path: String,
+        from: i64,
+        to: i64,
+        /// The version the line numbers refer to (see `cat -n`).
+        #[arg(long, short = 'b')]
+        base_version: Option<i64>,
+        #[arg(long, short = 't', conflicts_with = "file")]
+        text: Option<String>,
+        #[arg(long, short = 'f')]
+        file: Option<PathBuf>,
+    },
+    /// Append text (the argument, or stdin) to the end of a file; never conflicts.
+    Append {
+        #[arg(value_parser = store_path)]
+        path: String,
+        text: Option<String>,
+    },
+    /// Versions of a file, oldest first.
+    History {
+        #[arg(value_parser = store_path)]
+        path: String,
+    },
+    /// Unified diff between two versions; V2 defaults to the current version.
+    Diff {
+        #[arg(value_parser = store_path)]
+        path: String,
+        v1: i64,
+        v2: Option<i64>,
+    },
+    /// Line hunks between two versions; defaults to the latest commit.
+    Hunks {
+        #[arg(value_parser = store_path)]
+        path: String,
+        v1: Option<i64>,
+        v2: Option<i64>,
+    },
+    /// The content-defined chunks a file is stored as.
+    Chunks {
+        #[arg(value_parser = store_path)]
+        path: String,
+        #[arg(long = "version", short = 'v', value_name = "VERSION")]
+        at: Option<i64>,
+    },
+    /// Move or rename a file or folder.
+    Mv {
+        #[arg(value_parser = store_path)]
+        from: String,
+        #[arg(value_parser = store_path)]
+        to: String,
+    },
+    /// Delete a file or folder; its history stays readable.
+    Rm {
+        #[arg(value_parser = store_path)]
+        path: String,
+    },
+    /// Changes after a sequence number, oldest first.
+    Log {
+        #[arg(long, default_value_t = 0)]
+        since: i64,
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
+    },
+    /// Follow changes as they happen, one line each (JSON lines with --json).
+    Watch {
+        /// Start after this sequence number instead of now.
+        #[arg(long)]
+        since: Option<i64>,
+        /// Only changes under this folder.
+        #[arg(long, short = 'p', default_value = "/", value_parser = store_path)]
+        prefix: String,
+    },
+}
+
+fn main() {
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let json = cli.json;
+    let status = match run(cli, &matches) {
+        Ok(()) => 0,
+        Err(e) => {
+            report(&e, json);
+            e.exit_code()
+        }
+    };
+    let _ = std::io::stdout().flush();
+    std::process::exit(status);
+}
+
+fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
+    let json = cli.json;
+    if let Cmd::Config = cli.cmd {
+        return show_config(&cli, matches);
+    }
+    let mut store = store::open(&cli.store)?;
+    let st = store.as_mut();
+    let author = Some(cli.author.as_str());
+    match cli.cmd {
+        Cmd::Config => unreachable!("handled above"),
+        Cmd::Init => {
+            st.init()?;
+            let seq = st.last_seq()?;
+            let shown = config::redact(&cli.store);
+            if json {
+                emit_json(&json!({ "store": shown, "backend": st.backend(), "last_seq": seq }))
+            } else {
+                line(format!("{} store ready: {shown} (last change #{seq})", st.backend()))
+            }
+        }
+        Cmd::Import { dir, prefix, ext, batch } => import(st, &dir, &prefix, &ext, batch, author, json),
+        Cmd::Export { prefix, dir } => {
+            let prefix = normalize_path(&prefix)?;
+            let n = st.export(&prefix, &mut |path: &str, body: &[u8]| {
+                let rel = if prefix == "/" { path } else { &path[prefix.len()..] };
+                let target = dir.join(rel.trim_start_matches('/'));
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(target, body)
+            })?;
+            if json {
+                emit_json(&json!({ "exported": n, "dir": dir.display().to_string() }))
+            } else {
+                line(format!("exported {n} files to {}", dir.display()))
+            }
+        }
+        Cmd::Ls { path } => {
+            let mut entries = st.ls(&path)?;
+            entries.sort_by(|a, b| (a.kind != "folder", &a.name).cmp(&(b.kind != "folder", &b.name)));
+            if json {
+                return emit_json(&entries);
+            }
+            let mut s = String::new();
+            for e in &entries {
+                if e.kind == "folder" {
+                    s.push_str(&format!("{:>9}  {:>7}  {}/\n", "", "", e.name));
+                } else {
+                    s.push_str(&format!(
+                        "{:>9}  {:>7}  {}\n",
+                        human_bytes(e.nbytes.unwrap_or(0)),
+                        format!("{}L", e.nlines.unwrap_or(0)),
+                        e.name
+                    ));
+                }
+            }
+            out(s.as_bytes())
+        }
+        Cmd::Tree { path, depth, dirs } => tree(st, &path, depth, dirs, json),
+        Cmd::Stat { path } => {
+            let s = st.stat(&path)?;
+            if json {
+                return emit_json(&s);
+            }
+            let mut text = format!("{} {} v{}", s.path, s.kind, s.version);
+            if s.kind == "file" {
+                text.push_str(&format!(
+                    " · {} · {} lines",
+                    human_bytes(s.nbytes.unwrap_or(0)),
+                    s.nlines.unwrap_or(0)
+                ));
+            }
+            if let Some(at) = &s.updated_at {
+                text.push_str(&format!(" · updated {at}"));
+            }
+            if let Some(by) = &s.updated_by {
+                text.push_str(&format!(" by {by}"));
+            }
+            line(text)
+        }
+        Cmd::Cat { path, number, lines, at, section } => cat(st, &path, number, lines.as_deref(), at, section.as_deref(), json),
+        Cmd::Search { query, prefix, limit } => {
+            let hits = st.search(&query, &prefix, limit)?;
+            if json {
+                return emit_json(&hits);
+            }
+            let s: String = hits.iter().map(|h| format!("{}:{}: {}\n", h.path, h.line, h.snippet)).collect();
+            out(s.as_bytes())
+        }
+        Cmd::Write {
+            path,
+            base_version,
+            file,
+            message,
+            allow_empty,
+        } => {
+            let content = input(file.as_deref(), "write")?;
+            if content.is_empty() && !allow_empty {
+                return Err(StoreError::invalid(
+                    "refusing to write empty content (nothing on stdin?); pass --allow-empty to mean it",
+                ));
+            }
+            let w = st.write(&path, &content, base_version, author, message.as_deref())?;
+            emit_written(&path, &w, json)
+        }
+        Cmd::Edit {
+            path,
+            old,
+            new,
+            old_file,
+            new_file,
+            stdin_json,
+        } => {
+            let (old, new) = if stdin_json {
+                #[derive(Deserialize)]
+                struct Pair {
+                    old: String,
+                    new: String,
+                }
+                let raw = input(None, "edit --stdin-json")?;
+                let pair: Pair = serde_json::from_slice(&raw)
+                    .map_err(|e| StoreError::invalid(format!("stdin must be {{\"old\": …, \"new\": …}}: {e}")))?;
+                (pair.old.into_bytes(), pair.new.into_bytes())
+            } else {
+                (text_or_file(old, old_file, "old")?, text_or_file(new, new_file, "new")?)
+            };
+            let w = st.edit(&path, &old, &new, author)?;
+            emit_written(&path, &w, json)
+        }
+        Cmd::ReplaceLines {
+            path,
+            from,
+            to,
+            base_version,
+            text,
+            file,
+        } => {
+            if from < 1 || to < from - 1 {
+                return Err(StoreError::invalid(format!(
+                    "invalid line range {from}..{to}: FROM starts at 1, and TO is at least FROM-1 (which inserts)"
+                )));
+            }
+            let body = match (text, file) {
+                (Some(t), _) => t.into_bytes(),
+                (None, file) => {
+                    let body = input(file.as_deref(), "replace-lines")?;
+                    if body.is_empty() && file.is_none() {
+                        return Err(StoreError::invalid(
+                            "no replacement text on stdin; to delete the lines pass --text ''",
+                        ));
+                    }
+                    body
+                }
+            };
+            let w = st.replace_lines(&path, from, to, &body, base_version, author)?;
+            emit_written(&path, &w, json)
+        }
+        Cmd::Append { path, text } => {
+            let tail = match text {
+                // An argument is a line of text; stdin is taken as it comes.
+                Some(t) if t.ends_with('\n') => t.into_bytes(),
+                Some(t) => format!("{t}\n").into_bytes(),
+                None => input(None, "append")?,
+            };
+            let w = st.append(&path, &tail, author)?;
+            emit_written(&path, &w, json)
+        }
+        Cmd::History { path } => {
+            let commits = st.history(&path)?;
+            if json {
+                return emit_json(&commits);
+            }
+            let mut s = String::new();
+            for c in &commits {
+                let mut how = c.kind.clone().unwrap_or_default();
+                if let Some(b) = c.base_version.filter(|b| *b != c.version - 1) {
+                    how.push_str(&format!(" from v{b}"));
+                }
+                s.push_str(&format!(
+                    "v{:<5} {}  {:<14} {:<16} {}\n",
+                    c.version,
+                    c.ts,
+                    c.author.as_deref().unwrap_or("-"),
+                    how,
+                    c.message.as_deref().unwrap_or("")
+                ));
+            }
+            out(s.as_bytes())
+        }
+        Cmd::Diff { path, v1, v2 } => {
+            let v2 = match v2 {
+                Some(v) => v,
+                None => st.stat(&path)?.version,
+            };
+            let diff = st.diff(&path, v1, v2)?;
+            if json {
+                emit_json(&json!({ "path": path, "from": v1, "to": v2, "diff": diff }))
+            } else {
+                out(diff.as_bytes())
+            }
+        }
+        Cmd::Hunks { path, v1, v2 } => {
+            let v2 = match v2 {
+                Some(v) => v,
+                None => st.stat(&path)?.version,
+            };
+            let v1 = v1.unwrap_or(v2 - 1).max(0);
+            let hunks = st.hunks(&path, v1, v2)?;
+            if json {
+                return emit_json(&json!({ "path": path, "from": v1, "to": v2, "hunks": hunks }));
+            }
+            let mut s = String::new();
+            for h in &hunks {
+                s.push_str(&format!("@@ -{},{} +{},{} @@\n", h.old_from, h.old_count, h.new_from, h.new_count));
+                for (sign, text) in [('-', &h.old_text), ('+', &h.new_text)] {
+                    for l in text.split_inclusive('\n') {
+                        s.push(sign);
+                        s.push_str(l);
+                        if !l.ends_with('\n') {
+                            s.push('\n');
+                        }
+                    }
+                }
+            }
+            out(s.as_bytes())
+        }
+        Cmd::Chunks { path, at } => {
+            let chunks = st.chunks(&path, at)?;
+            if json {
+                return emit_json(&chunks);
+            }
+            let s: String = chunks
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{:>5}  lines {:>6}-{:<6} {:>8}  {}\n",
+                        c.ord,
+                        c.line_from,
+                        c.line_from + c.nlines.max(1) - 1,
+                        human_bytes(c.nbytes),
+                        &c.hash[..16.min(c.hash.len())]
+                    )
+                })
+                .collect();
+            out(s.as_bytes())
+        }
+        Cmd::Mv { from, to } => {
+            st.mv(&from, &to, author)?;
+            if json {
+                emit_json(&json!({ "moved": from, "to": to }))
+            } else {
+                line(format!("moved {from} -> {to}"))
+            }
+        }
+        Cmd::Rm { path } => {
+            st.rm(&path, author)?;
+            if json {
+                emit_json(&json!({ "deleted": path }))
+            } else {
+                line(format!("deleted {path}"))
+            }
+        }
+        Cmd::Log { since, limit } => {
+            let changes = st.feed(since, limit)?;
+            if json {
+                return emit_json(&changes);
+            }
+            let s: String = changes.iter().map(|c| change_line(c) + "\n").collect();
+            out(s.as_bytes())
+        }
+        Cmd::Watch { since, prefix } => watch(st, since, &prefix, json),
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Output
+// ---------------------------------------------------------------------------------------
+
+/// Write to stdout. A reader that went away (`textdb cat big.md | head`) ends the program
+/// quietly instead of as an error.
+fn out(bytes: &[u8]) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_all(bytes).and_then(|_| stdout.flush()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+        r => r.map_err(StoreError::from),
+    }
+}
+
+fn line(s: impl Into<String>) -> Result<()> {
+    let mut s = s.into();
+    s.push('\n');
+    out(s.as_bytes())
+}
+
+fn emit_json<T: Serialize + ?Sized>(v: &T) -> Result<()> {
+    line(serde_json::to_string(v).map_err(StoreError::other)?)
+}
+
+fn emit_written(path: &str, w: &Written, json: bool) -> Result<()> {
+    if json {
+        emit_json(&json!({ "path": path, "version": w.version, "kind": w.kind }))
+    } else if w.kind == "noop" {
+        line(format!("{path}: unchanged, still v{}", w.version))
+    } else {
+        line(format!("{path}: v{} ({})", w.version, w.kind))
+    }
+}
+
+fn report(e: &StoreError, json: bool) {
+    if json {
+        let _ = emit_json(&json!({ "error": e }));
+        return;
+    }
+    eprintln!("{}: {}", e.code, e.message);
+    if let Some(c) = &e.conflict {
+        let text = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        eprintln!(
+            "the same lines changed since your base version (lines {}-{}, now v{})",
+            c["region_line_from"], c["region_line_to"], c["current_version"]
+        );
+        eprintln!("--- base\n{}--- theirs (current text)\n{}--- ours\n{}", text("base"), text("theirs"), text("ours"));
+        eprintln!("Rebuild the change on 'theirs' and write again with --base-version {}.", c["current_version"]);
+    }
+}
+
+fn human_bytes(n: i64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = n as f64;
+    let mut unit = 0;
+    while v >= 1024.0 && unit < UNITS.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[unit])
+    }
+}
+
+fn change_line(c: &Change) -> String {
+    let mut s = format!("#{} {} {:<6} {}", c.seq, c.ts, c.op, c.path);
+    if let Some(old) = &c.old_path {
+        s.push_str(&format!(" (from {old})"));
+    }
+    if let Some(v) = c.version {
+        s.push_str(&format!(" v{v}"));
+        if let Some(kind) = c.commit_kind.as_deref().filter(|k| *k != "direct") {
+            s.push_str(&format!(" {kind}"));
+        }
+        if let Some(b) = c.base_version.filter(|b| *b != v - 1) {
+            s.push_str(&format!(" from v{b}"));
+        }
+    }
+    if let Some(a) = &c.author {
+        s.push_str(&format!(" by {a}"));
+    }
+    if let Some(m) = &c.message {
+        s.push_str(&format!(" · {m}"));
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------------------
+
+fn read_file(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|e| StoreError::other(format!("{}: {e}", path.display())))
+}
+
+/// Content from `file`, else stdin — unless stdin is a terminal, where waiting for input
+/// would look like a hang.
+fn input(file: Option<&Path>, what: &str) -> Result<Vec<u8>> {
+    if let Some(path) = file {
+        return read_file(path);
+    }
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Err(StoreError::invalid(format!("{what}: pass --file or pipe the text on stdin")));
+    }
+    let mut buf = Vec::new();
+    stdin.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+fn text_or_file(text: Option<String>, file: Option<PathBuf>, name: &str) -> Result<Vec<u8>> {
+    match (text, file) {
+        (Some(t), _) => Ok(t.into_bytes()),
+        (None, Some(f)) => read_file(&f),
+        (None, None) => Err(StoreError::invalid(format!("pass --{name}, --{name}-file or --stdin-json"))),
+    }
+}
+
+/// `A:B`, `A:`, `:B`, `A-B` or `A`.
+fn parse_range(s: &str) -> Result<(Option<i64>, Option<i64>)> {
+    let bad = || StoreError::invalid(format!("line range '{s}' should look like 10:20, 10:, :20 or 10"));
+    let num = |t: &str| -> Result<Option<i64>> {
+        let t = t.trim();
+        if t.is_empty() {
+            Ok(None)
+        } else {
+            t.parse().map(Some).map_err(|_| bad())
+        }
+    };
+    match s.split_once(':').or_else(|| s.split_once('-')) {
+        Some((a, b)) => Ok((num(a)?, num(b)?)),
+        None => {
+            let n = num(s)?.ok_or_else(bad)?;
+            Ok((Some(n), Some(n)))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Commands with more than a few lines of logic
+// ---------------------------------------------------------------------------------------
+
+fn cat(
+    st: &mut dyn Store,
+    path: &str,
+    number: bool,
+    lines: Option<&str>,
+    at: Option<i64>,
+    section: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let (content, version) = st.read(path, at)?;
+    let all: Vec<&[u8]> = content.split_inclusive(|&c| c == b'\n').collect();
+    let total = all.len() as i64;
+    let (mut from, mut to) = (1, total);
+    if let Some(heading) = section {
+        let body = st
+            .section(path, heading)?
+            .ok_or_else(|| StoreError::not_found(format!("no section '{heading}' in {path}")))?;
+        let pos = content
+            .windows(body.len().max(1))
+            .position(|w| w == body.as_slice())
+            .ok_or_else(|| StoreError::other(format!("{path} changed while reading; try again")))?;
+        from = content[..pos].iter().filter(|&&c| c == b'\n').count() as i64 + 1;
+        to = from + body.split_inclusive(|&c| c == b'\n').count() as i64 - 1;
+    }
+    if let Some(range) = lines {
+        let (a, b) = parse_range(range)?;
+        from = from.max(a.unwrap_or(from));
+        to = to.min(b.unwrap_or(to));
+    }
+    let from = from.max(1);
+    let to = to.min(total);
+    let selected: &[&[u8]] = if from <= to { &all[(from - 1) as usize..to as usize] } else { &[] };
+    if json {
+        return emit_json(&json!({
+            "path": path,
+            "version": version,
+            "nlines": total,
+            "from": from,
+            "to": to,
+            "content": String::from_utf8_lossy(&selected.concat()),
+        }));
+    }
+    if !number {
+        return out(&selected.concat());
+    }
+    let mut s = format!("{path} v{version} · lines {from}-{to} of {total}\n");
+    for (i, l) in selected.iter().enumerate() {
+        let text = String::from_utf8_lossy(l);
+        s.push_str(&format!("{:>6}\t{text}", from + i as i64));
+        if !text.ends_with('\n') {
+            s.push('\n');
+        }
+    }
+    out(s.as_bytes())
+}
+
+fn import(
+    st: &mut dyn Store,
+    dir: &Path,
+    prefix: &str,
+    ext: &str,
+    batch: usize,
+    author: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let exts: Vec<String> = ext
+        .split(',')
+        .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect();
+    let files = collect_files(dir, &exts)?;
+    let total = files.len();
+    let prefix = normalize_path(prefix)?;
+    let base = if prefix == "/" { "" } else { prefix.as_str() };
+    let interactive = std::io::stderr().is_terminal() && !json;
+    let started = Instant::now();
+    let mut contents = files.into_iter().filter_map(|(rel, local)| match std::fs::read(&local) {
+        Ok(body) => Some((format!("{base}/{rel}"), body)),
+        Err(e) => {
+            eprintln!("skipped {}: {e}", local.display());
+            None
+        }
+    });
+    let stats = st.import(
+        &mut contents,
+        author,
+        batch.max(1),
+        &mut |s: &ImportStats| {
+            if interactive {
+                eprint!("\r{} / {total} files", s.files);
+            }
+        },
+        &mut |path: &str, e: &StoreError| {
+            eprintln!("{}failed {path}: {} {}", if interactive { "\n" } else { "" }, e.code, e.message)
+        },
+    )?;
+    let seconds = started.elapsed().as_secs_f64();
+    if interactive {
+        eprintln!();
+    }
+    if json {
+        return emit_json(&json!({ "dir": dir.display().to_string(), "prefix": prefix, "stats": stats, "seconds": seconds }));
+    }
+    line(format!(
+        "{} files ({}) in {seconds:.1}s: {} created, {} updated, {} unchanged, {} failed",
+        stats.files,
+        human_bytes(stats.bytes as i64),
+        stats.created,
+        stats.updated,
+        stats.unchanged,
+        stats.failed
+    ))
+}
+
+/// Files under `root` with one of `exts` (or any, for `*`), as `(relative/path, local path)`
+/// sorted by the relative path. Hidden directories and `node_modules` are skipped.
+fn collect_files(root: &Path, exts: &[String]) -> Result<Vec<(String, PathBuf)>> {
+    let any = exts.iter().any(|e| e == "*");
+    let mut found = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let entries = std::fs::read_dir(&dir).map_err(|e| StoreError::other(format!("{}: {e}", dir.display())))?;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                if !name.starts_with('.') && name != "node_modules" {
+                    dirs.push(entry.path());
+                }
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let wanted = any
+                || Path::new(&name)
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                    .is_some_and(|e| exts.contains(&e));
+            if wanted {
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("walked from root")
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                found.push((rel, path));
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+#[derive(Default)]
+struct TreeNode {
+    entry: Option<Entry>,
+    children: BTreeMap<String, TreeNode>,
+    files: usize,
+    bytes: i64,
+}
+
+impl TreeNode {
+    fn is_folder(&self) -> bool {
+        self.entry.as_ref().is_none_or(|e| e.kind != "file")
+    }
+}
+
+fn tree(st: &mut dyn Store, path: &str, depth: Option<usize>, dirs_only: bool, json: bool) -> Result<()> {
+    let root = normalize_path(path)?;
+    let base_len = if root == "/" { 0 } else { root.len() };
+    let mut entries = st.nodes(&root)?;
+    entries.retain(|e| {
+        let rel = e.path[base_len.min(e.path.len())..].trim_start_matches('/');
+        let level = if rel.is_empty() { 1 } else { rel.split('/').count() };
+        depth.is_none_or(|d| level <= d) && (!dirs_only || e.kind == "folder")
+    });
+    if json {
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        return emit_json(&entries);
+    }
+    let mut top = TreeNode::default();
+    for e in entries {
+        let rel = e.path[base_len.min(e.path.len())..].trim_start_matches('/').to_string();
+        if rel.is_empty() {
+            // `path` is itself a file.
+            top.children.insert(e.name.clone(), TreeNode { entry: Some(e), ..Default::default() });
+            continue;
+        }
+        let size = if e.kind == "file" { e.nbytes.unwrap_or(0) } else { 0 };
+        let is_file = e.kind == "file";
+        let mut node = &mut top;
+        for seg in rel.split('/') {
+            if is_file {
+                node.files += 1;
+                node.bytes += size;
+            }
+            node = node.children.entry(seg.to_string()).or_default();
+        }
+        node.entry = Some(e);
+    }
+    let mut s = format!("{root}  ({}, {})\n", count_files(top.files), human_bytes(top.bytes));
+    render_tree(&top, "", &mut s);
+    out(s.as_bytes())
+}
+
+fn count_files(n: usize) -> String {
+    if n == 1 { "1 file".to_string() } else { format!("{n} files") }
+}
+
+fn render_tree(node: &TreeNode, indent: &str, s: &mut String) {
+    let mut kids: Vec<(&String, &TreeNode)> = node.children.iter().collect();
+    kids.sort_by_key(|(name, n)| (!n.is_folder(), name.to_lowercase()));
+    for (i, (name, kid)) in kids.iter().enumerate() {
+        let last = i + 1 == kids.len();
+        let branch = if last { "└── " } else { "├── " };
+        if kid.is_folder() {
+            s.push_str(&format!("{indent}{branch}{name}/  ({}, {})\n", count_files(kid.files), human_bytes(kid.bytes)));
+            render_tree(kid, &format!("{indent}{}", if last { "    " } else { "│   " }), s);
+        } else {
+            let size = kid.entry.as_ref().and_then(|e| e.nbytes).unwrap_or(0);
+            s.push_str(&format!("{indent}{branch}{name}  {}\n", human_bytes(size)));
+        }
+    }
+}
+
+fn watch(st: &mut dyn Store, since: Option<i64>, prefix: &str, json: bool) -> Result<()> {
+    let prefix = normalize_path(prefix)?;
+    // Start listening before reading the position, so nothing committed in between is missed.
+    st.wait(Duration::ZERO)?;
+    let mut since = match since {
+        Some(s) => s,
+        None => st.last_seq()?,
+    };
+    let under = |p: &str| prefix == "/" || p == prefix || p.starts_with(&format!("{prefix}/"));
+    const PAGE: i64 = 1000;
+    loop {
+        let changes = st.feed(since, PAGE)?;
+        for c in &changes {
+            since = c.seq;
+            if under(&c.path) || c.old_path.as_deref().is_some_and(&under) {
+                if json {
+                    emit_json(c)?;
+                } else {
+                    line(change_line(c))?;
+                }
+            }
+        }
+        if (changes.len() as i64) < PAGE {
+            st.wait(Duration::from_secs(5))?;
+        }
+    }
+}
+
+fn show_config(cli: &Cli, matches: &ArgMatches) -> Result<()> {
+    let source = |id: &str| match matches.value_source(id) {
+        Some(ValueSource::CommandLine) => "flag",
+        Some(ValueSource::EnvVariable) => "environment",
+        Some(ValueSource::DefaultValue) => "default",
+        _ => "unknown",
+    };
+    let backend = match config::parse_store(&cli.store) {
+        StoreUrl::Sqlite(path) => format!("sqlite file {path}"),
+        StoreUrl::Postgres(_) => "postgres".to_string(),
+    };
+    let store = config::redact(&cli.store);
+    if cli.json {
+        return emit_json(&json!({
+            "store": { "value": store, "source": source("store"), "backend": backend },
+            "author": { "value": cli.author, "source": source("author") },
+        }));
+    }
+    line(format!(
+        "store   {store}  [{}] -> {backend}\nauthor  {}  [{}]",
+        source("store"),
+        cli.author,
+        source("author")
+    ))
+}

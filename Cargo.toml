@@ -4,6 +4,7 @@ members = [
     "crates/textdb-core",
     "crates/textdb-md",
     "crates/textdb-sqlite",
+    "crates/textdb-cli",
     "bench/harness",
 ]
 # textdb-pg is a pgrx extension and is built separately (see docs/INSTALL.md); it is excluded

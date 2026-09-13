@@ -1,0 +1,234 @@
+//! The operations the CLI performs, over either backend.
+
+pub mod pg;
+pub mod sqlite;
+
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use crate::config::{parse_store, StoreUrl};
+
+/// An error in the store's own terms: the `TX00n` code the bindings use, a message, and for a
+/// conflict the payload with the current text of the contested lines.
+#[derive(Debug, Serialize)]
+pub struct StoreError {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<serde_json::Value>,
+}
+
+pub type Result<T> = std::result::Result<T, StoreError>;
+
+impl StoreError {
+    fn new(code: &str, message: impl std::fmt::Display) -> Self {
+        StoreError {
+            code: code.to_string(),
+            message: message.to_string(),
+            conflict: None,
+        }
+    }
+
+    pub fn other(message: impl std::fmt::Display) -> Self {
+        Self::new("TX000", message)
+    }
+
+    pub fn not_found(message: impl std::fmt::Display) -> Self {
+        Self::new("TX003", message)
+    }
+
+    pub fn invalid(message: impl std::fmt::Display) -> Self {
+        Self::new("TX004", message)
+    }
+
+    /// Process exit status, distinct per code so a script can branch without parsing output.
+    pub fn exit_code(&self) -> i32 {
+        match self.code.as_str() {
+            "TX001" => 3,
+            "TX002" => 4,
+            "TX003" => 5,
+            "TX004" => 6,
+            _ => 1,
+        }
+    }
+}
+
+impl From<textdb_core::TextdbError> for StoreError {
+    fn from(e: textdb_core::TextdbError) -> Self {
+        let conflict = match &e {
+            textdb_core::TextdbError::Conflict(c) => serde_json::to_value(c).ok(),
+            _ => None,
+        };
+        StoreError {
+            code: e.code().to_string(),
+            message: e.to_string(),
+            conflict,
+        }
+    }
+}
+
+impl From<std::io::Error> for StoreError {
+    fn from(e: std::io::Error) -> Self {
+        Self::other(e)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Entry {
+    pub path: String,
+    pub name: String,
+    /// `file` or `folder`.
+    pub kind: String,
+    pub nbytes: Option<i64>,
+    pub nlines: Option<i64>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Stat {
+    pub path: String,
+    pub kind: String,
+    pub version: i64,
+    pub nbytes: Option<i64>,
+    pub nlines: Option<i64>,
+    pub updated_at: Option<String>,
+    pub updated_by: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Commit {
+    pub version: i64,
+    pub author: Option<String>,
+    pub ts: String,
+    pub message: Option<String>,
+    pub nbytes: Option<i64>,
+    pub kind: Option<String>,
+    pub base_version: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Hit {
+    pub path: String,
+    pub line: i64,
+    pub snippet: String,
+    pub rank: f64,
+}
+
+/// Lines `old_from..old_from + old_count` (1-based) became `new_from..new_from + new_count`.
+#[derive(Debug, Serialize)]
+pub struct Hunk {
+    pub old_from: i64,
+    pub old_count: i64,
+    pub new_from: i64,
+    pub new_count: i64,
+    pub old_text: String,
+    pub new_text: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Chunk {
+    pub ord: i64,
+    pub hash: String,
+    pub byte_from: i64,
+    pub nbytes: i64,
+    pub line_from: i64,
+    pub nlines: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Change {
+    pub seq: i64,
+    pub ts: String,
+    pub op: String,
+    pub path: String,
+    pub old_path: Option<String>,
+    pub node_kind: String,
+    pub version: Option<i64>,
+    pub base_version: Option<i64>,
+    pub commit_kind: Option<String>,
+    pub author: Option<String>,
+    pub message: Option<String>,
+}
+
+/// How a write landed: the version it produced and `direct`, `rebased`, `merged` or `noop`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Written {
+    pub version: i64,
+    pub kind: String,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct ImportStats {
+    pub files: usize,
+    pub created: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+    pub failed: usize,
+    pub bytes: u64,
+}
+
+/// A textdb store. Paths are `/folder/file.md`; versions are per file and consecutive.
+pub trait Store {
+    fn backend(&self) -> &'static str;
+    /// Make the store usable: create what is missing, upgrade what is old.
+    fn init(&mut self) -> Result<()>;
+    /// Every folder and file under `prefix` (not `prefix` itself unless it is a file).
+    fn nodes(&mut self, prefix: &str) -> Result<Vec<Entry>>;
+    fn ls(&mut self, path: &str) -> Result<Vec<Entry>>;
+    fn stat(&mut self, path: &str) -> Result<Stat>;
+    /// Content at `version` (HEAD when `None`) and the version it is.
+    fn read(&mut self, path: &str, version: Option<i64>) -> Result<(Vec<u8>, i64)>;
+    fn section(&mut self, path: &str, heading: &str) -> Result<Option<Vec<u8>>>;
+    fn search(&mut self, query: &str, prefix: &str, limit: i64) -> Result<Vec<Hit>>;
+    fn write(
+        &mut self,
+        path: &str,
+        content: &[u8],
+        base_version: Option<i64>,
+        author: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<Written>;
+    fn edit(&mut self, path: &str, old: &[u8], new: &[u8], author: Option<&str>) -> Result<Written>;
+    fn append(&mut self, path: &str, tail: &[u8], author: Option<&str>) -> Result<Written>;
+    fn replace_lines(
+        &mut self,
+        path: &str,
+        from: i64,
+        to: i64,
+        text: &[u8],
+        base_version: Option<i64>,
+        author: Option<&str>,
+    ) -> Result<Written>;
+    fn history(&mut self, path: &str) -> Result<Vec<Commit>>;
+    fn diff(&mut self, path: &str, v1: i64, v2: i64) -> Result<String>;
+    fn hunks(&mut self, path: &str, v1: i64, v2: i64) -> Result<Vec<Hunk>>;
+    fn chunks(&mut self, path: &str, version: Option<i64>) -> Result<Vec<Chunk>>;
+    fn mv(&mut self, from: &str, to: &str, author: Option<&str>) -> Result<()>;
+    fn rm(&mut self, path: &str, author: Option<&str>) -> Result<()>;
+    fn last_seq(&mut self) -> Result<i64>;
+    fn feed(&mut self, since: i64, limit: i64) -> Result<Vec<Change>>;
+    /// Return once another writer may have committed, or after `timeout`; waking early for
+    /// nothing is allowed. The first call only starts listening, so a caller primes it before
+    /// reading the feed and cannot miss a commit that lands in between.
+    fn wait(&mut self, timeout: Duration) -> Result<()>;
+    /// Create or update many files, `batch` to a transaction. A file that fails is reported
+    /// to `on_error` and does not stop the rest.
+    fn import(
+        &mut self,
+        files: &mut dyn Iterator<Item = (String, Vec<u8>)>,
+        author: Option<&str>,
+        batch: usize,
+        progress: &mut dyn FnMut(&ImportStats),
+        on_error: &mut dyn FnMut(&str, &StoreError),
+    ) -> Result<ImportStats>;
+    /// Hand every file under `prefix` to `sink`; returns how many.
+    fn export(&mut self, prefix: &str, sink: &mut dyn FnMut(&str, &[u8]) -> std::io::Result<()>) -> Result<usize>;
+}
+
+pub fn open(store: &str) -> Result<Box<dyn Store>> {
+    Ok(match parse_store(store) {
+        StoreUrl::Sqlite(path) => Box::new(sqlite::SqliteStore::open(&path)?),
+        StoreUrl::Postgres(url) => Box::new(pg::PgStore::connect(&url)?),
+    })
+}
