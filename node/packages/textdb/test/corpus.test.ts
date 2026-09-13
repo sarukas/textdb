@@ -104,7 +104,7 @@ describe('corpus', () => {
     kb.write('/feed/a.md', 'x\n', { author: 'alice' });
     kb.write('/feed/a.md', 'y\n', { author: 'bob' });
     kb.move('/feed/a.md', '/moved/a.md', { author: 'carol' });
-    kb.remove('/moved');
+    kb.remove('/moved', { author: 'dave' });
 
     const rows = kb.feed(since);
     assert.deepEqual(
@@ -115,7 +115,7 @@ describe('corpus', () => {
         ['commit', '/feed/a.md', null, 'file', 2, 1, 'direct', 'bob'],
         ['mkdir', '/moved', null, 'folder', null, null, null, null],
         ['move', '/moved/a.md', '/feed/a.md', 'file', null, null, null, 'carol'],
-        ['delete', '/moved', null, 'folder', null, null, null, null],
+        ['delete', '/moved', null, 'folder', null, null, null, 'dave'],
       ],
     );
     assert.ok(rows.every((r, i) => i === 0 || r.seq > rows[i - 1]!.seq));

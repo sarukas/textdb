@@ -1,5 +1,5 @@
 export { resolveExtension } from './connection.ts';
-export { type AuthorOptions, Corpus, type OpenOptions, type WriteOptions, openCorpus } from './corpus.ts';
+export { type AuthorOptions, Corpus, type OpenOptions, type Stat, type WriteOptions, openCorpus } from './corpus.ts';
 export {
   Conflict,
   type ConflictPayload,

@@ -220,6 +220,27 @@ pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
     })?;
     let p = prefix.to_string();
     conn.create_scalar_function("textdb_last_seq", 0, flags, move |ctx| with_db(ctx, h, &p, |db| db.last_seq()))?;
+    // Moving and deleting through the `kb` table cannot always carry an author (a DELETE has
+    // no column values), so these name one explicitly. Both act on a whole folder subtree.
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_move", -1, flags, move |ctx| {
+        if ctx.len() < 2 {
+            return Err(Error::UserFunctionError("textdb_move(from, to[, author])".into()));
+        }
+        let from = arg_str(ctx, 0)?;
+        let to = arg_str(ctx, 1)?;
+        let author = opt_str(ctx, 2)?.filter(|a| !a.is_empty());
+        with_db(ctx, h, &p, |db| db.rename_by(&from, &to, author.as_deref()).map(|()| 1i64))
+    })?;
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_delete", -1, flags, move |ctx| {
+        if ctx.is_empty() {
+            return Err(Error::UserFunctionError("textdb_delete(path[, author])".into()));
+        }
+        let path = arg_str(ctx, 0)?;
+        let author = opt_str(ctx, 1)?.filter(|a| !a.is_empty());
+        with_db(ctx, h, &p, |db| db.delete_by(&path, author.as_deref()).map(|()| 1i64))
+    })?;
     let p = prefix.to_string();
     conn.create_scalar_function("textdb_migrate", 0, flags, move |ctx| {
         let added = with_db(ctx, h, &p, |db| crate::schema::migrate(db.conn, &db.p).map_err(crate::storage::sql_err))?;

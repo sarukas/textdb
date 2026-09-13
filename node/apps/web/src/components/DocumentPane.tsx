@@ -6,6 +6,7 @@ import { relativeTime } from "../live/time";
 import type { FeedHub } from "../state/hub";
 import type { OwnWrites } from "../state/ownWrites";
 import { effectiveAuthor } from "../state/useAuthor";
+import type { PathAction } from "../tree/actions";
 import { useNow } from "../state/useNow";
 import { ConflictPanel } from "./ConflictPanel";
 import { Editor } from "./Editor";
@@ -30,6 +31,7 @@ interface Props {
   own: OwnWrites;
   author: string;
   onPathChange: (path: string) => void;
+  onAction: (action: PathAction) => void;
 }
 
 const MODES: Array<{ id: Mode; label: string }> = [
@@ -39,7 +41,7 @@ const MODES: Array<{ id: Mode; label: string }> = [
 ];
 
 /** Mounted with `key={open.id}`: one controller per opened document. */
-export function DocumentPane({ open, mode, onMode, hub, own, author, onPathChange }: Props) {
+export function DocumentPane({ open, mode, onMode, hub, own, author, onPathChange, onAction }: Props) {
   const toast = useToast();
   const authorRef = useRef(author);
   authorRef.current = author;
@@ -140,6 +142,24 @@ export function DocumentPane({ open, mode, onMode, hub, own, author, onPathChang
           </span>
         </div>
         <div className="doc-actions">
+          <span className="doc-file-actions">
+            <button
+              type="button"
+              className="btn btn-ghost btn-small"
+              onClick={() => onAction({ op: "move", path: state.path, kind: "file" })}
+              title="Rename or move this file"
+            >
+              Rename…
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost btn-small danger"
+              onClick={() => onAction({ op: "delete", path: state.path, kind: "file" })}
+              title="Delete this file"
+            >
+              Delete…
+            </button>
+          </span>
           {mode !== "history" && (
             <label className="toggle" title="Show textdb's content-defined chunk boundaries">
               <input type="checkbox" checked={chunksOn} onChange={(e) => setChunksOn(e.target.checked)} />

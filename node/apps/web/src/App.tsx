@@ -4,8 +4,11 @@ import { ActivityFeed } from "./components/ActivityFeed";
 import { DocumentPane, type Mode, type OpenDoc } from "./components/DocumentPane";
 import { Header } from "./components/Header";
 import { ImportDialog } from "./components/ImportDialog";
+import { DeleteDialog, MoveDialog } from "./components/PathDialogs";
 import { Sidebar } from "./components/Sidebar";
 import { addToFeed, type FeedItem } from "./live/activity";
+import { isWithin } from "./live/paths";
+import type { PathAction } from "./tree/actions";
 import { FeedHub } from "./state/hub";
 import { OwnWrites } from "./state/ownWrites";
 import { useAuthor } from "./state/useAuthor";
@@ -37,6 +40,7 @@ export function App() {
   const [lastSeq, setLastSeq] = useState(0);
   const [feed, setFeed] = useState<FeedItem[]>([]);
   const [importing, setImporting] = useState(false);
+  const [pathAction, setPathAction] = useState<PathAction | null>(null);
   const [open, setOpen] = useState<OpenDoc | null>(fromHash);
   const [mode, setMode] = useState<Mode>("preview");
   const [feedOpen, setFeedOpen] = useState(readFeedOpen);
@@ -129,6 +133,16 @@ export function App() {
     history.replaceState(null, "", `#${encodeURI(path)}`);
   }, []);
 
+  // A moved document follows its file through the change feed (see DocController); a deleted
+  // one is closed here rather than left open on a path that no longer exists.
+  const onDeleted = (path: string) => {
+    setPathAction(null);
+    if (open && (open.path === path || isWithin(path, open.path))) {
+      setOpen(null);
+      history.replaceState(null, "", location.pathname + location.search);
+    }
+  };
+
   const toggleFeed = () =>
     setFeedOpen((v) => {
       try {
@@ -150,9 +164,28 @@ export function App() {
         onImport={() => setImporting(true)}
       />
       {importing && <ImportDialog author={author} onClose={() => setImporting(false)} onOpen={openFile} />}
+      {pathAction?.op === "move" && (
+        <MoveDialog
+          key={pathAction.path}
+          target={pathAction}
+          author={author}
+          onClose={() => setPathAction(null)}
+          onMoved={() => setPathAction(null)}
+        />
+      )}
+      {pathAction?.op === "delete" && (
+        <DeleteDialog
+          key={pathAction.path}
+          target={pathAction}
+          author={author}
+          openPath={open?.path ?? null}
+          onClose={() => setPathAction(null)}
+          onDeleted={onDeleted}
+        />
+      )}
       <main className="workspace">
         <aside className="sidebar" aria-label="Files and search">
-          <Sidebar hub={hub} openPath={open?.path ?? null} onOpen={openFile} />
+          <Sidebar hub={hub} openPath={open?.path ?? null} onOpen={openFile} onAction={setPathAction} />
         </aside>
         <section className="center" aria-label="Document">
           {open ? (
@@ -165,6 +198,7 @@ export function App() {
               own={own}
               author={author}
               onPathChange={onPathChange}
+              onAction={setPathAction}
             />
           ) : (
             <div className="empty welcome">

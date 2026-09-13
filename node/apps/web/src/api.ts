@@ -152,7 +152,21 @@ export const api = {
     request<WriteResult>("PUT", "/api/file", body),
   importBatch: (body: { author?: string; files: { path: string; content: string }[] }) =>
     request<ImportResult>("POST", "/api/import", body),
+  stat: (path: string) => request<Stat>("GET", `/api/stat?path=${encodeURIComponent(path)}`),
+  move: (from: string, to: string, author?: string) =>
+    request<{ from: string; to: string }>("POST", "/api/move", { from, to, author }),
+  remove: (path: string, author?: string) => request<{ path: string }>("POST", "/api/delete", { path, author }),
 };
+
+export interface Stat {
+  path: string;
+  kind: "file" | "folder";
+  /** Files in the subtree (1 for a file). */
+  files: number;
+  /** Folders below a folder, not counting itself. */
+  folders: number;
+  nbytes: number;
+}
 
 export type ConnectionState = "connecting" | "live" | "offline";
 

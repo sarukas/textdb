@@ -25,6 +25,8 @@ learns about the CLI's commits from the store's change feed.
 | `textdb_history(path)` | `version, author, ts, message, nbytes, kind, base_version` |
 | `textdb_write(path, content[, base_version[, author[, message]]])` | JSON `{"version": n, "kind": "direct"\|"rebased"\|"merged"\|"noop"}`; creates the file if missing |
 | `textdb_replace_lines(path, from, to, text[, base_version[, author]])` | same JSON; lines refer to `base_version` (HEAD if NULL); `to = from - 1` inserts |
+| `textdb_move(from, to[, author])` | `1`; moves or renames a file, or a folder with everything below it (missing parent folders are created). History moves with the files. TX003 when `from` is missing, TX004 when `to` exists, is inside `from`, or either is the root |
+| `textdb_delete(path[, author])` | `1`; deletes a file, or a folder with everything below it. History stays in the store. TX003 when missing, TX004 for the root |
 | `textdb_migrate()` | brings a store written by an older build up to date; call once after `CREATE VIRTUAL TABLE IF NOT EXISTS kb USING textdb(store='kb_')` |
 
 plus the existing `kb` table, `textdb_content`, `textdb_ls`, `textdb_search`, `textdb_diff`,
@@ -62,6 +64,9 @@ Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./
 | `GET /api/search?q=…[&prefix=/][&limit=50]` | | `[{ path, line, snippet, rank }]` |
 | `PUT /api/file` | `{ path, content, base_version?, author?, message? }` | `{ version, kind }` — rebased over concurrent commits; 409 with `conflict` when the same lines changed |
 | `POST /api/replace-lines` | `{ path, from, to, text, base_version?, author? }` | `{ version, kind }` |
+| `GET /api/stat?path=…` | | `{ path, kind, files, folders, nbytes }` — for a folder, everything below it (`folders` does not count the folder itself) |
+| `POST /api/move` | `{ from, to, author? }` | `{ from, to }` — a file or a whole folder; one `move` change for the moved node |
+| `POST /api/delete` | `{ path, author? }` | `{ path }` — a file or a whole folder; one `delete` change for the deleted node |
 | `POST /api/import` | `{ files: [{ path, content }], author? }` (at most 5000 files) | `{ created, updated, unchanged, failed, failures: [{ path, code, message }] }` — one transaction, message `import`; unchanged files make no version; a refused file is listed and the rest still land |
 | `GET /api/events[?since=seq]` | `Last-Event-ID` honoured | Server-sent events, see below |
 

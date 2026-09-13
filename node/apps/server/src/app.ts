@@ -79,6 +79,21 @@ export function createApp(corpus: Corpus, hub: ChangeHub, options: AppOptions): 
     return c.json(result);
   });
 
+  app.get('/api/stat', (c) => c.json(corpus.stat(queryString(c, 'path'))));
+  app.post('/api/move', async (c) => {
+    const body = await jsonBody(c);
+    const from = bodyString(body, 'from');
+    const to = bodyString(body, 'to');
+    corpus.move(from, to, { author: bodyOptionalString(body, 'author') });
+    return c.json({ from, to });
+  });
+  app.post('/api/delete', async (c) => {
+    const body = await jsonBody(c);
+    const target = bodyString(body, 'path');
+    corpus.remove(target, { author: bodyOptionalString(body, 'author') });
+    return c.json({ path: target });
+  });
+
   app.post('/api/import', async (c) => {
     const body = await jsonBody(c);
     const files = bodyImportFiles(body);

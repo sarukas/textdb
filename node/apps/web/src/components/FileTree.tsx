@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { api, type ChangeEvent, type LsEntry } from "../api";
 import { authorHue } from "../live/color";
 import { ancestorsOf, isWithin, parentOf } from "../live/paths";
 import type { FeedHub } from "../state/hub";
+import { actionFor, type PathAction } from "../tree/actions";
 import { ensureRowVisible, VirtualList } from "./VirtualList";
 
 const ROW = 24;
@@ -12,6 +13,7 @@ interface Props {
   hub: FeedHub;
   openPath: string | null;
   onOpen: (path: string, line?: number) => void;
+  onAction: (action: PathAction) => void;
 }
 
 type Row =
@@ -31,7 +33,7 @@ interface Marker {
   op: string;
 }
 
-export function FileTree({ hub, openPath, onOpen }: Props) {
+export function FileTree({ hub, openPath, onOpen, onAction }: Props) {
   const [data, setData] = useState<TreeData>(() => ({ children: new Map(), loading: new Set(), errors: new Map() }));
   const dataRef = useRef(data);
   dataRef.current = data;
@@ -40,6 +42,11 @@ export function FileTree({ hub, openPath, onOpen }: Props) {
   const [active, setActive] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
   const pendingReveal = useRef<string | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number; entry: LsEntry } | null>(null);
+  const closeMenu = useCallback((refocus: boolean) => {
+    setMenu(null);
+    if (refocus) listRef.current?.focus();
+  }, []);
 
   const load = useCallback((dir: string, force = false): Promise<void> => {
     if (!force && dataRef.current.children.has(dir)) return Promise.resolve();
@@ -273,6 +280,18 @@ export function FileTree({ hub, openPath, onOpen }: Props) {
       case " ":
         activate(row);
         break;
+      case "F2":
+        if (row?.type === "entry") onAction(actionFor("move", row.entry));
+        break;
+      case "Delete":
+        if (row?.type === "entry") onAction(actionFor("delete", row.entry));
+        break;
+      case "ContextMenu":
+        if (row?.type === "entry") {
+          const el = document.getElementById(`tree-row-${activeIdx}`)?.getBoundingClientRect();
+          if (el) setMenu({ x: el.left + 24, y: el.bottom, entry: row.entry });
+        }
+        break;
       default:
         return;
     }
@@ -285,6 +304,7 @@ export function FileTree({ hub, openPath, onOpen }: Props) {
   const activeRow = rows[activeIdx];
 
   return (
+    <>
     <VirtualList
       outerRef={listRef}
       className="tree"
@@ -331,6 +351,11 @@ export function FileTree({ hub, openPath, onOpen }: Props) {
               setActive(i);
               activate(row);
             }}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setActive(i);
+              setMenu({ x: e.clientX, y: e.clientY, entry });
+            }}
           >
             <span className={`twisty${folder ? (row.open ? " open" : "") : " none"}`} aria-hidden="true" />
             <span className={folder ? "icon icon-folder" : "icon icon-file"} aria-hidden="true" />
@@ -338,9 +363,119 @@ export function FileTree({ hub, openPath, onOpen }: Props) {
             {live && (
               <span key={mark.seq} className={`tree-marker op-${mark.op}`} style={{ "--h": String(mark.hue) } as React.CSSProperties} aria-label="changed just now" />
             )}
+            <button
+              type="button"
+              className="tree-more"
+              tabIndex={-1}
+              aria-label={`Actions for ${entry.name}`}
+              aria-haspopup="menu"
+              aria-expanded={menu?.entry.path === entry.path}
+              title="Rename, move or delete"
+              onClick={(e) => {
+                e.stopPropagation();
+                const r = e.currentTarget.getBoundingClientRect();
+                setActive(i);
+                setMenu({ x: r.left, y: r.bottom + 2, entry });
+              }}
+            >
+              ⋯
+            </button>
           </div>
         );
       }}
     />
+    {menu && (
+      <TreeMenu
+        {...menu}
+        onClose={closeMenu}
+        onOpen={() => (menu.entry.kind === "folder" ? toggle(menu.entry.path) : onOpen(menu.entry.path))}
+        onAction={onAction}
+      />
+    )}
+    </>
+  );
+}
+
+interface MenuProps {
+  x: number;
+  y: number;
+  entry: LsEntry;
+  onClose: (refocus: boolean) => void;
+  onOpen: () => void;
+  onAction: (action: PathAction) => void;
+}
+
+/** A row's context menu: kept inside the window, closed by Escape, a click elsewhere or a choice. */
+function TreeMenu({ x, y, entry, onClose, onOpen, onAction }: MenuProps) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState({ left: x, top: y });
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    setPos({
+      left: Math.max(4, Math.min(x, window.innerWidth - r.width - 4)),
+      top: Math.max(4, Math.min(y, window.innerHeight - r.height - 4)),
+    });
+    el.querySelector<HTMLElement>("[role=menuitem]")?.focus();
+  }, [x, y]);
+
+  useEffect(() => {
+    const away = (e: Event) => {
+      if (!ref.current?.contains(e.target as Node)) onClose(false);
+    };
+    const leave = () => onClose(false);
+    window.addEventListener("mousedown", away, true);
+    window.addEventListener("resize", leave);
+    window.addEventListener("blur", leave);
+    return () => {
+      window.removeEventListener("mousedown", away, true);
+      window.removeEventListener("resize", leave);
+      window.removeEventListener("blur", leave);
+    };
+  }, [onClose]);
+
+  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    const items = Array.from(ref.current?.querySelectorAll<HTMLElement>("[role=menuitem]") ?? []);
+    const at = items.indexOf(document.activeElement as HTMLElement);
+    if (e.key === "Escape" || e.key === "Tab") onClose(true);
+    else if (e.key === "ArrowDown") items[(at + 1) % items.length]?.focus();
+    else if (e.key === "ArrowUp") items[(at - 1 + items.length) % items.length]?.focus();
+    else return;
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  const choose = (fn: () => void) => () => {
+    onClose(false);
+    fn();
+  };
+  const folder = entry.kind === "folder";
+
+  return (
+    <div
+      ref={ref}
+      className="menu"
+      role="menu"
+      aria-label={`Actions for ${entry.name}`}
+      style={pos}
+      onKeyDown={onKeyDown}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      <button type="button" role="menuitem" onClick={choose(onOpen)}>
+        {folder ? "Expand or collapse" : "Open"}
+        <kbd>Enter</kbd>
+      </button>
+      <button type="button" role="menuitem" onClick={choose(() => onAction(actionFor("move", entry)))}>
+        Rename or move…
+        <kbd>F2</kbd>
+      </button>
+      <div role="separator" />
+      <button type="button" role="menuitem" className="danger" onClick={choose(() => onAction(actionFor("delete", entry)))}>
+        {folder ? "Delete folder…" : "Delete file…"}
+        <kbd>Del</kbd>
+      </button>
+    </div>
   );
 }

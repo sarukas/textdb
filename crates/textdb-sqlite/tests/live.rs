@@ -11,6 +11,44 @@ fn setup() -> Connection {
     conn
 }
 
+#[test]
+fn scalar_move_and_delete_act_on_whole_subtrees_with_an_author() {
+    let conn = setup();
+    for p in ["/f/a.md", "/f/sub/b.md", "/f/sub/deep/c.md"] {
+        conn.query_row("SELECT textdb_write(?1, 'x')", [p], |_| Ok(())).unwrap();
+    }
+    let since: i64 = conn.query_row("SELECT textdb_last_seq()", [], |r| r.get(0)).unwrap();
+    let one = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0));
+
+    assert_eq!(one("SELECT textdb_move('/f/sub', '/g/moved', 'human')").unwrap(), 1);
+    assert_eq!(one("SELECT count(*) FROM kb WHERE path LIKE '/g/moved/%'").unwrap(), 3);
+    assert_eq!(one("SELECT textdb_move('/f/a.md', '/f/renamed.md', '')").unwrap(), 1);
+    let err = one("SELECT textdb_move('/g', '/g/inside')").unwrap_err().to_string();
+    assert!(err.starts_with("TX004"), "{err}");
+    let err = one("SELECT textdb_move('/nope.md', '/x.md')").unwrap_err().to_string();
+    assert!(err.starts_with("TX003"), "{err}");
+
+    assert_eq!(one("SELECT textdb_delete('/g', 'agent-7')").unwrap(), 1);
+    assert_eq!(one("SELECT count(*) FROM kb WHERE path LIKE '/g%'").unwrap(), 0);
+    let err = one("SELECT textdb_delete('/')").unwrap_err().to_string();
+    assert!(err.starts_with("TX004"), "{err}");
+
+    let ops: Vec<_> = feed(&conn, since)
+        .into_iter()
+        .filter(|r| r.1 == "move" || r.1 == "delete")
+        .map(|r| (r.1, r.2, r.3, r.7))
+        .collect();
+    let s = |v: &str| v.to_string();
+    assert_eq!(
+        ops,
+        vec![
+            (s("move"), s("/g/moved"), Some(s("/f/sub")), Some(s("human"))),
+            (s("move"), s("/f/renamed.md"), Some(s("/f/a.md")), None),
+            (s("delete"), s("/g"), None, Some(s("agent-7"))),
+        ]
+    );
+}
+
 type FeedRow = (i64, String, String, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>);
 
 fn feed(conn: &Connection, since: i64) -> Vec<FeedRow> {

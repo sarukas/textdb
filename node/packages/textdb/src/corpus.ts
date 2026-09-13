@@ -53,6 +53,16 @@ export interface ImportStats {
   failures: ImportFailure[];
 }
 
+export interface Stat {
+  path: string;
+  kind: 'file' | 'folder';
+  /** Files in the subtree (1 for a file). */
+  files: number;
+  /** Folders below a folder, not counting itself. */
+  folders: number;
+  nbytes: number;
+}
+
 export function openCorpus(options: OpenOptions): Corpus {
   const extension = resolveExtension(options.extension);
   const db = options.db === ':memory:' ? options.db : path.resolve(options.db);
@@ -211,16 +221,34 @@ export class Corpus {
   }
 
   /** Moves a file or a whole folder. */
+  /** Moves or renames a file, or a folder with everything below it. */
   move(from: string, to: string, options: AuthorOptions = {}): void {
-    if (this.sql.run('UPDATE kb SET path = ?, author = ? WHERE path = ?', to, this.authorOf(options), from) === 0) {
-      throw new NotFound(`not found: ${from}`);
-    }
+    this.sql.value('SELECT textdb_move(?, ?, ?)', from, to, this.authorOf(options));
   }
 
-  remove(filePath: string): void {
-    if (this.sql.run('DELETE FROM kb WHERE path = ?', filePath) === 0) {
-      throw new NotFound(`not found: ${filePath}`);
-    }
+  /** Deletes a file, or a folder with everything below it. History stays in the store. */
+  remove(target: string, options: AuthorOptions = {}): void {
+    this.sql.value('SELECT textdb_delete(?, ?)', target, this.authorOf(options));
+  }
+
+  /** What `target` holds: one file, or a folder with the files and folders anywhere below it. */
+  stat(target: string): Stat {
+    const node = this.sql.get<{ path: string; kind: 'file' | 'folder'; nbytes: number | null }>(
+      'SELECT path, kind, nbytes FROM kb WHERE path = ?',
+      target,
+    );
+    if (!node) throw new NotFound(`not found: ${target}`);
+    if (node.kind === 'file') return { path: node.path, kind: 'file', files: 1, folders: 0, nbytes: node.nbytes ?? 0 };
+    // Everything strictly below the folder sorts between "<folder>/" and "<folder>0".
+    const base = node.path === '/' ? '' : node.path;
+    const below = this.sql.get<{ files: number; folders: number; nbytes: number }>(
+      `SELECT count(*) FILTER (WHERE kind = 'file') AS files, count(*) FILTER (WHERE kind = 'folder') AS folders,
+              coalesce(sum(nbytes), 0) AS nbytes
+         FROM kb WHERE path > ? AND path < ?`,
+      `${base}/`,
+      `${base}0`,
+    );
+    return { path: node.path, kind: 'folder', files: Number(below?.files ?? 0), folders: Number(below?.folders ?? 0), nbytes: Number(below?.nbytes ?? 0) };
   }
 
   lastSeq(): number {

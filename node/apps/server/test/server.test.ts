@@ -183,10 +183,61 @@ describe('http api', () => {
       [2, 'human', 'import'],
     ]);
 
+    res = await api('GET', '/api/stat?path=/imported');
+    assert.deepEqual(res.body, { path: '/imported', kind: 'folder', files: 2, folders: 1, nbytes: 4 + 13 });
+
     res = await api('POST', '/api/import', { files: [] });
     assert.deepEqual([res.status, res.body.code], [400, 'TX004']);
     res = await api('POST', '/api/import', { files: [{ path: '/x.md' }] });
     assert.deepEqual([res.status, res.body.message], [400, 'files[0] must be an object with string path and content']);
+  });
+});
+
+describe('move and delete', () => {
+  test('renames a file and moves a folder with everything below it, attributed', async () => {
+    const since = server.corpus.lastSeq();
+    for (const p of ['/tree/a.md', '/tree/sub/b.md', '/tree/sub/deep/c.md']) {
+      await api('PUT', '/api/file', { path: p, content: `${p}\n` });
+    }
+    let res = await api('GET', '/api/stat?path=/tree');
+    assert.deepEqual([res.body.kind, res.body.files, res.body.folders], ['folder', 3, 2]);
+    res = await api('GET', '/api/stat?path=/tree/a.md');
+    assert.deepEqual(res.body, { path: '/tree/a.md', kind: 'file', files: 1, folders: 0, nbytes: 11 });
+
+    res = await api('POST', '/api/move', { from: '/tree/a.md', to: '/tree/renamed.md', author: 'human' });
+    assert.deepEqual([res.status, res.body], [200, { from: '/tree/a.md', to: '/tree/renamed.md' }]);
+    res = await api('POST', '/api/move', { from: '/tree/sub', to: '/elsewhere/sub2', author: 'human' });
+    assert.equal(res.status, 200);
+    res = await api('GET', '/api/file?path=/elsewhere/sub2/deep/c.md');
+    assert.deepEqual([res.status, res.body.content, res.body.version], [200, '/tree/sub/deep/c.md\n', 1]);
+    res = await api('GET', '/api/history?path=/elsewhere/sub2/deep/c.md');
+    assert.equal(res.body.length, 1);
+
+    res = await api('POST', '/api/move', { from: '/tree/renamed.md', to: '/elsewhere/sub2/b.md' });
+    assert.deepEqual([res.status, res.body.code], [400, 'TX004']);
+    res = await api('POST', '/api/move', { from: '/elsewhere', to: '/elsewhere/inside' });
+    assert.deepEqual([res.status, res.body.code], [400, 'TX004']);
+    res = await api('POST', '/api/move', { from: '/nope.md', to: '/x.md' });
+    assert.deepEqual([res.status, res.body.code], [404, 'TX003']);
+
+    res = await api('POST', '/api/delete', { path: '/elsewhere', author: 'agent-7' });
+    assert.deepEqual([res.status, res.body], [200, { path: '/elsewhere' }]);
+    res = await api('GET', '/api/file?path=/elsewhere/sub2/b.md');
+    assert.equal(res.status, 404);
+    res = await api('GET', '/api/stat?path=/elsewhere');
+    assert.equal(res.status, 404);
+    res = await api('POST', '/api/delete', { path: '/' });
+    assert.deepEqual([res.status, res.body.code], [400, 'TX004']);
+
+    const moves = server.corpus
+      .feed(since)
+      .filter((c) => c.op === 'move' || c.op === 'delete')
+      .map((c) => [c.op, c.path, c.old_path, c.node_kind, c.author]);
+    assert.deepEqual(moves, [
+      ['move', '/tree/renamed.md', '/tree/a.md', 'file', 'human'],
+      ['move', '/elsewhere/sub2', '/tree/sub', 'folder', 'human'],
+      ['delete', '/elsewhere', null, 'folder', 'agent-7'],
+    ]);
   });
 });
 

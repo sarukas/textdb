@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type SearchHit } from "../api";
 import type { FeedHub } from "../state/hub";
+import type { PathAction } from "../tree/actions";
 import { FileTree } from "./FileTree";
 import { SearchResults } from "./SearchResults";
 
@@ -8,6 +9,7 @@ interface Props {
   hub: FeedHub;
   openPath: string | null;
   onOpen: (path: string, line?: number) => void;
+  onAction: (action: PathAction) => void;
 }
 
 interface SearchState {
@@ -17,7 +19,7 @@ interface SearchState {
   error: string | null;
 }
 
-export function Sidebar({ hub, openPath, onOpen }: Props) {
+export function Sidebar({ hub, openPath, onOpen, onAction }: Props) {
   const [query, setQuery] = useState("");
   const [search, setSearch] = useState<SearchState | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -92,7 +94,7 @@ export function Sidebar({ hub, openPath, onOpen }: Props) {
         />
       )}
       <div className="tree-wrap" hidden={searching}>
-        <FileTree hub={hub} openPath={openPath} onOpen={onOpen} />
+        <FileTree hub={hub} openPath={openPath} onOpen={onOpen} onAction={onAction} />
       </div>
     </div>
   );
