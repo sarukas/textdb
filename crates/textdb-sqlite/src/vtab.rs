@@ -74,6 +74,15 @@ const KB_SCHEMA: &CStr = c"CREATE TABLE x(id INTEGER, path TEXT, name TEXT, pare
 
 const COL_ID: c_int = 0;
 const COL_PATH: c_int = 1;
+
+/// `idx_num` values agreed between `best_index` and `filter`.
+const IDX_SCAN: c_int = 0;
+const IDX_PATH_EQ: c_int = 1;
+const IDX_ID_EQ: c_int = 2;
+/// Range over `path`, with the two bits below saying which bounds were supplied.
+const IDX_PATH_RANGE: c_int = 4;
+const IDX_RANGE_LOWER: c_int = 1;
+const IDX_RANGE_UPPER: c_int = 2;
 const COL_CONTENT: c_int = 5;
 const COL_BASE_VERSION: usize = 11;
 const COL_AUTHOR: usize = 12;
@@ -128,33 +137,77 @@ unsafe impl<'vtab> VTab<'vtab> for KbTab {
     }
 
     fn best_index(&self, info: &mut IndexInfo) -> Result<bool> {
-        let mut idx_num = 0;
-        let mut chosen: Option<usize> = None;
+        let mut eq: Option<(usize, c_int)> = None; // (constraint, idx_num 1 or 2)
+        let mut lower: Option<usize> = None;
+        let mut upper: Option<usize> = None;
         for (i, c) in info.constraints().enumerate() {
-            if !c.is_usable() || c.operator() != IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ {
+            if !c.is_usable() {
                 continue;
             }
-            if c.column() == COL_PATH {
-                idx_num = 1;
-                chosen = Some(i);
-                break;
-            }
-            if c.column() == COL_ID || c.column() == -1 {
-                idx_num = 2;
-                chosen = Some(i);
+            match c.operator() {
+                IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ => {
+                    if c.column() == COL_PATH {
+                        eq = Some((i, IDX_PATH_EQ));
+                    } else if c.column() == COL_ID || c.column() == -1 {
+                        // Keep a path equality if one was already found: it is the narrower
+                        // of the two and the only one that needs no rowid lookup.
+                        if eq.is_none() {
+                            eq = Some((i, IDX_ID_EQ));
+                        }
+                    }
+                }
+                // A bound on `path` becomes a seek over `{p}node_path`, which is what makes
+                // `WHERE path >= '/notes/' AND path < '/notes0'` — a subtree listing — cost
+                // the size of the subtree instead of the size of the table.
+                IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_GE | IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_GT
+                    if c.column() == COL_PATH && lower.is_none() =>
+                {
+                    lower = Some(i);
+                }
+                IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_LE | IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_LT
+                    if c.column() == COL_PATH && upper.is_none() =>
+                {
+                    upper = Some(i);
+                }
+                _ => {}
             }
         }
-        if let Some(i) = chosen {
+        if let Some((i, idx_num)) = eq {
             let mut u = info.constraint_usage(i);
             u.set_argv_index(1);
             u.set_omit(true);
             info.set_estimated_cost(1.0);
             info.set_estimated_rows(1);
-        } else {
-            info.set_estimated_cost(100_000.0);
-            info.set_estimated_rows(50_000);
+            info.set_idx_num(idx_num);
+            return Ok(true);
         }
-        info.set_idx_num(idx_num);
+        if lower.is_some() || upper.is_some() {
+            let mut idx_num = IDX_PATH_RANGE;
+            let mut argv = 1;
+            if let Some(i) = lower {
+                idx_num |= IDX_RANGE_LOWER;
+                let mut u = info.constraint_usage(i);
+                u.set_argv_index(argv);
+                // Deliberately not omitted: the bound is widened to `>=` / `<=` regardless
+                // of whether the caller wrote a strict comparison, so the range is always a
+                // superset and SQLite has to apply the exact test itself.
+                u.set_omit(false);
+                argv += 1;
+            }
+            if let Some(i) = upper {
+                idx_num |= IDX_RANGE_UPPER;
+                let mut u = info.constraint_usage(i);
+                u.set_argv_index(argv);
+                u.set_omit(false);
+            }
+            info.set_estimated_cost(1_000.0);
+            info.set_estimated_rows(500);
+            info.set_idx_num(idx_num);
+            return Ok(true);
+        }
+        info.set_estimated_cost(100_000.0);
+        info.set_estimated_rows(50_000);
+        info.set_idx_num(IDX_SCAN);
         Ok(true)
     }
 
@@ -287,23 +340,43 @@ unsafe impl VTabCursor for KbCursor<'_> {
     fn filter(&mut self, idx_num: c_int, _idx_str: Option<&str>, args: &Filters<'_>) -> Result<()> {
         let conn = unsafe { Connection::from_handle(self.db) }?;
         let cols = "id, path, name, kind, root, version, nbytes, nlines, updated_at, updated_by";
-        let (sql, param): (String, Option<Value>) = match idx_num {
-            1 => (
+        let (sql, params): (String, Vec<Value>) = match idx_num {
+            IDX_PATH_EQ => (
                 format!("SELECT {} FROM {}node WHERE path = ?1 AND deleted_at IS NULL", cols, self.prefix),
-                Some(Value::Text(
+                vec![Value::Text(
                     normalize_path(&value_str(args.get::<Value>(0)?).unwrap_or_default()).unwrap_or_default(),
-                )),
+                )],
             ),
-            2 => (
+            IDX_ID_EQ => (
                 format!("SELECT {} FROM {}node WHERE id = ?1 AND deleted_at IS NULL", cols, self.prefix),
-                Some(Value::Integer(value_i64(args.get::<Value>(0)?).unwrap_or(-1))),
+                vec![Value::Integer(value_i64(args.get::<Value>(0)?).unwrap_or(-1))],
             ),
+            n if n & IDX_PATH_RANGE != 0 => {
+                // The bounds are widened to `>=` / `<=` whatever the caller wrote; `omit` was
+                // left false in `best_index` so SQLite re-applies the exact comparison.
+                let mut where_ = String::from("deleted_at IS NULL AND path <> '/'");
+                let mut vals = Vec::new();
+                let mut arg = 0usize;
+                if n & IDX_RANGE_LOWER != 0 {
+                    where_.push_str(&format!(" AND path >= ?{}", vals.len() + 1));
+                    vals.push(Value::Text(value_str(args.get::<Value>(arg)?).unwrap_or_default()));
+                    arg += 1;
+                }
+                if n & IDX_RANGE_UPPER != 0 {
+                    where_.push_str(&format!(" AND path <= ?{}", vals.len() + 1));
+                    vals.push(Value::Text(value_str(args.get::<Value>(arg)?).unwrap_or_default()));
+                }
+                (
+                    format!("SELECT {} FROM {}node WHERE {} ORDER BY path", cols, self.prefix, where_),
+                    vals,
+                )
+            }
             _ => (
                 format!(
                     "SELECT {} FROM {}node WHERE deleted_at IS NULL AND path <> '/' ORDER BY path",
                     cols, self.prefix
                 ),
-                None,
+                Vec::new(),
             ),
         };
         let mut stmt = conn.prepare(&sql)?;
@@ -322,10 +395,9 @@ unsafe impl VTabCursor for KbCursor<'_> {
                 updated_by: r.get(9)?,
             })
         };
-        self.rows = match param {
-            Some(p) => stmt.query_map([p], map)?.collect::<Result<Vec<_>>>()?,
-            None => stmt.query_map([], map)?.collect::<Result<Vec<_>>>()?,
-        };
+        self.rows = stmt
+            .query_map(rusqlite::params_from_iter(params), map)?
+            .collect::<Result<Vec<_>>>()?;
         self.i = 0;
         Ok(())
     }

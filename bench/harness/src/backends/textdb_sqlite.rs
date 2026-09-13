@@ -152,11 +152,17 @@ impl Backend for TextdbSqlite {
     }
     fn list(&self, prefix: &str) -> R<Vec<Entry>> {
         self.with(|c| {
-            let mut st = c.prepare_cached(
-                "SELECT path, kind, nbytes FROM kb WHERE ?1 = '/' OR substr(path, 1, length(?1) + 1) = ?1 || '/' ORDER BY path",
-            )?;
+            // A bound on `path` is pushed into the shadow table's index by the virtual
+            // table; the root has no bounds and gets the plain scan.
+            let bounds = crate::backends::subtree_bounds(prefix);
+            let sql = match bounds {
+                Some(_) => "SELECT path, kind, nbytes FROM kb WHERE path >= ?1 AND path < ?2 ORDER BY path",
+                None => "SELECT path, kind, nbytes FROM kb ORDER BY path",
+            };
+            let args: Vec<String> = bounds.map(|(lo, hi)| vec![lo, hi]).unwrap_or_default();
+            let mut st = c.prepare_cached(sql)?;
             let rows = st
-                .query_map(params![prefix], |r| {
+                .query_map(rusqlite::params_from_iter(args), |r| {
                     Ok(Entry {
                         path: r.get(0)?,
                         is_dir: r.get::<_, String>(1)? == "folder",

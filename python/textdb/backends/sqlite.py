@@ -84,9 +84,17 @@ class SqliteBackend(Backend):
 
     @_wrap
     def list_files(self, prefix: str):
-        rows = self.conn.execute(
-            "SELECT path, nbytes, nlines, version, updated_at FROM kb WHERE kind = 'file' AND (? = '/' OR substr(path, 1, length(?) + 1) = ? || '/') ORDER BY path",
-            (prefix, prefix, prefix)).fetchall()
+        # A range on `path` rather than `substr(path, 1, length(?) + 1) = ? || '/'`: the
+        # virtual table turns a bound into an index seek on the shadow table, where the
+        # substr form is a function of the column and forces a full scan. "0" (0x30) is the
+        # byte after "/" (0x2F), so `prefix || '0'` is the exclusive end of the subtree.
+        cols = "SELECT path, nbytes, nlines, version, updated_at FROM kb WHERE kind = 'file'"
+        if prefix == "/":
+            rows = self.conn.execute(f"{cols} ORDER BY path").fetchall()
+        else:
+            rows = self.conn.execute(
+                f"{cols} AND path >= ? AND path < ? ORDER BY path", (prefix + "/", prefix + "0")
+            ).fetchall()
         return [dict(path=r[0], nbytes=r[1], nlines=r[2], version=r[3], updated_at=r[4]) for r in rows]
 
     @_wrap

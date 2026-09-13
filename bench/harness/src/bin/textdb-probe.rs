@@ -346,6 +346,35 @@ fn probe_prefix() -> anyhow::Result<()> {
             name, scan, range, scan / range
         );
     }
+    // Through the virtual table, which is how every caller actually lists a subtree. A
+    // bound on `path` reaches `{p}node_path`; `substr(path, …)` cannot be a constraint at
+    // all, so SQLite asks the cursor for every row and filters afterwards.
+    for (name, prefix) in [("shallow ('/wide/d00')", "/wide/d00".to_string()), ("deep (depth 1000)", "/a".repeat(1000))] {
+        let scan = timed(20, |_| {
+            let _: i64 = s
+                .td
+                .query_row(
+                    "SELECT count(*) FROM kb WHERE substr(path, 1, length(?1) + 1) = ?1 || '/'",
+                    params![&prefix],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        });
+        let range = timed(20, |_| {
+            let _: i64 = s
+                .td
+                .query_row(
+                    "SELECT count(*) FROM kb WHERE path >= ?1 || '/' AND path < ?1 || '0'",
+                    params![&prefix],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        });
+        println!(
+            "  via kb {:22}  substr scan {:8.3} ms | pushed-down range {:8.3} ms  ({:.0}x)",
+            name, scan, range, scan / range
+        );
+    }
     // `ensure_folder` issues a lookup and an insert per missing component.
     let deep2 = "/b".repeat(1000);
     let t = Instant::now();

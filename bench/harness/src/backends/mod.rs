@@ -92,3 +92,21 @@ pub fn du(path: &Path) -> u64 {
     }
     total
 }
+
+/// Half-open `[lo, hi)` bounds selecting every path strictly under the folder `prefix`;
+/// `None` for the root, which bounds nothing.
+///
+/// Both SQL backends used to spell a subtree test `substr(path, 1, length(?1) + 1) = ?1 || '/'`,
+/// which is a function of the column and so defeats the unique index on `path` on either
+/// side: every subtree listing, folder rename and folder delete scanned the whole table.
+/// Measured at 58x a range over 2000 files. Giving both backends the range form keeps the
+/// comparison fair — it is the query a competent implementation of either would write —
+/// and stops the suite reporting a self-inflicted full scan as the cost of the operation.
+/// `'0'` (0x30) is the byte after `'/'` (0x2F), so under SQLite's default BINARY collation
+/// `prefix || '0'` is the exclusive end of the subtree and the range is exact.
+pub fn subtree_bounds(prefix: &str) -> Option<(String, String)> {
+    if prefix == "/" {
+        return None;
+    }
+    Some((format!("{}/", prefix), format!("{}0", prefix)))
+}

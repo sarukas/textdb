@@ -292,3 +292,89 @@ fn roundtrip_edge_cases_and_reimport() {
     );
     assert!((chunk_bytes as f64) < 8.0 * reference.len() as f64);
 }
+
+/// A bound on `path` is pushed into the shadow table so a subtree listing seeks through
+/// `{p}node_path` instead of scanning every row. The bounds the cursor applies are widened
+/// to `>=` / `<=` whatever the caller wrote, so the exact comparison has to come back from
+/// SQLite — these cases are the ones that catch it if it does not.
+#[test]
+fn path_range_listing_is_exact() {
+    let conn = setup();
+    for p in [
+        "/a.md",
+        "/notes/a.md",
+        "/notes/b.md",
+        "/notes/sub/c.md",
+        "/notes0/d.md", // sorts immediately after "/notes/…" and must never be included
+        "/nz.md",
+    ] {
+        conn.execute("INSERT INTO kb(path, content) VALUES (?1, 'x')", params![p]).unwrap();
+    }
+    let paths = |sql: &str, args: &[&str]| -> Vec<String> {
+        let mut st = conn.prepare(sql).unwrap();
+        st.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+
+    // The subtree of /notes, as the engine itself spells it.
+    let under = paths(
+        "SELECT path FROM kb WHERE path >= ?1 AND path < ?2 ORDER BY path",
+        &["/notes/", "/notes0"],
+    );
+    assert_eq!(under, ["/notes/a.md", "/notes/b.md", "/notes/sub", "/notes/sub/c.md"]);
+
+    // Strict lower bound: "/notes/a.md" itself must drop out.
+    let strict = paths(
+        "SELECT path FROM kb WHERE path > ?1 AND path < ?2 ORDER BY path",
+        &["/notes/a.md", "/notes0"],
+    );
+    assert_eq!(strict, ["/notes/b.md", "/notes/sub", "/notes/sub/c.md"]);
+
+    // Inclusive upper bound: "/notes/b.md" must be kept.
+    let inclusive = paths(
+        "SELECT path FROM kb WHERE path >= ?1 AND path <= ?2 ORDER BY path",
+        &["/notes/", "/notes/b.md"],
+    );
+    assert_eq!(inclusive, ["/notes/a.md", "/notes/b.md"]);
+
+    // One-sided bounds still work, and the root folder row stays hidden as in a full scan.
+    let from = paths("SELECT path FROM kb WHERE path >= ?1 ORDER BY path", &["/notes0"]);
+    assert_eq!(from, ["/notes0", "/notes0/d.md", "/nz.md"]);
+    let upto = paths("SELECT path FROM kb WHERE path <= ?1 ORDER BY path", &["/a.md"]);
+    assert_eq!(upto, ["/a.md"]);
+
+    // A range and an equality on the same column: equality wins and is still exact.
+    let eq: String = conn
+        .query_row(
+            "SELECT path FROM kb WHERE path = '/notes/b.md' AND path >= '/notes/' AND path < '/notes0'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(eq, "/notes/b.md");
+
+    // And the full scan is unchanged.
+    let all = conn
+        .prepare("SELECT path FROM kb ORDER BY path")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        all,
+        [
+            "/a.md",
+            "/notes",
+            "/notes/a.md",
+            "/notes/b.md",
+            "/notes/sub",
+            "/notes/sub/c.md",
+            "/notes0",
+            "/notes0/d.md",
+            "/nz.md"
+        ]
+    );
+}

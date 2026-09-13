@@ -151,29 +151,45 @@ impl Backend for SqlTextSqlite {
     }
     fn delete(&self, path: &str) -> R<()> {
         self.with(|c| {
-            c.execute(
-                "UPDATE doc SET deleted = 1 WHERE deleted = 0 AND (path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/')",
-                params![path],
-            )?;
+            match crate::backends::subtree_bounds(path) {
+                Some((lo, hi)) => c.execute(
+                    "UPDATE doc SET deleted = 1 WHERE deleted = 0 AND (path = ?1 OR (path >= ?2 AND path < ?3))",
+                    params![path, lo, hi],
+                )?,
+                // Deleting the root means the whole store.
+                None => c.execute("UPDATE doc SET deleted = 1 WHERE deleted = 0", [])?,
+            };
             Ok(())
         })
     }
     fn rename(&self, from: &str, to: &str) -> R<()> {
         self.with(|c| {
+            let (lo, hi) = match crate::backends::subtree_bounds(from) {
+                Some(b) => b,
+                None => return Err(BackendError::Other("cannot rename the root".into())),
+            };
             c.execute(
-                "UPDATE doc SET path = ?2 || substr(path, length(?1) + 1) WHERE deleted = 0 AND (path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/')",
-                params![from, to],
+                "UPDATE doc SET path = ?2 || substr(path, length(?1) + 1) \
+                 WHERE deleted = 0 AND (path = ?1 OR (path >= ?3 AND path < ?4))",
+                params![from, to, lo, hi],
             )?;
             Ok(())
         })
     }
     fn list(&self, prefix: &str) -> R<Vec<Entry>> {
         self.with(|c| {
-            let mut st = c.prepare_cached(
-                "SELECT path, length(CAST(body AS BLOB)) FROM doc WHERE deleted = 0 AND (?1 = '/' OR substr(path, 1, length(?1) + 1) = ?1 || '/') ORDER BY path",
-            )?;
+            // The root has no bounds, so it gets the unbounded statement rather than a
+            // sentinel upper bound that some path could one day sort above.
+            let bounds = crate::backends::subtree_bounds(prefix);
+            let sql = match bounds {
+                Some(_) => "SELECT path, length(CAST(body AS BLOB)) FROM doc WHERE deleted = 0 \
+                            AND path >= ?1 AND path < ?2 ORDER BY path",
+                None => "SELECT path, length(CAST(body AS BLOB)) FROM doc WHERE deleted = 0 ORDER BY path",
+            };
+            let args: Vec<String> = bounds.map(|(lo, hi)| vec![lo, hi]).unwrap_or_default();
+            let mut st = c.prepare_cached(sql)?;
             let rows = st
-                .query_map(params![prefix], |r| {
+                .query_map(rusqlite::params_from_iter(args), |r| {
                     Ok(Entry {
                         path: r.get(0)?,
                         is_dir: false,

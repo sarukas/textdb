@@ -114,6 +114,24 @@ pub fn name_of(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or("")
 }
 
+/// Half-open `[lo, hi)` bounds selecting everything strictly under the folder `path`.
+///
+/// A prefix test written `substr(path, 1, length(?1) + 1) = ?1 || '/'` is a function of the
+/// column, so no index can serve it and every such query scans the whole `node` table —
+/// measured at 58x a range over 2000 files, and 147x at path depth 1000. The same set as a
+/// range uses `{p}node_path` directly.
+///
+/// `'0'` is `0x30` and `'/'` is `0x2F`, so under the `BINARY` collation that `path` is
+/// stored with, `prefix || '0'` is the immediate successor of `prefix || '/'` and the range
+/// is exact: nothing sorts between them. `None` for the root, which has no bound — every
+/// path is under it.
+pub fn subtree_bounds(path: &str) -> Option<(String, String)> {
+    if path == "/" {
+        return None;
+    }
+    Some((format!("{}/", path), format!("{}0", path)))
+}
+
 impl<'c> TextDb<'c> {
     /// Create the shadow tables if missing and return a handle.
     pub fn open(conn: &'c Connection, prefix: &str) -> Result<Self> {
@@ -606,13 +624,16 @@ impl<'c> TextDb<'c> {
             }
             let parent = db.ensure_folder(parent_of(&to))?;
             let now = Self::now();
+            // `from` is never "/" here, so the subtree always has bounds.
+            let (lo, hi) = subtree_bounds(&from).expect("rename rejects the root above");
             db.conn
                 .prepare_cached(&format!(
-                    "UPDATE {}node SET path = ?2 || substr(path, length(?1) + 1), updated_at = ?3 WHERE substr(path, 1, length(?1) + 1) = ?1 || '/' AND deleted_at IS NULL",
+                    "UPDATE {}node SET path = ?2 || substr(path, length(?1) + 1), updated_at = ?3 \
+                     WHERE path >= ?4 AND path < ?5 AND deleted_at IS NULL",
                     db.p
                 ))
                 .map_err(sql_err)?
-                .execute(params![from, to, now])
+                .execute(params![from, to, now, lo, hi])
                 .map_err(sql_err)?;
             db.conn
                 .prepare_cached(&format!(
@@ -635,13 +656,15 @@ impl<'c> TextDb<'c> {
             }
             db.node_by_path(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
             let now = Self::now();
+            let (lo, hi) = subtree_bounds(&path).expect("delete rejects the root above");
             db.conn
                 .prepare_cached(&format!(
-                    "UPDATE {}node SET deleted_at = ?2 WHERE (path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/') AND deleted_at IS NULL",
+                    "UPDATE {}node SET deleted_at = ?2 \
+                     WHERE (path = ?1 OR (path >= ?3 AND path < ?4)) AND deleted_at IS NULL",
                     db.p
                 ))
                 .map_err(sql_err)?
-                .execute(params![path, now])
+                .execute(params![path, now, lo, hi])
                 .map_err(sql_err)?;
             Ok(())
         })
@@ -675,16 +698,35 @@ impl<'c> TextDb<'c> {
     /// All live files under `prefix` (a folder path), sorted by path.
     pub fn list_files(&self, prefix: &str) -> Result<Vec<NodeRow>> {
         let prefix = normalize_path(prefix)?;
-        let mut stmt = self
-            .conn
-            .prepare_cached(&format!(
-                "SELECT {} FROM {}node WHERE kind = 1 AND deleted_at IS NULL AND (?1 = '/' OR substr(path, 1, length(?1) + 1) = ?1 || '/') ORDER BY path",
-                Self::NODE_COLS,
-                self.p
-            ))
-            .map_err(sql_err)?;
-        let rows = stmt.query_map(params![prefix], Self::row_from).map_err(sql_err)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+        // Two statements rather than one with `?1 = '/' OR …`: the root case has no bounds,
+        // and a query that has to evaluate the alternative cannot use the range for a seek.
+        match subtree_bounds(&prefix) {
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare_cached(&format!(
+                        "SELECT {} FROM {}node WHERE kind = 1 AND deleted_at IS NULL ORDER BY path",
+                        Self::NODE_COLS,
+                        self.p
+                    ))
+                    .map_err(sql_err)?;
+                let rows = stmt.query_map([], Self::row_from).map_err(sql_err)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+            }
+            Some((lo, hi)) => {
+                let mut stmt = self
+                    .conn
+                    .prepare_cached(&format!(
+                        "SELECT {} FROM {}node WHERE kind = 1 AND deleted_at IS NULL \
+                         AND path >= ?1 AND path < ?2 ORDER BY path",
+                        Self::NODE_COLS,
+                        self.p
+                    ))
+                    .map_err(sql_err)?;
+                let rows = stmt.query_map(params![lo, hi], Self::row_from).map_err(sql_err)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+            }
+        }
     }
 
     pub fn history(&self, path: &str) -> Result<Vec<CommitRow>> {
