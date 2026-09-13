@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { destPath, formatBytes, includeFile, normalizePrefix, parseExtensions } from "./select";
+import {
+  countExtensions,
+  destPath,
+  formatBytes,
+  includeFile,
+  NO_EXTENSION,
+  normalizePrefix,
+  parseExtensions,
+  toggleExtension,
+} from "./select";
 
 const MD = ["md", "markdown"];
 
@@ -23,6 +32,40 @@ describe("includeFile", () => {
   it("takes every visible file for *", () => {
     expect(includeFile("data/table.csv", ["*"])).toBe(true);
     expect(includeFile("LICENSE", ["*"])).toBe(true);
+  });
+});
+
+describe("extensions found in a folder", () => {
+  const files = [
+    { rel: "a.md", size: 10 },
+    { rel: "docs/b.MD", size: 20 },
+    { rel: "docs/c.pdf", size: 1000 },
+    { rel: "Makefile", size: 5 },
+    { rel: "odd.", size: 1 },
+    { rel: ".git/config", size: 3 },
+    { rel: "node_modules/x/readme.md", size: 7 },
+    { rel: "docs/.hidden.txt", size: 2 },
+  ];
+
+  it("counts what an import could read, most files first", () => {
+    expect(countExtensions(files)).toEqual([
+      { ext: "md", files: 2, bytes: 30 },
+      { ext: NO_EXTENSION, files: 2, bytes: 6 },
+      { ext: "pdf", files: 1, bytes: 1000 },
+    ]);
+    expect(countExtensions([{ rel: "a.md", size: null }, { rel: "b.md", size: 3 }])).toEqual([{ ext: "md", files: 2, bytes: null }]);
+  });
+
+  it("selects files without an extension only when asked", () => {
+    expect(includeFile("Makefile", ["md"])).toBe(false);
+    expect(includeFile("Makefile", [NO_EXTENSION])).toBe(true);
+    expect(parseExtensions(`md, ${NO_EXTENSION}`)).toEqual(["md", NO_EXTENSION]);
+  });
+
+  it("toggles one extension, including out of *", () => {
+    expect(toggleExtension(["md"], "txt", true, [])).toEqual(["md", "txt"]);
+    expect(toggleExtension(["md", "txt"], "md", false, [])).toEqual(["txt"]);
+    expect(toggleExtension(["*"], "pdf", false, ["md", "pdf", NO_EXTENSION])).toEqual(["md", NO_EXTENSION]);
   });
 });
 

@@ -1605,6 +1605,72 @@ kbd {
   background: var(--danger-weak);
   border-color: transparent;
 }
+/* ---- import: file types ------------------------------------------------------------------ */
+.ext-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+}
+.ext-actions {
+  display: flex;
+  gap: 2px;
+}
+.ext-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 4px;
+  max-height: 188px;
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+.ext-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 3px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ext-item:hover {
+  background: var(--hover);
+}
+.ext-item.on {
+  background: var(--accent-weak);
+}
+.ext-item input {
+  margin: 0;
+  accent-color: var(--accent);
+}
+.ext-name {
+  font-weight: 500;
+}
+.ext-count {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--muted);
+  font-size: 12px;
+}
+.field small.ext-hint {
+  white-space: normal;
+}
+.ext-binary {
+  margin-left: auto;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--warn-weak);
+  color: var(--warn);
+  font-size: 11px;
+}
+
 /* ---- folder view ------------------------------------------------------------------------- */
 button.crumb {
   border: 0;

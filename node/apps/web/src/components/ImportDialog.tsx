@@ -1,13 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { runImport, type ImportProgress } from "../import/runner";
 import {
+  countExtensions,
   DEFAULT_EXTENSIONS,
   destPath,
   formatBytes,
   formatDuration,
   includeFile,
+  isLikelyBinary,
+  NO_EXTENSION,
   normalizePrefix,
   parseExtensions,
+  toggleExtension,
 } from "../import/select";
 import {
   canPickDirectory,
@@ -50,6 +54,9 @@ export function ImportDialog({ author, onClose, onOpen }: Props) {
   const busy = step.kind === "scanning" || running;
 
   const extensions = useMemo(() => parseExtensions(extInput), [extInput]);
+  const found = useMemo(() => (step.kind === "review" ? countExtensions(step.folder.files) : []), [step]);
+  const everything = extensions.includes("*");
+  const setExtensions = (list: readonly string[]) => setExtInput(list.join(", "));
   const selection = useMemo(
     () => (step.kind === "review" ? step.folder.files.filter((f) => includeFile(f.rel, extensions)) : []),
     [step, extensions],
@@ -222,11 +229,69 @@ export function ImportDialog({ author, onClose, onOpen }: Props) {
                 selection[0] && <small>For example {destPath(prefix, selection[0].rel)}</small>
               )}
             </label>
-            <label className="field">
-              <span>File types</span>
-              <input value={extInput} onChange={(e) => setExtInput(e.target.value)} spellCheck={false} />
-              <small>Extensions, separated by commas; * for every file. Binary and non-UTF-8 files are skipped.</small>
-            </label>
+            <div className="field">
+              <div className="ext-head">
+                <span id="ext-label">File types in this folder</span>
+                <span className="ext-actions">
+                  <button type="button" className="btn btn-ghost btn-small" onClick={() => setExtInput("*")}>
+                    All
+                  </button>
+                  <button type="button" className="btn btn-ghost btn-small" onClick={() => setExtInput("")}>
+                    None
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-small"
+                    onClick={() => setExtensions(DEFAULT_EXTENSIONS)}
+                    title={DEFAULT_EXTENSIONS.map((e) => `.${e}`).join(" ")}
+                  >
+                    Text
+                  </button>
+                </span>
+              </div>
+              {found.length === 0 ? (
+                <small>No files an import could read.</small>
+              ) : (
+                <div className="ext-list" role="group" aria-labelledby="ext-label">
+                  {found.map((c) => {
+                    const on = everything || extensions.includes(c.ext);
+                    const binary = isLikelyBinary(c.ext);
+                    return (
+                      <label key={c.ext} className={`ext-item${on ? " on" : ""}`}>
+                        <input
+                          type="checkbox"
+                          checked={on}
+                          onChange={(e) =>
+                            setExtensions(toggleExtension(extensions, c.ext, e.target.checked, found.map((f) => f.ext)))
+                          }
+                        />
+                        <span className="mono ext-name">{c.ext === NO_EXTENSION ? "no extension" : `.${c.ext}`}</span>
+                        <span className="ext-count">
+                          {c.files.toLocaleString()} {c.files === 1 ? "file" : "files"}
+                          {c.bytes !== null && ` · ${formatBytes(c.bytes)}`}
+                        </span>
+                        {binary && (
+                          <span className="ext-binary" title="Usually binary: such files are skipped during the import">
+                            binary
+                          </span>
+                        )}
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+              <input
+                value={extInput}
+                onChange={(e) => setExtInput(e.target.value)}
+                spellCheck={false}
+                aria-label="File types, typed"
+                placeholder="md, txt — or * for every file"
+              />
+              <small className="ext-hint">
+                Tick the types to import, or type extensions separated by commas (* for every file,{" "}
+                <span className="mono">{NO_EXTENSION}</span> for files without one). Binary and non-UTF-8 files are skipped.
+              </small>
+            </div>
           </div>
           <div className="dialog-foot">
             <button type="button" className="btn spacer" onClick={() => void pick()}>
