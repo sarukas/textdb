@@ -50,6 +50,64 @@ Findings — what changed, what is new, what is still open.
 
 ---
 
+## 2026-09-13 — s, Windows, after the live-app work (trash, path history)
+
+**Artefacts:** [`results/2026-09-13-s-windows/`](results/2026-09-13-s-windows/) — `results.jsonl`,
+`manifest.json`, `report.md`, `run.log`
+**Manifest:** size `s` (scale 0.3) · profile `poc` · mode `fast` · seed 20260912 · 8 CPUs,
+Windows 11, NTFS, desktop with other work open · SQLite 3.53.2 · rustc 1.93.0 · harness
+`b6adf31`
+**Status:** complete — 39 tests, `fs` + `sql-text-sqlite` + `textdb-sqlite`, 513 s wall clock
+
+| check | outcome |
+|---|---|
+| accuracy checks | **all pass** (43 per check per backend; canary 2 n/a) |
+| timings voided | **0 cells** |
+
+The first run after the store gained the change feed, the trash and path history: every
+delete and rename now also writes change and path-event rows. The suite still passes every
+oracle, and the two operations that grew work are still far ahead of the baseline.
+
+### Against `sql-text-sqlite` (p50 ratio, lower is better; same run, same machine)
+
+| operation | calls (textdb) | this run | Linux run above | |
+|---|---|---|---|---|
+| `read` | 1.31M | 1.39x | 1.52x | 96 µs against 69 µs |
+| `create` | 4904 | 2.31x | 2.96x | |
+| `replace` | 8561 | **0.78x** | 1.30x | p99 72 ms against 250 ms |
+| `append` | 1275 | **0.42x** | 0.36x | |
+| `read_lines` | 41.0k | **0.22x** | 1.10x | |
+| `read_version` | 14.9k | **0.82x** | 0.35x | |
+| `search` | 1462 | 2.49x | 2.80x | still the largest gap |
+| `history` | 9 | 2.54x | 1.69x | 9 calls |
+| `list` | 2 | 2.88x | 3.36x | 2 calls |
+| `delete` | 1 | 0.17x | 0.04x | one sample, now with path events and change row |
+| `rename` | 1 | 0.27x | 0.19x | one sample, now with path events and change row |
+| `maintenance` | 1 | 0.62x | 0.83x | |
+
+**Do not compare absolute numbers with the Linux run.** This is a Windows desktop: `fs` pays
+NTFS and on-access scanning on every file operation (`create` p50 11.6 ms here against
+306 µs on Linux, `delete` of a large folder 2.56 s), and several families are
+duration-bounded, so a faster engine does more operations and changes cache pressure (`read`
+calls: 1.31M here, 4.16M on Linux). Ratios within one run are the comparable quantity.
+
+### Claims (`bench/scripts/verdict.py`)
+
+| claim | this run | Linux run above |
+|---|---|---|
+| 1 — O(edit) writes: XL-04 write amplification | **not measurable here**: every backend reports 0.000, including `fs` — the harness cannot read the storage footprint on this host | textdb 441, `fs` 43 150, `sql-text` 199 585 |
+| 1 — ME-04 leaves changed per edit | max 1.00 (target ≤ 4) | max 1.00 |
+| 2 — conflict rate at N=20 | CW-01 0.000 vs 0.250; CW-02 **0.028 vs 0.200** (0.14x; the claim asks ≤ 0.1x); CW-03 0.143 vs 0.200; zero lost updates | CW-02 0.044 vs 0.372 |
+| 3 — insert-only index: SR-04 growth per edit | 3 444 B vs 3 607 B | 3 221 B vs 3 607 B |
+| 4 — SQL surface through the Postgres views | not run (no Postgres) | not run |
+| not worse: XL-02 full read vs `fs` | 3.42x (target ≤ 2x) | 3.71x |
+
+The verdict script prints FAIL for every claim on both runs: claim 1 needs the footprint the
+harness cannot measure on Windows, claim 2's CW-02 ratio is 0.14x against a 0.1x target, and
+claim 4 needs Postgres. Those are the open items, unchanged by this work.
+
+---
+
 ## 2026-09-13 — s, Linux, optimisation pass 2 (+ the Postgres and Python surfaces made buildable)
 
 **Artefacts:** [`results/2026-09-13-s-linux/`](results/2026-09-13-s-linux/) — `results.jsonl`
