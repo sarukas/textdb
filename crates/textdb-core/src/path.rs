@@ -55,6 +55,17 @@ fn parent(path: &str) -> &str {
     }
 }
 
+/// Every folder above a normalised `path`, root first: `/a/b/c.md` gives `/`, `/a`, `/a/b`.
+/// The folders whose totals a change at `path` touches.
+pub fn ancestors(path: &str) -> Vec<&str> {
+    if path == "/" {
+        return Vec::new();
+    }
+    let mut out = vec!["/"];
+    out.extend(path.match_indices('/').skip(1).map(|(i, _)| &path[..i]));
+    out
+}
+
 /// The store setting that turns path history on or off.
 pub const PATH_HISTORY_SETTING: &str = "path_history";
 
@@ -93,5 +104,12 @@ mod tests {
         assert_eq!(parse_switch(" ON "), Some(true));
         assert_eq!(parse_switch("0"), Some(false));
         assert_eq!(parse_switch("maybe"), None);
+    }
+
+    #[test]
+    fn ancestors_root_first() {
+        assert_eq!(ancestors("/a/b/c.md"), ["/", "/a", "/a/b"]);
+        assert_eq!(ancestors("/x.md"), ["/"]);
+        assert!(ancestors("/").is_empty());
     }
 }

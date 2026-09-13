@@ -92,6 +92,16 @@ describe('http api', () => {
     res = await api('GET', '/api/ls');
     assert.deepEqual(res.body.map((e: { name: string }) => e.name), ['guides']);
 
+    res = await api('GET', '/api/list?path=/guides&sort=size&order=desc&limit=2');
+    assert.equal(res.status, 200);
+    assert.deepEqual(
+      [res.body.total, res.body.offset, res.body.entries.map((e: { name: string }) => e.name)],
+      [3, 0, ['deep', 'intro.md']],
+    );
+    assert.deepEqual([res.body.entries[1].nwords, res.body.entries[1].versions], [3, 2]);
+    res = await api('GET', '/api/list?path=/guides&sort=colour');
+    assert.equal(res.status, 400);
+
     res = await api('GET', '/api/chunks?path=/guides/intro.md&version=1');
     assert.deepEqual(Object.keys(res.body[0]), ['ord', 'hash', 'byte_from', 'nbytes', 'line_from', 'nlines']);
 

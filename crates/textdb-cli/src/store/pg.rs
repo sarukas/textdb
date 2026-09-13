@@ -55,11 +55,30 @@ fn entry(r: &Row) -> Entry {
         nbytes: r.get(3),
         nlines: r.get(4),
         updated_at: r.get(5),
+        ..Entry::default()
     }
 }
 
 const ENTRY_COLS: &str =
     "n.path, n.name, CASE n.kind WHEN 1 THEN 'file' ELSE 'folder' END, n.nbytes, n.nlines, n.updated_at::text";
+
+/// A row of `kb.entry` selected with [`LISTING_COLS`].
+fn listed(r: &Row) -> Entry {
+    let authors: Option<String> = r.get(12);
+    Entry {
+        nwords: r.get(6),
+        versions: r.get(7),
+        created_at: r.get(8),
+        updated_by: r.get(9),
+        files: r.get(10),
+        folders: r.get(11),
+        authors: authors.and_then(|a| serde_json::from_str(&a).ok()).unwrap_or_default(),
+        ..entry(r)
+    }
+}
+
+const LISTING_COLS: &str = "e.path, e.name, e.kind, e.nbytes, e.nlines, e.updated_at::text, e.nwords, e.versions, \
+     e.created_at::text, e.updated_by, e.files, e.folders, e.authors::text";
 
 impl PgStore {
     pub fn connect(url: &str) -> Result<Self> {
@@ -126,20 +145,14 @@ impl Store for PgStore {
         Ok(rows.iter().map(entry).collect())
     }
 
-    fn ls(&mut self, path: &str) -> Result<Vec<Entry>> {
+    fn ls(&mut self, path: &str, recursive: bool) -> Result<Vec<Entry>> {
         let path = normalize_path(path)?;
         self.stat(&path)?;
         let rows = self
             .client
-            .query(
-                &format!(
-                    "SELECT {ENTRY_COLS} FROM kb.node n JOIN kb.node d ON n.parent_id = d.id \
-                     WHERE d.path = $1 AND d.deleted_at IS NULL AND n.deleted_at IS NULL ORDER BY n.name"
-                ),
-                &[&path],
-            )
+            .query(&format!("SELECT {LISTING_COLS} FROM kb.ls($1, $2) e"), &[&path, &recursive])
             .map_err(pg)?;
-        Ok(rows.iter().map(entry).collect())
+        Ok(rows.iter().map(listed).collect())
     }
 
     fn stat(&mut self, path: &str) -> Result<Stat> {

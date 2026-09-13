@@ -102,6 +102,19 @@ enum Cmd {
     Ls {
         #[arg(default_value = "/", value_parser = store_path)]
         path: String,
+        /// A table: size, lines, words, versions, last update, and a file's authors or a
+        /// folder's contents. A folder's figures are totals over everything below it.
+        #[arg(long, short = 'l')]
+        long: bool,
+        /// Order by this; folders stay before files.
+        #[arg(long, short = 's', value_enum, default_value_t = SortKey::Name)]
+        sort: SortKey,
+        /// Reverse the order.
+        #[arg(long, short = 'r')]
+        reverse: bool,
+        /// Everything below the folder, listed by path.
+        #[arg(long, short = 'R')]
+        recursive: bool,
     },
     /// Show the folder tree.
     Tree {
@@ -320,26 +333,19 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
                 line(format!("exported {n} files to {}", dir.display()))
             }
         }
-        Cmd::Ls { path } => {
-            let mut entries = st.ls(&path)?;
-            entries.sort_by(|a, b| (a.kind != "folder", &a.name).cmp(&(b.kind != "folder", &b.name)));
+        Cmd::Ls {
+            path,
+            long,
+            sort,
+            reverse,
+            recursive,
+        } => {
+            let mut entries = st.ls(&path, recursive)?;
+            sort_entries(&mut entries, sort, reverse, recursive);
             if json {
                 return emit_json(&entries);
             }
-            let mut s = String::new();
-            for e in &entries {
-                if e.kind == "folder" {
-                    s.push_str(&format!("{:>9}  {:>7}  {}/\n", "", "", e.name));
-                } else {
-                    s.push_str(&format!(
-                        "{:>9}  {:>7}  {}\n",
-                        human_bytes(e.nbytes.unwrap_or(0)),
-                        format!("{}L", e.nlines.unwrap_or(0)),
-                        e.name
-                    ));
-                }
-            }
-            out(s.as_bytes())
+            out(ls_text(&entries, long, recursive).as_bytes())
         }
         Cmd::Tree { path, depth, dirs } => tree(st, &path, depth, dirs, json),
         Cmd::Stat { path } => {
@@ -673,6 +679,104 @@ fn report(e: &StoreError, json: bool) {
         eprintln!("--- base\n{}--- theirs (current text)\n{}--- ours\n{}", text("base"), text("theirs"), text("ours"));
         eprintln!("Rebuild the change on 'theirs' and write again with --base-version {}.", c["current_version"]);
     }
+}
+
+/// What `ls --sort` orders by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum SortKey {
+    Name,
+    /// The file extension.
+    Type,
+    Size,
+    Lines,
+    Words,
+    Versions,
+    Created,
+    Updated,
+    /// The number of authors.
+    Authors,
+}
+
+/// Order a listing by `key`, ties by name (by path when recursive). Folders come first except
+/// in a recursive listing, where each folder stays in front of what is inside it by path.
+fn sort_entries(entries: &mut [Entry], key: SortKey, reverse: bool, recursive: bool) {
+    let ext = |e: &Entry| -> String {
+        match e.name.rsplit_once('.') {
+            Some((_, x)) if e.kind == "file" => x.to_ascii_lowercase(),
+            _ => String::new(),
+        }
+    };
+    entries.sort_by(|a, b| {
+        let by = match key {
+            SortKey::Name => std::cmp::Ordering::Equal,
+            SortKey::Type => ext(a).cmp(&ext(b)),
+            SortKey::Size => a.nbytes.cmp(&b.nbytes),
+            SortKey::Lines => a.nlines.cmp(&b.nlines),
+            SortKey::Words => a.nwords.cmp(&b.nwords),
+            SortKey::Versions => a.versions.cmp(&b.versions),
+            SortKey::Created => a.created_at.cmp(&b.created_at),
+            SortKey::Updated => a.updated_at.cmp(&b.updated_at),
+            SortKey::Authors => a.authors.len().cmp(&b.authors.len()),
+        };
+        let by = if recursive { by.then_with(|| a.path.cmp(&b.path)) } else { by.then_with(|| a.name.cmp(&b.name)) };
+        let by = if reverse { by.reverse() } else { by };
+        if recursive {
+            by
+        } else {
+            (a.kind != "folder").cmp(&(b.kind != "folder")).then(by)
+        }
+    });
+}
+
+fn ls_text(entries: &[Entry], long: bool, recursive: bool) -> String {
+    let name = |e: &Entry| {
+        let n = if recursive { &e.path } else { &e.name };
+        if e.kind == "folder" {
+            format!("{n}/")
+        } else {
+            n.clone()
+        }
+    };
+    let mut s = String::new();
+    if !long {
+        for e in entries {
+            let (size, lines) = if e.kind == "folder" {
+                (String::new(), String::new())
+            } else {
+                (human_bytes(e.nbytes.unwrap_or(0)), format!("{}L", e.nlines.unwrap_or(0)))
+            };
+            s.push_str(&format!("{size:>9}  {lines:>7}  {}\n", name(e)));
+        }
+        return s;
+    }
+    s.push_str(&format!(
+        "{:>9} {:>8} {:>9} {:>5}  {:<16}  {:<28}  {}\n",
+        "SIZE", "LINES", "WORDS", "VERS", "UPDATED", "AUTHORS / CONTAINS", "NAME"
+    ));
+    for e in entries {
+        let who = if e.kind == "folder" {
+            format!("{} files, {} folders", e.files.unwrap_or(0), e.folders.unwrap_or(0))
+        } else {
+            let mut names: Vec<String> =
+                e.authors.iter().take(2).map(|a| format!("{} ({})", a.author.as_deref().unwrap_or("-"), a.commits)).collect();
+            if e.authors.len() > 2 {
+                names.push(format!("+{}", e.authors.len() - 2));
+            }
+            names.join(", ")
+        };
+        let updated: String = e.updated_at.as_deref().unwrap_or("").replace('T', " ").chars().take(16).collect();
+        s.push_str(&format!(
+            "{:>9} {:>8} {:>9} {:>5}  {:<16}  {:<28}  {}\n",
+            human_bytes(e.nbytes.unwrap_or(0)),
+            e.nlines.unwrap_or(0),
+            e.nwords.unwrap_or(0),
+            e.versions.unwrap_or(0),
+            updated,
+            who,
+            name(e)
+        ));
+    }
+    s
 }
 
 fn human_bytes(n: i64) -> String {

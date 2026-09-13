@@ -15,6 +15,7 @@ pub mod path;
 pub mod storage;
 pub mod structure;
 pub mod tree;
+pub mod words;
 
 pub use chunker::ChunkParams;
 pub use commit::{commit, commit_append, CommitKind, Committed, ConflictInfo, DEFAULT_RETRIES};
@@ -26,6 +27,7 @@ pub use path::{parse_switch, PathOp, PATH_HISTORY_DEFAULT, PATH_HISTORY_SETTING}
 pub use storage::{MemStorage, Storage};
 pub use structure::{Link, NoStructure, Section, Structure, StructureExtractor};
 pub use tree::{build, build_with_chunks, leaves, lines, locate_byte, locate_line, materialize, materialize_range, totals, LeafRef};
+pub use words::{count_words, word_delta, words_at, WordCounter};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TextdbError {

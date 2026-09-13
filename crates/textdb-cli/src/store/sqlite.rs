@@ -7,7 +7,7 @@ use textdb_core::CommitKind;
 use textdb_sqlite::db::subtree_bounds;
 use textdb_sqlite::{normalize_path, NodeRow, TextDb, DEFAULT_PREFIX};
 
-use super::{Change, Chunk, Commit, Entry, Hit, Hunk, ImportStats, PathEvent, Result, Stat, Store, StoreError, Written};
+use super::{Author, Change, Chunk, Commit, Entry, Hit, Hunk, ImportStats, PathEvent, Result, Stat, Store, StoreError, Written};
 
 pub struct SqliteStore {
     conn: Connection,
@@ -45,6 +45,7 @@ fn entry(n: NodeRow) -> Entry {
         nbytes: n.nbytes,
         nlines: n.nlines,
         updated_at: Some(n.updated_at),
+        ..Entry::default()
     }
 }
 
@@ -118,6 +119,7 @@ impl Store for SqliteStore {
                 nbytes: r.get(3)?,
                 nlines: r.get(4)?,
                 updated_at: r.get(5)?,
+                ..Entry::default()
             })
         };
         let rows = match subtree_bounds(&prefix) {
@@ -143,10 +145,10 @@ impl Store for SqliteStore {
         rows.map_err(sql)
     }
 
-    fn ls(&mut self, path: &str) -> Result<Vec<Entry>> {
+    fn ls(&mut self, path: &str, recursive: bool) -> Result<Vec<Entry>> {
         Ok(self
             .db()
-            .ls(path)?
+            .list(path, recursive)?
             .into_iter()
             .map(|e| Entry {
                 path: e.path,
@@ -155,6 +157,21 @@ impl Store for SqliteStore {
                 nbytes: e.nbytes,
                 nlines: e.nlines,
                 updated_at: Some(e.updated_at),
+                nwords: e.nwords,
+                versions: Some(e.versions),
+                created_at: Some(e.created_at),
+                updated_by: e.updated_by,
+                files: e.files,
+                folders: e.folders,
+                authors: e
+                    .authors
+                    .into_iter()
+                    .map(|a| Author {
+                        author: a.author,
+                        commits: a.commits,
+                        last_ts: Some(a.last_ts),
+                    })
+                    .collect(),
             })
             .collect())
     }

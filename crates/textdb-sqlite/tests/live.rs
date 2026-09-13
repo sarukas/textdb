@@ -433,6 +433,77 @@ fn scalar_write_and_replace_lines_report_how_the_commit_landed() {
 }
 
 #[test]
+fn listings_carry_words_authors_and_folder_totals() {
+    let conn = textdb_sqlite::open_in_memory().unwrap();
+    conn.execute_batch("CREATE VIRTUAL TABLE kb USING textdb(store='kb_');").unwrap();
+    let run = |sql: &str| conn.query_row(sql, [], |_| Ok(())).unwrap();
+    // Every live folder's totals equal an aggregate over its subtree, computed from scratch.
+    let consistent = || {
+        let wrong: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM kb_node f WHERE f.kind = 0 AND f.deleted_at IS NULL AND \
+                 (f.t_files, f.t_folders, f.t_bytes, f.t_lines, f.t_words, f.t_versions) <> \
+                 (SELECT count(*) FILTER (WHERE kind = 1), count(*) FILTER (WHERE kind = 0), coalesce(sum(nbytes), 0), \
+                         coalesce(sum(nlines), 0), coalesce(sum(nwords), 0), coalesce(sum(CASE kind WHEN 1 THEN version END), 0) \
+                  FROM kb_node n WHERE n.deleted_at IS NULL AND n.path <> '/' AND (f.path = '/' OR n.path LIKE f.path || '/%'))",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong, 0, "folder totals drifted from their subtrees");
+    };
+    let folder = |dir: &str, name: &str| -> (i64, i64, i64, i64, i64, i64) {
+        conn.query_row(
+            "SELECT files, folders, nbytes, nlines, nwords, versions FROM textdb_ls(?1) WHERE name = ?2",
+            [dir, name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .unwrap()
+    };
+
+    run("SELECT textdb_write('/docs/a.md', '# Title' || char(10) || 'one two three' || char(10), NULL, 'alice')");
+    run("SELECT textdb_write('/docs/deep/b.md', 'four five' || char(10), NULL, 'bob')");
+    run("SELECT textdb_append('/docs/a.md', 'six' || char(10), 'bob')");
+    run("SELECT textdb_append('/docs/a.md', 'seven eight' || char(10), 'bob')");
+    run("SELECT textdb_replace_lines('/docs/a.md', 2, 2, 'one' || char(10), NULL, 'carol')");
+    // a.md is "# Title\none\nsix\nseven eight\n": 28 bytes, 4 lines, 6 words, 4 versions.
+    let (words, versions, nauthors, authors): (i64, i64, i64, String) = conn
+        .query_row("SELECT nwords, versions, nauthors, authors FROM textdb_ls('/docs') WHERE name = 'a.md'", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .unwrap();
+    assert_eq!((words, versions, nauthors), (6, 4, 3));
+    let authors: serde_json::Value = serde_json::from_str(&authors).unwrap();
+    assert_eq!((authors[0]["author"].as_str(), authors[0]["commits"].as_i64()), (Some("bob"), Some(2)));
+    assert_eq!(folder("/", "docs"), (2, 1, 38, 5, 8, 5));
+    consistent();
+
+    run("SELECT textdb_move('/docs/deep', '/archive/deep', 'dave')");
+    assert_eq!(folder("/", "docs"), (1, 0, 28, 4, 6, 4));
+    assert_eq!(folder("/", "archive"), (1, 1, 10, 1, 2, 1));
+    consistent();
+
+    run("SELECT textdb_delete('/docs/a.md', 'dave')");
+    assert_eq!(folder("/", "docs"), (0, 0, 0, 0, 0, 0));
+    let root: (i64, i64) = conn.query_row("SELECT t_files, t_folders FROM kb_node WHERE path = '/'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(root, (1, 3));
+    consistent();
+
+    let mut stmt = conn.prepare("SELECT path FROM textdb_ls('/', 1)").unwrap();
+    let all: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(all, ["/archive", "/archive/deep", "/archive/deep/b.md", "/docs"]);
+    // A file lists no subtree counts; a folder has no authors of its own.
+    let (files, authors): (Option<i64>, String) = conn
+        .query_row("SELECT files, authors FROM textdb_ls('/archive', 1) WHERE name = 'b.md'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    let authors: serde_json::Value = serde_json::from_str(&authors).unwrap();
+    assert_eq!((files, authors[0]["author"].as_str(), authors[0]["commits"].as_i64()), (None, Some("bob"), Some(1)));
+    let folder_authors: String =
+        conn.query_row("SELECT authors FROM textdb_ls('/') WHERE name = 'archive'", [], |r| r.get(0)).unwrap();
+    assert_eq!(folder_authors, "[]");
+}
+
+#[test]
 fn an_older_store_is_upgraded_in_place() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("old.db");
@@ -446,10 +517,22 @@ fn an_older_store_is_upgraded_in_place() {
             "DROP TABLE kb_change; ALTER TABLE kb_commit DROP COLUMN kind; ALTER TABLE kb_commit DROP COLUMN base_version;",
         )
         .unwrap();
+        conn.execute_batch("DROP TABLE kb_file_author;").unwrap();
+        for column in ["nwords", "nauthors", "t_files", "t_folders", "t_bytes", "t_lines", "t_words", "t_versions", "t_updated_at"] {
+            conn.execute_batch(&format!("ALTER TABLE kb_node DROP COLUMN {column};")).unwrap();
+        }
     }
     let conn = textdb_sqlite::open(path).unwrap();
     let added: i64 = conn.query_row("SELECT textdb_migrate()", [], |r| r.get(0)).unwrap();
-    assert_eq!(added, 2);
+    // commit.kind and commit.base_version, and nine node columns for listings.
+    assert_eq!(added, 11);
+    // ... computed from what the store already holds.
+    let (words, authors): (i64, i64) = conn
+        .query_row("SELECT nwords, nauthors FROM kb_node WHERE path = '/a.md'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!((words, authors), (1, 1));
+    let root_files: i64 = conn.query_row("SELECT t_files FROM kb_node WHERE path = '/'", [], |r| r.get(0)).unwrap();
+    assert_eq!(root_files, 1);
     let again: i64 = conn.query_row("SELECT textdb_migrate()", [], |r| r.get(0)).unwrap();
     assert_eq!(again, 0);
     conn.execute("UPDATE kb SET content = 'two' WHERE path = '/a.md'", []).unwrap();

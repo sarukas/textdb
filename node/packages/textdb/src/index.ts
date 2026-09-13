@@ -1,6 +1,8 @@
 export { resolveExtension } from './connection.ts';
 export {
   type AuthorOptions,
+  type BulkOptions,
+  type BulkResult,
   Corpus,
   type OpenOptions,
   type PathEvent,
@@ -22,4 +24,5 @@ export {
   toTextdbError,
 } from './errors.ts';
 export type * from './types.ts';
+export { SORT_KEYS } from './types.ts';
 export { type WatchOptions, Watcher } from './watch.ts';

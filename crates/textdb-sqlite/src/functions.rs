@@ -345,6 +345,11 @@ pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
         Ok(purge_json(&with_db(ctx, h, &p, |db| db.empty_trash(author.as_deref()))?))
     })?;
     let p = prefix.to_string();
+    conn.create_scalar_function("textdb_entry", 1, flags, move |ctx| {
+        let path = arg_str(ctx, 0)?;
+        Ok(with_db(ctx, h, &p, |db| db.entry(&path))?.to_json().to_string())
+    })?;
+    let p = prefix.to_string();
     conn.create_scalar_function("textdb_migrate", 0, flags, move |ctx| {
         let added = with_db(ctx, h, &p, |db| crate::schema::migrate(db.conn, &db.p).map_err(crate::storage::sql_err))?;
         Ok(added as i64)

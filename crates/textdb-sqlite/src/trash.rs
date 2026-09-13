@@ -324,7 +324,7 @@ impl<'c> TextDb<'c> {
             self.conn.prepare_cached(&sql).map_err(sql_err)?.execute(params![arg]).map_err(sql_err)
         };
         stats.versions = run(format!("DELETE FROM {p}commit WHERE file_id IN (SELECT value FROM json_each(?1))"), &files_json)? as i64;
-        for table in ["section", "link", "frontmatter", "checkpoint", "chunk_ref"] {
+        for table in ["section", "link", "frontmatter", "checkpoint", "chunk_ref", "file_author"] {
             run(format!("DELETE FROM {p}{table} WHERE file_id IN (SELECT value FROM json_each(?1))"), &files_json)?;
         }
         run(format!("DELETE FROM {p}path_event WHERE node_id IN (SELECT value FROM json_each(?1))"), &all_json)?;

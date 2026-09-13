@@ -13,11 +13,12 @@ pub mod db;
 pub mod functions;
 pub mod path_history;
 pub mod schema;
+pub mod stats;
 pub mod storage;
 pub mod trash;
 pub mod vtab;
 
-pub use db::{normalize_path, ChangeRow, CommitRow, Entry, Hit, NodeRow, TextDb, WriteResult, DEFAULT_PREFIX};
+pub use db::{normalize_path, AuthorCount, ChangeRow, CommitRow, Entry, Hit, NodeRow, TextDb, WriteResult, DEFAULT_PREFIX};
 pub use storage::SqliteStorage;
 pub use path_history::PathEventRow;
 pub use trash::{PurgeStats, TrashEntry};

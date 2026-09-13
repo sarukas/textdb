@@ -514,7 +514,7 @@ pub struct FnSpec {
 impl FnKind {
     fn schema(self) -> &'static CStr {
         match self {
-            FnKind::Ls => c"CREATE TABLE x(name TEXT, kind TEXT, nbytes INTEGER, nlines INTEGER, updated_at TEXT, path TEXT, dir TEXT HIDDEN)",
+            FnKind::Ls => c"CREATE TABLE x(name TEXT, kind TEXT, nbytes INTEGER, nlines INTEGER, updated_at TEXT, path TEXT, nwords INTEGER, versions INTEGER, created_at TEXT, updated_by TEXT, nauthors INTEGER, authors TEXT, files INTEGER, folders INTEGER, id INTEGER, dir TEXT HIDDEN, recursive INTEGER HIDDEN)",
             FnKind::Search => c"CREATE TABLE x(path TEXT, line INTEGER, snippet TEXT, rank REAL, query TEXT HIDDEN, prefix TEXT HIDDEN, lim INTEGER HIDDEN)",
             FnKind::History => c"CREATE TABLE x(version INTEGER, author TEXT, ts TEXT, message TEXT, nbytes INTEGER, kind TEXT, base_version INTEGER, path TEXT HIDDEN)",
             FnKind::Export => c"CREATE TABLE x(path TEXT, content TEXT, prefix TEXT HIDDEN)",
@@ -527,7 +527,7 @@ impl FnKind {
     /// Number of visible columns; hidden argument columns follow.
     fn visible(self) -> c_int {
         match self {
-            FnKind::Ls => 6,
+            FnKind::Ls => 15,
             FnKind::Search => 4,
             FnKind::History => 7,
             FnKind::Export => 2,
@@ -539,7 +539,7 @@ impl FnKind {
     }
     fn n_hidden(self) -> c_int {
         match self {
-            FnKind::Ls => 1,
+            FnKind::Ls => 2,
             FnKind::Search => 3,
             FnKind::History => 1,
             FnKind::Export => 1,
@@ -683,17 +683,30 @@ unsafe impl VTabCursor for FnCursor<'_> {
         self.rows = match self.kind {
             FnKind::Ls => {
                 let dir = s(&hidden[0]).unwrap_or_else(|| "/".into());
-                db.ls(&dir)
+                let recursive = hidden_i64(&hidden[1]).unwrap_or(0) != 0;
+                let int = |v: Option<i64>| v.map_or(Value::Null, Value::Integer);
+                db.list(&dir, recursive)
                     .map_err(map_err)?
                     .into_iter()
                     .map(|e| {
+                        let file = e.kind == 1;
+                        let authors: Vec<_> = e.authors.iter().map(crate::db::AuthorCount::to_json).collect();
                         vec![
                             Value::Text(e.name),
-                            Value::Text(if e.kind == 1 { "file".into() } else { "folder".into() }),
-                            e.nbytes.map_or(Value::Null, Value::Integer),
-                            e.nlines.map_or(Value::Null, Value::Integer),
+                            Value::Text(if file { "file".into() } else { "folder".into() }),
+                            int(e.nbytes),
+                            int(e.nlines),
                             Value::Text(e.updated_at),
                             Value::Text(e.path),
+                            int(e.nwords),
+                            Value::Integer(e.versions),
+                            Value::Text(e.created_at),
+                            e.updated_by.map_or(Value::Null, Value::Text),
+                            if file { Value::Integer(authors.len() as i64) } else { Value::Null },
+                            Value::Text(serde_json::Value::Array(authors).to_string()),
+                            int(e.files),
+                            int(e.folders),
+                            Value::Integer(e.id),
                         ]
                     })
                     .collect()

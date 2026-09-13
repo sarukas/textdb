@@ -6,9 +6,12 @@ use textdb_core::commit::{commit, commit_append, CommitKind, Committed};
 use textdb_core::myers::byte_edits;
 use textdb_core::storage::Result;
 use textdb_core::tree::totals;
-use textdb_core::{unified_diff, ChunkParams, Edit, Hash, LeafRef, LineHunk, PathOp, Storage, StructureExtractor, TextdbError};
+use textdb_core::{
+    count_words, unified_diff, word_delta, ChunkParams, Edit, Hash, LeafRef, LineHunk, PathOp, Storage, StructureExtractor, TextdbError,
+};
 use textdb_md::MarkdownExtractor;
 
+use crate::stats::Totals;
 use crate::storage::{sql_err, SqliteStorage};
 
 pub const DEFAULT_PREFIX: &str = "kb_";
@@ -29,14 +32,68 @@ pub struct NodeRow {
     pub deleted_at: Option<String>,
 }
 
+/// A file or folder in a listing. For a folder the size, line, word and version figures are
+/// totals over every live file below it.
 #[derive(Clone, Debug)]
 pub struct Entry {
+    pub id: i64,
     pub name: String,
     pub path: String,
     pub kind: i64,
     pub nbytes: Option<i64>,
     pub nlines: Option<i64>,
+    pub nwords: Option<i64>,
+    /// A file's version; a folder's total of versions below it.
+    pub versions: i64,
+    /// A file's last commit or move; for a folder the latest change to it or anywhere below.
     pub updated_at: String,
+    pub updated_by: Option<String>,
+    pub created_at: String,
+    /// Folder only: live files and folders anywhere below it.
+    pub files: Option<i64>,
+    pub folders: Option<i64>,
+    /// File only: everyone who committed to it, most commits first.
+    pub authors: Vec<AuthorCount>,
+}
+
+/// One author's commits to a file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorCount {
+    /// `None` for commits made without an author.
+    pub author: Option<String>,
+    pub commits: i64,
+    pub first_ts: String,
+    pub last_ts: String,
+}
+
+impl AuthorCount {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"author": self.author, "commits": self.commits, "first_ts": self.first_ts, "last_ts": self.last_ts})
+    }
+}
+
+impl Entry {
+    /// The entry as `textdb_ls` columns name it, `authors` as an array.
+    pub fn to_json(&self) -> serde_json::Value {
+        let file = self.kind == 1;
+        serde_json::json!({
+            "id": self.id,
+            "name": self.name,
+            "path": self.path,
+            "kind": if file { "file" } else { "folder" },
+            "nbytes": self.nbytes,
+            "nlines": self.nlines,
+            "nwords": self.nwords,
+            "versions": self.versions,
+            "updated_at": self.updated_at,
+            "updated_by": self.updated_by,
+            "created_at": self.created_at,
+            "files": self.files,
+            "folders": self.folders,
+            "nauthors": if file { Some(self.authors.len()) } else { None },
+            "authors": self.authors.iter().map(AuthorCount::to_json).collect::<Vec<_>>(),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -105,7 +162,7 @@ pub struct TextDb<'c> {
     pub path_history: Option<bool>,
 }
 
-fn to_hash(v: &[u8]) -> Result<Hash> {
+pub(crate) fn to_hash(v: &[u8]) -> Result<Hash> {
     if v.len() != 32 {
         return Err(TextdbError::Storage("bad hash length".into()));
     }
@@ -344,17 +401,26 @@ impl<'c> TextDb<'c> {
             }
         };
         let now = Self::now();
-        for p in missing.iter().rev() {
+        // `missing` runs deepest first, so a folder's index is the number of new folders below it.
+        for (below, p) in missing.iter().enumerate().rev() {
             self.conn
                 .prepare_cached(&format!(
-                    "INSERT INTO {}node(parent_id, name, kind, path, created_at, updated_at) VALUES (?1, ?2, 0, ?3, ?4, ?4)",
+                    "INSERT INTO {}node(parent_id, name, kind, path, created_at, updated_at, t_folders, t_updated_at) \
+                     VALUES (?1, ?2, 0, ?3, ?4, ?4, ?5, CASE WHEN ?5 > 0 THEN ?4 END)",
                     self.p
                 ))
                 .map_err(sql_err)?
-                .execute(params![parent, name_of(p), p, now])
+                .execute(params![parent, name_of(p), p, now, below as i64])
                 .map_err(sql_err)?;
             parent = self.conn.last_insert_rowid();
             self.record_change("mkdir", parent, 0, p, None, None, None, None, None, None)?;
+        }
+        if let Some(top) = missing.last() {
+            let added = Totals {
+                folders: missing.len() as i64,
+                ..Totals::default()
+            };
+            self.add_to_ancestors(top, &added, &now)?;
         }
         Ok(parent)
     }
@@ -425,6 +491,18 @@ impl<'c> TextDb<'c> {
         let st = self.storage();
         let (nbytes, nlines) = totals(&st, &c.root)?;
         let now = Self::now();
+        let (old_bytes, old_lines, old_words): (Option<i64>, Option<i64>, Option<i64>) = self
+            .conn
+            .prepare_cached(&format!("SELECT nbytes, nlines, nwords FROM {}node WHERE id = ?1", self.p))
+            .map_err(sql_err)?
+            .query_row(params![file_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(sql_err)?;
+        // Words over the lines this commit changed when the previous count is known; a first
+        // version counts its whole content, which the caller has just put in the cache.
+        let nwords = match (parent_root, old_words) {
+            (Some(parent), Some(words)) => words + word_delta(&st, parent, &c.root)?,
+            _ => count_words(&st.document(&c.root)?.0) as i64,
+        };
         self.conn
             .prepare_cached(&format!(
                 "INSERT INTO {}commit(file_id, version, root, parent_root, author, ts, message, nbytes, nlines, kind, base_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -460,12 +538,31 @@ impl<'c> TextDb<'c> {
         )?;
         self.conn
             .prepare_cached(&format!(
-                "UPDATE {}node SET nbytes = ?1, nlines = ?2, updated_by = ?3 WHERE id = ?4",
+                "INSERT INTO {}file_author(file_id, author, commits, first_ts, last_ts) VALUES (?1, coalesce(?2, ''), 1, ?3, ?3) \
+                 ON CONFLICT(file_id, author) DO UPDATE SET commits = commits + 1, last_ts = excluded.last_ts",
                 self.p
             ))
             .map_err(sql_err)?
-            .execute(params![nbytes as i64, nlines as i64, author, file_id])
+            .execute(params![file_id, author, now])
             .map_err(sql_err)?;
+        self.conn
+            .prepare_cached(&format!(
+                "UPDATE {p}node SET nbytes = ?1, nlines = ?2, updated_by = ?3, nwords = ?5, \
+                 nauthors = (SELECT count(*) FROM {p}file_author WHERE file_id = ?4) WHERE id = ?4",
+                p = self.p
+            ))
+            .map_err(sql_err)?
+            .execute(params![nbytes as i64, nlines as i64, author, file_id, nwords])
+            .map_err(sql_err)?;
+        let change = Totals {
+            files: (c.version == 1) as i64,
+            folders: 0,
+            bytes: nbytes as i64 - old_bytes.unwrap_or(0),
+            lines: nlines as i64 - old_lines.unwrap_or(0),
+            words: nwords - old_words.unwrap_or(0),
+            versions: 1,
+        };
+        self.add_to_ancestors(path, &change, &now)?;
         // Reverse index for search: chunk → file, recorded once per (chunk, file).
         let mut seen = std::collections::HashSet::new();
         for h in &c.new_chunks {
@@ -847,6 +944,8 @@ impl<'c> TextDb<'c> {
             }
             let parent = db.ensure_folder(parent_of(&to))?;
             let now = Self::now();
+            let moved = db.subtree_totals(src.id)?;
+            db.add_to_ancestors(&from, &moved.neg(), &now)?;
             let seq = db.record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, None)?;
             if db.path_history_enabled()? {
                 db.record_path_events(PathOp::classify(&from, &to), &src, Some(&to), author, seq, &now)?;
@@ -870,6 +969,7 @@ impl<'c> TextDb<'c> {
                 .map_err(sql_err)?
                 .execute(params![to, name_of(&to), parent, now, src.id])
                 .map_err(sql_err)?;
+            db.add_to_ancestors(&to, &moved, &now)?;
             Ok(())
         })
     }
@@ -888,6 +988,8 @@ impl<'c> TextDb<'c> {
             }
             let n = db.node_by_path(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
             let now = Self::now();
+            let gone = db.subtree_totals(n.id)?;
+            db.add_to_ancestors(&path, &gone.neg(), &now)?;
             let seq = db.record_change("delete", n.id, n.kind, &path, None, None, None, None, author, None)?;
             if db.path_history_enabled()? {
                 db.record_path_events(PathOp::Delete, &n, None, author, seq, &now)?;
@@ -906,25 +1008,87 @@ impl<'c> TextDb<'c> {
         })
     }
 
+    /// The live files and folders directly in the folder `path`, by name.
     pub fn ls(&self, path: &str) -> Result<Vec<Entry>> {
+        self.list(path, false)
+    }
+
+    /// As [`ls`](Self::ls), or with `recursive` every live file and folder below `path`, by
+    /// path.
+    pub fn list(&self, path: &str, recursive: bool) -> Result<Vec<Entry>> {
+        use rusqlite::types::Value;
         let path = normalize_path(path)?;
         let dir = self.node_by_path(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
+        match (recursive, subtree_bounds(&path)) {
+            (false, _) => self.entries_where("parent_id = ?1", vec![Value::Integer(dir.id)], "name"),
+            (true, None) => self.entries_where("path <> '/'", vec![], "path"),
+            (true, Some((lo, hi))) => self.entries_where("path >= ?1 AND path < ?2", vec![Value::Text(lo), Value::Text(hi)], "path"),
+        }
+    }
+
+    /// The live file or folder at `path` as a listing shows it; the root too.
+    pub fn entry(&self, path: &str) -> Result<Entry> {
+        let path = normalize_path(path)?;
+        let n = self.node_by_path(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
+        self.entries_where("id = ?1", vec![rusqlite::types::Value::Integer(n.id)], "id")?
+            .pop()
+            .ok_or(TextdbError::NotFound(path))
+    }
+
+    /// Live nodes matching `scope`, a condition over unqualified node columns: the same
+    /// condition selects the nodes and, joined, their authors.
+    fn entries_where(&self, scope: &str, args: Vec<rusqlite::types::Value>, order: &str) -> Result<Vec<Entry>> {
+        let mut authors: std::collections::HashMap<i64, Vec<AuthorCount>> = std::collections::HashMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare_cached(&format!(
+                    "SELECT file_id, author, commits, first_ts, last_ts FROM {p}file_author JOIN {p}node ON id = file_id \
+                     WHERE kind = 1 AND deleted_at IS NULL AND {scope} ORDER BY file_id, commits DESC, last_ts DESC",
+                    p = self.p
+                ))
+                .map_err(sql_err)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(args.iter())).map_err(sql_err)?;
+            while let Some(r) = rows.next().map_err(sql_err)? {
+                let author: String = r.get(1).map_err(sql_err)?;
+                authors.entry(r.get(0).map_err(sql_err)?).or_default().push(AuthorCount {
+                    author: (!author.is_empty()).then_some(author),
+                    commits: r.get(2).map_err(sql_err)?,
+                    first_ts: r.get(3).map_err(sql_err)?,
+                    last_ts: r.get(4).map_err(sql_err)?,
+                });
+            }
+        }
         let mut stmt = self
             .conn
             .prepare_cached(&format!(
-                "SELECT name, path, kind, nbytes, nlines, updated_at FROM {}node WHERE parent_id = ?1 AND deleted_at IS NULL ORDER BY name",
+                "SELECT id, name, path, kind, \
+                 CASE kind WHEN 1 THEN nbytes ELSE t_bytes END, CASE kind WHEN 1 THEN nlines ELSE t_lines END, \
+                 CASE kind WHEN 1 THEN nwords ELSE t_words END, CASE kind WHEN 1 THEN version ELSE t_versions END, \
+                 CASE WHEN kind = 0 AND t_updated_at > updated_at THEN t_updated_at ELSE updated_at END, \
+                 updated_by, created_at, CASE kind WHEN 0 THEN t_files END, CASE kind WHEN 0 THEN t_folders END \
+                 FROM {}node WHERE deleted_at IS NULL AND {scope} ORDER BY {order}",
                 self.p
             ))
             .map_err(sql_err)?;
         let rows = stmt
-            .query_map(params![dir.id], |r| {
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                let id: i64 = r.get(0)?;
                 Ok(Entry {
-                    name: r.get(0)?,
-                    path: r.get(1)?,
-                    kind: r.get(2)?,
-                    nbytes: r.get(3)?,
-                    nlines: r.get(4)?,
-                    updated_at: r.get(5)?,
+                    id,
+                    name: r.get(1)?,
+                    path: r.get(2)?,
+                    kind: r.get(3)?,
+                    nbytes: r.get(4)?,
+                    nlines: r.get(5)?,
+                    nwords: r.get(6)?,
+                    versions: r.get(7)?,
+                    updated_at: r.get(8)?,
+                    updated_by: r.get(9)?,
+                    created_at: r.get(10)?,
+                    files: r.get(11)?,
+                    folders: r.get(12)?,
+                    authors: authors.remove(&id).unwrap_or_default(),
                 })
             })
             .map_err(sql_err)?;
