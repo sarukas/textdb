@@ -27,7 +27,8 @@ INSERT INTO kb.file(path, content, updated_by) VALUES ('/clients/acme/notes.md',
 SELECT content, version FROM kb.file WHERE path = '/clients/acme/notes.md';
 SELECT kb.lines('/clients/acme/notes.md', 3, 3);              -- 1-based inclusive line range
 SELECT kb.section('/clients/acme/notes.md', 'Acme');           -- text of a heading's section (markdown)
-SELECT * FROM kb.ls('/clients');                                -- one folder level
+SELECT * FROM kb.ls('/clients');                                -- one folder level, with words, versions, authors, folder totals
+SELECT path, nwords FROM kb.ls('/clients', true) WHERE kind = 'file' ORDER BY nwords DESC LIMIT 10;  -- everything below, largest first
 SELECT path, nbytes FROM kb.file WHERE path LIKE '/clients/%'; -- subtree (see the note below)
 
 -- write whole content (the trigger diffs OLD → NEW and commits the edit set)
@@ -77,6 +78,9 @@ These mirror the SQLite binding's `textdb_feed`, `textdb_hunks`, … (see
 | `kb.last_seq()` | newest `seq`, 0 when the feed is empty |
 | `kb.move(from_path text, to_path text, author text DEFAULT NULL)` | `void` — `_rename` with the move attributed in the feed |
 | `kb.remove(path text, author text DEFAULT NULL)` | `void` — `_delete` (tombstone) attributed in the feed |
+| `kb.path_history(path text)` | `TABLE(id, ts, op, old_path, new_path, via, version, author)` — the renames, moves and deletes that touched the file or folder at `path` (live, else the one most recently deleted there), oldest first. One `kb.path_event` row per node an operation touched: a folder's move gives every file inside a row with `via` = the folder. `op` ∈ `rename` (same folder), `move`, `delete`; `version` is a file's version at the time. They are not versions |
+| `kb.path_history_enabled()` | `boolean` — whether renames, moves and deletes are recorded: the session's `textdb.path_history` (`SET textdb.path_history = off`, or `ALTER ROLE … SET` / `ALTER DATABASE … SET` for a default), else the store setting, else on |
+| `kb.setting(k text)`, `kb.set_setting(k text, v text)` | a store setting (`path_history` = `on` / `off`), NULL at its default; `kb.set_setting(k, NULL)` clears it; an unknown key or value is `TX004` |
 
 ```sql
 SELECT kb.write('/guides/intro.md', $body, 6, 'agent-7', 'rewrite intro');   -- {"version": 7, "kind": "rebased"}
@@ -84,6 +88,9 @@ SELECT kb.replace_lines('/guides/intro.md', 12, 12, E'new line 12\nand 13\n', 7,
 SELECT * FROM kb.hunks('/guides/intro.md', 7, 8);
 SELECT * FROM kb.feed(kb.last_seq() - 100);
 SELECT kb.move('/drafts/x.md', '/guides/x.md', 'agent-7');
+SELECT * FROM kb.path_history('/guides/x.md');                              -- move /drafts/x.md -> /guides/x.md by agent-7
+SET textdb.path_history = off;                                              -- this session records no path history
+SELECT kb.set_setting('path_history', 'off');                               -- nor, by default, does anyone else
 ```
 
 Every create, commit, mkdir, move and delete writes one `kb.change` row **in the same
@@ -101,8 +108,8 @@ truth. Versions of a file are consecutive, so the hunks for a `commit` row at ve
 `kb.hunks(path, v - 1, v)`. The `kb.file` / `kb.folder` view triggers go through `kb.move` and
 `kb.remove`; a file rename via `UPDATE kb.file SET path = …` is attributed to `NEW.updated_by`.
 
-> **Fresh install required.** This release adds `kb.change` and the `kind` / `base_version`
-> columns of `kb.commit`. There is no upgrade script: `DROP EXTENSION textdb_pg CASCADE;
+> **Fresh install required.** This release adds `kb.change`, `kb.path_event`, `kb.setting` and
+> the `kind` / `base_version` columns of `kb.commit`. There is no upgrade script: `DROP EXTENSION textdb_pg CASCADE;
 > CREATE EXTENSION textdb_pg;` into an empty `kb` schema (reload content with `kb.write` or the
 > Python loader).
 
@@ -148,7 +155,9 @@ SELECT textdb_append('/a.md', 'tail' || char(10));
 SELECT textdb_content('/a.md'), textdb_content('/a.md', 1);
 SELECT textdb_lines('/a.md', 2, 2), textdb_section('/a.md', 'A'), textdb_diff('/a.md', 1, 2);
 SELECT * FROM textdb_history('/a.md');
-SELECT * FROM textdb_ls('/');
+SELECT * FROM textdb_ls('/');                              -- words, versions, authors (JSON), folder totals
+SELECT path, nwords FROM textdb_ls('/', 1) WHERE kind = 'file' ORDER BY nwords DESC LIMIT 10;
+SELECT textdb_entry('/notes');                             -- one folder's totals as JSON
 -- A whole subtree: give `kb` a range on `path` and it seeks the index. Write it as a range
 -- rather than `substr(path, 1, length(?) + 1) = ? || '/'` or `path LIKE ? || '/%'`: those are
 -- functions of the column, so they cost a full scan of the store. `'0'` is the byte after

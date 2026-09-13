@@ -1,5 +1,17 @@
 export { resolveExtension } from './connection.ts';
-export { type AuthorOptions, Corpus, type OpenOptions, type WriteOptions, openCorpus } from './corpus.ts';
+export {
+  type AuthorOptions,
+  type BulkOptions,
+  type BulkResult,
+  Corpus,
+  type OpenOptions,
+  type PathEvent,
+  type PurgeStats,
+  type Stat,
+  type TrashEntry,
+  type WriteOptions,
+  openCorpus,
+} from './corpus.ts';
 export {
   Conflict,
   type ConflictPayload,
@@ -12,4 +24,5 @@ export {
   toTextdbError,
 } from './errors.ts';
 export type * from './types.ts';
+export { SORT_KEYS } from './types.ts';
 export { type WatchOptions, Watcher } from './watch.ts';

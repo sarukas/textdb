@@ -18,6 +18,9 @@ export TEXTDB_AUTHOR=agent-<name>        # your writes are attributed to this na
 export MSYS_NO_PATHCONV=1               # Git Bash on Windows only: stops "/a.md" being rewritten
 ```
 
+Run `textdb config` once to check the store, your author name and whether renames, moves and
+deletes are recorded in history, and where each setting came from.
+
 Paths look like `/folder/file.md`. Writing them without the leading slash (`folder/file.md`)
 also works and is immune to shell rewriting. Add `--json` to any command for machine-readable
 output.
@@ -28,6 +31,9 @@ output.
 textdb tree -L 2                         # top of the tree with file counts
 textdb tree guides -d                    # folders only under /guides
 textdb ls guides/api
+textdb ls -l guides                      # + words, versions, last update, authors; folders show totals below them
+textdb ls -R -l --sort updated -r guides # everything below /guides, most recently changed first
+textdb ls -l --sort words guides --json  # machine-readable, with authors and folder file counts
 textdb search 'rate limit' -p guides     # path:line: snippet — terms ANDed, "phrase", prefix*
 textdb stat guides/api/index.md          # version, size, lines, last author
 ```
@@ -90,13 +96,32 @@ three-way merge was clean), `unchanged` (nothing to do).
 ## History and other people's changes
 
 ```sh
-textdb history guides/api/index.md       # who changed it, when, and how each change landed
+textdb history guides/api/index.md       # who changed it, when, how each change landed, and renames/moves/deletes
 textdb diff guides/api/index.md 10 12    # unified diff between versions
 textdb hunks guides/api/index.md         # what the latest commit changed, line by line
 textdb cat guides/api/index.md -v 10     # an old version
 textdb log --since 0 --limit 50          # recent changes across the corpus
 textdb watch -p guides --json            # follow changes live (runs until stopped)
 ```
+
+`history` lists versions and, between them, the renames, moves and deletes that touched the
+file — also those of a folder it was in (`renamed … (with /old-folder)`). In `--json` each
+entry has `"type": "version"` or `"type": "path"` (`op`: `rename`, `move`, `delete`);
+`--versions-only` gives versions alone. A deleted file's history is still found at the path it
+was deleted from.
+
+## Reorganise
+
+```sh
+textdb mv guides/draft.md guides/published/intro.md   # a file or a whole folder; history moves with it
+textdb rm guides/old                                  # a file or a whole folder, recursively
+textdb setting                                        # path_history: on (default) or off for this store
+textdb --path-history off mv archive/2024 archive/y2024   # keep one bulk reshuffle out of history
+```
+
+`rm` is not final: deleted files keep their content and versions in the store's trash, where
+people can read and restore-by-copy them in the web app until someone permanently removes
+them. Moving or deleting a folder touches everything inside it — check with `tree` first.
 
 ## Rules
 
@@ -106,3 +131,4 @@ textdb watch -p guides --json            # follow changes live (runs until stopp
    that lacks `-b`.
 4. Use `append` for journals and logs.
 5. Use your own `TEXTDB_AUTHOR`, so the changes you make are attributed to you.
+6. Do not `rm` or `mv` folders you were not asked to reorganise; people are browsing them.

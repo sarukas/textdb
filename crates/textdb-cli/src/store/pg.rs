@@ -9,7 +9,7 @@ use postgres::fallible_iterator::FallibleIterator;
 use postgres::{Client, NoTls, Row};
 use textdb_sqlite::normalize_path;
 
-use super::{Change, Chunk, Commit, Entry, Hit, Hunk, ImportStats, Result, Stat, Store, StoreError, Written};
+use super::{Change, Chunk, Commit, Entry, Hit, Hunk, ImportStats, PathEvent, Result, Stat, Store, StoreError, Written};
 
 pub struct PgStore {
     client: Client,
@@ -55,11 +55,30 @@ fn entry(r: &Row) -> Entry {
         nbytes: r.get(3),
         nlines: r.get(4),
         updated_at: r.get(5),
+        ..Entry::default()
     }
 }
 
 const ENTRY_COLS: &str =
     "n.path, n.name, CASE n.kind WHEN 1 THEN 'file' ELSE 'folder' END, n.nbytes, n.nlines, n.updated_at::text";
+
+/// A row of `kb.entry` selected with [`LISTING_COLS`].
+fn listed(r: &Row) -> Entry {
+    let authors: Option<String> = r.get(12);
+    Entry {
+        nwords: r.get(6),
+        versions: r.get(7),
+        created_at: r.get(8),
+        updated_by: r.get(9),
+        files: r.get(10),
+        folders: r.get(11),
+        authors: authors.and_then(|a| serde_json::from_str(&a).ok()).unwrap_or_default(),
+        ..entry(r)
+    }
+}
+
+const LISTING_COLS: &str = "e.path, e.name, e.kind, e.nbytes, e.nlines, e.updated_at::text, e.nwords, e.versions, \
+     e.created_at::text, e.updated_by, e.files, e.folders, e.authors::text";
 
 impl PgStore {
     pub fn connect(url: &str) -> Result<Self> {
@@ -126,20 +145,14 @@ impl Store for PgStore {
         Ok(rows.iter().map(entry).collect())
     }
 
-    fn ls(&mut self, path: &str) -> Result<Vec<Entry>> {
+    fn ls(&mut self, path: &str, recursive: bool) -> Result<Vec<Entry>> {
         let path = normalize_path(path)?;
         self.stat(&path)?;
         let rows = self
             .client
-            .query(
-                &format!(
-                    "SELECT {ENTRY_COLS} FROM kb.node n JOIN kb.node d ON n.parent_id = d.id \
-                     WHERE d.path = $1 AND d.deleted_at IS NULL AND n.deleted_at IS NULL ORDER BY n.name"
-                ),
-                &[&path],
-            )
+            .query(&format!("SELECT {LISTING_COLS} FROM kb.ls($1, $2) e"), &[&path, &recursive])
             .map_err(pg)?;
-        Ok(rows.iter().map(entry).collect())
+        Ok(rows.iter().map(listed).collect())
     }
 
     fn stat(&mut self, path: &str) -> Result<Stat> {
@@ -348,6 +361,54 @@ impl Store for PgStore {
     fn rm(&mut self, path: &str, author: Option<&str>) -> Result<()> {
         self.client.execute("SELECT kb.remove($1, $2)", &[&path, &author]).map_err(pg)?;
         Ok(())
+    }
+
+    fn path_history(&mut self, path: &str) -> Result<Vec<PathEvent>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT id, ts::text, op, old_path, new_path, via, version, author FROM kb.path_history($1)",
+                &[&path],
+            )
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| PathEvent {
+                id: r.get(0),
+                ts: r.get(1),
+                op: r.get(2),
+                old_path: r.get(3),
+                new_path: r.get(4),
+                via: r.get(5),
+                version: r.get(6),
+                author: r.get(7),
+            })
+            .collect())
+    }
+
+    /// A session setting (`textdb.path_history`), so it covers every call on this connection.
+    fn set_session_path_history(&mut self, on: Option<bool>) -> Result<()> {
+        match on {
+            Some(true) => self.client.batch_execute("SET textdb.path_history = 'on'").map_err(pg),
+            Some(false) => self.client.batch_execute("SET textdb.path_history = 'off'").map_err(pg),
+            None => Ok(()),
+        }
+    }
+
+    fn path_history_enabled(&mut self) -> Result<bool> {
+        Ok(self.client.query_one("SELECT kb.path_history_enabled()", &[]).map_err(pg)?.get(0))
+    }
+
+    fn setting(&mut self, key: &str) -> Result<Option<String>> {
+        Ok(self.client.query_one("SELECT kb.setting($1)", &[&key]).map_err(pg)?.get(0))
+    }
+
+    fn set_setting(&mut self, key: &str, value: Option<&str>) -> Result<Option<String>> {
+        Ok(self
+            .client
+            .query_one("SELECT kb.set_setting($1, $2)", &[&key, &value])
+            .map_err(pg)?
+            .get(0))
     }
 
     fn last_seq(&mut self) -> Result<i64> {

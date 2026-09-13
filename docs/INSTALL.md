@@ -151,6 +151,12 @@ textdb-core = { git = "https://github.com/sarukas/textdb", package = "textdb-cor
 Implement `textdb_core::Storage` for your store and use `build`, `materialize`, `apply_edits`,
 `commit`, `changed_runs`, `unified_diff`. `MemStorage` is the in-memory reference.
 
+## Live corpus app and CLI
+
+The web app needs the loadable SQLite extension (above) and Node.js 24; the `textdb` CLI
+builds with `cargo build --release -p textdb-cli`. Build, start and configuration are in
+[`demo-app.md`](demo-app.md); using the CLI, including from an agent, in [`cli.md`](cli.md).
+
 ## Benchmark harness
 
 ```sh

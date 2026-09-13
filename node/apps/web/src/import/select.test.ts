@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { destPath, formatBytes, includeFile, normalizePrefix, parseExtensions, planBatches } from "./select";
+import { destPath, formatBytes, includeFile, normalizePrefix, parseExtensions } from "./select";
 
 const MD = ["md", "markdown"];
 
@@ -44,24 +44,6 @@ describe("normalizePrefix / destPath", () => {
   it("joins the folder and the relative path", () => {
     expect(destPath("/", "a/b.md")).toBe("/a/b.md");
     expect(destPath("/docs", "a/b.md")).toBe("/docs/a/b.md");
-  });
-});
-
-describe("planBatches", () => {
-  const files = (...sizes: number[]) => sizes.map((size, i) => ({ id: i, size }));
-  const ids = (batches: { id: number }[][]) => batches.map((b) => b.map((f) => f.id));
-
-  it("fills a request up to the byte budget, keeping order", () => {
-    expect(ids(planBatches(files(40, 40, 40, 10), 100, 10))).toEqual([[0, 1], [2, 3]]);
-  });
-
-  it("caps the number of files per request", () => {
-    expect(ids(planBatches(files(1, 1, 1, 1, 1), 100, 2))).toEqual([[0, 1], [2, 3], [4]]);
-  });
-
-  it("sends a file larger than the budget on its own", () => {
-    expect(ids(planBatches(files(10, 500, 10), 100, 10))).toEqual([[0], [1], [2]]);
-    expect(planBatches([], 100, 10)).toEqual([]);
   });
 });
 

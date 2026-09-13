@@ -31,7 +31,18 @@ CREATE TABLE kb.node (
   created_at  timestamptz NOT NULL DEFAULT now(),
   updated_at  timestamptz NOT NULL DEFAULT now(),
   updated_by  text,
-  deleted_at  timestamptz NULL
+  deleted_at  timestamptz NULL,
+  nwords      bigint,                       -- file: words, as wc -w counts them
+  nauthors    bigint,                       -- file: distinct commit authors (kb.file_author rows)
+  -- Folder: totals of every live node below it, as of the last kb.compact_folder_totals();
+  -- kb.folder_delta holds the changes since. Zero on files.
+  t_files      bigint NOT NULL DEFAULT 0,
+  t_folders    bigint NOT NULL DEFAULT 0,
+  t_bytes      bigint NOT NULL DEFAULT 0,
+  t_lines      bigint NOT NULL DEFAULT 0,
+  t_words      bigint NOT NULL DEFAULT 0,
+  t_versions   bigint NOT NULL DEFAULT 0,
+  t_updated_at timestamptz NULL
 );
 CREATE UNIQUE INDEX node_path ON kb.node(path text_pattern_ops) WHERE deleted_at IS NULL;
 CREATE UNIQUE INDEX node_parent_name ON kb.node(parent_id, name) WHERE deleted_at IS NULL;
@@ -72,6 +83,49 @@ CREATE TABLE kb.link (file_id bigint NOT NULL, version bigint NOT NULL, target_p
 CREATE INDEX link_file ON kb.link(file_id, version);
 CREATE TABLE kb.frontmatter (file_id bigint NOT NULL, version bigint NOT NULL, data jsonb, PRIMARY KEY (file_id, version));
 CREATE TABLE kb.checkpoint (name text NOT NULL, file_id bigint NOT NULL, path text NOT NULL, root bytea NOT NULL, version bigint NOT NULL, PRIMARY KEY (name, file_id));
+-- Path history (textdb_core::path): one row per node a rename, move or delete touched — the
+-- node it named and everything below a folder — next to the versions in kb.commit.
+CREATE TABLE kb.path_event (
+  id          bigserial PRIMARY KEY,
+  node_id     bigint NOT NULL,
+  node_kind   smallint NOT NULL,     -- 0 folder, 1 file
+  op          text NOT NULL,         -- rename, move, delete
+  ts          timestamptz NOT NULL DEFAULT now(),
+  author      text,
+  old_path    text NOT NULL,
+  new_path    text,                  -- rename, move: the path after
+  via         text,                  -- the folder the operation named, when this node went with it
+  version     bigint,                -- a file's version when it happened
+  change_seq  bigint                 -- the kb.change row of the operation
+);
+CREATE INDEX path_event_node ON kb.path_event(node_id, id);
+-- Store settings, e.g. path_history = on | off. A missing row means the default.
+CREATE TABLE kb.setting (key text PRIMARY KEY, value text NOT NULL);
+-- Who wrote each file: one row per (file, author) with that author's commits; '' is a commit
+-- without an author.
+CREATE TABLE kb.file_author (
+  file_id  bigint NOT NULL,
+  author   text NOT NULL,
+  commits  bigint NOT NULL,
+  first_ts timestamptz NOT NULL,
+  last_ts  timestamptz NOT NULL,
+  PRIMARY KEY (file_id, author)
+);
+-- Changes to folder totals, one row per folder above each commit, mkdir, move and delete.
+-- Insert-only, so concurrent writers never wait on a shared ancestor's row (updating the root
+-- folder's totals in place would serialize every commit in the store). kb.entry adds them to
+-- the node rows; kb.compact_folder_totals() folds them in.
+CREATE TABLE kb.folder_delta (
+  folder_id bigint NOT NULL,
+  files     bigint NOT NULL,
+  folders   bigint NOT NULL,
+  bytes     bigint NOT NULL,
+  lines     bigint NOT NULL,
+  words     bigint NOT NULL,
+  versions  bigint NOT NULL,
+  ts        timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX folder_delta_folder ON kb.folder_delta(folder_id);
 
 -- Custom SQLSTATEs (spec §7.2): TX001 conflict, TX002 contention, TX003 not found, TX004 invalid edit.
 CREATE FUNCTION kb._raise(code text, msg text, detail text) RETURNS void LANGUAGE plpgsql AS $$
@@ -90,6 +144,43 @@ BEGIN RAISE EXCEPTION USING ERRCODE = code, MESSAGE = msg, DETAIL = coalesce(det
 -- IMMUTABLE so the planner folds it and can still extract the literal prefix.
 CREATE FUNCTION kb._subtree_like(p text) RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
 $$ SELECT replace(replace(replace(p, '\', '\\'), '%', '\%'), '_', '\_') || '/%' $$;
+
+-- An on/off value: on, true, yes, 1 / off, false, no, 0 in any case; NULL for anything else.
+CREATE FUNCTION kb._switch(v text) RETURNS boolean LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT CASE lower(trim(v)) WHEN 'on' THEN true WHEN 'true' THEN true WHEN 'yes' THEN true WHEN '1' THEN true
+                             WHEN 'off' THEN false WHEN 'false' THEN false WHEN 'no' THEN false WHEN '0' THEN false END
+$$;
+
+-- Store settings. kb.setting(key) is NULL at the default; kb.set_setting(key, NULL) returns a
+-- setting to its default. The only setting so far is path_history.
+CREATE FUNCTION kb.setting(k text) RETURNS text LANGUAGE sql STABLE AS $$
+  SELECT s.value FROM kb.setting s WHERE s.key = k
+$$;
+CREATE FUNCTION kb.set_setting(k text, v text) RETURNS text LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+  IF k IS DISTINCT FROM 'path_history' THEN
+    PERFORM kb._raise('TX004', format('unknown setting ''%s'' (known: path_history)', k), NULL);
+  END IF;
+  IF v IS NULL THEN
+    DELETE FROM kb.setting s WHERE s.key = k;
+    RETURN NULL;
+  END IF;
+  IF kb._switch(v) IS NULL THEN
+    PERFORM kb._raise('TX004', format('%s is on or off, not ''%s''', k, v), NULL);
+  END IF;
+  INSERT INTO kb.setting AS s (key, value) VALUES (k, CASE WHEN kb._switch(v) THEN 'on' ELSE 'off' END)
+    ON CONFLICT ON CONSTRAINT setting_pkey DO UPDATE SET value = EXCLUDED.value;
+  RETURN kb.setting(k);
+END $$;
+
+-- Whether renames, moves and deletes are recorded: this session's textdb.path_history
+-- (SET textdb.path_history = off, or ALTER ROLE / ALTER DATABASE … SET for a default), else the
+-- store's path_history setting, else on.
+CREATE FUNCTION kb.path_history_enabled() RETURNS boolean LANGUAGE sql STABLE AS $$
+  SELECT coalesce(kb._switch(nullif(current_setting('textdb.path_history', true), '')),
+                  kb._switch(kb.setting('path_history')),
+                  true)
+$$;
 "#,
     name = "kb_tables",
     bootstrap
@@ -124,6 +215,77 @@ CREATE VIEW kb.file_version AS
          CASE WHEN c.version > 1 THEN c.version - 1 END AS parent_version,
          c.author, c.ts, c.message
   FROM kb.commit c JOIN kb.node n ON n.id = c.file_id;
+
+-- Files and folders as a listing shows them. A folder's size, lines, words and versions are
+-- totals over every live file below it: its node row plus the kb.folder_delta rows not yet
+-- folded in. `authors`: a file's committers, most commits first.
+CREATE VIEW kb.entry AS
+  SELECT n.id, n.parent_id, n.path, n.name,
+         CASE n.kind WHEN 1 THEN 'file' ELSE 'folder' END AS kind,
+         CASE n.kind WHEN 1 THEN n.nbytes ELSE n.t_bytes + coalesce(d.bytes, 0) END AS nbytes,
+         CASE n.kind WHEN 1 THEN n.nlines ELSE n.t_lines + coalesce(d.lines, 0) END AS nlines,
+         CASE n.kind WHEN 1 THEN n.nwords ELSE n.t_words + coalesce(d.words, 0) END AS nwords,
+         CASE n.kind WHEN 1 THEN n.version ELSE n.t_versions + coalesce(d.versions, 0) END AS versions,
+         CASE n.kind WHEN 1 THEN n.updated_at ELSE greatest(n.updated_at, n.t_updated_at, d.ts) END AS updated_at,
+         n.updated_by, n.created_at,
+         CASE n.kind WHEN 0 THEN n.t_files + coalesce(d.files, 0) END AS files,
+         CASE n.kind WHEN 0 THEN n.t_folders + coalesce(d.folders, 0) END AS folders,
+         CASE n.kind WHEN 1 THEN n.nauthors END AS nauthors,
+         CASE n.kind WHEN 1 THEN coalesce(
+           (SELECT jsonb_agg(jsonb_build_object('author', nullif(a.author, ''), 'commits', a.commits, 'first_ts', a.first_ts, 'last_ts', a.last_ts)
+                             ORDER BY a.commits DESC, a.last_ts DESC)
+            FROM kb.file_author a WHERE a.file_id = n.id), '[]'::jsonb)
+         ELSE '[]'::jsonb END AS authors
+  FROM kb.node n
+  LEFT JOIN LATERAL (
+    SELECT sum(x.files)::bigint AS files, sum(x.folders)::bigint AS folders, sum(x.bytes)::bigint AS bytes,
+           sum(x.lines)::bigint AS lines, sum(x.words)::bigint AS words, sum(x.versions)::bigint AS versions, max(x.ts) AS ts
+    FROM kb.folder_delta x WHERE x.folder_id = n.id
+  ) d ON n.kind = 0
+  WHERE n.deleted_at IS NULL;
+
+-- The files and folders in the folder `path`, by name; with `recursive`, everything below it, by path.
+CREATE FUNCTION kb.ls(path text, recursive boolean DEFAULT false) RETURNS SETOF kb.entry LANGUAGE sql STABLE AS $$
+  SELECT e.* FROM kb.node d JOIN kb.entry e
+    ON CASE WHEN recursive THEN e.path <> '/' AND (d.path = '/' OR e.path LIKE kb._subtree_like(d.path)) ELSE e.parent_id = d.id END
+  WHERE d.id = kb._node_id(path)
+  ORDER BY CASE WHEN recursive THEN e.path ELSE e.name END
+$$;
+
+-- Fold kb.folder_delta into the node rows; returns the rows folded. Safe while others write
+-- (one statement: a reader sees the rows before or after, never half); run it from a
+-- maintenance job when the table grows.
+CREATE FUNCTION kb.compact_folder_totals() RETURNS bigint LANGUAGE sql VOLATILE AS $$
+  WITH gone AS (DELETE FROM kb.folder_delta RETURNING *),
+       s AS (SELECT folder_id, sum(files) AS files, sum(folders) AS folders, sum(bytes) AS bytes, sum(lines) AS lines,
+                    sum(words) AS words, sum(versions) AS versions, max(ts) AS ts, count(*) AS n
+             FROM gone GROUP BY folder_id),
+       u AS (UPDATE kb.node f SET t_files = f.t_files + s.files, t_folders = f.t_folders + s.folders, t_bytes = f.t_bytes + s.bytes,
+                                  t_lines = f.t_lines + s.lines, t_words = f.t_words + s.words, t_versions = f.t_versions + s.versions,
+                                  t_updated_at = greatest(f.t_updated_at, s.ts)
+             FROM s WHERE f.id = s.folder_id RETURNING s.n)
+  SELECT coalesce(sum(n), 0)::bigint FROM u
+$$;
+
+-- Recompute every folder's totals from the files below it, discarding kb.folder_delta. A
+-- repair for totals that drifted, which a move racing a commit inside the moved folder can do.
+CREATE FUNCTION kb.rebuild_folder_totals() RETURNS void LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+  LOCK TABLE kb.folder_delta IN EXCLUSIVE MODE;
+  DELETE FROM kb.folder_delta;
+  UPDATE kb.node f SET t_files = coalesce(s.files, 0), t_folders = coalesce(s.folders, 0), t_bytes = coalesce(s.bytes, 0),
+                       t_lines = coalesce(s.lines, 0), t_words = coalesce(s.words, 0), t_versions = coalesce(s.versions, 0),
+                       t_updated_at = s.ts
+  FROM kb.node f2 LEFT JOIN LATERAL (
+    SELECT count(*) FILTER (WHERE n.kind = 1) AS files, count(*) FILTER (WHERE n.kind = 0) AS folders,
+           sum(n.nbytes) FILTER (WHERE n.kind = 1) AS bytes, sum(n.nlines) FILTER (WHERE n.kind = 1) AS lines,
+           sum(n.nwords) FILTER (WHERE n.kind = 1) AS words, sum(n.version) FILTER (WHERE n.kind = 1) AS versions,
+           max(n.updated_at) AS ts
+    FROM kb.node n
+    WHERE n.deleted_at IS NULL AND n.path <> '/' AND (f2.path = '/' OR n.path LIKE kb._subtree_like(f2.path))
+  ) s ON true
+  WHERE f.id = f2.id AND f2.kind = 0 AND f2.deleted_at IS NULL;
+END $$;
 
 -- Attributed namespace changes (recorded in the change feed with `author`).
 CREATE FUNCTION kb.move(from_path text, to_path text, author text DEFAULT NULL) RETURNS void LANGUAGE sql VOLATILE AS $$ SELECT kb._move(from_path, to_path, author) $$;
@@ -211,7 +373,10 @@ mod kb {
     use textdb_core::commit::{commit, commit_append, CommitKind, Committed};
     use textdb_core::myers::byte_edits;
     use textdb_core::tree::{leaves, locate_line, materialize, materialize_range, totals};
-    use textdb_core::{unified_diff, ChunkParams, Edit, Hash, LineHunk, Storage, StructureExtractor, TextdbError};
+    use textdb_core::path::ancestors;
+    use textdb_core::{
+        unified_diff, word_delta, words_at, ChunkParams, Edit, Hash, LineHunk, PathOp, Storage, StructureExtractor, TextdbError,
+    };
     use textdb_md::MarkdownExtractor;
 
     use crate::store::{normalize_path, parent_of, name_of, raise, spi_err, to_hash, NodeRow, SpiStorage};
@@ -331,12 +496,102 @@ mod kb {
         .map_err(storage_err)?
         .ok_or_else(|| TextdbError::Storage("folder insert returned no id".into()))?;
         record_change("mkdir", id, 0, path, None, None, None, None, None, None);
+        add_to_ancestors(
+            path,
+            &Totals {
+                folders: 1,
+                ..Totals::default()
+            },
+        )?;
         Ok(id)
     }
 
+    /// What a node adds to every folder above it.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Totals {
+        files: i64,
+        folders: i64,
+        bytes: i64,
+        lines: i64,
+        words: i64,
+        versions: i64,
+    }
+
+    impl Totals {
+        fn neg(self) -> Self {
+            Totals {
+                files: -self.files,
+                folders: -self.folders,
+                bytes: -self.bytes,
+                lines: -self.lines,
+                words: -self.words,
+                versions: -self.versions,
+            }
+        }
+    }
+
+    /// Record `t` against every live folder above `path`, as kb.folder_delta rows.
+    fn add_to_ancestors(path: &str, t: &Totals) -> Result<(), TextdbError> {
+        let list = serde_json::to_string(&ancestors(path)).expect("paths serialize");
+        Spi::run_with_args(
+            "INSERT INTO kb.folder_delta(folder_id, files, folders, bytes, lines, words, versions) \
+             SELECT n.id, $2, $3, $4, $5, $6, $7 FROM kb.node n \
+             WHERE n.path IN (SELECT jsonb_array_elements_text($1::jsonb)) AND n.deleted_at IS NULL",
+            &[
+                list.as_str().into(),
+                t.files.into(),
+                t.folders.into(),
+                t.bytes.into(),
+                t.lines.into(),
+                t.words.into(),
+                t.versions.into(),
+            ],
+        )
+        .map_err(storage_err)?;
+        Ok(())
+    }
+
+    /// What the live node `id` and everything below it add to the folders above: a file counts
+    /// itself, a folder its totals plus itself.
+    fn subtree_totals(id: i64) -> Result<Totals, TextdbError> {
+        Spi::connect(|client| {
+            let rows = client
+                .select(
+                    "SELECT CASE kind WHEN 'file' THEN 1 ELSE files END::bigint, CASE kind WHEN 'file' THEN 0 ELSE folders + 1 END::bigint, \
+                     coalesce(nbytes, 0)::bigint, coalesce(nlines, 0)::bigint, coalesce(nwords, 0)::bigint, versions::bigint \
+                     FROM kb.entry WHERE id = $1",
+                    None,
+                    &[id.into()],
+                )
+                .map_err(storage_err)?;
+            for r in rows {
+                let get = |i: usize| -> Result<i64, TextdbError> { Ok(r.get::<i64>(i).map_err(storage_err)?.unwrap_or(0)) };
+                return Ok(Totals {
+                    files: get(1)?,
+                    folders: get(2)?,
+                    bytes: get(3)?,
+                    lines: get(4)?,
+                    words: get(5)?,
+                    versions: get(6)?,
+                });
+            }
+            Err(TextdbError::NotFound(format!("node {}", id)))
+        })
+    }
+
+    /// Id of the live node at `path`, for `kb.ls`; TX003 when there is none.
+    #[pg_extern(stable)]
+    fn _node_id(path: &str) -> i64 {
+        let path = ok(normalize_path(path));
+        match node_by_path(&path) {
+            Some(n) => n.id,
+            None => fail(TextdbError::NotFound(path)),
+        }
+    }
+
     /// Append one row to the change feed and announce its `seq` on the `textdb_change`
-    /// channel. Runs inside the calling statement's transaction, so the row and the
-    /// notification exist exactly when the change commits.
+    /// channel; returns the `seq`. Runs inside the calling statement's transaction, so the row
+    /// and the notification exist exactly when the change commits.
     #[allow(clippy::too_many_arguments)]
     fn record_change(
         op: &str,
@@ -349,7 +604,7 @@ mod kb {
         commit_kind: Option<&str>,
         author: Option<&str>,
         message: Option<&str>,
-    ) {
+    ) -> i64 {
         Spi::run_with_args(
             "WITH c AS (INSERT INTO kb.change(op, node_id, node_kind, path, old_path, version, base_version, commit_kind, author, message) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING seq) SELECT pg_notify('textdb_change', seq::text) FROM c",
             &[
@@ -366,6 +621,50 @@ mod kb {
             ],
         )
         .unwrap_or_else(|e| spi_err(e));
+        Spi::get_one::<i64>("SELECT currval(pg_get_serial_sequence('kb.change', 'seq'))")
+            .unwrap_or_else(|e| spi_err(e))
+            .unwrap_or(0)
+    }
+
+    fn path_history_enabled() -> Result<bool, TextdbError> {
+        Ok(Spi::get_one::<bool>("SELECT kb.path_history_enabled()").map_err(storage_err)?.unwrap_or(true))
+    }
+
+    /// Record `op` in kb.path_event for `node` and, for a folder, every live node below it.
+    /// Call before the paths change: the rows keep the paths as they were.
+    fn record_path_events(
+        op: PathOp,
+        node: &NodeRow,
+        to: Option<&str>,
+        author: Option<&str>,
+        change_seq: i64,
+    ) -> Result<(), TextdbError> {
+        if node.kind == 0 {
+            Spi::run_with_args(
+                "INSERT INTO kb.path_event(node_id, node_kind, op, author, old_path, new_path, via, version, change_seq) \
+                 SELECT id, kind, $1, $2, path, CASE WHEN $3::text IS NULL THEN NULL ELSE $3::text || substr(path, length($4) + 1) END, \
+                        $4, CASE WHEN kind = 1 THEN version END, $5 \
+                 FROM kb.node WHERE path LIKE kb._subtree_like($4) AND deleted_at IS NULL",
+                &[op.as_str().into(), author.into(), to.into(), node.path.as_str().into(), change_seq.into()],
+            )
+            .map_err(storage_err)?;
+        }
+        Spi::run_with_args(
+            "INSERT INTO kb.path_event(node_id, node_kind, op, author, old_path, new_path, version, change_seq) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                node.id.into(),
+                node.kind.into(),
+                op.as_str().into(),
+                author.into(),
+                node.path.as_str().into(),
+                to.into(),
+                (node.kind == 1).then_some(node.version).into(),
+                change_seq.into(),
+            ],
+        )
+        .map_err(storage_err)?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -380,6 +679,27 @@ mod kb {
     ) {
         let st = SpiStorage::new();
         let (nbytes, nlines) = ok(totals(&st, &c.root));
+        let (old_bytes, old_lines, old_words) = Spi::connect(|client| {
+            let rows = client
+                .select("SELECT nbytes, nlines, nwords FROM kb.node WHERE id = $1", None, &[file_id.into()])
+                .unwrap_or_else(|e| spi_err(e));
+            let mut out = (None, None, None);
+            for r in rows {
+                out = (
+                    r.get::<i64>(1).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<i64>(2).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<i64>(3).unwrap_or_else(|e| spi_err(e)),
+                );
+            }
+            out
+        });
+        // Words over the lines that changed since the previous version. That is the previous
+        // version's root rather than `parent_root`: with concurrent writers, `commit` may have
+        // rebased over a commit that landed after the caller read its head.
+        let nwords = match old_words {
+            Some(words) if c.version > 1 => words + ok(word_delta(&st, &root_of_version(file_id, c.version - 1), &c.root)),
+            _ => ok(words_at(&st, &c.root)) as i64,
+        };
         Spi::run_with_args(
             "INSERT INTO kb.commit(file_id, version, root, parent_root, author, message, nbytes, nlines, kind, base_version) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
             &[
@@ -399,10 +719,26 @@ mod kb {
         let op = if c.version == 1 { "create" } else { "commit" };
         record_change(op, file_id, 1, path, None, Some(c.version as i64), base_version, Some(c.kind.as_str()), author, message);
         Spi::run_with_args(
-            "UPDATE kb.node SET nbytes = $1, nlines = $2, updated_by = $3 WHERE id = $4",
-            &[(nbytes as i64).into(), (nlines as i64).into(), author.into(), file_id.into()],
+            "INSERT INTO kb.file_author AS a (file_id, author, commits, first_ts, last_ts) VALUES ($1, coalesce($2, ''), 1, now(), now()) \
+             ON CONFLICT (file_id, author) DO UPDATE SET commits = a.commits + 1, last_ts = EXCLUDED.last_ts",
+            &[file_id.into(), author.into()],
         )
         .unwrap_or_else(|e| spi_err(e));
+        Spi::run_with_args(
+            "UPDATE kb.node SET nbytes = $1, nlines = $2, updated_by = $3, nwords = $5, \
+             nauthors = (SELECT count(*) FROM kb.file_author WHERE file_id = $4) WHERE id = $4",
+            &[(nbytes as i64).into(), (nlines as i64).into(), author.into(), file_id.into(), nwords.into()],
+        )
+        .unwrap_or_else(|e| spi_err(e));
+        let change = Totals {
+            files: (c.version == 1) as i64,
+            folders: 0,
+            bytes: nbytes as i64 - old_bytes.unwrap_or(0),
+            lines: nlines as i64 - old_lines.unwrap_or(0),
+            words: nwords - old_words.unwrap_or(0),
+            versions: 1,
+        };
+        ok(add_to_ancestors(path, &change));
         let mut seen = std::collections::HashSet::new();
         for h in &c.new_chunks {
             if !seen.insert(*h) {
@@ -700,6 +1036,12 @@ mod kb {
             return Err(TextdbError::InvalidEdit(format!("{} already exists", to)));
         }
         let parent = ensure_folder(parent_of(&to))?;
+        let moved = subtree_totals(src.id)?;
+        add_to_ancestors(&from, &moved.neg())?;
+        let seq = record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, None);
+        if path_history_enabled()? {
+            record_path_events(PathOp::classify(&from, &to), &src, Some(&to), author, seq)?;
+        }
         Spi::run_with_args(
             "UPDATE kb.node SET path = $2 || substr(path, length($1) + 1), updated_at = now() WHERE path LIKE kb._subtree_like($1) AND deleted_at IS NULL",
             &[from.as_str().into(), to.as_str().into()],
@@ -710,7 +1052,7 @@ mod kb {
             &[to.as_str().into(), name_of(&to).into(), parent.into(), src.id.into()],
         )
         .map_err(storage_err)?;
-        record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, None);
+        add_to_ancestors(&to, &moved)?;
         Ok(())
     }
 
@@ -732,12 +1074,17 @@ mod kb {
             return Err(TextdbError::InvalidEdit("cannot delete the root".into()));
         }
         let n = node_by_path(&path).ok_or_else(|| TextdbError::NotFound(path.clone()))?;
+        let gone = subtree_totals(n.id)?;
+        add_to_ancestors(&path, &gone.neg())?;
+        let seq = record_change("delete", n.id, n.kind, &path, None, None, None, None, author, None);
+        if path_history_enabled()? {
+            record_path_events(PathOp::Delete, &n, None, author, seq)?;
+        }
         Spi::run_with_args(
             "UPDATE kb.node SET deleted_at = now() WHERE (path = $1 OR path LIKE kb._subtree_like($1)) AND deleted_at IS NULL",
             &[path.as_str().into()],
         )
         .map_err(storage_err)?;
-        record_change("delete", n.id, n.kind, &path, None, None, None, None, author, None);
         Ok(())
     }
 
@@ -804,36 +1151,6 @@ mod kb {
     }
 
     #[pg_extern(stable)]
-    fn ls(
-        path: &str,
-    ) -> TableIterator<'static, (name!(name, String), name!(kind, String), name!(nbytes, Option<i64>), name!(nlines, Option<i64>), name!(updated_at, pgrx::datum::TimestampWithTimeZone))> {
-        let path = ok(normalize_path(path));
-        let dir = node_by_path(&path).unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
-        let rows: Vec<_> = Spi::connect(|client| {
-            let t = client
-                .select(
-                    "SELECT name, kind, nbytes, nlines, updated_at FROM kb.node WHERE parent_id = $1 AND deleted_at IS NULL ORDER BY name",
-                    None,
-                    &[dir.id.into()],
-                )
-                .unwrap_or_else(|e| spi_err(e));
-            let mut v = Vec::new();
-            for r in t {
-                let kind: i16 = r.get(2).unwrap_or_else(|e| spi_err(e)).unwrap_or(1);
-                v.push((
-                    r.get::<String>(1).unwrap_or_else(|e| spi_err(e)).unwrap_or_default(),
-                    if kind == 1 { "file".to_string() } else { "folder".to_string() },
-                    r.get::<i64>(3).unwrap_or_else(|e| spi_err(e)),
-                    r.get::<i64>(4).unwrap_or_else(|e| spi_err(e)),
-                    r.get::<pgrx::datum::TimestampWithTimeZone>(5).unwrap_or_else(|e| spi_err(e)).expect("updated_at"),
-                ));
-            }
-            v
-        });
-        TableIterator::new(rows)
-    }
-
-    #[pg_extern(stable)]
     fn history(
         path: &str,
     ) -> TableIterator<
@@ -866,6 +1183,52 @@ mod kb {
                     r.get::<String>(4).unwrap_or_else(|e| spi_err(e)),
                     r.get::<String>(5).unwrap_or_else(|e| spi_err(e)),
                     r.get::<i64>(6).unwrap_or_else(|e| spi_err(e)),
+                ));
+            }
+            v
+        });
+        TableIterator::new(rows)
+    }
+
+    /// Renames, moves and deletes of the file or folder at `path` (the live one, else the one
+    /// most recently deleted there), oldest first. See `kb.path_history_enabled()`.
+    #[pg_extern(stable)]
+    fn path_history(
+        path: &str,
+    ) -> TableIterator<
+        'static,
+        (
+            name!(id, i64),
+            name!(ts, pgrx::datum::TimestampWithTimeZone),
+            name!(op, String),
+            name!(old_path, String),
+            name!(new_path, Option<String>),
+            name!(via, Option<String>),
+            name!(version, Option<i64>),
+            name!(author, Option<String>),
+        ),
+    > {
+        let path = ok(normalize_path(path));
+        let n = NodeRow::by_path(&path, true).unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
+        let rows: Vec<_> = Spi::connect(|client| {
+            let t = client
+                .select(
+                    "SELECT id, ts, op, old_path, new_path, via, version, author FROM kb.path_event WHERE node_id = $1 ORDER BY id",
+                    None,
+                    &[n.id.into()],
+                )
+                .unwrap_or_else(|e| spi_err(e));
+            let mut v = Vec::new();
+            for r in t {
+                v.push((
+                    r.get::<i64>(1).unwrap_or_else(|e| spi_err(e)).unwrap_or(0),
+                    r.get::<pgrx::datum::TimestampWithTimeZone>(2).unwrap_or_else(|e| spi_err(e)).expect("ts"),
+                    r.get::<String>(3).unwrap_or_else(|e| spi_err(e)).unwrap_or_default(),
+                    r.get::<String>(4).unwrap_or_else(|e| spi_err(e)).unwrap_or_default(),
+                    r.get::<String>(5).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<String>(6).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<i64>(7).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<String>(8).unwrap_or_else(|e| spi_err(e)),
                 ));
             }
             v

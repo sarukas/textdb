@@ -11,6 +11,201 @@ fn setup() -> Connection {
     conn
 }
 
+#[test]
+fn scalar_move_and_delete_act_on_whole_subtrees_with_an_author() {
+    let conn = setup();
+    for p in ["/f/a.md", "/f/sub/b.md", "/f/sub/deep/c.md"] {
+        conn.query_row("SELECT textdb_write(?1, 'x')", [p], |_| Ok(())).unwrap();
+    }
+    let since: i64 = conn.query_row("SELECT textdb_last_seq()", [], |r| r.get(0)).unwrap();
+    let one = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0));
+
+    assert_eq!(one("SELECT textdb_move('/f/sub', '/g/moved', 'human')").unwrap(), 1);
+    assert_eq!(one("SELECT count(*) FROM kb WHERE path LIKE '/g/moved/%'").unwrap(), 3);
+    assert_eq!(one("SELECT textdb_move('/f/a.md', '/f/renamed.md', '')").unwrap(), 1);
+    let err = one("SELECT textdb_move('/g', '/g/inside')").unwrap_err().to_string();
+    assert!(err.starts_with("TX004"), "{err}");
+    let err = one("SELECT textdb_move('/nope.md', '/x.md')").unwrap_err().to_string();
+    assert!(err.starts_with("TX003"), "{err}");
+
+    assert_eq!(one("SELECT textdb_delete('/g', 'agent-7')").unwrap(), 1);
+    assert_eq!(one("SELECT count(*) FROM kb WHERE path LIKE '/g%'").unwrap(), 0);
+    let err = one("SELECT textdb_delete('/')").unwrap_err().to_string();
+    assert!(err.starts_with("TX004"), "{err}");
+
+    let ops: Vec<_> = feed(&conn, since)
+        .into_iter()
+        .filter(|r| r.1 == "move" || r.1 == "delete")
+        .map(|r| (r.1, r.2, r.3, r.7))
+        .collect();
+    let s = |v: &str| v.to_string();
+    assert_eq!(
+        ops,
+        vec![
+            (s("move"), s("/g/moved"), Some(s("/f/sub")), Some(s("human"))),
+            (s("move"), s("/f/renamed.md"), Some(s("/f/a.md")), None),
+            (s("delete"), s("/g"), None, Some(s("agent-7"))),
+        ]
+    );
+}
+
+#[test]
+fn trash_lists_reads_and_purges_what_deletes_left() {
+    let conn = setup();
+    let json = |sql: &str| -> serde_json::Value {
+        serde_json::from_str(&conn.query_row(sql, [], |r| r.get::<_, String>(0)).unwrap()).unwrap()
+    };
+    let one = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+    let text = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, String>(0));
+    let write = |path: &str, content: &str| {
+        conn.query_row("SELECT textdb_write(?1, ?2)", [path, content], |_| Ok(())).unwrap();
+    };
+    // Long enough to span many chunks, so a file that starts the same way shares all but
+    // its last chunk with it.
+    let shared: String = (0..3000).map(|i| format!("shared paragraph {i} that both files contain\n")).collect();
+    write("/keep.md", &shared);
+    write("/old/a.md", &format!("{shared}alpha ending\n"));
+    write("/old/a.md", "# a, second version\nbeta words\n");
+    write("/old/sub/b.md", "zeta words\n");
+    write("/lone.md", "lone words\n");
+    conn.query_row("SELECT textdb_delete('/lone.md', 'agent-7')", [], |_| Ok(())).unwrap();
+    conn.query_row("SELECT textdb_delete('/old', 'human')", [], |_| Ok(())).unwrap();
+
+    let items = json("SELECT textdb_trash()");
+    let items = items.as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let old = &items[0];
+    assert_eq!(
+        (old["path"].as_str(), old["kind"].as_str(), old["files"].as_i64(), old["deleted_by"].as_str()),
+        (Some("/old"), Some("folder"), Some(2), Some("human"))
+    );
+    assert_eq!(items[1]["path"], "/lone.md");
+
+    let inside = json(&format!("SELECT textdb_trash({})", old["id"]));
+    let names: Vec<_> = inside.as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap().to_string()).collect();
+    assert_eq!(names, ["sub", "a.md"]);
+    let a = inside[1]["id"].as_i64().unwrap();
+    assert_eq!(inside[1]["deleted_by"], "human");
+    assert_eq!(text(&format!("SELECT textdb_trash_content({a})")).unwrap(), "# a, second version\nbeta words\n");
+    assert!(text(&format!("SELECT textdb_trash_content({a}, 1)")).unwrap().ends_with("alpha ending\n"));
+    assert_eq!(json(&format!("SELECT textdb_trash_history({a})")).as_array().unwrap().len(), 2);
+    assert_eq!(json(&format!("SELECT textdb_trash_entry({a})"))["path"], "/old/a.md");
+    let err = text("SELECT textdb_trash_content(999999)").unwrap_err().to_string();
+    assert!(err.starts_with("TX003"), "{err}");
+
+    let chunks_before = one("SELECT count(*) FROM kb_chunk");
+    let nodes_before = one("SELECT count(*) FROM kb_tree_node");
+    let stats = json(&format!("SELECT textdb_purge({}, 'human')", old["id"]));
+    assert_eq!(
+        (stats["items"].as_i64(), stats["files"].as_i64(), stats["folders"].as_i64(), stats["versions"].as_i64()),
+        (Some(1), Some(2), Some(2), Some(3))
+    );
+    let freed = stats["chunks"].as_i64().unwrap();
+    assert!(freed > 0);
+    assert_eq!(one("SELECT count(*) FROM kb_chunk"), chunks_before - freed);
+    assert_eq!(one("SELECT count(*) FROM kb_tree_node"), nodes_before - stats["tree_nodes"].as_i64().unwrap());
+    // The chunks /old/a.md shared with /keep.md are still there, and still searchable.
+    assert_eq!(
+        one("SELECT count(*) FROM textdb_chunks('/keep.md') c JOIN kb_chunk k ON lower(hex(k.hash)) = lower(c.hash)"),
+        one("SELECT count(*) FROM textdb_chunks('/keep.md')")
+    );
+    assert_eq!(text("SELECT textdb_content('/keep.md')").unwrap(), shared);
+    assert!(one("SELECT count(*) FROM kb_fts WHERE kb_fts MATCH 'paragraph'") > 0);
+    // Content only the purged files had is gone from the index too.
+    assert_eq!(one("SELECT count(*) FROM kb_fts WHERE kb_fts MATCH 'zeta'"), 0);
+    assert_eq!(one("SELECT count(*) FROM kb_fts WHERE kb_fts MATCH 'beta'"), 0);
+    let err = text(&format!("SELECT textdb_trash_content({a})")).unwrap_err().to_string();
+    assert!(err.starts_with("TX003"), "{err}");
+    assert_eq!(json("SELECT textdb_trash()").as_array().unwrap().len(), 1);
+
+    // The path is free again.
+    write("/old/a.md", "a new file\n");
+    assert_eq!(one("SELECT version FROM kb WHERE path = '/old/a.md'"), 1);
+
+    assert_eq!(one("SELECT count(*) FROM kb_fts WHERE kb_fts MATCH 'lone'"), 1);
+    let stats = json("SELECT textdb_empty_trash('ops')");
+    assert_eq!((stats["items"].as_i64(), stats["files"].as_i64()), (Some(1), Some(1)));
+    assert_eq!(json("SELECT textdb_trash()").as_array().unwrap().len(), 0);
+    assert_eq!(one("SELECT count(*) FROM kb_fts WHERE kb_fts MATCH 'lone'"), 0);
+    assert_eq!(json("SELECT textdb_empty_trash()")["items"], 0);
+
+    let purges: Vec<_> = feed(&conn, 0).into_iter().filter(|r| r.1 == "purge").map(|r| (r.2, r.7)).collect();
+    assert_eq!(
+        purges,
+        vec![("/old".to_string(), Some("human".to_string())), ("/lone.md".to_string(), Some("ops".to_string()))]
+    );
+}
+
+#[test]
+fn renames_moves_and_deletes_are_recorded_for_every_node_they_touch() {
+    let conn = setup();
+    let run = |sql: &str| conn.query_row(sql, [], |_| Ok(())).unwrap();
+    let one = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+    let write = |path: &str, content: &str| {
+        conn.query_row("SELECT textdb_write(?1, ?2)", [path, content], |_| Ok(())).unwrap();
+    };
+    type Event = (String, String, Option<String>, Option<String>, Option<i64>, Option<String>);
+    let events = |sql: &str| -> Vec<Event> {
+        conn.prepare(sql)
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let history = |path: &str| events(&format!("SELECT op, old_path, new_path, via, version, author FROM textdb_path_history('{path}')"));
+    let s = |v: &str| Some(v.to_string());
+
+    write("/a/x.md", "x\n");
+    write("/a/x.md", "x2\n");
+    write("/a/sub/y.md", "y\n");
+    run("SELECT textdb_move('/a/x.md', '/a/renamed.md', 'human')");
+    run("SELECT textdb_move('/a', '/b/a2', 'agent-7')");
+    run("SELECT textdb_delete('/b/a2/sub', 'ops')");
+
+    // A file's history follows it through its own rename and its folder's move.
+    assert_eq!(
+        history("/b/a2/renamed.md"),
+        vec![
+            ("rename".into(), "/a/x.md".into(), s("/a/renamed.md"), None, Some(2), s("human")),
+            ("move".into(), "/a/renamed.md".into(), s("/b/a2/renamed.md"), s("/a"), Some(2), s("agent-7")),
+        ]
+    );
+    assert_eq!(history("/b/a2"), vec![("move".into(), "/a".into(), s("/b/a2"), None, None, s("agent-7"))]);
+    // A deleted file is found at the path it was deleted from, or by id.
+    assert_eq!(
+        history("/b/a2/sub/y.md"),
+        vec![
+            ("move".into(), "/a/sub/y.md".into(), s("/b/a2/sub/y.md"), s("/a"), Some(1), s("agent-7")),
+            ("delete".into(), "/b/a2/sub/y.md".into(), None, s("/b/a2/sub"), Some(1), s("ops")),
+        ]
+    );
+    let y = one("SELECT id FROM kb_node WHERE path = '/b/a2/sub/y.md'");
+    assert_eq!(one(&format!("SELECT count(*) FROM textdb_path_history(NULL, {y})")), 2);
+    // Versions are untouched: a path event is not a version.
+    assert_eq!(one("SELECT version FROM kb WHERE path = '/b/a2/renamed.md'"), 2);
+
+    // The store setting turns it off; a handle can decide for itself.
+    let text = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, Option<String>>(0));
+    assert_eq!(text("SELECT textdb_setting('path_history')").unwrap(), None);
+    assert_eq!(text("SELECT textdb_setting('path_history', 'OFF')").unwrap().as_deref(), Some("off"));
+    let before = one("SELECT count(*) FROM kb_path_event");
+    run("SELECT textdb_move('/b/a2/renamed.md', '/b/a2/quiet.md')");
+    assert_eq!(one("SELECT count(*) FROM kb_path_event"), before);
+    let db = TextDb::attach(&conn, "kb_", true).with_path_history(Some(true));
+    db.rename_by("/b/a2/quiet.md", "/b/a2/loud.md", Some("cli")).unwrap();
+    assert_eq!(one("SELECT count(*) FROM kb_path_event"), before + 1);
+    assert_eq!(text("SELECT textdb_setting('path_history', NULL)").unwrap(), None);
+    for bad in ["SELECT textdb_setting('colour')", "SELECT textdb_setting('path_history', 'maybe')"] {
+        let err = text(bad).unwrap_err().to_string();
+        assert!(err.starts_with("TX004"), "{err}");
+    }
+
+    // Purging removes the events with the node.
+    run("SELECT textdb_empty_trash()");
+    assert_eq!(one(&format!("SELECT count(*) FROM kb_path_event WHERE node_id = {y}")), 0);
+}
+
 type FeedRow = (i64, String, String, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>);
 
 fn feed(conn: &Connection, since: i64) -> Vec<FeedRow> {
@@ -238,6 +433,77 @@ fn scalar_write_and_replace_lines_report_how_the_commit_landed() {
 }
 
 #[test]
+fn listings_carry_words_authors_and_folder_totals() {
+    let conn = textdb_sqlite::open_in_memory().unwrap();
+    conn.execute_batch("CREATE VIRTUAL TABLE kb USING textdb(store='kb_');").unwrap();
+    let run = |sql: &str| conn.query_row(sql, [], |_| Ok(())).unwrap();
+    // Every live folder's totals equal an aggregate over its subtree, computed from scratch.
+    let consistent = || {
+        let wrong: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM kb_node f WHERE f.kind = 0 AND f.deleted_at IS NULL AND \
+                 (f.t_files, f.t_folders, f.t_bytes, f.t_lines, f.t_words, f.t_versions) <> \
+                 (SELECT count(*) FILTER (WHERE kind = 1), count(*) FILTER (WHERE kind = 0), coalesce(sum(nbytes), 0), \
+                         coalesce(sum(nlines), 0), coalesce(sum(nwords), 0), coalesce(sum(CASE kind WHEN 1 THEN version END), 0) \
+                  FROM kb_node n WHERE n.deleted_at IS NULL AND n.path <> '/' AND (f.path = '/' OR n.path LIKE f.path || '/%'))",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong, 0, "folder totals drifted from their subtrees");
+    };
+    let folder = |dir: &str, name: &str| -> (i64, i64, i64, i64, i64, i64) {
+        conn.query_row(
+            "SELECT files, folders, nbytes, nlines, nwords, versions FROM textdb_ls(?1) WHERE name = ?2",
+            [dir, name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .unwrap()
+    };
+
+    run("SELECT textdb_write('/docs/a.md', '# Title' || char(10) || 'one two three' || char(10), NULL, 'alice')");
+    run("SELECT textdb_write('/docs/deep/b.md', 'four five' || char(10), NULL, 'bob')");
+    run("SELECT textdb_append('/docs/a.md', 'six' || char(10), 'bob')");
+    run("SELECT textdb_append('/docs/a.md', 'seven eight' || char(10), 'bob')");
+    run("SELECT textdb_replace_lines('/docs/a.md', 2, 2, 'one' || char(10), NULL, 'carol')");
+    // a.md is "# Title\none\nsix\nseven eight\n": 28 bytes, 4 lines, 6 words, 4 versions.
+    let (words, versions, nauthors, authors): (i64, i64, i64, String) = conn
+        .query_row("SELECT nwords, versions, nauthors, authors FROM textdb_ls('/docs') WHERE name = 'a.md'", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .unwrap();
+    assert_eq!((words, versions, nauthors), (6, 4, 3));
+    let authors: serde_json::Value = serde_json::from_str(&authors).unwrap();
+    assert_eq!((authors[0]["author"].as_str(), authors[0]["commits"].as_i64()), (Some("bob"), Some(2)));
+    assert_eq!(folder("/", "docs"), (2, 1, 38, 5, 8, 5));
+    consistent();
+
+    run("SELECT textdb_move('/docs/deep', '/archive/deep', 'dave')");
+    assert_eq!(folder("/", "docs"), (1, 0, 28, 4, 6, 4));
+    assert_eq!(folder("/", "archive"), (1, 1, 10, 1, 2, 1));
+    consistent();
+
+    run("SELECT textdb_delete('/docs/a.md', 'dave')");
+    assert_eq!(folder("/", "docs"), (0, 0, 0, 0, 0, 0));
+    let root: (i64, i64) = conn.query_row("SELECT t_files, t_folders FROM kb_node WHERE path = '/'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(root, (1, 3));
+    consistent();
+
+    let mut stmt = conn.prepare("SELECT path FROM textdb_ls('/', 1)").unwrap();
+    let all: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(all, ["/archive", "/archive/deep", "/archive/deep/b.md", "/docs"]);
+    // A file lists no subtree counts; a folder has no authors of its own.
+    let (files, authors): (Option<i64>, String) = conn
+        .query_row("SELECT files, authors FROM textdb_ls('/archive', 1) WHERE name = 'b.md'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    let authors: serde_json::Value = serde_json::from_str(&authors).unwrap();
+    assert_eq!((files, authors[0]["author"].as_str(), authors[0]["commits"].as_i64()), (None, Some("bob"), Some(1)));
+    let folder_authors: String =
+        conn.query_row("SELECT authors FROM textdb_ls('/') WHERE name = 'archive'", [], |r| r.get(0)).unwrap();
+    assert_eq!(folder_authors, "[]");
+}
+
+#[test]
 fn an_older_store_is_upgraded_in_place() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("old.db");
@@ -251,10 +517,22 @@ fn an_older_store_is_upgraded_in_place() {
             "DROP TABLE kb_change; ALTER TABLE kb_commit DROP COLUMN kind; ALTER TABLE kb_commit DROP COLUMN base_version;",
         )
         .unwrap();
+        conn.execute_batch("DROP TABLE kb_file_author;").unwrap();
+        for column in ["nwords", "nauthors", "t_files", "t_folders", "t_bytes", "t_lines", "t_words", "t_versions", "t_updated_at"] {
+            conn.execute_batch(&format!("ALTER TABLE kb_node DROP COLUMN {column};")).unwrap();
+        }
     }
     let conn = textdb_sqlite::open(path).unwrap();
     let added: i64 = conn.query_row("SELECT textdb_migrate()", [], |r| r.get(0)).unwrap();
-    assert_eq!(added, 2);
+    // commit.kind and commit.base_version, and nine node columns for listings.
+    assert_eq!(added, 11);
+    // ... computed from what the store already holds.
+    let (words, authors): (i64, i64) = conn
+        .query_row("SELECT nwords, nauthors FROM kb_node WHERE path = '/a.md'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!((words, authors), (1, 1));
+    let root_files: i64 = conn.query_row("SELECT t_files FROM kb_node WHERE path = '/'", [], |r| r.get(0)).unwrap();
+    assert_eq!(root_files, 1);
     let again: i64 = conn.query_row("SELECT textdb_migrate()", [], |r| r.get(0)).unwrap();
     assert_eq!(again, 0);
     conn.execute("UPDATE kb SET content = 'two' WHERE path = '/a.md'", []).unwrap();

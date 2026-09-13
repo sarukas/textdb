@@ -201,7 +201,7 @@ Trait `StructureExtractor { fn extract(&self, bytes) -> Structure }` producing s
 - `CREATE VIRTUAL TABLE kb USING textdb(store='kb_')` creates shadow tables `kb_node`, `kb_chunk`, `kb_tree_node`, `kb_commit`, `kb_section`, `kb_link`, and `kb_fts` (FTS5, external-content on `kb_chunk`).
 - Virtual table columns: `id, path, name, parent_path, kind, content, version, nbytes, nlines, updated_at`.
 - `xUpdate` implements INSERT (create, `mkdir -p`), UPDATE of `content` (diff OLD/NEW → edit set → commit with rebase), UPDATE of `path` (move), DELETE (tombstone).
-- Table-valued functions: `textdb_ls(path)`, `textdb_search(query, prefix)`, `textdb_history(path)`, `textdb_lines(path, from, to)`, `textdb_section(path, heading)`, `textdb_diff(path, v1, v2)`, `textdb_content(path, version)`.
+- Table-valued functions: `textdb_ls(path[, recursive])` (with word counts, authors and folder totals, see `docs/live-app.md`), `textdb_search(query, prefix)`, `textdb_history(path)`, `textdb_lines(path, from, to)`, `textdb_section(path, heading)`, `textdb_diff(path, v1, v2)`, `textdb_content(path, version)`.
 - Single writer per connection is accepted; this stage validates algorithms, not concurrency.
 
 ### 7.2 Postgres (`textdb-pg`) — Stage 3
@@ -226,7 +226,12 @@ section(kb.file, text) → text
 edit(kb.file, old text, new text) → bigint   -- strict: old must be unique; raises on conflict
 append(kb.file, text) → bigint
 diff(kb.file, bigint, bigint) → text
-kb.ls(path) → TABLE(name, kind, nbytes, nlines, updated_at)
+kb.ls(path, recursive boolean DEFAULT false) → SETOF kb.entry
+                                        -- id, parent_id, path, name, kind, nbytes, nlines, nwords, versions,
+                                        -- updated_at, updated_by, created_at, files, folders, nauthors, authors jsonb;
+                                        -- a folder's figures total everything below it
+kb.compact_folder_totals() → bigint     -- fold kb.folder_delta into the folder rows (maintenance)
+kb.rebuild_folder_totals() → void       -- recompute every folder's totals from its files
 kb.search(tsquery text, prefix text) → TABLE(path, line, snippet, rank)
 kb.history(path) → TABLE(version, author, ts, message)
 kb.content(path, version) → text

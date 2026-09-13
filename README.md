@@ -11,9 +11,12 @@ This repository is the proof of concept described in [`docs/spec.md`](docs/spec.
 - **Install:** [`docs/INSTALL.md`](docs/INSTALL.md) · **Use:** [`docs/USAGE.md`](docs/USAGE.md)
 - **Benchmark results:** [`bench/RESULTS.md`](bench/RESULTS.md) (raw data in `bench/results/`)
 - **Command line:** [`docs/cli.md`](docs/cli.md) — `textdb` for SQLite and Postgres stores: tree, cat, search,
-  line-range and anchored edits that rebase over concurrent writers, history, hunks, and `watch` for live changes.
-- **Live corpus app:** [`docs/live-app.md`](docs/live-app.md) — a Node server and web UI where an agent's edits
-  appear in the open viewer or editor as they land, attributed, with version history and diffs.
+  line-range and anchored edits that rebase over concurrent writers, history with renames/moves/deletes, hunks,
+  and `watch` for live changes. [Working with an external agent](docs/cli.md#working-with-an-external-agent).
+- **Demo app:** [`docs/demo-app.md`](docs/demo-app.md) — build, start and configure the live corpus app: a Node
+  server and web UI where an agent's edits appear in the open viewer or editor as they land, attributed, with
+  history and diffs, folder import, rename/move/delete, a trash, download and replace. HTTP API and client
+  semantics: [`docs/live-app.md`](docs/live-app.md).
 - **Python library:** [`python/`](python/README.md) — `Corpus.open("sqlite:///kb.db" | "postgresql://…")`,
   file/folder loaders, anchored edits, conflict handling, CLI.
 - **Skills for AI agents:** [`skills/textdb-install`](skills/textdb-install/SKILL.md),

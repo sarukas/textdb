@@ -1,11 +1,34 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, subscribe, type ChangeEvent, type ConnectionState, type Info, type Subscription } from "./api";
+import {
+  api,
+  subscribe,
+  type ChangeEvent,
+  type ConnectionState,
+  type Info,
+  type PurgeStats,
+  type Subscription,
+} from "./api";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { DocumentPane, type Mode, type OpenDoc } from "./components/DocumentPane";
+import { FolderView } from "./components/FolderView";
 import { Header } from "./components/Header";
 import { ImportDialog } from "./components/ImportDialog";
+import {
+  BulkDeleteDialog,
+  BulkMoveDialog,
+  DeleteDialog,
+  MoveDialog,
+  PurgeDialog,
+  ReplaceDialog,
+} from "./components/PathDialogs";
+import { downloadText } from "./doc/transfer";
 import { Sidebar } from "./components/Sidebar";
+import { useToast } from "./components/Toasts";
+import { TrashDocument } from "./components/TrashDocument";
 import { addToFeed, type FeedItem } from "./live/activity";
+import { baseName, isWithin, parentOf } from "./live/paths";
+import { hashFor, parseHash, type Target } from "./nav/hash";
+import { bulkSummary, purgeSummary, type BulkAction, type PathAction, type TrashAction } from "./tree/actions";
 import { FeedHub } from "./state/hub";
 import { OwnWrites } from "./state/ownWrites";
 import { useAuthor } from "./state/useAuthor";
@@ -13,11 +36,12 @@ import { useAuthor } from "./state/useAuthor";
 const FEED_CAP = 500;
 let openSeq = 0;
 
-function fromHash(): OpenDoc | null {
-  const raw = decodeURIComponent(location.hash.slice(1));
-  const m = /^(\/.*?)(?::(\d+))?$/.exec(raw);
-  if (!m?.[1]) return null;
-  return { id: ++openSeq, path: m[1], line: m[2] ? Number(m[2]) : null, nonce: 1 };
+/** Show `target` in the address bar: a history entry for a navigation, in place otherwise. */
+function writeHash(target: Target, push: boolean): void {
+  const hash = hashFor(target);
+  if (location.hash === hash) return;
+  if (push) history.pushState(null, "", hash);
+  else history.replaceState(null, "", hash);
 }
 
 function readFeedOpen(): boolean {
@@ -31,13 +55,45 @@ function readFeedOpen(): boolean {
 export function App() {
   const hub = useMemo(() => new FeedHub(), []);
   const own = useMemo(() => new OwnWrites(), []);
+  const [initial] = useState(() => parseHash(location.hash));
   const [author, setAuthor] = useAuthor();
   const [info, setInfo] = useState<Info | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [lastSeq, setLastSeq] = useState(0);
   const [feed, setFeed] = useState<FeedItem[]>([]);
   const [importing, setImporting] = useState(false);
-  const [open, setOpen] = useState<OpenDoc | null>(fromHash);
+  const [pathAction, setPathAction] = useState<PathAction | null>(null);
+  const [trashAction, setTrashAction] = useState<TrashAction | null>(null);
+  const [trashDoc, setTrashDoc] = useState<number | null>(initial?.type === "trash" ? initial.id : null);
+  // The folder in the central listing, when neither a document nor a trashed file is open.
+  const [folder, setFolder] = useState<string | null>(initial?.type === "folder" ? initial.path : null);
+  const [bulkAction, setBulkAction] = useState<BulkAction | null>(null);
+  const toast = useToast();
+  const [replacing, setReplacing] = useState<{ path: string; file: File } | null>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const replaceTarget = useRef<string | null>(null);
+
+  // Download and replace need no dialog of their own before the browser's: the file picker has
+  // to open within the click that asked for it.
+  const onPathAction = useCallback(
+    (action: PathAction) => {
+      if (action.op === "download") {
+        api.file(action.path, action.version).then(
+          (f) => downloadText(baseName(f.path), f.content),
+          (e: unknown) => toast(`Could not download ${action.path}: ${e instanceof Error ? e.message : String(e)}`, "error"),
+        );
+      } else if (action.op === "replace") {
+        replaceTarget.current = action.path;
+        fileInput.current?.click();
+      } else {
+        setPathAction(action);
+      }
+    },
+    [toast],
+  );
+  const [open, setOpen] = useState<OpenDoc | null>(() =>
+    initial?.type === "file" ? { id: ++openSeq, path: initial.path, line: initial.line, nonce: 1 } : null,
+  );
   const [mode, setMode] = useState<Mode>("preview");
   const [feedOpen, setFeedOpen] = useState(readFeedOpen);
 
@@ -104,30 +160,67 @@ export function App() {
 
   // ---- navigation ----------------------------------------------------------------------------
 
-  const openFile = useCallback((path: string, line?: number) => {
+  // Opening something is a navigation (Back returns); `push = false` shows it without a new
+  // history entry, for the hash changes that already are one.
+  const openFile = useCallback((path: string, line?: number, push = true) => {
+    setTrashDoc(null);
+    setFolder(null);
     setOpen((prev) =>
       prev && prev.path === path
         ? { ...prev, line: line ?? null, nonce: prev.nonce + 1 }
         : { id: ++openSeq, path, line: line ?? null, nonce: 1 },
     );
     if (line !== undefined) setMode((m) => (m === "history" ? "preview" : m));
-    history.replaceState(null, "", `#${encodeURI(path)}${line ? `:${line}` : ""}`);
+    writeHash({ type: "file", path, line: line ?? null }, push);
   }, []);
 
-  // Follow deep links typed into the address bar (a hash change does not reload the page).
+  const openFolder = useCallback((path: string, push = true) => {
+    setTrashDoc(null);
+    setOpen(null);
+    setFolder(path);
+    writeHash({ type: "folder", path }, push);
+  }, []);
+
+  const openTrash = useCallback((id: number, push = true) => {
+    setOpen(null);
+    setFolder(null);
+    setTrashDoc(id);
+    writeHash({ type: "trash", id }, push);
+  }, []);
+
+  const closeTrash = useCallback(() => openFolder("/", false), [openFolder]);
+
+  // Back, Forward and links typed into the address bar change the hash without a reload.
   useEffect(() => {
     const onHash = () => {
-      const target = fromHash();
-      if (target) openFile(target.path, target.line ?? undefined);
+      const target: Target = parseHash(location.hash) ?? { type: "folder", path: "/" };
+      if (target.type === "trash") openTrash(target.id, false);
+      else if (target.type === "folder") openFolder(target.path, false);
+      else openFile(target.path, target.line ?? undefined, false);
     };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
-  }, [openFile]);
+  }, [openFile, openFolder, openTrash]);
+
+  // A purged trash file that is open closes here; one purged with its folder notices by itself.
+  const onPurged = (action: TrashAction, stats: PurgeStats) => {
+    setTrashAction(null);
+    if (action.op === "empty" || action.entry.id === trashDoc) closeTrash();
+    toast(purgeSummary(stats), "ok");
+  };
 
   const onPathChange = useCallback((path: string) => {
     setOpen((prev) => (prev ? { ...prev, path } : prev));
-    history.replaceState(null, "", `#${encodeURI(path)}`);
+    writeHash({ type: "file", path, line: null }, false);
   }, []);
+
+  // A moved document follows its file through the change feed (see DocController); a deleted
+  // document or folder listing gives way to the folder that held it.
+  const onDeleted = (path: string) => {
+    setPathAction(null);
+    const shown = open?.path ?? folder;
+    if (shown && (shown === path || isWithin(path, shown))) openFolder(parentOf(path), false);
+  };
 
   const toggleFeed = () =>
     setFeedOpen((v) => {
@@ -150,12 +243,114 @@ export function App() {
         onImport={() => setImporting(true)}
       />
       {importing && <ImportDialog author={author} onClose={() => setImporting(false)} onOpen={openFile} />}
+      {pathAction?.op === "move" && (
+        <MoveDialog
+          key={pathAction.path}
+          target={pathAction}
+          author={author}
+          onClose={() => setPathAction(null)}
+          onMoved={() => setPathAction(null)}
+        />
+      )}
+      <input
+        ref={fileInput}
+        type="file"
+        hidden
+        onChange={(e) => {
+          const file = e.currentTarget.files?.[0];
+          const path = replaceTarget.current;
+          e.currentTarget.value = "";
+          if (file && path) setReplacing({ path, file });
+        }}
+      />
+      {replacing && (
+        <ReplaceDialog
+          key={`${replacing.path}:${replacing.file.name}`}
+          path={replacing.path}
+          file={replacing.file}
+          author={author}
+          onClose={() => setReplacing(null)}
+          onReplaced={(path, result) => {
+            setReplacing(null);
+            toast(
+              result.kind === "noop"
+                ? `${baseName(path)} is unchanged`
+                : `Replaced ${baseName(path)}: v${result.version}${result.kind === "direct" ? "" : ` · ${result.kind}`}`,
+              "ok",
+            );
+          }}
+        />
+      )}
+      {trashAction && (
+        <PurgeDialog
+          key={trashAction.op === "empty" ? "empty" : trashAction.entry.id}
+          action={trashAction}
+          author={author}
+          onClose={() => setTrashAction(null)}
+          onDone={(stats) => onPurged(trashAction, stats)}
+        />
+      )}
+      {pathAction?.op === "delete" && (
+        <DeleteDialog
+          key={pathAction.path}
+          target={pathAction}
+          author={author}
+          openPath={open?.path ?? null}
+          onClose={() => setPathAction(null)}
+          onDeleted={onDeleted}
+        />
+      )}
+      {bulkAction && (
+        <>
+          {bulkAction.op === "move" ? (
+            <BulkMoveDialog
+              action={bulkAction}
+              author={author}
+              openPath={open?.path ?? null}
+              onClose={() => setBulkAction(null)}
+              onDone={(result) => {
+                setBulkAction(null);
+                toast(bulkSummary(result), "ok");
+              }}
+            />
+          ) : (
+            <BulkDeleteDialog
+              action={bulkAction}
+              author={author}
+              openPath={open?.path ?? null}
+              onClose={() => setBulkAction(null)}
+              onDone={(result) => {
+                setBulkAction(null);
+                toast(bulkSummary(result), "ok");
+              }}
+            />
+          )}
+        </>
+      )}
       <main className="workspace">
         <aside className="sidebar" aria-label="Files and search">
-          <Sidebar hub={hub} openPath={open?.path ?? null} onOpen={openFile} />
+          <Sidebar
+            hub={hub}
+            openPath={open?.path ?? null}
+            openFolder={open || trashDoc !== null ? null : (folder ?? "/")}
+            openTrashId={trashDoc}
+            onOpen={openFile}
+            onOpenFolder={openFolder}
+            onOpenTrash={openTrash}
+            onAction={onPathAction}
+            onTrashAction={setTrashAction}
+          />
         </aside>
-        <section className="center" aria-label="Document">
-          {open ? (
+        <section className="center" aria-label={trashDoc !== null ? "Trashed file" : open ? "Document" : "Folder"}>
+          {trashDoc !== null ? (
+            <TrashDocument
+              key={trashDoc}
+              id={trashDoc}
+              hub={hub}
+              onPurge={(entry) => setTrashAction({ op: "purge", entry })}
+              onClose={closeTrash}
+            />
+          ) : open ? (
             <DocumentPane
               key={open.id}
               open={open}
@@ -165,15 +360,19 @@ export function App() {
               own={own}
               author={author}
               onPathChange={onPathChange}
+              onAction={onPathAction}
+              onOpenFolder={openFolder}
             />
           ) : (
-            <div className="empty welcome">
-              <h2>Open a document</h2>
-              <p>
-                Pick a file from the tree or search the corpus (<kbd>/</kbd>). Changes made by agents from the command
-                line appear here as they land.
-              </p>
-            </div>
+            <FolderView
+              key={folder ?? "/"}
+              path={folder ?? "/"}
+              hub={hub}
+              onOpenFolder={openFolder}
+              onOpenFile={openFile}
+              onAction={onPathAction}
+              onBulk={setBulkAction}
+            />
           )}
         </section>
         <aside className="activity-wrap" aria-label="Activity feed">

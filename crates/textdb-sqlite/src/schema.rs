@@ -16,11 +16,23 @@ CREATE TABLE IF NOT EXISTS {p}node (
   created_at  TEXT    NOT NULL,
   updated_at  TEXT    NOT NULL,
   updated_by  TEXT,
-  deleted_at  TEXT    NULL
+  deleted_at  TEXT    NULL,
+  nwords      INTEGER,                        -- file: words, as wc -w counts them
+  nauthors    INTEGER,                        -- file: distinct commit authors (file_author rows)
+  -- Folder: totals of every live node below it, kept current by each commit, mkdir, move and
+  -- delete. Zero on files; a file's own figures are nbytes, nlines, nwords and version.
+  t_files      INTEGER NOT NULL DEFAULT 0,
+  t_folders    INTEGER NOT NULL DEFAULT 0,
+  t_bytes      INTEGER NOT NULL DEFAULT 0,
+  t_lines      INTEGER NOT NULL DEFAULT 0,
+  t_words      INTEGER NOT NULL DEFAULT 0,
+  t_versions   INTEGER NOT NULL DEFAULT 0,
+  t_updated_at TEXT    NULL                   -- the last change anywhere below
 );
 CREATE UNIQUE INDEX IF NOT EXISTS {p}node_path ON {p}node(path) WHERE deleted_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS {p}node_parent_name ON {p}node(parent_id, name) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS {p}node_parent ON {p}node(parent_id);
+CREATE INDEX IF NOT EXISTS {p}node_deleted ON {p}node(deleted_at) WHERE deleted_at IS NOT NULL;
 CREATE TABLE IF NOT EXISTS {p}commit (
   file_id      INTEGER NOT NULL,
   version      INTEGER NOT NULL,
@@ -77,7 +89,7 @@ CREATE TABLE IF NOT EXISTS {p}checkpoint (
 CREATE TABLE IF NOT EXISTS {p}change (
   seq          INTEGER PRIMARY KEY AUTOINCREMENT,
   ts           TEXT    NOT NULL,
-  op           TEXT    NOT NULL,              -- create, commit, mkdir, move, delete
+  op           TEXT    NOT NULL,              -- create, commit, mkdir, move, delete, purge
   node_id      INTEGER NOT NULL,
   node_kind    INTEGER NOT NULL,              -- 0 folder, 1 file
   path         TEXT    NOT NULL,              -- the path after the change
@@ -88,6 +100,38 @@ CREATE TABLE IF NOT EXISTS {p}change (
   author       TEXT    NULL,
   message      TEXT    NULL
 );
+CREATE INDEX IF NOT EXISTS {p}change_node ON {p}change(node_id);
+-- Path history (textdb_core::path): one row per node a rename, move or delete touched — the
+-- node it named and everything below a folder — next to the versions in `commit`.
+CREATE TABLE IF NOT EXISTS {p}path_event (
+  id           INTEGER PRIMARY KEY,
+  node_id      INTEGER NOT NULL,
+  node_kind    INTEGER NOT NULL,              -- 0 folder, 1 file
+  op           TEXT    NOT NULL,              -- rename, move, delete
+  ts           TEXT    NOT NULL,
+  author       TEXT    NULL,
+  old_path     TEXT    NOT NULL,
+  new_path     TEXT    NULL,                  -- rename, move: the path after
+  via          TEXT    NULL,                  -- the folder the operation named, when this node went with it
+  version      INTEGER NULL,                  -- a file's version when it happened
+  change_seq   INTEGER NULL                   -- the change feed row of the operation
+);
+CREATE INDEX IF NOT EXISTS {p}path_event_node ON {p}path_event(node_id, id);
+-- Store settings, e.g. `path_history` = on | off. A missing row means the default.
+CREATE TABLE IF NOT EXISTS {p}setting (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+-- Who wrote each file: one row per (file, author) with that author's commits. '' is a commit
+-- without an author.
+CREATE TABLE IF NOT EXISTS {p}file_author (
+  file_id  INTEGER NOT NULL,
+  author   TEXT    NOT NULL,
+  commits  INTEGER NOT NULL,
+  first_ts TEXT    NOT NULL,
+  last_ts  TEXT    NOT NULL,
+  PRIMARY KEY (file_id, author)
+) WITHOUT ROWID;
 CREATE VIRTUAL TABLE IF NOT EXISTS {p}fts USING fts5(text, content='', tokenize='unicode61');
 "#,
         p = p
@@ -95,17 +139,31 @@ CREATE VIRTUAL TABLE IF NOT EXISTS {p}fts USING fts5(text, content='', tokenize=
 }
 
 /// Columns added to existing tables after their first release, as `(table, column, type)`.
-const ADDED_COLUMNS: &[(&str, &str, &str)] = &[("commit", "kind", "TEXT"), ("commit", "base_version", "INTEGER")];
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("commit", "kind", "TEXT"),
+    ("commit", "base_version", "INTEGER"),
+    ("node", "nwords", "INTEGER"),
+    ("node", "nauthors", "INTEGER"),
+    ("node", "t_files", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "t_folders", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "t_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "t_lines", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "t_words", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "t_versions", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "t_updated_at", "TEXT NULL"),
+];
 
 /// Bring a store created by an earlier build up to this schema. Idempotent; returns the
 /// number of columns it had to add.
 ///
 /// New tables come from `create_sql`, which is all `IF NOT EXISTS`. A column added to an
 /// existing table needs `ALTER TABLE … ADD COLUMN`, which has no such clause, so each one is
-/// checked against `pragma_table_info` first.
+/// checked against `pragma_table_info` first. A store that gains the word, author and folder
+/// total columns has them computed from its content once, in the same savepoint, so no reader
+/// ever sees the columns without their values.
 pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> {
     conn.execute_batch(&create_sql(p))?;
-    let mut added = 0;
+    let mut missing = Vec::new();
     for (table, column, decl) in ADDED_COLUMNS {
         let present: bool = conn.query_row(
             &format!("SELECT count(*) > 0 FROM pragma_table_info('{p}{table}') WHERE name = ?1"),
@@ -113,16 +171,37 @@ pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> 
             |r| r.get(0),
         )?;
         if !present {
-            conn.execute_batch(&format!("ALTER TABLE {p}{table} ADD COLUMN {column} {decl}"))?;
-            added += 1;
+            missing.push((table, column, decl));
         }
     }
-    Ok(added)
+    if missing.is_empty() {
+        return Ok(0);
+    }
+    let backfill = missing.iter().any(|(table, _, _)| **table == "node");
+    conn.execute_batch("SAVEPOINT textdb_migrate")?;
+    let run = || -> rusqlite::Result<()> {
+        for (table, column, decl) in &missing {
+            conn.execute_batch(&format!("ALTER TABLE {p}{table} ADD COLUMN {column} {decl}"))?;
+        }
+        if backfill {
+            crate::stats::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+        }
+        Ok(())
+    };
+    match run() {
+        Ok(()) => conn.execute_batch("RELEASE textdb_migrate")?,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO textdb_migrate; RELEASE textdb_migrate");
+            return Err(e);
+        }
+    }
+    Ok(missing.len())
 }
 
 pub fn drop_sql(p: &str) -> String {
     [
-        "node", "commit", "chunk", "tree_node", "chunk_ref", "section", "link", "frontmatter", "checkpoint", "change", "fts",
+        "node", "commit", "chunk", "tree_node", "chunk_ref", "section", "link", "frontmatter", "checkpoint", "change", "path_event",
+        "setting", "file_author", "fts",
     ]
     .iter()
     .map(|t| format!("DROP TABLE IF EXISTS {}{};", p, t))

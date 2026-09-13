@@ -28,9 +28,11 @@ Postgres extension: absolute `/` paths, folders on demand, tombstone deletes, fu
 
 | Shell habit | textdb SQL (SQLite) |
 |---|---|
-| `ls /clients` | `SELECT * FROM textdb_ls('/clients');` |
+| `ls /clients` | `SELECT * FROM textdb_ls('/clients');` (a folder row's `nbytes`, `nlines`, `nwords`, `versions`, `files`, `folders` total everything below it; a file's `authors` is JSON, most commits first) |
+| `ls -lt` / `ls -R` | `SELECT path, updated_at FROM textdb_ls('/clients') ORDER BY updated_at DESC;` / `SELECT path FROM textdb_ls('/clients', 1);` |
 | `find /clients -name '*.md'` | `SELECT path FROM kb WHERE kind = 'file' AND path >= '/clients/' AND path < '/clients0' AND path LIKE '%.md';` |
-| `du -sb /clients` | `SELECT sum(nbytes) FROM kb WHERE kind = 'file' AND path >= '/clients/' AND path < '/clients0';` |
+| `du -sb /clients` | `SELECT json_extract(textdb_entry('/clients'), '$.nbytes');` (kept current; no subtree scan) |
+| `wc -w notes.md` | `SELECT nwords FROM textdb_ls('/clients/acme') WHERE name = 'notes.md';` |
 | `cat notes.md` | `SELECT content FROM kb WHERE path = '/clients/acme/notes.md';` or `SELECT textdb_content('/clients/acme/notes.md');` |
 | `sed -n '40,60p' notes.md` | `SELECT textdb_lines('/clients/acme/notes.md', 40, 60);` |
 | `head -20` / `tail -20` | `SELECT textdb_lines(p, 1, 20)` / `SELECT textdb_lines(path, nlines - 19, nlines) FROM kb WHERE path = p` |
@@ -45,10 +47,10 @@ Postgres extension: absolute `/` paths, folders on demand, tombstone deletes, fu
 | `echo "- done" >> journal.md` | `SELECT textdb_append('/clients/acme/journal.md', '- done' \|\| char(10), 'me');` |
 | `cat > new.md` (create/overwrite) | `INSERT INTO kb(path, content, author) VALUES ('/clients/acme/new.md', ?, 'me');` |
 | `mkdir -p /clients/acme/2027` | `INSERT INTO kb(path, kind) VALUES ('/clients/acme/2027', 'folder');` |
-| `mv notes.md notes-2026.md` | `UPDATE kb SET path = '/clients/acme/notes-2026.md' WHERE path = '/clients/acme/notes.md';` |
-| `mv /clients/acme /archive/acme` | `UPDATE kb SET path = '/archive/acme' WHERE path = '/clients/acme';` |
-| `rm notes.md` / `rm -r /archive` | `DELETE FROM kb WHERE path = '/clients/acme/notes.md';` / `DELETE FROM kb WHERE path = '/archive';` |
-| `git log notes.md` | `SELECT * FROM textdb_history('/clients/acme/notes.md');` |
+| `mv notes.md notes-2026.md` | `SELECT textdb_move('/clients/acme/notes.md', '/clients/acme/notes-2026.md', 'me');` (or `UPDATE kb SET path = … WHERE path = …`) |
+| `mv /clients/acme /archive/acme` | `SELECT textdb_move('/clients/acme', '/archive/acme', 'me');` |
+| `rm notes.md` / `rm -r /archive` | `SELECT textdb_delete('/clients/acme/notes.md', 'me');` / `SELECT textdb_delete('/archive', 'me');` (to the trash; `DELETE FROM kb WHERE path = …` too, without an author) |
+| `git log notes.md` | `SELECT * FROM textdb_history('/clients/acme/notes.md');` and `SELECT * FROM textdb_path_history('/clients/acme/notes.md');` (renames, moves, deletes) |
 | `git show v3:notes.md` | `SELECT textdb_content('/clients/acme/notes.md', 3);` |
 | `git diff v1 v2 -- notes.md` | `SELECT textdb_diff('/clients/acme/notes.md', 1, 2);` |
 | `git tag before-migration` | `SELECT textdb_checkpoint('before-migration');` |
@@ -96,4 +98,43 @@ SELECT * FROM textdb_history('/clients/acme/notes.md');
 SELECT textdb_content('/clients/acme/notes.md', 3);
 SELECT textdb_diff('/clients/acme/notes.md', 3, 7);
 SELECT textdb_checkpoint('before-bulk-rewrite');
+```
+
+### Renames, moves and deletes
+
+A rename, move or delete is recorded for every node it touched — a folder's move gives each
+file inside an entry with `via` = the folder — while the store's `path_history` setting is on
+(the default). These are not versions: version numbers only count content changes.
+
+```sql
+SELECT op, old_path, new_path, via, version, author, ts FROM textdb_path_history('/clients/acme/notes.md');
+SELECT textdb_setting('path_history');            -- NULL = default (on)
+SELECT textdb_setting('path_history', 'off');     -- stop recording for everyone; NULL as the value restores the default
+```
+
+## Trash
+
+Deletes are tombstones. Each delete is one trash item; entries are addressed by id because a
+path can be deleted, reused and deleted again.
+
+```sql
+SELECT textdb_trash();                             -- JSON: items, newest delete first: id, name, kind, path, files, nbytes, deleted_at, deleted_by
+SELECT textdb_trash(42);                           -- JSON: what was deleted inside trashed folder 42
+SELECT textdb_trash_content(57);                   -- a trashed file as it was deleted; textdb_trash_content(57, 2) for version 2
+SELECT textdb_trash_history(57);                   -- JSON: its versions
+SELECT * FROM textdb_path_history(NULL, 57);       -- its renames, moves and delete
+SELECT textdb_purge(42, 'me');                     -- gone for good, with everything deleted inside it; JSON stats
+SELECT textdb_empty_trash('me');                   -- purge every item
+```
+
+Purging cannot be undone. To bring something back, read it from the trash and write it again.
+
+## Following changes
+
+```sql
+SELECT textdb_last_seq();
+SELECT * FROM textdb_feed(1200);                   -- every create, commit, mkdir, move, delete, purge after seq 1200
+SELECT * FROM textdb_hunks('/clients/acme/notes.md', 6, 7);   -- what version 7 changed, as line hunks
+SELECT textdb_write('/clients/acme/notes.md', ?, 6, 'me', 'rewrite');           -- JSON {"version", "kind"}
+SELECT textdb_replace_lines('/clients/acme/notes.md', 12, 14, ?, 6, 'me');      -- lines as numbered in version 6
 ```

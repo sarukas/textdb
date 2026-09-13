@@ -74,15 +74,42 @@ impl From<std::io::Error> for StoreError {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Entry {
     pub path: String,
     pub name: String,
     /// `file` or `folder`.
     pub kind: String,
+    /// In `ls`, a folder's size, lines, words and versions are totals over every file below it.
     pub nbytes: Option<i64>,
     pub nlines: Option<i64>,
     pub updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nwords: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub versions: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
+    /// Folder: files and folders anywhere below it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folders: Option<i64>,
+    /// File: who committed to it, most commits first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub authors: Vec<Author>,
+}
+
+/// One author's commits to a file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Author {
+    /// `None` for commits made without an author.
+    pub author: Option<String>,
+    pub commits: i64,
+    #[serde(default)]
+    pub last_ts: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,6 +132,23 @@ pub struct Commit {
     pub nbytes: Option<i64>,
     pub kind: Option<String>,
     pub base_version: Option<i64>,
+}
+
+/// A rename, move or delete as it touched one file or folder.
+#[derive(Debug, Serialize)]
+pub struct PathEvent {
+    pub id: i64,
+    pub ts: String,
+    /// `rename`, `move` or `delete`.
+    pub op: String,
+    pub old_path: String,
+    /// Where it went; absent for a delete.
+    pub new_path: Option<String>,
+    /// The folder the operation named, when this file or folder went along with it.
+    pub via: Option<String>,
+    /// A file's version when it happened.
+    pub version: Option<i64>,
+    pub author: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -175,7 +219,9 @@ pub trait Store {
     fn init(&mut self) -> Result<()>;
     /// Every folder and file under `prefix` (not `prefix` itself unless it is a file).
     fn nodes(&mut self, prefix: &str) -> Result<Vec<Entry>>;
-    fn ls(&mut self, path: &str) -> Result<Vec<Entry>>;
+    /// The folder's entries by name, or with `recursive` everything below it by path. A folder's
+    /// size, lines, words and versions are totals over the files below it.
+    fn ls(&mut self, path: &str, recursive: bool) -> Result<Vec<Entry>>;
     fn stat(&mut self, path: &str) -> Result<Stat>;
     /// Content at `version` (HEAD when `None`) and the version it is.
     fn read(&mut self, path: &str, version: Option<i64>) -> Result<(Vec<u8>, i64)>;
@@ -206,6 +252,17 @@ pub trait Store {
     fn chunks(&mut self, path: &str, version: Option<i64>) -> Result<Vec<Chunk>>;
     fn mv(&mut self, from: &str, to: &str, author: Option<&str>) -> Result<()>;
     fn rm(&mut self, path: &str, author: Option<&str>) -> Result<()>;
+    /// Renames, moves and deletes of the file or folder at `path`, oldest first.
+    fn path_history(&mut self, path: &str) -> Result<Vec<PathEvent>>;
+    /// Record renames, moves and deletes on this connection (`Some(true)`), don't
+    /// (`Some(false)`), or follow the store's `path_history` setting (`None`).
+    fn set_session_path_history(&mut self, on: Option<bool>) -> Result<()>;
+    /// Whether this connection records renames, moves and deletes.
+    fn path_history_enabled(&mut self) -> Result<bool>;
+    /// A store setting's value; `None` at its default.
+    fn setting(&mut self, key: &str) -> Result<Option<String>>;
+    /// Set a store setting, or return it to its default with `None`; answers the stored value.
+    fn set_setting(&mut self, key: &str, value: Option<&str>) -> Result<Option<String>>;
     fn last_seq(&mut self) -> Result<i64>;
     fn feed(&mut self, since: i64, limit: i64) -> Result<Vec<Change>>;
     /// Return once another writer may have committed, or after `timeout`; waking early for

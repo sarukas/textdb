@@ -22,7 +22,8 @@ const OP: Record<ChangeOp, { glyph: string; label: string }> = {
   commit: { glyph: "~", label: "edited" },
   mkdir: { glyph: "▣", label: "folder created" },
   move: { glyph: "→", label: "moved" },
-  delete: { glyph: "−", label: "deleted" },
+  delete: { glyph: "−", label: "moved to trash" },
+  purge: { glyph: "×", label: "permanently removed" },
 };
 
 export function ActivityFeed({ items, author, own, open, onToggle, onOpen }: Props) {
@@ -98,7 +99,7 @@ function Who({ name }: { name: string | null }) {
 
 function EventRow({ event: e, own, now, onOpen }: RowProps & { event: ChangeEvent }) {
   const op = OP[e.op] ?? { glyph: "·", label: e.op };
-  const openable = e.node_kind === "file" && e.op !== "delete";
+  const openable = e.node_kind === "file" && e.op !== "delete" && e.op !== "purge";
   return (
     <button
       type="button"

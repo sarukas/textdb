@@ -27,9 +27,11 @@ psycopg, JDBC, …). Python: `pip install -e python/` from the repo gives `textd
 
 | Shell habit | textdb SQL |
 |---|---|
-| `ls /clients` | `SELECT * FROM kb.ls('/clients');` |
+| `ls /clients` | `SELECT * FROM kb.ls('/clients');` (a folder row's `nbytes`, `nlines`, `nwords`, `versions`, `files`, `folders` total everything below it; a file's `authors` is jsonb, most commits first) |
+| `ls -lt` / `ls -R` | `SELECT path, updated_at FROM kb.ls('/clients') ORDER BY updated_at DESC;` / `SELECT path FROM kb.ls('/clients', true);` |
 | `find /clients -name '*.md'` | `SELECT path FROM kb.file WHERE path LIKE '/clients/%' AND path LIKE '%.md' ORDER BY path;` |
-| `du -sh /clients` | `SELECT nbytes_total FROM kb.folder WHERE path = '/clients';` |
+| `du -sh /clients` | `SELECT nbytes FROM kb.entry WHERE path = '/clients';` (kept current; no subtree scan) |
+| `wc -w notes.md` | `SELECT nwords FROM kb.entry WHERE path = '/clients/acme/notes.md';` |
 | `cat notes.md` | `SELECT content FROM kb.file WHERE path = '/clients/acme/notes.md';` |
 | `sed -n '40,60p' notes.md` | `SELECT kb.lines('/clients/acme/notes.md', 40, 60);` |
 | `head -20 notes.md` / `tail -20 notes.md` | `SELECT kb.lines(p, 1, 20)` / `SELECT kb.lines(p, nlines - 19, nlines) FROM kb.file WHERE path = p` |
@@ -47,7 +49,8 @@ psycopg, JDBC, …). Python: `pip install -e python/` from the repo gives `textd
 | `mv notes.md notes-2026.md` | `UPDATE kb.file SET path = '/clients/acme/notes-2026.md' WHERE path = '/clients/acme/notes.md';` |
 | `mv /clients/acme /archive/acme` | `UPDATE kb.folder SET path = '/archive/acme' WHERE path = '/clients/acme';` |
 | `rm notes.md` / `rm -r /archive` | `DELETE FROM kb.file WHERE path = …;` / `DELETE FROM kb.folder WHERE path = '/archive';` (tombstones; history stays) |
-| `git log notes.md` | `SELECT * FROM kb.history('/clients/acme/notes.md');` |
+| `mv` with attribution | `SELECT kb.move('/clients/acme', '/archive/acme', 'me');` · `SELECT kb.remove('/archive/old', 'me');` |
+| `git log notes.md` | `SELECT * FROM kb.history('/clients/acme/notes.md');` and `SELECT * FROM kb.path_history('/clients/acme/notes.md');` (renames, moves, deletes) |
 | `git show HEAD~3:notes.md` | `SELECT kb.content('/clients/acme/notes.md', version - 3) FROM kb.file WHERE path = …;` |
 | `git diff v1 v2 -- notes.md` | `SELECT kb.diff('/clients/acme/notes.md', 1, 2);` |
 | `git tag before-migration` | `SELECT kb.checkpoint('before-migration');` |
@@ -71,6 +74,11 @@ SELECT kb.section('/clients/acme/notes.md', 'Open questions');               -- 
 ```
 
 `kb.lines` and `kb.section` cost O(fragment); `content` costs the whole document.
+
+Folder totals are written as insert-only rows in `kb.folder_delta` so concurrent commits never
+wait on a shared parent folder; `kb.entry` adds them in. A maintenance job can fold them with
+`SELECT kb.compact_folder_totals();`; `SELECT kb.rebuild_folder_totals();` recomputes every
+folder from its files if a move raced a commit inside the moved folder.
 
 ## Change
 
@@ -109,3 +117,19 @@ SELECT kb.diff('/clients/acme/notes.md', 3, 7);
 SELECT version, author, ts FROM kb.file_version WHERE path = '/clients/acme/notes.md' ORDER BY version DESC LIMIT 5;
 SELECT kb.checkpoint('before-bulk-rewrite');
 ```
+
+### Renames, moves and deletes
+
+Every rename, move and delete is recorded for each node it touched (a folder's move gives
+each file inside an entry with `via` = the folder), unless path history is off. They are not
+versions.
+
+```sql
+SELECT op, old_path, new_path, via, version, author, ts FROM kb.path_history('/clients/acme/notes.md');
+SELECT kb.path_history_enabled();                 -- session setting, else store setting, else true
+SET textdb.path_history = off;                    -- this session only, e.g. for a scripted reorganisation
+SELECT kb.set_setting('path_history', 'off');     -- the store default for everyone; NULL restores on
+```
+
+Postgres has no trash functions yet: a deleted file's versions stay readable with
+`kb.content(path, version)` and `kb.history(path)`.

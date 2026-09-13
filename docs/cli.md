@@ -25,6 +25,7 @@ extension built from this repository (see [INSTALL.md](INSTALL.md)).
 | Store | `--store`, `-s` | `TEXTDB_STORE` | `kb.db` |
 | Author of writes | `--author`, `-a` | `TEXTDB_AUTHOR` | `cli` |
 | JSON output | `--json` | | off |
+| Record renames, moves and deletes | `--path-history on\|off` | `TEXTDB_PATH_HISTORY` | the store's `path_history` setting, which is on unless changed with `textdb setting path_history off` |
 
 A store is a SQLite path (`kb.db`, `C:\data\kb.db`, `sqlite:kb.db`, `sqlite:///kb.db` relative,
 `sqlite:////srv/kb.db` absolute) or a Postgres URL (`postgres://user@host:5432/db`).
@@ -43,6 +44,62 @@ can be written without the leading slash (`guides/a.md` means `/guides/a.md`), o
 `MSYS_NO_PATHCONV=1`. `textdb` refuses a drive-letter path with this explanation rather than
 reporting it as not found.
 
+## Working with an external agent
+
+The CLI is all an agent needs: no server, no daemon, no SDK. Give each agent its own shell
+environment and its own author name, and the instructions in
+[`skills/textdb-cli/SKILL.md`](../skills/textdb-cli/SKILL.md).
+
+1. **Build once:** `cargo build --release -p textdb-cli` gives `target/release/textdb`
+   (`textdb.exe` on Windows). On Windows a running binary is locked, so if you keep
+   rebuilding while agents work, point the agents at a copy.
+2. **Set the agent's environment** in the shell its commands run in:
+
+   ```sh
+   export TEXTDB_STORE=/srv/corpus/kb.db           # a SQLite file, or postgres://user@host/db
+   export TEXTDB_AUTHOR=agent-7                    # one name per agent: history, the log and the web UI show it
+   export MSYS_NO_PATHCONV=1                       # Git Bash on Windows only
+   export PATH=/path/to/textdb/target/release:$PATH
+   textdb config                                   # prints store, author and path history, and where each came from
+   ```
+
+   Windows `cmd` (a `set` value takes no quotes; the setting lasts for that window):
+
+   ```bat
+   set TEXTDB_STORE=C:\data\kb.db
+   set TEXTDB_AUTHOR=agent-7
+   set PATH=C:\path\to\textdb\target\release;%PATH%
+   textdb config
+   ```
+
+   PowerShell: `$env:TEXTDB_STORE = 'C:\data\kb.db'; $env:TEXTDB_AUTHOR = 'agent-7'`. In `cmd`
+   and PowerShell a store path such as `/guides/a.md` reaches the program unchanged — only Git
+   Bash rewrites it. For multi-line text in `cmd`, put it in a file and pass `-f FILE`
+   (`echo … |` would add CRLF line endings).
+
+3. **Give it the instructions.** For Claude Code, copy `skills/textdb-cli` into the project's
+   `.claude/skills/` (or `~/.claude/skills/`); any other agent gets the contents of `SKILL.md`
+   in its prompt. A one-line brief that works:
+
+   > The documents are in a textdb store; use only the `textdb` command, as described in
+   > SKILL.md. Read with `textdb cat -n`, edit with `replace-lines -b <version>` or
+   > `edit --old/--new`, and on exit status 3 rebuild your change on the `theirs` text from
+   > the error and retry with the new version.
+
+4. **The loop it should follow:** find (`tree`, `ls`, `search`) → read (`cat -n`, remember
+   `vN` from the header) → change (`replace-lines PATH FROM TO -b N`, `edit --old … --new …`,
+   `append` for journals) → check (`hunks PATH`, `history PATH`). Add `--json` to any command
+   for machine-readable output; a refused write exits with 3 (conflict, payload has `theirs`
+   and `current_version`), 4 (store busy: retry), 5 (not found), 6 (invalid edit).
+5. **Follow what others do:** `textdb watch --json -p /some/folder` prints one JSON line per
+   change as it commits (SQLite: within ~100 ms; Postgres: on `NOTIFY`), and
+   `textdb log --since SEQ` reads the change log from a known point.
+6. **Alongside the web app:** the agent and the [demo app](demo-app.md) share the store file
+   directly; the agent's commits appear in open browsers attributed to `TEXTDB_AUTHOR`. The
+   server does not need to be running for the CLI to work.
+7. **Reorganising in bulk:** `--path-history off` (or `TEXTDB_PATH_HISTORY=off`) keeps a large
+   scripted reshuffle out of every file's history for that command.
+
 ## Commands
 
 | Command | What it does |
@@ -51,7 +108,7 @@ reporting it as not found.
 | `config` | Show settings and their sources |
 | `import DIR [--prefix /p] [--ext md,markdown,mdx,txt] [--batch 500]` | Load matching files; unchanged files make no new version. Hidden directories and `node_modules` are skipped |
 | `export PREFIX DIR` | Write every file under a folder to disk |
-| `ls [PATH]` | One folder: folders first, then files with size and line count |
+| `ls [PATH] [-l] [-s KEY] [-r] [-R]` | One folder: folders first, then files with size and line count. `-l` adds words, versions, last update, and a file's authors (commits each) or a folder's contents; a folder's size, lines, words and versions are totals of everything below it. `--sort` by `name`, `type`, `size`, `lines`, `words`, `versions`, `created`, `updated` or `authors`; `-r` reverses; `-R` lists everything below the folder by path |
 | `tree [PATH] [-L DEPTH] [-d]` | The folder tree with file counts and sizes; `--json` gives a flat, path-sorted list |
 | `stat PATH` | Kind, version, size, lines, last update and author |
 | `cat PATH [-n] [--lines A:B] [--version V] [--section HEADING]` | Content; `-n` numbers lines under a header `PATH vN · lines A-B of T` |
@@ -60,11 +117,12 @@ reporting it as not found.
 | `edit PATH --old TEXT --new TEXT` | Replace the one occurrence of `old`. Also `--old-file`/`--new-file`, or `--stdin-json` reading `{"old": …, "new": …}` |
 | `replace-lines PATH FROM TO [-b V] [--text T \| -f FILE \| stdin]` | Replace lines `FROM..TO` (1-based, inclusive) as numbered in version `V`; `TO = FROM-1` inserts before `FROM` |
 | `append PATH [TEXT]` | Append the argument (as a line) or stdin; never conflicts |
-| `history PATH` | Versions: time, author, how each landed (`direct`, `rebased`, `merged`) and its base |
+| `history PATH [--versions-only]` | Versions — time, author, how each landed (`direct`, `rebased`, `merged`) and its base — and, between them, the renames, moves and deletes that touched the file, including those of a folder it was in. A deleted file is found at the path it was deleted from |
 | `diff PATH V1 [V2]` | Unified diff; `V2` defaults to the current version |
 | `hunks PATH [V1 [V2]]` | Line hunks; defaults to the latest commit |
 | `chunks PATH [--version V]` | The content-defined chunks the file is stored as |
-| `mv FROM TO`, `rm PATH` | Move/rename and delete files or folders (history stays readable) |
+| `mv FROM TO`, `rm PATH` | Move/rename and delete files or folders. History stays readable, and each file or folder touched gets a `rename`, `move` or `delete` entry in its history while path history is on |
+| `setting [KEY [VALUE]]` | Show or change a store setting. `path_history` is `on` (default) or `off`; `default` clears it. `--path-history` overrides it for one command |
 | `log [--since SEQ] [--limit N]` | The change log: every create, commit, mkdir, move and delete, in order |
 | `watch [--since SEQ] [-p PREFIX]` | Follow the change log live — one line per change, JSON lines with `--json` |
 
@@ -108,9 +166,11 @@ EOF
 |---|---|
 | writes | `{"path", "version", "kind"}` |
 | `cat` | `{"path", "version", "nlines", "from", "to", "content"}` |
-| `ls`, `tree` | `[{"path", "name", "kind", "nbytes", "nlines", "updated_at"}]` |
+| `ls` | `[{"path", "name", "kind", "nbytes", "nlines", "updated_at", "nwords", "versions", "created_at", "updated_by", "files", "folders", "authors": [{"author", "commits", "last_ts"}]}]`; `files`/`folders` only for folders, `authors` only for files |
+| `tree` | `[{"path", "name", "kind", "nbytes", "nlines", "updated_at"}]` |
 | `stat` | `{"path", "kind", "version", "nbytes", "nlines", "updated_at", "updated_by"}` |
-| `history` | `[{"version", "author", "ts", "message", "nbytes", "kind", "base_version"}]` |
+| `history` | time-ordered `[{"type": "version", "version", "author", "ts", "message", "nbytes", "kind", "base_version"} \| {"type": "path", "id", "ts", "op", "old_path", "new_path", "via", "version", "author"}]`; `op` is `rename`, `move` or `delete`, `via` the folder the operation named when the file went along with it, `version` the file's version at the time. With `--versions-only`, the version objects without `type` |
+| `setting` | `{"path_history": {"value": "on" \| "off" \| null, "effective": true \| false}}` |
 | `hunks` | `{"path", "from", "to", "hunks": [{"old_from", "old_count", "new_from", "new_count", "old_text", "new_text"}]}` |
 | `log`, `watch` | `{"seq", "ts", "op", "path", "old_path", "node_kind", "version", "base_version", "commit_kind", "author", "message"}` |
 | `search` | `[{"path", "line", "snippet", "rank"}]` |

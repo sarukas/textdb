@@ -1,17 +1,22 @@
 import path from 'node:path';
 import { openConnection, resolveExtension } from './connection.ts';
-import { NotFound, TextdbError } from './errors.ts';
+import { InvalidEdit, NotFound, TextdbError } from './errors.ts';
 import { Sql, asText, placeholders } from './sql.ts';
-import type {
-  Change,
-  Chunk,
-  Entry,
-  FileView,
-  HistoryEntry,
-  Hunk,
-  Info,
-  SearchHit,
-  WriteResult,
+import {
+  type AuthorCount,
+  type Change,
+  type Chunk,
+  type Entry,
+  type FileView,
+  type HistoryEntry,
+  type Hunk,
+  type Info,
+  type ListOptions,
+  type ListPage,
+  SORT_KEYS,
+  type SearchHit,
+  type SortKey,
+  type WriteResult,
 } from './types.ts';
 import { type WatchOptions, Watcher } from './watch.ts';
 
@@ -53,6 +58,77 @@ export interface ImportStats {
   failures: ImportFailure[];
 }
 
+/** A rename, move or delete as it touched one file or folder. */
+export interface PathEvent {
+  id: number;
+  ts: string;
+  op: 'rename' | 'move' | 'delete';
+  old_path: string;
+  /** Where it went; null for a delete. */
+  new_path: string | null;
+  /** The folder the operation named, when this file or folder went along with it. */
+  via: string | null;
+  /** A file's version when it happened. */
+  version: number | null;
+  author: string | null;
+}
+
+/** Something a delete left behind, readable until it is purged. */
+export interface TrashEntry {
+  id: number;
+  name: string;
+  kind: 'file' | 'folder';
+  /** Where it was when it was deleted. */
+  path: string;
+  version: number;
+  /** A file's size; for a folder, the total of the files deleted with it. */
+  nbytes: number;
+  nlines: number | null;
+  /** 1 for a file; for a folder, the files deleted with it. */
+  files: number;
+  updated_at: string;
+  updated_by: string | null;
+  deleted_at: string;
+  deleted_by: string | null;
+}
+
+export interface PurgeStats {
+  /** Trash items removed whole. */
+  items: number;
+  files: number;
+  folders: number;
+  versions: number;
+  chunks: number;
+  tree_nodes: number;
+  /** Content bytes freed: what nothing remaining shares. */
+  bytes: number;
+}
+
+export interface BulkOptions extends AuthorOptions {
+  /** A move's destination folder; created when missing. */
+  to?: string;
+}
+
+export interface BulkResult {
+  op: 'move' | 'delete';
+  /** A move's destination folder; null for a delete. */
+  to: string | null;
+  /** The paths moved or deleted, sorted. */
+  done: string[];
+  /** Paths that went with a listed folder, or were already in the destination. */
+  skipped: string[];
+}
+
+export interface Stat {
+  path: string;
+  kind: 'file' | 'folder';
+  /** Files in the subtree (1 for a file). */
+  files: number;
+  /** Folders below a folder, not counting itself. */
+  folders: number;
+  nbytes: number;
+}
+
 export function openCorpus(options: OpenOptions): Corpus {
   const extension = resolveExtension(options.extension);
   const db = options.db === ':memory:' ? options.db : path.resolve(options.db);
@@ -65,6 +141,40 @@ export function openCorpus(options: OpenOptions): Corpus {
     throw error;
   }
   return new Corpus(sql, db, extension, options.author ?? null);
+}
+
+const ENTRY_COLS =
+  'id, name, path, kind, nbytes, nlines, nwords, versions, updated_at, updated_by, created_at, files, folders, nauthors, authors';
+
+type EntryRow = Omit<Entry, 'authors'> & { authors: string };
+
+function toEntry({ authors, ...row }: EntryRow & { total?: number }): Entry {
+  delete row.total;
+  return { ...row, authors: JSON.parse(authors) as AuthorCount[] };
+}
+
+/** A file's extension, lower-cased, '' for folders and names without one (SQL over `textdb_ls` rows). */
+const EXTENSION_SQL =
+  "CASE WHEN kind = 'folder' OR instr(name, '.') = 0 THEN '' ELSE lower(replace(name, rtrim(name, replace(name, '.', '')), '')) END";
+
+const SORT_SQL: Record<SortKey, string> = {
+  name: 'name COLLATE NOCASE',
+  type: EXTENSION_SQL,
+  size: 'nbytes',
+  lines: 'nlines',
+  words: 'nwords',
+  versions: 'versions',
+  created: 'created_at',
+  updated: 'updated_at',
+  authors: 'coalesce(nauthors, 0)',
+};
+
+const MAX_PAGE = 1000;
+
+/** A LIKE pattern: a glob when `q` has `*` or `?`, otherwise "contains". */
+export function namePattern(q: string): string {
+  const escaped = q.replace(/[\\%_]/g, (c) => `\\${c}`);
+  return /[*?]/.test(q) ? escaped.replace(/\*/g, '%').replace(/\?/g, '_') : `%${escaped}%`;
 }
 
 interface HeadRow {
@@ -96,8 +206,48 @@ export class Corpus {
 
   /** One folder level: folders first, then files, each in the store's name order. */
   ls(dir = '/'): Entry[] {
-    const rows = this.sql.all<Entry>('SELECT name, path, kind, nbytes, nlines, updated_at FROM textdb_ls(?)', dir);
-    return rows.sort((a, b) => Number(a.kind === 'file') - Number(b.kind === 'file'));
+    const rows = this.sql.all<EntryRow>(`SELECT ${ENTRY_COLS} FROM textdb_ls(?)`, dir);
+    return rows.map(toEntry).sort((a, b) => Number(a.kind === 'file') - Number(b.kind === 'file'));
+  }
+
+  /** A page of a folder's entries (or, recursive, of everything below it), sorted and filtered in the store. */
+  list(dir = '/', options: ListOptions = {}): ListPage {
+    const key = options.sort ?? 'name';
+    if (!SORT_KEYS.includes(key)) throw new InvalidEdit(`sort must be one of ${SORT_KEYS.join(', ')}`);
+    const order = options.order === 'desc' ? 'DESC' : 'ASC';
+    const offset = Math.max(0, Math.trunc(options.offset ?? 0));
+    const limit = Math.min(MAX_PAGE, Math.max(1, Math.trunc(options.limit ?? 200)));
+    const where: string[] = [];
+    const params: (string | number)[] = [dir, options.recursive ? 1 : 0];
+    if (options.name) {
+      where.push("name LIKE ? ESCAPE '\\'");
+      params.push(namePattern(options.name));
+    }
+    if (options.author !== undefined) {
+      where.push("EXISTS (SELECT 1 FROM json_each(authors) WHERE coalesce(json_extract(value, '$.author'), '') = ?)");
+      params.push(options.author);
+    }
+    if (options.type) {
+      where.push(`${EXTENSION_SQL} = lower(?)`);
+      params.push(options.type.replace(/^\./, ''));
+    }
+    if (options.kind) {
+      where.push('kind = ?');
+      params.push(options.kind);
+    }
+    const filter = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    // A recursive listing keeps each folder with what is inside it; one level lists folders first.
+    const groups = options.recursive ? '' : "kind = 'file', ";
+    const tie = options.recursive ? 'path' : 'name';
+    const rows = this.sql.all<EntryRow & { total: number }>(
+      `SELECT ${ENTRY_COLS}, count(*) OVER () AS total FROM textdb_ls(?, ?) ${filter}
+       ORDER BY ${groups}${SORT_SQL[key]} ${order}, ${tie} ${order} LIMIT ? OFFSET ?`,
+      ...params,
+      limit,
+      offset,
+    );
+    const total = rows[0]?.total ?? Number(this.sql.value(`SELECT count(*) FROM textdb_ls(?, ?) ${filter}`, ...params));
+    return { path: dir, total, offset, entries: rows.map(toEntry) };
   }
 
   read(filePath: string, version?: number): FileView {
@@ -143,6 +293,32 @@ export class Corpus {
       'SELECT version, author, ts, message, nbytes, kind, base_version FROM textdb_history(?)',
       filePath,
     );
+  }
+
+  /** Renames, moves and deletes of the file or folder at `filePath`, oldest first. */
+  pathHistory(filePath: string): PathEvent[] {
+    return this.sql.all<PathEvent>(
+      'SELECT id, ts, op, old_path, new_path, via, version, author FROM textdb_path_history(?)',
+      filePath,
+    );
+  }
+
+  /** As `pathHistory`, for the node with this id (a trash entry). */
+  pathHistoryOf(id: number): PathEvent[] {
+    return this.sql.all<PathEvent>(
+      'SELECT id, ts, op, old_path, new_path, via, version, author FROM textdb_path_history(NULL, ?)',
+      id,
+    );
+  }
+
+  /** A store setting (`path_history`); null at its default. */
+  setting(key: string): string | null {
+    return (this.sql.value('SELECT textdb_setting(?)', key) as string | null) ?? null;
+  }
+
+  /** Sets a store setting, or returns it to its default with null; answers the stored value. */
+  setSetting(key: string, value: string | null): string | null {
+    return (this.sql.value('SELECT textdb_setting(?, ?)', key, value) as string | null) ?? null;
   }
 
   /** Line hunks turning `from` into `to`; `to` defaults to HEAD and `from` to `to - 1`. */
@@ -211,16 +387,101 @@ export class Corpus {
   }
 
   /** Moves a file or a whole folder. */
+  /** Moves or renames a file, or a folder with everything below it. */
   move(from: string, to: string, options: AuthorOptions = {}): void {
-    if (this.sql.run('UPDATE kb SET path = ?, author = ? WHERE path = ?', to, this.authorOf(options), from) === 0) {
-      throw new NotFound(`not found: ${from}`);
-    }
+    this.sql.value('SELECT textdb_move(?, ?, ?)', from, to, this.authorOf(options));
   }
 
-  remove(filePath: string): void {
-    if (this.sql.run('DELETE FROM kb WHERE path = ?', filePath) === 0) {
-      throw new NotFound(`not found: ${filePath}`);
-    }
+  /** Deletes a file, or a folder with everything below it. History stays in the store. */
+  remove(target: string, options: AuthorOptions = {}): void {
+    this.sql.value('SELECT textdb_delete(?, ?)', target, this.authorOf(options));
+  }
+
+  /** One file or folder as a listing shows it; the root too. */
+  entry(target: string): Entry {
+    return JSON.parse(String(this.sql.value('SELECT textdb_entry(?)', target))) as Entry;
+  }
+
+  /**
+   * Moves several files and folders into the folder `to`, keeping their names, or deletes them —
+   * in one transaction, so a failure leaves all of them as they were. A path inside another
+   * listed folder goes along with that folder and is reported as skipped, as is a move to where
+   * a path already is.
+   */
+  bulk(op: 'move' | 'delete', paths: readonly string[], options: BulkOptions = {}): BulkResult {
+    const unique = [...new Set(paths)].sort();
+    const covered = (p: string) => unique.some((q) => q !== p && (q === '/' || p.startsWith(`${q}/`)));
+    const to = op === 'move' ? `/${(options.to ?? '').split('/').filter(Boolean).join('/')}` : null;
+    if (op === 'move' && !options.to) throw new InvalidEdit('a bulk move needs a destination folder');
+    const done: string[] = [];
+    const skipped: string[] = [];
+    this.transaction(() => {
+      for (const p of unique) {
+        const name = p.slice(p.lastIndexOf('/') + 1);
+        const target = to === null ? null : `${to === '/' ? '' : to}/${name}`;
+        if (covered(p) || target === p) {
+          skipped.push(p);
+          continue;
+        }
+        try {
+          if (target === null) this.remove(p, options);
+          else this.move(p, target, options);
+        } catch (error) {
+          if (error instanceof Error) error.message = `${p}: ${error.message}`;
+          throw error;
+        }
+        done.push(p);
+      }
+    });
+    return { op, to, done, skipped };
+  }
+
+  /** Trash items, newest delete first; with `parent`, what was deleted inside that trashed folder. */
+  trash(parent?: number): TrashEntry[] {
+    return JSON.parse(String(this.sql.value('SELECT textdb_trash(?)', parent ?? null))) as TrashEntry[];
+  }
+
+  trashEntry(id: number): TrashEntry {
+    return JSON.parse(String(this.sql.value('SELECT textdb_trash_entry(?)', id))) as TrashEntry;
+  }
+
+  /** A trashed file's content at `version`, or as it was when deleted. */
+  trashRead(id: number, version?: number): string {
+    return asText(this.sql.value('SELECT textdb_trash_content(?, ?)', id, version ?? null));
+  }
+
+  trashHistory(id: number): HistoryEntry[] {
+    return JSON.parse(String(this.sql.value('SELECT textdb_trash_history(?)', id))) as HistoryEntry[];
+  }
+
+  /** Removes a trash entry, and everything deleted with it inside, for good. */
+  purge(id: number, options: AuthorOptions = {}): PurgeStats {
+    return JSON.parse(String(this.sql.value('SELECT textdb_purge(?, ?)', id, this.authorOf(options)))) as PurgeStats;
+  }
+
+  /** Purges every trash item. */
+  emptyTrash(options: AuthorOptions = {}): PurgeStats {
+    return JSON.parse(String(this.sql.value('SELECT textdb_empty_trash(?)', this.authorOf(options)))) as PurgeStats;
+  }
+
+  /** What `target` holds: one file, or a folder with the files and folders anywhere below it. */
+  stat(target: string): Stat {
+    const node = this.sql.get<{ path: string; kind: 'file' | 'folder'; nbytes: number | null }>(
+      'SELECT path, kind, nbytes FROM kb WHERE path = ?',
+      target,
+    );
+    if (!node) throw new NotFound(`not found: ${target}`);
+    if (node.kind === 'file') return { path: node.path, kind: 'file', files: 1, folders: 0, nbytes: node.nbytes ?? 0 };
+    // Everything strictly below the folder sorts between "<folder>/" and "<folder>0".
+    const base = node.path === '/' ? '' : node.path;
+    const below = this.sql.get<{ files: number; folders: number; nbytes: number }>(
+      `SELECT count(*) FILTER (WHERE kind = 'file') AS files, count(*) FILTER (WHERE kind = 'folder') AS folders,
+              coalesce(sum(nbytes), 0) AS nbytes
+         FROM kb WHERE path > ? AND path < ?`,
+      `${base}/`,
+      `${base}0`,
+    );
+    return { path: node.path, kind: 'folder', files: Number(below?.files ?? 0), folders: Number(below?.folders ?? 0), nbytes: Number(below?.nbytes ?? 0) };
   }
 
   lastSeq(): number {

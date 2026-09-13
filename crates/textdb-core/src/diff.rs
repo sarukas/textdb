@@ -256,7 +256,7 @@ pub fn unified_diff<S: Storage + ?Sized>(storage: &S, a: &Hash, b: &Hash, contex
 }
 
 /// [`changed_runs`] widened to whole lines on both sides, with runs that touch merged.
-fn changed_line_regions<S: Storage + ?Sized>(storage: &S, a: &Hash, b: &Hash) -> Result<Vec<ChangedRun>> {
+pub(crate) fn changed_line_regions<S: Storage + ?Sized>(storage: &S, a: &Hash, b: &Hash) -> Result<Vec<ChangedRun>> {
     let runs = changed_runs(storage, a, b)?;
     if runs.is_empty() {
         return Ok(Vec::new());

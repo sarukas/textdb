@@ -104,7 +104,22 @@ describe('corpus', () => {
     kb.write('/feed/a.md', 'x\n', { author: 'alice' });
     kb.write('/feed/a.md', 'y\n', { author: 'bob' });
     kb.move('/feed/a.md', '/moved/a.md', { author: 'carol' });
-    kb.remove('/moved');
+    kb.remove('/moved', { author: 'dave' });
+
+    assert.deepEqual(
+      kb.pathHistory('/moved/a.md').map((e) => [e.op, e.old_path, e.new_path, e.via, e.version, e.author]),
+      [
+        ['move', '/feed/a.md', '/moved/a.md', null, 2, 'carol'],
+        ['delete', '/moved/a.md', null, '/moved', 2, 'dave'],
+      ],
+    );
+    const [first] = kb.pathHistory('/moved/a.md');
+    assert.equal(kb.pathHistoryOf(kb.trash(Number(kb.trash()[0]!.id))[0]!.id).length, 2);
+    assert.match(first!.ts, /^\d{4}-\d\d-\d\dT/);
+    assert.equal(kb.setting('path_history'), null);
+    assert.equal(kb.setSetting('path_history', 'off'), 'off');
+    assert.equal(kb.setSetting('path_history', null), null);
+    assert.throws(() => kb.setting('colour'), InvalidEdit);
 
     const rows = kb.feed(since);
     assert.deepEqual(
@@ -115,7 +130,7 @@ describe('corpus', () => {
         ['commit', '/feed/a.md', null, 'file', 2, 1, 'direct', 'bob'],
         ['mkdir', '/moved', null, 'folder', null, null, null, null],
         ['move', '/moved/a.md', '/feed/a.md', 'file', null, null, null, 'carol'],
-        ['delete', '/moved', null, 'folder', null, null, null, null],
+        ['delete', '/moved', null, 'folder', null, null, null, 'dave'],
       ],
     );
     assert.ok(rows.every((r, i) => i === 0 || r.seq > rows[i - 1]!.seq));
@@ -136,5 +151,65 @@ describe('corpus', () => {
       }),
     );
     assert.throws(() => kb.read('/tx/3.md'), NotFound);
+  });
+
+  test('list sorts, filters and pages with words, authors and folder totals', () => {
+    kb.write('/lst/b.md', 'alpha beta gamma\n', { author: 'ann' });
+    kb.write('/lst/b.md', 'alpha beta gamma\ndelta\n', { author: 'bo' });
+    kb.write('/lst/a.txt', 'one\n', { author: 'ann' });
+    kb.write('/lst/sub/c.md', 'x y\n', { author: 'cy' });
+
+    const page = kb.list('/lst', { sort: 'words', order: 'desc' });
+    assert.equal(page.total, 3);
+    assert.deepEqual(
+      page.entries.map((e) => [e.name, e.nwords]),
+      [
+        ['sub', 2],
+        ['b.md', 4],
+        ['a.txt', 1],
+      ],
+    );
+    const sub = page.entries[0]!;
+    const b = page.entries[1]!;
+    assert.deepEqual([sub.kind, sub.files, sub.folders, sub.nbytes, sub.versions, sub.authors], ['folder', 1, 0, 4, 1, []]);
+    assert.deepEqual([b.versions, b.nauthors, b.authors.map((a) => a.author).sort()], [2, 2, ['ann', 'bo']]);
+
+    assert.deepEqual(kb.list('/lst', { type: '.md' }).entries.map((e) => e.name), ['b.md']);
+    assert.deepEqual(
+      kb.list('/lst', { recursive: true, name: '*.md' }).entries.map((e) => e.path),
+      ['/lst/b.md', '/lst/sub/c.md'],
+    );
+    assert.deepEqual(kb.list('/lst', { recursive: true, author: 'cy' }).entries.map((e) => e.path), ['/lst/sub/c.md']);
+    assert.deepEqual(kb.list('/lst', { name: '50%' }).total, 0);
+
+    const last = kb.list('/lst', { limit: 2, offset: 2 });
+    assert.deepEqual([last.total, last.entries.map((e) => e.name)], [3, ['b.md']]);
+    assert.deepEqual([kb.list('/lst', { offset: 10 }).total, kb.list('/lst', { offset: 10 }).entries], [3, []]);
+    assert.throws(() => kb.list('/lst', { sort: 'colour' as never }), InvalidEdit);
+  });
+
+  test('entry describes any node; bulk moves or deletes several in one transaction', () => {
+    kb.write('/bulk/a/x.md', 'x\n');
+    kb.write('/bulk/a/y.md', 'y y\n');
+    kb.write('/bulk/b.md', 'b\n');
+    const root = kb.entry('/');
+    assert.equal(root.kind, 'folder');
+    assert.ok((root.files ?? 0) >= 3);
+    assert.deepEqual([kb.entry('/bulk').files, kb.entry('/bulk').folders, kb.entry('/bulk/a/y.md').nwords], [3, 1, 2]);
+
+    // A path inside a listed folder goes with the folder.
+    assert.deepEqual(kb.bulk('move', ['/bulk/b.md', '/bulk/a/x.md', '/bulk/a'], { to: '/moved' }), {
+      op: 'move',
+      to: '/moved',
+      done: ['/bulk/a', '/bulk/b.md'],
+      skipped: ['/bulk/a/x.md'],
+    });
+    assert.deepEqual(kb.list('/moved').entries.map((e) => e.path), ['/moved/a', '/moved/b.md']);
+    // All or nothing: the second path fails, so the first stays where it was.
+    assert.throws(() => kb.bulk('move', ['/moved/b.md', '/nope.md'], { to: '/bulk' }), NotFound);
+    assert.equal(kb.entry('/moved/b.md').kind, 'file');
+
+    assert.deepEqual(kb.bulk('delete', ['/moved/a', '/moved/b.md']).done, ['/moved/a', '/moved/b.md']);
+    assert.equal(kb.entry('/moved').files, 0);
   });
 });

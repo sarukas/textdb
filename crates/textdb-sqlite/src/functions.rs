@@ -74,6 +74,36 @@ fn opt_str(ctx: &Context, i: usize) -> Result<Option<String>> {
     arg_str(ctx, i).map(Some)
 }
 
+fn trash_json(e: &crate::trash::TrashEntry) -> serde_json::Value {
+    serde_json::json!({
+        "id": e.id,
+        "name": e.name,
+        "kind": if e.kind == 1 { "file" } else { "folder" },
+        "path": e.path,
+        "version": e.version,
+        "nbytes": e.nbytes,
+        "nlines": e.nlines,
+        "files": e.files,
+        "updated_at": e.updated_at,
+        "updated_by": e.updated_by,
+        "deleted_at": e.deleted_at,
+        "deleted_by": e.deleted_by,
+    })
+}
+
+fn purge_json(s: &crate::trash::PurgeStats) -> String {
+    serde_json::json!({
+        "items": s.items,
+        "files": s.files,
+        "folders": s.folders,
+        "versions": s.versions,
+        "chunks": s.chunks,
+        "tree_nodes": s.tree_nodes,
+        "bytes": s.bytes,
+    })
+    .to_string()
+}
+
 /// A write's outcome as JSON, `{"version":3,"kind":"rebased"}`. A caller showing how its
 /// commit landed needs the kind as well as the version, and a scalar returns one value.
 fn write_json(r: &crate::db::WriteResult) -> String {
@@ -220,6 +250,105 @@ pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
     })?;
     let p = prefix.to_string();
     conn.create_scalar_function("textdb_last_seq", 0, flags, move |ctx| with_db(ctx, h, &p, |db| db.last_seq()))?;
+    // Moving and deleting through the `kb` table cannot always carry an author (a DELETE has
+    // no column values), so these name one explicitly. Both act on a whole folder subtree.
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_move", -1, flags, move |ctx| {
+        if ctx.len() < 2 {
+            return Err(Error::UserFunctionError("textdb_move(from, to[, author])".into()));
+        }
+        let from = arg_str(ctx, 0)?;
+        let to = arg_str(ctx, 1)?;
+        let author = opt_str(ctx, 2)?.filter(|a| !a.is_empty());
+        with_db(ctx, h, &p, |db| db.rename_by(&from, &to, author.as_deref()).map(|()| 1i64))
+    })?;
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_delete", -1, flags, move |ctx| {
+        if ctx.is_empty() {
+            return Err(Error::UserFunctionError("textdb_delete(path[, author])".into()));
+        }
+        let path = arg_str(ctx, 0)?;
+        let author = opt_str(ctx, 1)?.filter(|a| !a.is_empty());
+        with_db(ctx, h, &p, |db| db.delete_by(&path, author.as_deref()).map(|()| 1i64))
+    })?;
+    // Store settings: `textdb_setting(key)` reads (NULL at the default), `textdb_setting(key,
+    // value)` sets and `textdb_setting(key, NULL)` returns it to its default.
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_setting", -1, flags, move |ctx| {
+        if ctx.is_empty() || ctx.len() > 2 {
+            return Err(Error::UserFunctionError("textdb_setting(key[, value])".into()));
+        }
+        let key = arg_str(ctx, 0)?;
+        let value = if ctx.len() == 2 { Some(opt_str(ctx, 1)?) } else { None };
+        with_db(ctx, h, &p, |db| {
+            if let Some(v) = &value {
+                db.set_setting(&key, v.as_deref())?;
+            }
+            db.setting(&key)
+        })
+    })?;
+    // The trash: what deletes left behind, readable until purged. Entries are addressed by
+    // id, since a path may have been deleted more than once or reused since.
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_trash", -1, flags, move |ctx| {
+        let parent = opt_i64(ctx, 0)?;
+        let entries = with_db(ctx, h, &p, |db| db.trash(parent))?;
+        Ok(serde_json::Value::Array(entries.iter().map(trash_json).collect()).to_string())
+    })?;
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_trash_entry", 1, flags, move |ctx| {
+        let id = arg_i64(ctx, 0)?;
+        Ok(trash_json(&with_db(ctx, h, &p, |db| db.trash_entry(id))?).to_string())
+    })?;
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_trash_content", -1, flags, move |ctx| {
+        if ctx.is_empty() {
+            return Err(Error::UserFunctionError("textdb_trash_content(id[, version])".into()));
+        }
+        let id = arg_i64(ctx, 0)?;
+        let version = opt_i64(ctx, 1)?.map(|v| v.max(0) as u64);
+        let (bytes, utf8) = with_db(ctx, h, &p, |db| db.trash_read(id, version))?;
+        Ok(text_or_blob_checked(&bytes, utf8))
+    })?;
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_trash_history", 1, flags, move |ctx| {
+        let id = arg_i64(ctx, 0)?;
+        let commits = with_db(ctx, h, &p, |db| db.trash_history(id))?;
+        let rows = commits
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "version": c.version,
+                    "author": c.author,
+                    "ts": c.ts,
+                    "message": c.message,
+                    "nbytes": c.nbytes,
+                    "kind": c.kind,
+                    "base_version": c.base_version,
+                })
+            })
+            .collect();
+        Ok(serde_json::Value::Array(rows).to_string())
+    })?;
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_purge", -1, flags, move |ctx| {
+        if ctx.is_empty() {
+            return Err(Error::UserFunctionError("textdb_purge(id[, author])".into()));
+        }
+        let id = arg_i64(ctx, 0)?;
+        let author = opt_str(ctx, 1)?.filter(|a| !a.is_empty());
+        Ok(purge_json(&with_db(ctx, h, &p, |db| db.purge(id, author.as_deref()))?))
+    })?;
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_empty_trash", -1, flags, move |ctx| {
+        let author = opt_str(ctx, 0)?.filter(|a| !a.is_empty());
+        Ok(purge_json(&with_db(ctx, h, &p, |db| db.empty_trash(author.as_deref()))?))
+    })?;
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_entry", 1, flags, move |ctx| {
+        let path = arg_str(ctx, 0)?;
+        Ok(with_db(ctx, h, &p, |db| db.entry(&path))?.to_json().to_string())
+    })?;
     let p = prefix.to_string();
     conn.create_scalar_function("textdb_migrate", 0, flags, move |ctx| {
         let added = with_db(ctx, h, &p, |db| crate::schema::migrate(db.conn, &db.p).map_err(crate::storage::sql_err))?;
