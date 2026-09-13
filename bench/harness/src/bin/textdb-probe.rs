@@ -509,6 +509,81 @@ fn probe_writepath() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How much of a tree walk is the walk, and how much is the bytes?
+///
+/// `Storage::get_node` returns `Node` by value, so every node access clones a `Vec<Child>`
+/// of up to `MAX_FANOUT` entries, and `tree::Cursor` holds nodes by value too, so cloning a
+/// cursor deep-copies its whole path. An `Arc<Node>` would make both pointer bumps — the
+/// same move `chunk_shared` already made for chunk bytes. Whether that is worth doing is a
+/// question about the ratio below, not a matter of taste: if materialising a document runs
+/// near memcpy speed then the walk is not where the time is.
+fn probe_tree() -> anyhow::Result<()> {
+    use textdb_core::{storage::MemStorage, ChunkParams};
+    println!("## tree — walk overhead against the cost of the bytes themselves\n");
+    // `MemStorage` takes the default `chunk_shared`, which allocates a fresh `Arc` and copies
+    // the chunk into it on every leaf. `SqliteStorage` overrides that and hands out the cached
+    // `Arc`, so the materialize column here is an upper bound on the real path, not a
+    // measurement of it. It is still the right vehicle for the edit scaling below, which is
+    // about the algorithm rather than the binding.
+    println!("  (materialize over MemStorage, whose default chunk_shared copies per leaf: an upper bound)");
+    for size in [1usize << 20, 8 << 20, 32 << 20] {
+        let body = corpus(size, 5).into_bytes();
+        let mut mem = MemStorage::new();
+        let root = textdb_core::build(&mut mem, &ChunkParams::DEFAULT, &body).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let leaves = textdb_core::tree::leaves(&mem, &root).map_err(|e| anyhow::anyhow!("{e}"))?.len();
+        let depth = textdb_core::tree::depth(&mem, &root).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let reps = (64 << 20) / size;
+        let walk = timed(reps, |_| {
+            let v = textdb_core::materialize(&mem, &root).unwrap();
+            assert_eq!(std::hint::black_box(&v).len(), body.len());
+        });
+        // The floor: one allocation and one copy of the same bytes, no tree involved.
+        // `black_box` both ways, or the optimiser deletes a clone nobody reads.
+        let copy = timed(reps, |_| {
+            let v = std::hint::black_box(&body).clone();
+            assert_eq!(std::hint::black_box(&v).len(), body.len());
+        });
+        println!(
+            "  {:>6}  {:6} leaves, depth {}, {:4} internal nodes | materialize {:8.3} ms ({:.0} MB/s) | plain copy {:8.3} ms ({:.0} MB/s) | {:.2}x",
+            label(size),
+            leaves,
+            depth,
+            mem.nodes.len(),
+            walk,
+            size as f64 / 1e6 / (walk / 1e3),
+            copy,
+            size as f64 / 1e6 / (copy / 1e3),
+            walk / copy
+        );
+    }
+    // The edit path is where cursors get cloned: `apply_one` clones a whole `Cursor` — and
+    // so every `Node` on its path — for each suffix leaf it pulls into the re-chunk window,
+    // and `rebuild_level` clones the path again per level. If that mattered, the cost of one
+    // small edit would grow with the document. Claim O1 says it should not.
+    println!("\n  one 10-byte edit in the middle, by document size (claim O1: cost of the edit, not the file)");
+    for size in [1usize << 20, 8 << 20, 32 << 20] {
+        let body = corpus(size, 6).into_bytes();
+        let mut mem = MemStorage::new();
+        let root = textdb_core::build(&mut mem, &ChunkParams::DEFAULT, &body).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let at = (size / 2) as u64;
+        let depth = textdb_core::tree::depth(&mem, &root).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let reps = 200;
+        let edit = timed(reps, |_| {
+            let er = textdb_core::edit::apply_edits(
+                &mut mem,
+                &ChunkParams::DEFAULT,
+                &root,
+                &[textdb_core::Edit::new(at, at + 10, b"CHANGED".to_vec())],
+            )
+            .unwrap();
+            std::hint::black_box(er.root);
+        });
+        println!("    {:>6}  depth {}  apply_edits {:8.4} ms", label(size), depth, edit);
+    }
+    println!();
+    Ok(())
+}
+
 /// `myers::byte_edits` runs on every whole-document write (`UPDATE kb SET content = …`).
 /// Its V array and its per-diagonal trace are sized by the inputs rather than by the
 /// distance bound, so cost grows with the *square* of the number of changed lines.
@@ -549,6 +624,7 @@ fn main() -> anyhow::Result<()> {
         "scalar" => probe_scalar()?,
         "prefix" => probe_prefix()?,
         "writepath" => probe_writepath()?,
+        "tree" => probe_tree()?,
         "diff" => probe_diff(false)?,
         "diff-big" => probe_diff(true)?,
         "all" => {
@@ -557,11 +633,12 @@ fn main() -> anyhow::Result<()> {
             probe_scalar()?;
             probe_prefix()?;
             probe_writepath()?;
+            probe_tree()?;
             probe_diff(false)?;
         }
         other => {
             eprintln!("unknown probe '{}'", other);
-            eprintln!("usage: textdb-probe [all|ops|statements|scalar|prefix|writepath|diff|diff-big]");
+            eprintln!("usage: textdb-probe [all|ops|statements|scalar|prefix|writepath|tree|diff|diff-big]");
             std::process::exit(2);
         }
     }
