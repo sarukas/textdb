@@ -94,6 +94,25 @@ export function createApp(corpus: Corpus, hub: ChangeHub, options: AppOptions): 
     return c.json({ path: target });
   });
 
+  app.get('/api/trash', (c) => c.json(corpus.trash(queryInt(c, 'parent'))));
+  app.get('/api/trash/entry', (c) => c.json(corpus.trashEntry(parseInteger(queryString(c, 'id'), 'id'))));
+  app.get('/api/trash/file', (c) => {
+    const id = parseInteger(queryString(c, 'id'), 'id');
+    const version = queryInt(c, 'version');
+    const entry = corpus.trashEntry(id);
+    const content = corpus.trashRead(id, version);
+    return c.json({ entry, version: version ?? entry.version, content });
+  });
+  app.get('/api/trash/history', (c) => c.json(corpus.trashHistory(parseInteger(queryString(c, 'id'), 'id'))));
+  app.post('/api/trash/purge', async (c) => {
+    const body = await jsonBody(c);
+    return c.json(corpus.purge(bodyInt(body, 'id'), { author: bodyOptionalString(body, 'author') }));
+  });
+  app.post('/api/trash/empty', async (c) => {
+    const body = await jsonBody(c);
+    return c.json(corpus.emptyTrash({ author: bodyOptionalString(body, 'author') }));
+  });
+
   app.post('/api/import', async (c) => {
     const body = await jsonBody(c);
     const files = bodyImportFiles(body);

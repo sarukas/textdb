@@ -1,14 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, subscribe, type ChangeEvent, type ConnectionState, type Info, type Subscription } from "./api";
+import {
+  api,
+  subscribe,
+  type ChangeEvent,
+  type ConnectionState,
+  type Info,
+  type PurgeStats,
+  type Subscription,
+} from "./api";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { DocumentPane, type Mode, type OpenDoc } from "./components/DocumentPane";
 import { Header } from "./components/Header";
 import { ImportDialog } from "./components/ImportDialog";
-import { DeleteDialog, MoveDialog } from "./components/PathDialogs";
+import { DeleteDialog, MoveDialog, PurgeDialog } from "./components/PathDialogs";
 import { Sidebar } from "./components/Sidebar";
+import { useToast } from "./components/Toasts";
+import { TrashDocument } from "./components/TrashDocument";
 import { addToFeed, type FeedItem } from "./live/activity";
 import { isWithin } from "./live/paths";
-import type { PathAction } from "./tree/actions";
+import { purgeSummary, type PathAction, type TrashAction } from "./tree/actions";
 import { FeedHub } from "./state/hub";
 import { OwnWrites } from "./state/ownWrites";
 import { useAuthor } from "./state/useAuthor";
@@ -21,6 +31,12 @@ function fromHash(): OpenDoc | null {
   const m = /^(\/.*?)(?::(\d+))?$/.exec(raw);
   if (!m?.[1]) return null;
   return { id: ++openSeq, path: m[1], line: m[2] ? Number(m[2]) : null, nonce: 1 };
+}
+
+/** `#trash:<id>` opens a trashed file. */
+function trashFromHash(): number | null {
+  const m = /^#trash:(\d+)$/.exec(location.hash);
+  return m ? Number(m[1]) : null;
 }
 
 function readFeedOpen(): boolean {
@@ -41,6 +57,9 @@ export function App() {
   const [feed, setFeed] = useState<FeedItem[]>([]);
   const [importing, setImporting] = useState(false);
   const [pathAction, setPathAction] = useState<PathAction | null>(null);
+  const [trashAction, setTrashAction] = useState<TrashAction | null>(null);
+  const [trashDoc, setTrashDoc] = useState<number | null>(trashFromHash);
+  const toast = useToast();
   const [open, setOpen] = useState<OpenDoc | null>(fromHash);
   const [mode, setMode] = useState<Mode>("preview");
   const [feedOpen, setFeedOpen] = useState(readFeedOpen);
@@ -109,6 +128,7 @@ export function App() {
   // ---- navigation ----------------------------------------------------------------------------
 
   const openFile = useCallback((path: string, line?: number) => {
+    setTrashDoc(null);
     setOpen((prev) =>
       prev && prev.path === path
         ? { ...prev, line: line ?? null, nonce: prev.nonce + 1 }
@@ -118,15 +138,35 @@ export function App() {
     history.replaceState(null, "", `#${encodeURI(path)}${line ? `:${line}` : ""}`);
   }, []);
 
+  const openTrash = useCallback((id: number) => {
+    setOpen(null);
+    setTrashDoc(id);
+    history.replaceState(null, "", `#trash:${id}`);
+  }, []);
+
+  const closeTrash = useCallback(() => {
+    setTrashDoc(null);
+    history.replaceState(null, "", location.pathname + location.search);
+  }, []);
+
   // Follow deep links typed into the address bar (a hash change does not reload the page).
   useEffect(() => {
     const onHash = () => {
+      const trashed = trashFromHash();
+      if (trashed !== null) return openTrash(trashed);
       const target = fromHash();
       if (target) openFile(target.path, target.line ?? undefined);
     };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
-  }, [openFile]);
+  }, [openFile, openTrash]);
+
+  // A purged trash file that is open closes here; one purged with its folder notices by itself.
+  const onPurged = (action: TrashAction, stats: PurgeStats) => {
+    setTrashAction(null);
+    if (action.op === "empty" || action.entry.id === trashDoc) closeTrash();
+    toast(purgeSummary(stats), "ok");
+  };
 
   const onPathChange = useCallback((path: string) => {
     setOpen((prev) => (prev ? { ...prev, path } : prev));
@@ -173,6 +213,15 @@ export function App() {
           onMoved={() => setPathAction(null)}
         />
       )}
+      {trashAction && (
+        <PurgeDialog
+          key={trashAction.op === "empty" ? "empty" : trashAction.entry.id}
+          action={trashAction}
+          author={author}
+          onClose={() => setTrashAction(null)}
+          onDone={(stats) => onPurged(trashAction, stats)}
+        />
+      )}
       {pathAction?.op === "delete" && (
         <DeleteDialog
           key={pathAction.path}
@@ -185,10 +234,26 @@ export function App() {
       )}
       <main className="workspace">
         <aside className="sidebar" aria-label="Files and search">
-          <Sidebar hub={hub} openPath={open?.path ?? null} onOpen={openFile} onAction={setPathAction} />
+          <Sidebar
+            hub={hub}
+            openPath={open?.path ?? null}
+            openTrashId={trashDoc}
+            onOpen={openFile}
+            onOpenTrash={openTrash}
+            onAction={setPathAction}
+            onTrashAction={setTrashAction}
+          />
         </aside>
         <section className="center" aria-label="Document">
-          {open ? (
+          {trashDoc !== null ? (
+            <TrashDocument
+              key={trashDoc}
+              id={trashDoc}
+              hub={hub}
+              onPurge={(entry) => setTrashAction({ op: "purge", entry })}
+              onClose={closeTrash}
+            />
+          ) : open ? (
             <DocumentPane
               key={open.id}
               open={open}

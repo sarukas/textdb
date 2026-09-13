@@ -1,8 +1,10 @@
 import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { api, type Stat } from "../api";
+import { api, type PurgeStats, type Stat, type TrashEntry } from "../api";
+import { formatBytes } from "../import/select";
 import { baseName, isWithin, parentOf } from "../live/paths";
+import { relativeTime } from "../live/time";
 import { effectiveAuthor } from "../state/useAuthor";
-import { checkMove, count, describeStat, nameRange, type PathAction } from "../tree/actions";
+import { checkMove, count, describeStat, nameRange, type PathAction, type TrashAction } from "../tree/actions";
 
 /** A folder this large asks for its name to be typed before it is deleted. */
 const TYPE_TO_CONFIRM_FILES = 50;
@@ -228,7 +230,7 @@ export function DeleteDialog({ target, author, openPath, onClose, onDeleted }: D
                 ? "The folder is empty."
                 : `The folder and everything inside it are deleted: ${describeStat(stat)}.`
               : `The file is deleted (${describeStat(stat)}).`}{" "}
-          It disappears for everyone; its history stays in the store, but this app cannot bring it back.
+          It moves to the trash with its history, where it can still be read until it is permanently removed.
         </p>
       )}
       {closesOpen && <p>The open document {openPath === target.path ? "is" : "is inside it and is"} closed, unsaved changes included.</p>}
@@ -236,6 +238,114 @@ export function DeleteDialog({ target, author, openPath, onClose, onDeleted }: D
         <label className="field">
           <span>
             Type <span className="mono">{name}</span> to confirm
+          </span>
+          <input value={typed} onChange={(e) => setTyped(e.target.value)} readOnly={busy} spellCheck={false} autoFocus />
+        </label>
+      )}
+      {error && (
+        <p className="error-text" role="alert">
+          {error}
+        </p>
+      )}
+    </PathDialog>
+  );
+}
+
+interface PurgeProps {
+  action: TrashAction;
+  author: string;
+  onClose: () => void;
+  onDone: (stats: PurgeStats) => void;
+}
+
+export function PurgeDialog({ action, author, onClose, onDone }: PurgeProps) {
+  const all = action.op === "empty";
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const [items, setItems] = useState<TrashEntry[] | null>(action.op === "purge" ? [action.entry] : null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [typed, setTyped] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!all) return;
+    let live = true;
+    api.trash().then(
+      (list) => live && setItems(list),
+      (e: unknown) => live && setLoadError(message(e)),
+    );
+    return () => {
+      live = false;
+    };
+  }, [all]);
+
+  const files = items?.reduce((n, e) => n + e.files, 0) ?? 0;
+  const bytes = items?.reduce((n, e) => n + e.nbytes, 0) ?? 0;
+  const word = action.op === "purge" ? action.entry.name : "trash";
+  const mustType = files >= TYPE_TO_CONFIRM_FILES;
+  const ready = items !== null && items.length > 0 && (!mustType || typed.trim() === word);
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!ready || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const who = effectiveAuthor(author);
+      onDone(action.op === "purge" ? await api.purge(action.entry.id, who) : await api.emptyTrash(who));
+    } catch (err) {
+      setError(message(err));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <PathDialog
+      title={all ? "Permanently clean trash" : "Permanently remove"}
+      busy={busy}
+      onClose={onClose}
+      onSubmit={(e) => void submit(e)}
+      onShown={() => cancelRef.current?.focus()}
+      foot={
+        <>
+          <button ref={cancelRef} type="button" className="btn" onClick={onClose} disabled={busy}>
+            Cancel
+          </button>
+          <button type="submit" className="btn btn-danger-solid" disabled={!ready || busy}>
+            {busy ? "Removing…" : all ? "Clean trash" : "Remove permanently"}
+          </button>
+        </>
+      }
+    >
+      {action.op === "purge" ? (
+        <>
+          <p className="confirm-path">
+            <strong>{action.entry.path}</strong>
+          </p>
+          <p>
+            {action.entry.kind === "folder"
+              ? `The folder and everything deleted with it (${count(files, "file")}, ${formatBytes(bytes)})`
+              : `The file (${formatBytes(bytes)}) and its ${count(action.entry.version, "version")}`}{" "}
+            leave the store for good. It was deleted
+            {action.entry.deleted_by ? ` by ${action.entry.deleted_by}` : ""} {relativeTime(action.entry.deleted_at, Date.now())}.
+          </p>
+        </>
+      ) : loadError ? (
+        <p className="error-text">{loadError}</p>
+      ) : (
+        <p>
+          {items === null
+            ? "Counting what is in the trash…"
+            : items.length === 0
+              ? "The trash is empty."
+              : `Everything in the trash leaves the store for good: ${count(items.length, "item")}, ${count(files, "file")}, ${formatBytes(bytes)}, with every version.`}
+        </p>
+      )}
+      <p>This cannot be undone. Content that other files or versions also contain stays in the store.</p>
+      {mustType && (
+        <label className="field">
+          <span>
+            Type <span className="mono">{word}</span> to confirm
           </span>
           <input value={typed} onChange={(e) => setTyped(e.target.value)} readOnly={busy} spellCheck={false} autoFocus />
         </label>

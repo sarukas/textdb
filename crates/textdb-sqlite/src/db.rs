@@ -61,7 +61,7 @@ pub struct CommitRow {
 pub struct ChangeRow {
     pub seq: i64,
     pub ts: String,
-    /// `create`, `commit`, `mkdir`, `move` or `delete`.
+    /// `create`, `commit`, `mkdir`, `move`, `delete` or `purge` (removed from the trash).
     pub op: String,
     pub node_id: i64,
     /// 0 folder, 1 file.
@@ -181,11 +181,11 @@ impl<'c> TextDb<'c> {
         }
     }
 
-    fn storage(&self) -> SqliteStorage<'c> {
+    pub(crate) fn storage(&self) -> SqliteStorage<'c> {
         SqliteStorage::new(self.conn, &self.p)
     }
 
-    fn now() -> String {
+    pub(crate) fn now() -> String {
         SqliteStorage::now()
     }
 
@@ -234,7 +234,7 @@ impl<'c> TextDb<'c> {
         Ok(self.conn.last_insert_rowid())
     }
 
-    fn row_from(r: &rusqlite::Row) -> rusqlite::Result<NodeRow> {
+    pub(crate) fn row_from(r: &rusqlite::Row) -> rusqlite::Result<NodeRow> {
         let root: Option<Vec<u8>> = r.get(5)?;
         Ok(NodeRow {
             id: r.get(0)?,
@@ -252,7 +252,7 @@ impl<'c> TextDb<'c> {
         })
     }
 
-    const NODE_COLS: &'static str =
+    pub(crate) const NODE_COLS: &'static str =
         "id, parent_id, name, kind, path, root, version, nbytes, nlines, updated_at, updated_by, deleted_at";
 
     pub fn node_by_path(&self, path: &str) -> Result<Option<NodeRow>> {
@@ -951,6 +951,11 @@ impl<'c> TextDb<'c> {
     pub fn history(&self, path: &str) -> Result<Vec<CommitRow>> {
         let path = normalize_path(path)?;
         let n = self.node_by_path_any(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
+        self.commits_of(n.id)
+    }
+
+    /// Every commit of the file with id `file_id`, oldest first.
+    pub(crate) fn commits_of(&self, file_id: i64) -> Result<Vec<CommitRow>> {
         let mut stmt = self
             .conn
             .prepare_cached(&format!(
@@ -959,7 +964,7 @@ impl<'c> TextDb<'c> {
             ))
             .map_err(sql_err)?;
         let rows = stmt
-            .query_map(params![n.id], |r| {
+            .query_map(params![file_id], |r| {
                 let root: Vec<u8> = r.get(5)?;
                 Ok(CommitRow {
                     version: r.get(0)?,
@@ -1149,7 +1154,7 @@ impl<'c> TextDb<'c> {
     /// transaction, so a watcher can never see a change the store does not have, nor miss
     /// one it does.
     #[allow(clippy::too_many_arguments)]
-    fn record_change(
+    pub(crate) fn record_change(
         &self,
         op: &str,
         node_id: i64,

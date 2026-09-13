@@ -1,15 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type SearchHit } from "../api";
 import type { FeedHub } from "../state/hub";
-import type { PathAction } from "../tree/actions";
+import type { PathAction, TrashAction } from "../tree/actions";
 import { FileTree } from "./FileTree";
 import { SearchResults } from "./SearchResults";
 
 interface Props {
   hub: FeedHub;
   openPath: string | null;
+  openTrashId: number | null;
   onOpen: (path: string, line?: number) => void;
+  onOpenTrash: (id: number) => void;
   onAction: (action: PathAction) => void;
+  onTrashAction: (action: TrashAction) => void;
 }
 
 interface SearchState {
@@ -19,7 +22,7 @@ interface SearchState {
   error: string | null;
 }
 
-export function Sidebar({ hub, openPath, onOpen, onAction }: Props) {
+export function Sidebar({ hub, openPath, openTrashId, onOpen, onOpenTrash, onAction, onTrashAction }: Props) {
   const [query, setQuery] = useState("");
   const [search, setSearch] = useState<SearchState | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -94,7 +97,15 @@ export function Sidebar({ hub, openPath, onOpen, onAction }: Props) {
         />
       )}
       <div className="tree-wrap" hidden={searching}>
-        <FileTree hub={hub} openPath={openPath} onOpen={onOpen} onAction={onAction} />
+        <FileTree
+          hub={hub}
+          openPath={openPath}
+          openTrashId={openTrashId}
+          onOpen={onOpen}
+          onOpenTrash={onOpenTrash}
+          onAction={onAction}
+          onTrashAction={onTrashAction}
+        />
       </div>
     </div>
   );

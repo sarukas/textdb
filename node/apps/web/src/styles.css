@@ -1522,6 +1522,97 @@ kbd {
   font-family: var(--mono);
   font-size: 11px;
 }
+.menu [role="menuitem"]:disabled {
+  background: transparent;
+  color: var(--faint);
+  cursor: default;
+}
+
+/* ---- trash ---- */
+.icon-trash {
+  width: 10px;
+  height: 12px;
+  border: 1.5px solid color-mix(in srgb, var(--muted) 70%, transparent);
+  border-top-width: 3px;
+  border-radius: 1px 1px 2.5px 2.5px;
+}
+.tree-trash-root .tree-name {
+  font-weight: 500;
+}
+.tree-count {
+  flex: none;
+  min-width: 18px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 15px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.tree-row.trashed .tree-name {
+  color: var(--muted);
+}
+.tree-meta {
+  flex: none;
+  color: var(--faint);
+  font-size: 11px;
+}
+.trash-badge {
+  color: var(--danger);
+  background: var(--danger-weak);
+  border-color: transparent;
+}
+.notice-trash {
+  background: var(--panel-2);
+  color: var(--muted);
+}
+.trash-source {
+  box-sizing: border-box;
+  height: 100%;
+  margin: 0;
+  padding: 16px 24px;
+  overflow: auto;
+  font: 12.5px/1.55 var(--mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.trash-history {
+  box-sizing: border-box;
+  height: 100%;
+  margin: 0;
+  padding: 8px 12px;
+  overflow: auto;
+  list-style: none;
+}
+.trash-version {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.trash-version:hover {
+  background: var(--hover);
+}
+.trash-version.current {
+  background: var(--accent-weak);
+}
+.trash-when {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
 .menu [role="separator"] {
   margin: 4px 0;
   border-top: 1px solid var(--border);

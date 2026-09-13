@@ -53,6 +53,37 @@ export interface ImportStats {
   failures: ImportFailure[];
 }
 
+/** Something a delete left behind, readable until it is purged. */
+export interface TrashEntry {
+  id: number;
+  name: string;
+  kind: 'file' | 'folder';
+  /** Where it was when it was deleted. */
+  path: string;
+  version: number;
+  /** A file's size; for a folder, the total of the files deleted with it. */
+  nbytes: number;
+  nlines: number | null;
+  /** 1 for a file; for a folder, the files deleted with it. */
+  files: number;
+  updated_at: string;
+  updated_by: string | null;
+  deleted_at: string;
+  deleted_by: string | null;
+}
+
+export interface PurgeStats {
+  /** Trash items removed whole. */
+  items: number;
+  files: number;
+  folders: number;
+  versions: number;
+  chunks: number;
+  tree_nodes: number;
+  /** Content bytes freed: what nothing remaining shares. */
+  bytes: number;
+}
+
 export interface Stat {
   path: string;
   kind: 'file' | 'folder';
@@ -229,6 +260,34 @@ export class Corpus {
   /** Deletes a file, or a folder with everything below it. History stays in the store. */
   remove(target: string, options: AuthorOptions = {}): void {
     this.sql.value('SELECT textdb_delete(?, ?)', target, this.authorOf(options));
+  }
+
+  /** Trash items, newest delete first; with `parent`, what was deleted inside that trashed folder. */
+  trash(parent?: number): TrashEntry[] {
+    return JSON.parse(String(this.sql.value('SELECT textdb_trash(?)', parent ?? null))) as TrashEntry[];
+  }
+
+  trashEntry(id: number): TrashEntry {
+    return JSON.parse(String(this.sql.value('SELECT textdb_trash_entry(?)', id))) as TrashEntry;
+  }
+
+  /** A trashed file's content at `version`, or as it was when deleted. */
+  trashRead(id: number, version?: number): string {
+    return asText(this.sql.value('SELECT textdb_trash_content(?, ?)', id, version ?? null));
+  }
+
+  trashHistory(id: number): HistoryEntry[] {
+    return JSON.parse(String(this.sql.value('SELECT textdb_trash_history(?)', id))) as HistoryEntry[];
+  }
+
+  /** Removes a trash entry, and everything deleted with it inside, for good. */
+  purge(id: number, options: AuthorOptions = {}): PurgeStats {
+    return JSON.parse(String(this.sql.value('SELECT textdb_purge(?, ?)', id, this.authorOf(options)))) as PurgeStats;
+  }
+
+  /** Purges every trash item. */
+  emptyTrash(options: AuthorOptions = {}): PurgeStats {
+    return JSON.parse(String(this.sql.value('SELECT textdb_empty_trash(?)', this.authorOf(options)))) as PurgeStats;
   }
 
   /** What `target` holds: one file, or a folder with the files and folders anywhere below it. */

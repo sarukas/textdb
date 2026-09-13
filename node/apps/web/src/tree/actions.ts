@@ -1,5 +1,5 @@
 /** Renaming, moving and deleting files and folders from the UI. */
-import type { Stat } from "../api";
+import type { PurgeStats, Stat, TrashEntry } from "../api";
 import { formatBytes } from "../import/select";
 import { isWithin } from "../live/paths";
 
@@ -7,6 +7,15 @@ export interface PathAction {
   op: "move" | "delete";
   path: string;
   kind: "file" | "folder";
+}
+
+/** Removing one trash entry for good, or everything in the trash. */
+export type TrashAction = { op: "purge"; entry: TrashEntry } | { op: "empty" };
+
+/** "Permanently removed 3 files and 1 folder (5 versions); 2.0 KB freed". */
+export function purgeSummary(s: PurgeStats): string {
+  const what = [count(s.files, "file"), ...(s.folders > 0 ? [count(s.folders, "folder")] : [])].join(" and ");
+  return `Permanently removed ${what} (${count(s.versions, "version")}); ${formatBytes(s.bytes)} freed`;
 }
 
 export function actionFor(op: PathAction["op"], entry: { path: string; kind: string }): PathAction {

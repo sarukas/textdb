@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS {p}node (
 CREATE UNIQUE INDEX IF NOT EXISTS {p}node_path ON {p}node(path) WHERE deleted_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS {p}node_parent_name ON {p}node(parent_id, name) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS {p}node_parent ON {p}node(parent_id);
+CREATE INDEX IF NOT EXISTS {p}node_deleted ON {p}node(deleted_at) WHERE deleted_at IS NOT NULL;
 CREATE TABLE IF NOT EXISTS {p}commit (
   file_id      INTEGER NOT NULL,
   version      INTEGER NOT NULL,
@@ -77,7 +78,7 @@ CREATE TABLE IF NOT EXISTS {p}checkpoint (
 CREATE TABLE IF NOT EXISTS {p}change (
   seq          INTEGER PRIMARY KEY AUTOINCREMENT,
   ts           TEXT    NOT NULL,
-  op           TEXT    NOT NULL,              -- create, commit, mkdir, move, delete
+  op           TEXT    NOT NULL,              -- create, commit, mkdir, move, delete, purge
   node_id      INTEGER NOT NULL,
   node_kind    INTEGER NOT NULL,              -- 0 folder, 1 file
   path         TEXT    NOT NULL,              -- the path after the change
@@ -88,6 +89,7 @@ CREATE TABLE IF NOT EXISTS {p}change (
   author       TEXT    NULL,
   message      TEXT    NULL
 );
+CREATE INDEX IF NOT EXISTS {p}change_node ON {p}change(node_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS {p}fts USING fts5(text, content='', tokenize='unicode61');
 "#,
         p = p

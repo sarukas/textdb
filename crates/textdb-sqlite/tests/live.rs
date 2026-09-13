@@ -49,6 +49,93 @@ fn scalar_move_and_delete_act_on_whole_subtrees_with_an_author() {
     );
 }
 
+#[test]
+fn trash_lists_reads_and_purges_what_deletes_left() {
+    let conn = setup();
+    let json = |sql: &str| -> serde_json::Value {
+        serde_json::from_str(&conn.query_row(sql, [], |r| r.get::<_, String>(0)).unwrap()).unwrap()
+    };
+    let one = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+    let text = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, String>(0));
+    let write = |path: &str, content: &str| {
+        conn.query_row("SELECT textdb_write(?1, ?2)", [path, content], |_| Ok(())).unwrap();
+    };
+    // Long enough to span many chunks, so a file that starts the same way shares all but
+    // its last chunk with it.
+    let shared: String = (0..3000).map(|i| format!("shared paragraph {i} that both files contain\n")).collect();
+    write("/keep.md", &shared);
+    write("/old/a.md", &format!("{shared}alpha ending\n"));
+    write("/old/a.md", "# a, second version\nbeta words\n");
+    write("/old/sub/b.md", "zeta words\n");
+    write("/lone.md", "lone words\n");
+    conn.query_row("SELECT textdb_delete('/lone.md', 'agent-7')", [], |_| Ok(())).unwrap();
+    conn.query_row("SELECT textdb_delete('/old', 'human')", [], |_| Ok(())).unwrap();
+
+    let items = json("SELECT textdb_trash()");
+    let items = items.as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let old = &items[0];
+    assert_eq!(
+        (old["path"].as_str(), old["kind"].as_str(), old["files"].as_i64(), old["deleted_by"].as_str()),
+        (Some("/old"), Some("folder"), Some(2), Some("human"))
+    );
+    assert_eq!(items[1]["path"], "/lone.md");
+
+    let inside = json(&format!("SELECT textdb_trash({})", old["id"]));
+    let names: Vec<_> = inside.as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap().to_string()).collect();
+    assert_eq!(names, ["sub", "a.md"]);
+    let a = inside[1]["id"].as_i64().unwrap();
+    assert_eq!(inside[1]["deleted_by"], "human");
+    assert_eq!(text(&format!("SELECT textdb_trash_content({a})")).unwrap(), "# a, second version\nbeta words\n");
+    assert!(text(&format!("SELECT textdb_trash_content({a}, 1)")).unwrap().ends_with("alpha ending\n"));
+    assert_eq!(json(&format!("SELECT textdb_trash_history({a})")).as_array().unwrap().len(), 2);
+    assert_eq!(json(&format!("SELECT textdb_trash_entry({a})"))["path"], "/old/a.md");
+    let err = text("SELECT textdb_trash_content(999999)").unwrap_err().to_string();
+    assert!(err.starts_with("TX003"), "{err}");
+
+    let chunks_before = one("SELECT count(*) FROM kb_chunk");
+    let nodes_before = one("SELECT count(*) FROM kb_tree_node");
+    let stats = json(&format!("SELECT textdb_purge({}, 'human')", old["id"]));
+    assert_eq!(
+        (stats["items"].as_i64(), stats["files"].as_i64(), stats["folders"].as_i64(), stats["versions"].as_i64()),
+        (Some(1), Some(2), Some(2), Some(3))
+    );
+    let freed = stats["chunks"].as_i64().unwrap();
+    assert!(freed > 0);
+    assert_eq!(one("SELECT count(*) FROM kb_chunk"), chunks_before - freed);
+    assert_eq!(one("SELECT count(*) FROM kb_tree_node"), nodes_before - stats["tree_nodes"].as_i64().unwrap());
+    // The chunks /old/a.md shared with /keep.md are still there, and still searchable.
+    assert_eq!(
+        one("SELECT count(*) FROM textdb_chunks('/keep.md') c JOIN kb_chunk k ON lower(hex(k.hash)) = lower(c.hash)"),
+        one("SELECT count(*) FROM textdb_chunks('/keep.md')")
+    );
+    assert_eq!(text("SELECT textdb_content('/keep.md')").unwrap(), shared);
+    assert!(one("SELECT count(*) FROM kb_fts WHERE kb_fts MATCH 'paragraph'") > 0);
+    // Content only the purged files had is gone from the index too.
+    assert_eq!(one("SELECT count(*) FROM kb_fts WHERE kb_fts MATCH 'zeta'"), 0);
+    assert_eq!(one("SELECT count(*) FROM kb_fts WHERE kb_fts MATCH 'beta'"), 0);
+    let err = text(&format!("SELECT textdb_trash_content({a})")).unwrap_err().to_string();
+    assert!(err.starts_with("TX003"), "{err}");
+    assert_eq!(json("SELECT textdb_trash()").as_array().unwrap().len(), 1);
+
+    // The path is free again.
+    write("/old/a.md", "a new file\n");
+    assert_eq!(one("SELECT version FROM kb WHERE path = '/old/a.md'"), 1);
+
+    assert_eq!(one("SELECT count(*) FROM kb_fts WHERE kb_fts MATCH 'lone'"), 1);
+    let stats = json("SELECT textdb_empty_trash('ops')");
+    assert_eq!((stats["items"].as_i64(), stats["files"].as_i64()), (Some(1), Some(1)));
+    assert_eq!(json("SELECT textdb_trash()").as_array().unwrap().len(), 0);
+    assert_eq!(one("SELECT count(*) FROM kb_fts WHERE kb_fts MATCH 'lone'"), 0);
+    assert_eq!(json("SELECT textdb_empty_trash()")["items"], 0);
+
+    let purges: Vec<_> = feed(&conn, 0).into_iter().filter(|r| r.1 == "purge").map(|r| (r.2, r.7)).collect();
+    assert_eq!(
+        purges,
+        vec![("/old".to_string(), Some("human".to_string())), ("/lone.md".to_string(), Some("ops".to_string()))]
+    );
+}
+
 type FeedRow = (i64, String, String, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>);
 
 fn feed(conn: &Connection, since: i64) -> Vec<FeedRow> {

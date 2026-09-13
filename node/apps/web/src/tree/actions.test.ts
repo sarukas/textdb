@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { actionFor, checkMove, describeStat, nameRange } from "./actions";
+import { actionFor, checkMove, describeStat, nameRange, purgeSummary } from "./actions";
+
+describe("purgeSummary", () => {
+  it("says what went and what was freed", () => {
+    const stats = { items: 1, files: 3, folders: 1, versions: 5, chunks: 4, tree_nodes: 2, bytes: 2048 };
+    expect(purgeSummary(stats)).toBe("Permanently removed 3 files and 1 folder (5 versions); 2.0 KB freed");
+    expect(purgeSummary({ ...stats, files: 1, folders: 0, versions: 1, bytes: 0 })).toBe(
+      "Permanently removed 1 file (1 version); 0 B freed",
+    );
+  });
+});
 
 describe("checkMove", () => {
   it("normalises the target path", () => {

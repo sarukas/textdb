@@ -1,27 +1,47 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
-import { api, type ChangeEvent, type LsEntry } from "../api";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type MouseEvent,
+} from "react";
+import { api, ApiError, type ChangeEvent, type LsEntry, type TrashEntry } from "../api";
 import { authorHue } from "../live/color";
 import { ancestorsOf, isWithin, parentOf } from "../live/paths";
+import { relativeTime } from "../live/time";
 import type { FeedHub } from "../state/hub";
-import { actionFor, type PathAction } from "../tree/actions";
+import { actionFor, type PathAction, type TrashAction } from "../tree/actions";
 import { ensureRowVisible, VirtualList } from "./VirtualList";
 
 const ROW = 24;
 const MARK_MS = 5000;
+/** The Trash's key in the tree; a trashed folder is `trash:<id>`. Live paths start with "/". */
+const TRASH = "trash:";
+const trashKey = (id: number) => `${TRASH}${id}`;
+const isTrashKey = (key: string) => key.startsWith(TRASH);
 
 interface Props {
   hub: FeedHub;
   openPath: string | null;
+  openTrashId: number | null;
   onOpen: (path: string, line?: number) => void;
+  onOpenTrash: (id: number) => void;
   onAction: (action: PathAction) => void;
+  onTrashAction: (action: TrashAction) => void;
 }
 
 type Row =
   | { type: "entry"; key: string; entry: LsEntry; depth: number; open: boolean }
-  | { type: "status"; key: string; dir: string; depth: number; text: string; error: boolean };
+  | { type: "trash-root"; key: string; depth: number; open: boolean; count: number | null }
+  | { type: "trash"; key: string; entry: TrashEntry; depth: number; open: boolean }
+  | { type: "status"; key: string; list: string; depth: number; text: string; error: boolean };
 
-interface TreeData {
-  children: Map<string, LsEntry[]>;
+interface Lists<T> {
+  children: Map<string, T[]>;
   loading: Set<string>;
   errors: Map<string, string>;
 }
@@ -33,87 +53,156 @@ interface Marker {
   op: string;
 }
 
-export function FileTree({ hub, openPath, onOpen, onAction }: Props) {
-  const [data, setData] = useState<TreeData>(() => ({ children: new Map(), loading: new Set(), errors: new Map() }));
+interface MenuItem {
+  label: string;
+  hint?: string;
+  danger?: boolean;
+  /** Draw a separator above this item. */
+  separated?: boolean;
+  disabled?: boolean;
+  run: () => void;
+}
+
+interface MenuState {
+  x: number;
+  y: number;
+  /** The row the menu belongs to. */
+  key: string;
+  label: string;
+  items: MenuItem[];
+}
+
+/**
+ * Lists fetched on demand, one per key. A forced load refreshes a list already shown. With
+ * `onGone`, a list whose owner no longer exists (404) is dropped and reported instead of
+ * shown as an error.
+ */
+function useLists<T>(fetchList: (key: string) => Promise<T[]>, onGone?: (key: string) => void) {
+  const [data, setData] = useState<Lists<T>>(() => ({ children: new Map(), loading: new Set(), errors: new Map() }));
   const dataRef = useRef(data);
   dataRef.current = data;
   const inflight = useRef(new Map<string, Promise<void>>());
+  const goneRef = useRef(onGone);
+  goneRef.current = onGone;
+
+  const load = useCallback(
+    (key: string, force = false): Promise<void> => {
+      if (!force && dataRef.current.children.has(key)) return Promise.resolve();
+      const running = inflight.current.get(key);
+      if (running && !force) return running;
+      setData((d) => ({ ...d, loading: new Set(d.loading).add(key) }));
+      const settle = (update: (d: Lists<T>) => Lists<T>) =>
+        setData((d) => {
+          const next = update(d);
+          const loading = new Set(next.loading);
+          loading.delete(key);
+          return { ...next, loading };
+        });
+      const p = fetchList(key).then(
+        (list) =>
+          settle((d) => {
+            const errors = new Map(d.errors);
+            errors.delete(key);
+            return { ...d, children: new Map(d.children).set(key, list), errors };
+          }),
+        (err: unknown) => {
+          if (goneRef.current && err instanceof ApiError && err.status === 404) {
+            settle((d) => ({ ...d, children: new Map([...d.children].filter(([k]) => k !== key)) }));
+            goneRef.current(key);
+            return;
+          }
+          settle((d) => ({ ...d, errors: new Map(d.errors).set(key, err instanceof Error ? err.message : String(err)) }));
+        },
+      );
+      const tracked = p.finally(() => {
+        if (inflight.current.get(key) === tracked) inflight.current.delete(key);
+      });
+      inflight.current.set(key, tracked);
+      return tracked;
+    },
+    [fetchList],
+  );
+
+  const drop = useCallback(
+    (match: (key: string) => boolean) =>
+      setData((d) => {
+        if (![...d.children.keys()].some(match)) return d;
+        return { ...d, children: new Map([...d.children].filter(([k]) => !match(k))) };
+      }),
+    [],
+  );
+
+  return { data, dataRef, load, drop };
+}
+
+export function FileTree({ hub, openPath, openTrashId, onOpen, onOpenTrash, onAction, onTrashAction }: Props) {
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const collapse = useCallback(
+    (key: string) =>
+      setExpanded((prev) => {
+        if (!prev.has(key)) return prev;
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      }),
+    [],
+  );
+  const listDir = useCallback((dir: string) => api.ls(dir), []);
+  const listTrash = useCallback((key: string) => api.trash(key === TRASH ? undefined : Number(key.slice(TRASH.length))), []);
+  const live = useLists<LsEntry>(listDir);
+  const trash = useLists<TrashEntry>(listTrash, collapse);
+  const { data, dataRef, load, drop: dropLive } = live;
+  const { data: trashData, dataRef: trashRef, load: loadTrash } = trash;
+
   const [active, setActive] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
   const pendingReveal = useRef<string | null>(null);
-  const [menu, setMenu] = useState<{ x: number; y: number; entry: LsEntry } | null>(null);
+  const [menu, setMenu] = useState<MenuState | null>(null);
   const closeMenu = useCallback((refocus: boolean) => {
     setMenu(null);
     if (refocus) listRef.current?.focus();
   }, []);
 
-  const load = useCallback((dir: string, force = false): Promise<void> => {
-    if (!force && dataRef.current.children.has(dir)) return Promise.resolve();
-    const running = inflight.current.get(dir);
-    if (running && !force) return running;
-    setData((d) => ({ ...d, loading: new Set(d.loading).add(dir) }));
-    const p = api.ls(dir).then(
-      (list) =>
-        setData((d) => {
-          const loading = new Set(d.loading);
-          loading.delete(dir);
-          const errors = new Map(d.errors);
-          errors.delete(dir);
-          return { children: new Map(d.children).set(dir, list), loading, errors };
-        }),
-      (err: unknown) =>
-        setData((d) => {
-          const loading = new Set(d.loading);
-          loading.delete(dir);
-          return { ...d, loading, errors: new Map(d.errors).set(dir, err instanceof Error ? err.message : String(err)) };
-        }),
-    );
-    const tracked = p.finally(() => {
-      if (inflight.current.get(dir) === tracked) inflight.current.delete(dir);
-    });
-    inflight.current.set(dir, tracked);
-    return tracked;
-  }, []);
-
   useEffect(() => {
     void load("/");
-  }, [load]);
+    void loadTrash(TRASH);
+  }, [load, loadTrash]);
 
   // The server may not be up yet when the page loads: keep retrying the root listing.
   const rootError = data.errors.get("/");
   useEffect(() => {
     if (!rootError) return;
-    const t = setTimeout(() => void load("/", true), 3000);
+    const t = setTimeout(() => {
+      void load("/", true);
+      void loadTrash(TRASH, true);
+    }, 3000);
     return () => clearTimeout(t);
-  }, [rootError, load]);
+  }, [rootError, load, loadTrash]);
 
   const toggle = useCallback(
-    (path: string) => {
+    (key: string) => {
       setExpanded((prev) => {
         const next = new Set(prev);
-        if (next.has(path)) next.delete(path);
+        if (next.has(key)) next.delete(key);
         else {
-          next.add(path);
-          void load(path);
+          next.add(key);
+          void (isTrashKey(key) ? loadTrash(key) : load(key));
         }
         return next;
       });
     },
-    [load],
+    [load, loadTrash],
   );
 
   const rows = useMemo(() => {
     const out: Row[] = [];
+    const status = (list: string, depth: number, error: string | undefined) =>
+      out.push({ type: "status", key: `status:${list}`, list, depth, text: error ? `${error} · click to retry` : "Loading…", error: !!error });
     const walk = (dir: string, depth: number) => {
       const kids = data.children.get(dir);
-      if (!kids) {
-        const err = data.errors.get(dir);
-        out.push({ type: "status", key: `status:${dir}`, dir, depth, text: err ? `${err} · click to retry` : "Loading…", error: !!err });
-        return;
-      }
+      if (!kids) return status(dir, depth, data.errors.get(dir));
       if (kids.length === 0 && dir !== "/") {
-        out.push({ type: "status", key: `status:${dir}`, dir, depth, text: "Empty folder", error: false });
+        out.push({ type: "status", key: `status:${dir}`, list: dir, depth, text: "Empty folder", error: false });
       }
       for (const entry of kids) {
         const open = entry.kind === "folder" && expanded.has(entry.path);
@@ -121,9 +210,26 @@ export function FileTree({ hub, openPath, onOpen, onAction }: Props) {
         if (open) walk(entry.path, depth + 1);
       }
     };
+    const walkTrash = (key: string, depth: number) => {
+      const kids = trashData.children.get(key);
+      if (!kids) return status(key, depth, trashData.errors.get(key));
+      if (kids.length === 0) {
+        const text = key === TRASH ? "Trash is empty" : "Empty folder";
+        out.push({ type: "status", key: `status:${key}`, list: key, depth, text, error: false });
+      }
+      for (const entry of kids) {
+        const k = trashKey(entry.id);
+        const open = entry.kind === "folder" && expanded.has(k);
+        out.push({ type: "trash", key: k, entry, depth, open });
+        if (open) walkTrash(k, depth + 1);
+      }
+    };
     walk("/", 0);
+    const trashOpen = expanded.has(TRASH);
+    out.push({ type: "trash-root", key: TRASH, depth: 0, open: trashOpen, count: trashData.children.get(TRASH)?.length ?? null });
+    if (trashOpen) walkTrash(TRASH, 1);
     return out;
-  }, [data, expanded]);
+  }, [data, trashData, expanded]);
 
   // ---- live markers and refreshes ----------------------------------------------------------
 
@@ -145,14 +251,24 @@ export function FileTree({ hub, openPath, onOpen, onAction }: Props) {
         }, 300),
       );
     };
+    // A delete adds to the trash and a purge may take a trashed folder with it, so every
+    // trash list on screen is reloaded; one that is gone collapses.
+    let trashTimer: ReturnType<typeof setTimeout> | null = null;
+    const refreshTrash = () => {
+      if (trashTimer) clearTimeout(trashTimer);
+      trashTimer = setTimeout(() => {
+        trashTimer = null;
+        const keys = new Set([TRASH, ...trashRef.current.children.keys()]);
+        for (const key of keys) void loadTrash(key, true);
+      }, 300);
+    };
     const forget = (path: string) => {
-      setData((d) => {
-        if (![...d.children.keys()].some((k) => k === path || isWithin(path, k))) return d;
-        return { ...d, children: new Map([...d.children].filter(([k]) => k !== path && !isWithin(path, k))) };
-      });
+      dropLive((k) => k === path || isWithin(path, k));
       setExpanded((prev) => new Set([...prev].filter((k) => k !== path && !isWithin(path, k))));
     };
     const onEvent = (e: ChangeEvent) => {
+      if (e.op === "delete" || e.op === "purge") refreshTrash();
+      if (e.op === "purge") return;
       const mark: Marker = { hue: authorHue(e.author ?? ""), until: Date.now() + MARK_MS, seq: e.seq, op: e.op };
       for (const p of [e.path, ...ancestorsOf(e.path)]) markers.current.set(p, mark);
       if (!bumpTimer.current) {
@@ -186,9 +302,10 @@ export function FileTree({ hub, openPath, onOpen, onAction }: Props) {
       off();
       clearInterval(sweep);
       timers.forEach(clearTimeout);
+      if (trashTimer) clearTimeout(trashTimer);
       if (bumpTimer.current) clearTimeout(bumpTimer.current);
     };
-  }, [hub, load]);
+  }, [hub, load, loadTrash, dropLive, dataRef, trashRef]);
 
   // ---- reveal the open file ------------------------------------------------------------------
 
@@ -224,19 +341,85 @@ export function FileTree({ hub, openPath, onOpen, onAction }: Props) {
     }
   }, [rows]);
 
-  // ---- keyboard ----------------------------------------------------------------------------------
+  // ---- actions -----------------------------------------------------------------------------------
 
   const activeIdx = Math.min(active, Math.max(0, rows.length - 1));
 
+  /** The key a row expands under, or null for a row that does not expand. */
+  const expandKey = (row: Row | undefined): string | null => {
+    if (row?.type === "entry") return row.entry.kind === "folder" ? row.entry.path : null;
+    if (row?.type === "trash") return row.entry.kind === "folder" ? row.key : null;
+    return row?.type === "trash-root" ? TRASH : null;
+  };
+
   const activate = (row: Row | undefined) => {
-    if (!row || row.type !== "entry") return;
-    if (row.entry.kind === "folder") toggle(row.entry.path);
-    else onOpen(row.entry.path);
+    if (!row || row.type === "status") return;
+    const key = expandKey(row);
+    if (key) toggle(key);
+    else if (row.type === "entry") onOpen(row.entry.path);
+    else if (row.type === "trash") onOpenTrash(row.entry.id);
+  };
+
+  const remove = (row: Row | undefined) => {
+    if (row?.type === "entry") onAction(actionFor("delete", row.entry));
+    else if (row?.type === "trash") onTrashAction({ op: "purge", entry: row.entry });
+    else if (row?.type === "trash-root" && row.count) onTrashAction({ op: "empty" });
+  };
+
+  const menuFor = (row: Row): Omit<MenuState, "x" | "y"> | null => {
+    const expandOrOpen = (folder: boolean): MenuItem => ({
+      label: folder ? "Expand or collapse" : "Open",
+      hint: "Enter",
+      run: () => activate(row),
+    });
+    switch (row.type) {
+      case "entry": {
+        const folder = row.entry.kind === "folder";
+        return {
+          key: row.key,
+          label: row.entry.name,
+          items: [
+            expandOrOpen(folder),
+            { label: "Rename or move…", hint: "F2", run: () => onAction(actionFor("move", row.entry)) },
+            { label: folder ? "Delete folder…" : "Delete file…", hint: "Del", danger: true, separated: true, run: () => remove(row) },
+          ],
+        };
+      }
+      case "trash":
+        return {
+          key: row.key,
+          label: row.entry.name,
+          items: [
+            expandOrOpen(row.entry.kind === "folder"),
+            { label: "Permanently remove…", hint: "Del", danger: true, separated: true, run: () => remove(row) },
+          ],
+        };
+      case "trash-root":
+        return {
+          key: row.key,
+          label: "Trash",
+          items: [
+            expandOrOpen(true),
+            { label: "Permanently clean trash…", hint: "Del", danger: true, separated: true, disabled: !row.count, run: () => remove(row) },
+          ],
+        };
+      default:
+        return null;
+    }
+  };
+
+  const openMenu = (i: number, row: Row, x: number, y: number) => {
+    const m = menuFor(row);
+    if (!m) return;
+    setActive(i);
+    setMenu({ ...m, x, y });
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     if (!rows.length) return;
     const row = rows[activeIdx];
+    const key = expandKey(row);
+    const open = row !== undefined && row.type !== "status" && row.open;
     const page = Math.max(1, Math.floor((listRef.current?.clientHeight ?? 400) / ROW) - 1);
     let next = activeIdx;
     switch (e.key) {
@@ -259,14 +442,14 @@ export function FileTree({ hub, openPath, onOpen, onAction }: Props) {
         next = rows.length - 1;
         break;
       case "ArrowRight":
-        if (row?.type === "entry" && row.entry.kind === "folder") {
-          if (!row.open) toggle(row.entry.path);
+        if (key) {
+          if (!open) toggle(key);
           else next = Math.min(rows.length - 1, activeIdx + 1);
         }
         break;
       case "ArrowLeft":
-        if (row?.type === "entry" && row.entry.kind === "folder" && row.open) {
-          toggle(row.entry.path);
+        if (key && open) {
+          toggle(key);
         } else if (row) {
           for (let i = activeIdx - 1; i >= 0; i--) {
             if (rows[i]!.depth < row.depth) {
@@ -284,14 +467,13 @@ export function FileTree({ hub, openPath, onOpen, onAction }: Props) {
         if (row?.type === "entry") onAction(actionFor("move", row.entry));
         break;
       case "Delete":
-        if (row?.type === "entry") onAction(actionFor("delete", row.entry));
+        remove(row);
         break;
-      case "ContextMenu":
-        if (row?.type === "entry") {
-          const el = document.getElementById(`tree-row-${activeIdx}`)?.getBoundingClientRect();
-          if (el) setMenu({ x: el.left + 24, y: el.bottom, entry: row.entry });
-        }
+      case "ContextMenu": {
+        const rect = document.getElementById(`tree-row-${activeIdx}`)?.getBoundingClientRect();
+        if (row && rect) openMenu(activeIdx, row, rect.left + 24, rect.bottom);
         break;
+      }
       default:
         return;
     }
@@ -303,110 +485,152 @@ export function FileTree({ hub, openPath, onOpen, onAction }: Props) {
   const now = Date.now();
   const activeRow = rows[activeIdx];
 
+  const rowEvents = (i: number, row: Row) => ({
+    onClick: () => {
+      setActive(i);
+      activate(row);
+    },
+    onContextMenu: (e: MouseEvent) => {
+      e.preventDefault();
+      openMenu(i, row, e.clientX, e.clientY);
+    },
+  });
+
+  const more = (i: number, row: Row, name: string) => (
+    <button
+      type="button"
+      className="tree-more"
+      tabIndex={-1}
+      aria-label={`Actions for ${name}`}
+      aria-haspopup="menu"
+      aria-expanded={menu?.key === row.key}
+      title="Actions"
+      onClick={(e) => {
+        e.stopPropagation();
+        const r = e.currentTarget.getBoundingClientRect();
+        openMenu(i, row, r.left, r.bottom + 2);
+      }}
+    >
+      ⋯
+    </button>
+  );
+
   return (
     <>
-    <VirtualList
-      outerRef={listRef}
-      className="tree"
-      role="tree"
-      aria-label="Files"
-      tabIndex={0}
-      aria-activedescendant={activeRow ? `tree-row-${activeIdx}` : undefined}
-      onKeyDown={onKeyDown}
-      count={rows.length}
-      rowHeight={ROW}
-      renderRow={(i, style) => {
-        const row = rows[i]!;
-        const pad = 8 + row.depth * 14;
-        if (row.type === "status") {
+      <VirtualList
+        outerRef={listRef}
+        className="tree"
+        role="tree"
+        aria-label="Files"
+        tabIndex={0}
+        aria-activedescendant={activeRow ? `tree-row-${activeIdx}` : undefined}
+        onKeyDown={onKeyDown}
+        count={rows.length}
+        rowHeight={ROW}
+        renderRow={(i, style) => {
+          const row = rows[i]!;
+          const pad = 8 + row.depth * 14;
+          const activeClass = i === activeIdx ? " active" : "";
+          if (row.type === "status") {
+            return (
+              <div
+                key={row.key}
+                id={`tree-row-${i}`}
+                role="none"
+                className={`tree-status${row.error ? " error-text retry" : ""}`}
+                style={{ ...style, paddingLeft: pad + 18 }}
+                onClick={row.error ? () => void (isTrashKey(row.list) ? loadTrash(row.list, true) : load(row.list, true)) : undefined}
+              >
+                {row.text}
+              </div>
+            );
+          }
+          if (row.type === "trash-root") {
+            return (
+              <div
+                key={row.key}
+                id={`tree-row-${i}`}
+                role="treeitem"
+                aria-level={1}
+                aria-expanded={row.open}
+                className={`tree-row tree-trash-root${activeClass}`}
+                style={{ ...style, paddingLeft: pad }}
+                title="Deleted files and folders stay here until they are permanently removed"
+                {...rowEvents(i, row)}
+              >
+                <span className={`twisty${row.open ? " open" : ""}`} aria-hidden="true" />
+                <span className="icon icon-trash" aria-hidden="true" />
+                <span className="tree-name">Trash</span>
+                {row.count ? <span className="tree-count">{row.count.toLocaleString()}</span> : null}
+                {more(i, row, "Trash")}
+              </div>
+            );
+          }
+          if (row.type === "trash") {
+            const { entry } = row;
+            const folder = entry.kind === "folder";
+            const selected = !folder && entry.id === openTrashId;
+            const when = relativeTime(entry.deleted_at, now);
+            return (
+              <div
+                key={row.key}
+                id={`tree-row-${i}`}
+                role="treeitem"
+                aria-level={row.depth + 1}
+                aria-expanded={folder ? row.open : undefined}
+                aria-selected={selected}
+                className={`tree-row trashed${activeClass}${selected ? " selected" : ""}`}
+                style={{ ...style, paddingLeft: pad }}
+                title={`${entry.path}\ndeleted${entry.deleted_by ? ` by ${entry.deleted_by}` : ""} ${when}`}
+                {...rowEvents(i, row)}
+              >
+                <span className={`twisty${folder ? (row.open ? " open" : "") : " none"}`} aria-hidden="true" />
+                <span className={folder ? "icon icon-folder" : "icon icon-file"} aria-hidden="true" />
+                <span className="tree-name">{entry.name}</span>
+                {row.depth === 1 && <span className="tree-meta">{when}</span>}
+                {more(i, row, entry.name)}
+              </div>
+            );
+          }
+          const { entry } = row;
+          const folder = entry.kind === "folder";
+          const mark = markers.current.get(entry.path);
+          const markLive = mark && mark.until > now;
           return (
             <div
               key={row.key}
               id={`tree-row-${i}`}
-              role="none"
-              className={`tree-status${row.error ? " error-text retry" : ""}`}
-              style={{ ...style, paddingLeft: pad + 18 }}
-              onClick={row.error ? () => void load(row.dir, true) : undefined}
+              role="treeitem"
+              aria-level={row.depth + 1}
+              aria-expanded={folder ? row.open : undefined}
+              aria-selected={entry.path === openPath}
+              className={`tree-row${activeClass}${entry.path === openPath ? " selected" : ""}`}
+              style={{ ...style, paddingLeft: pad }}
+              title={entry.path}
+              {...rowEvents(i, row)}
             >
-              {row.text}
+              <span className={`twisty${folder ? (row.open ? " open" : "") : " none"}`} aria-hidden="true" />
+              <span className={folder ? "icon icon-folder" : "icon icon-file"} aria-hidden="true" />
+              <span className="tree-name">{entry.name}</span>
+              {markLive && (
+                <span key={mark.seq} className={`tree-marker op-${mark.op}`} style={{ "--h": String(mark.hue) } as React.CSSProperties} aria-label="changed just now" />
+              )}
+              {more(i, row, entry.name)}
             </div>
           );
-        }
-        const { entry } = row;
-        const folder = entry.kind === "folder";
-        const mark = markers.current.get(entry.path);
-        const live = mark && mark.until > now;
-        return (
-          <div
-            key={row.key}
-            id={`tree-row-${i}`}
-            role="treeitem"
-            aria-level={row.depth + 1}
-            aria-expanded={folder ? row.open : undefined}
-            aria-selected={entry.path === openPath}
-            className={`tree-row${i === activeIdx ? " active" : ""}${entry.path === openPath ? " selected" : ""}`}
-            style={{ ...style, paddingLeft: pad }}
-            title={entry.path}
-            onClick={() => {
-              setActive(i);
-              activate(row);
-            }}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              setActive(i);
-              setMenu({ x: e.clientX, y: e.clientY, entry });
-            }}
-          >
-            <span className={`twisty${folder ? (row.open ? " open" : "") : " none"}`} aria-hidden="true" />
-            <span className={folder ? "icon icon-folder" : "icon icon-file"} aria-hidden="true" />
-            <span className="tree-name">{entry.name}</span>
-            {live && (
-              <span key={mark.seq} className={`tree-marker op-${mark.op}`} style={{ "--h": String(mark.hue) } as React.CSSProperties} aria-label="changed just now" />
-            )}
-            <button
-              type="button"
-              className="tree-more"
-              tabIndex={-1}
-              aria-label={`Actions for ${entry.name}`}
-              aria-haspopup="menu"
-              aria-expanded={menu?.entry.path === entry.path}
-              title="Rename, move or delete"
-              onClick={(e) => {
-                e.stopPropagation();
-                const r = e.currentTarget.getBoundingClientRect();
-                setActive(i);
-                setMenu({ x: r.left, y: r.bottom + 2, entry });
-              }}
-            >
-              ⋯
-            </button>
-          </div>
-        );
-      }}
-    />
-    {menu && (
-      <TreeMenu
-        {...menu}
-        onClose={closeMenu}
-        onOpen={() => (menu.entry.kind === "folder" ? toggle(menu.entry.path) : onOpen(menu.entry.path))}
-        onAction={onAction}
+        }}
       />
-    )}
+      {menu && <TreeMenu {...menu} onClose={closeMenu} />}
     </>
   );
 }
 
-interface MenuProps {
-  x: number;
-  y: number;
-  entry: LsEntry;
+interface MenuProps extends MenuState {
   onClose: (refocus: boolean) => void;
-  onOpen: () => void;
-  onAction: (action: PathAction) => void;
 }
 
 /** A row's context menu: kept inside the window, closed by Escape, a click elsewhere or a choice. */
-function TreeMenu({ x, y, entry, onClose, onOpen, onAction }: MenuProps) {
+function TreeMenu({ x, y, label, items, onClose }: MenuProps) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ left: x, top: y });
 
@@ -418,7 +642,7 @@ function TreeMenu({ x, y, entry, onClose, onOpen, onAction }: MenuProps) {
       left: Math.max(4, Math.min(x, window.innerWidth - r.width - 4)),
       top: Math.max(4, Math.min(y, window.innerHeight - r.height - 4)),
     });
-    el.querySelector<HTMLElement>("[role=menuitem]")?.focus();
+    el.querySelector<HTMLElement>("[role=menuitem]:not(:disabled)")?.focus();
   }, [x, y]);
 
   useEffect(() => {
@@ -437,45 +661,44 @@ function TreeMenu({ x, y, entry, onClose, onOpen, onAction }: MenuProps) {
   }, [onClose]);
 
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    const items = Array.from(ref.current?.querySelectorAll<HTMLElement>("[role=menuitem]") ?? []);
-    const at = items.indexOf(document.activeElement as HTMLElement);
+    const enabled = Array.from(ref.current?.querySelectorAll<HTMLElement>("[role=menuitem]:not(:disabled)") ?? []);
+    const at = enabled.indexOf(document.activeElement as HTMLElement);
     if (e.key === "Escape" || e.key === "Tab") onClose(true);
-    else if (e.key === "ArrowDown") items[(at + 1) % items.length]?.focus();
-    else if (e.key === "ArrowUp") items[(at - 1 + items.length) % items.length]?.focus();
+    else if (e.key === "ArrowDown") enabled[(at + 1) % enabled.length]?.focus();
+    else if (e.key === "ArrowUp") enabled[(at - 1 + enabled.length) % enabled.length]?.focus();
     else return;
     e.preventDefault();
     e.stopPropagation();
   };
-
-  const choose = (fn: () => void) => () => {
-    onClose(false);
-    fn();
-  };
-  const folder = entry.kind === "folder";
 
   return (
     <div
       ref={ref}
       className="menu"
       role="menu"
-      aria-label={`Actions for ${entry.name}`}
+      aria-label={`Actions for ${label}`}
       style={pos}
       onKeyDown={onKeyDown}
       onContextMenu={(e) => e.preventDefault()}
     >
-      <button type="button" role="menuitem" onClick={choose(onOpen)}>
-        {folder ? "Expand or collapse" : "Open"}
-        <kbd>Enter</kbd>
-      </button>
-      <button type="button" role="menuitem" onClick={choose(() => onAction(actionFor("move", entry)))}>
-        Rename or move…
-        <kbd>F2</kbd>
-      </button>
-      <div role="separator" />
-      <button type="button" role="menuitem" className="danger" onClick={choose(() => onAction(actionFor("delete", entry)))}>
-        {folder ? "Delete folder…" : "Delete file…"}
-        <kbd>Del</kbd>
-      </button>
+      {items.map((item) => (
+        <Fragment key={item.label}>
+          {item.separated && <div role="separator" />}
+          <button
+            type="button"
+            role="menuitem"
+            className={item.danger ? "danger" : undefined}
+            disabled={item.disabled}
+            onClick={() => {
+              onClose(false);
+              item.run();
+            }}
+          >
+            {item.label}
+            {item.hint && <kbd>{item.hint}</kbd>}
+          </button>
+        </Fragment>
+      ))}
     </div>
   );
 }

@@ -13,10 +13,12 @@ pub mod db;
 pub mod functions;
 pub mod schema;
 pub mod storage;
+pub mod trash;
 pub mod vtab;
 
 pub use db::{normalize_path, ChangeRow, CommitRow, Entry, Hit, NodeRow, TextDb, WriteResult, DEFAULT_PREFIX};
 pub use storage::SqliteStorage;
+pub use trash::{PurgeStats, TrashEntry};
 
 use rusqlite::{Connection, Result};
 use vtab::{FnKind, FnSpec, FN_MODULE, KB_MODULE};

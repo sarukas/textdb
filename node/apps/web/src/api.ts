@@ -81,7 +81,7 @@ export interface ConflictInfo {
   current_version: number;
 }
 
-export type ChangeOp = "create" | "commit" | "mkdir" | "move" | "delete";
+export type ChangeOp = "create" | "commit" | "mkdir" | "move" | "delete" | "purge";
 
 export interface ChangeEvent {
   seq: number;
@@ -156,7 +156,47 @@ export const api = {
   move: (from: string, to: string, author?: string) =>
     request<{ from: string; to: string }>("POST", "/api/move", { from, to, author }),
   remove: (path: string, author?: string) => request<{ path: string }>("POST", "/api/delete", { path, author }),
+  trash: (parent?: number) => request<TrashEntry[]>("GET", `/api/trash?${qs({ parent })}`),
+  trashFile: (id: number, version?: number) => request<TrashFile>("GET", `/api/trash/file?${qs({ id, version })}`),
+  trashHistory: (id: number) => request<HistoryEntry[]>("GET", `/api/trash/history?${qs({ id })}`),
+  purge: (id: number, author?: string) => request<PurgeStats>("POST", "/api/trash/purge", { id, author }),
+  emptyTrash: (author?: string) => request<PurgeStats>("POST", "/api/trash/empty", { author }),
 };
+
+/** Something a delete left behind, readable until it is purged. */
+export interface TrashEntry {
+  id: number;
+  name: string;
+  kind: "file" | "folder";
+  /** Where it was when it was deleted. */
+  path: string;
+  version: number;
+  /** A file's size; for a folder, the total of the files deleted with it. */
+  nbytes: number;
+  nlines: number | null;
+  /** 1 for a file; for a folder, the files deleted with it. */
+  files: number;
+  updated_at: string;
+  updated_by: string | null;
+  deleted_at: string;
+  deleted_by: string | null;
+}
+
+export interface TrashFile {
+  entry: TrashEntry;
+  version: number;
+  content: string;
+}
+
+export interface PurgeStats {
+  items: number;
+  files: number;
+  folders: number;
+  versions: number;
+  chunks: number;
+  tree_nodes: number;
+  bytes: number;
+}
 
 export interface Stat {
   path: string;

@@ -1,7 +1,7 @@
 export type NodeKind = 'file' | 'folder';
 export type CommitKind = 'direct' | 'rebased' | 'merged';
 export type WriteKind = CommitKind | 'noop';
-export type ChangeOp = 'create' | 'commit' | 'mkdir' | 'move' | 'delete';
+export type ChangeOp = 'create' | 'commit' | 'mkdir' | 'move' | 'delete' | 'purge';
 
 export interface Info {
   db: string;

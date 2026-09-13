@@ -241,6 +241,48 @@ describe('move and delete', () => {
   });
 });
 
+describe('trash', () => {
+  test('lists, reads and purges what deletes left', async () => {
+    await api('PUT', '/api/file', { path: '/bin/a.md', content: 'one\n' });
+    await api('PUT', '/api/file', { path: '/bin/a.md', content: 'two\n' });
+    await api('PUT', '/api/file', { path: '/bin/sub/b.md', content: 'b\n' });
+    await api('POST', '/api/delete', { path: '/bin', author: 'human' });
+
+    let res = await api('GET', '/api/trash');
+    assert.equal(res.body[0].path, '/bin', 'newest delete first');
+    const item = res.body[0];
+    assert.deepEqual([item.kind, item.files, item.nbytes, item.deleted_by], ['folder', 2, 6, 'human']);
+    res = await api('GET', `/api/trash?parent=${item.id}`);
+    assert.deepEqual(res.body.map((e: { name: string }) => e.name), ['sub', 'a.md']);
+    const file = res.body[1];
+
+    res = await api('GET', `/api/trash/file?id=${file.id}`);
+    assert.deepEqual([res.body.entry.path, res.body.entry.deleted_by, res.body.version, res.body.content], ['/bin/a.md', 'human', 2, 'two\n']);
+    res = await api('GET', `/api/trash/file?id=${file.id}&version=1`);
+    assert.deepEqual([res.body.version, res.body.content], [1, 'one\n']);
+    res = await api('GET', `/api/trash/history?id=${file.id}`);
+    assert.deepEqual(res.body.map((h: { version: number }) => h.version), [1, 2]);
+    res = await api('GET', `/api/trash/file?id=${item.id}`);
+    assert.deepEqual([res.status, res.body.code], [400, 'TX004']);
+
+    res = await api('POST', '/api/trash/purge', { id: item.id, author: 'human' });
+    assert.deepEqual([res.status, res.body.items, res.body.files, res.body.folders, res.body.versions], [200, 1, 2, 2, 3]);
+    res = await api('GET', `/api/trash/file?id=${file.id}`);
+    assert.deepEqual([res.status, res.body.code], [404, 'TX003']);
+
+    res = await api('POST', '/api/trash/empty', { author: 'ops' });
+    assert.equal(res.status, 200);
+    res = await api('GET', '/api/trash');
+    assert.deepEqual(res.body, []);
+    const purges = server.corpus
+      .feed(0)
+      .filter((c) => (c.op as string) === 'purge')
+      .map((c) => [c.path, c.author]);
+    assert.deepEqual(purges[0], ['/bin', 'human']);
+    assert.ok(purges.slice(1).every(([, author]) => author === 'ops'));
+  });
+});
+
 describe('event stream', () => {
   test('a commit from another connection arrives with its hunks', async () => {
     await api('PUT', '/api/file', { path: '/live.md', content: 'alpha\nbeta\ngamma\n' });
