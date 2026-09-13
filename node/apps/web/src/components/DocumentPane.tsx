@@ -32,6 +32,7 @@ interface Props {
   author: string;
   onPathChange: (path: string) => void;
   onAction: (action: PathAction) => void;
+  onOpenFolder: (path: string) => void;
 }
 
 const MODES: Array<{ id: Mode; label: string }> = [
@@ -41,7 +42,7 @@ const MODES: Array<{ id: Mode; label: string }> = [
 ];
 
 /** Mounted with `key={open.id}`: one controller per opened document. */
-export function DocumentPane({ open, mode, onMode, hub, own, author, onPathChange, onAction }: Props) {
+export function DocumentPane({ open, mode, onMode, hub, own, author, onPathChange, onAction, onOpenFolder }: Props) {
   const toast = useToast();
   const authorRef = useRef(author);
   authorRef.current = author;
@@ -114,13 +115,28 @@ export function DocumentPane({ open, mode, onMode, hub, own, author, onPathChang
     <div className="doc">
       <div className="doc-bar">
         <div className="doc-title">
-          <span className="doc-path" title={state.path}>
-            {state.path.split("/").filter(Boolean).map((part, i, all) => (
-              <span key={i} className={i === all.length - 1 ? "crumb last" : "crumb"}>
-                {part}
-              </span>
-            ))}
-          </span>
+          <nav className="doc-path" title={state.path} aria-label="Path">
+            <button type="button" className="crumb" onClick={() => onOpenFolder("/")} title="All files">
+              All files
+            </button>
+            {state.path.split("/").filter(Boolean).map((part, i, all) =>
+              i === all.length - 1 ? (
+                <span key={i} className="crumb last" aria-current="page">
+                  {part}
+                </span>
+              ) : (
+                <button
+                  key={i}
+                  type="button"
+                  className="crumb"
+                  onClick={() => onOpenFolder(`/${all.slice(0, i + 1).join("/")}`)}
+                  title={`Open /${all.slice(0, i + 1).join("/")}`}
+                >
+                  {part}
+                </button>
+              ),
+            )}
+          </nav>
           <span className="doc-meta">
             <span className="mono" title="Version of the text you are looking at">
               v{state.version}

@@ -38,9 +38,11 @@ learns about the CLI's commits from the store's change feed.
 | `textdb_trash_history(id)` | JSON array of its commits, as `textdb_history` |
 | `textdb_purge(id[, author])` | JSON `{items, files, folders, versions, chunks, tree_nodes, bytes}`: removes the entry and everything deleted with it inside for good, then the chunks and tree nodes nothing remaining (any version of any file, HEAD, checkpoint) still reaches. Records a `purge` change |
 | `textdb_empty_trash([author])` | the same for every trash item; one `purge` change per item |
+| `textdb_ls(dir[, recursive])` | `name, kind, nbytes, nlines, updated_at, path, nwords, versions, created_at, updated_by, nauthors, authors, files, folders, id` — the folder's own entries by name, or with `recursive = 1` everything below it by path. A file's `nwords` counts words as `wc -w` does; `authors` is a JSON array `[{author, commits, first_ts, last_ts}]`, most commits first. For a folder, `nbytes`, `nlines`, `nwords` and `versions` total every live file below it, `files`/`folders` count what is below it, and `updated_at` is the latest change anywhere inside. The figures are kept current by every commit, mkdir, move and delete, so listing costs the rows listed, not the subtree |
+| `textdb_entry(path)` | one entry as JSON with the same fields (`authors` as an array); works for the root |
 | `textdb_migrate()` | brings a store written by an older build up to date; call once after `CREATE VIRTUAL TABLE IF NOT EXISTS kb USING textdb(store='kb_')` |
 
-plus the existing `kb` table, `textdb_content`, `textdb_ls`, `textdb_search`, `textdb_diff`,
+plus the existing `kb` table, `textdb_content`, `textdb_search`, `textdb_diff`,
 `textdb_edit`, `textdb_append`. Errors are `TX001 conflict: {json}`, `TX002 …`, `TX003 …`,
 `TX004 …` in the SQLite error message.
 
@@ -66,7 +68,10 @@ Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./
 | Method & path | Request | Response |
 |---|---|---|
 | `GET /api/info` | | `{ db, files, last_seq }` |
-| `GET /api/ls?path=/a` | | `[{ name, path, kind, nbytes, nlines, updated_at }]` — one folder level, folders first then files, by name |
+| `GET /api/ls?path=/a` | | `[entry]` — one folder level, folders first then files, by name. An entry is `{ id, name, path, kind, nbytes, nlines, nwords, versions, updated_at, updated_by, created_at, files, folders, nauthors, authors }`, see `textdb_ls` |
+| `GET /api/list?path=/a[&sort=name][&order=asc][&offset=0][&limit=200][&recursive=1][&name=…][&author=…][&type=md][&kind=file]` | | `{ path, total, offset, entries: [entry] }` — one page, sorted and filtered in the store. `sort` ∈ `name, type, size, lines, words, versions, created, updated, authors`; folders come first except when `recursive`. `name` matches names containing it, or as a glob with `*`/`?`; `author` keeps files that author committed to (`''` for commits without one); `type` is an extension. `limit` ≤ 1000; `total` counts every match |
+| `GET /api/entry?path=…` | | one `entry`, the root included |
+| `POST /api/bulk` | `{ op: "move" \| "delete", paths: [...], to?, author? }` (at most 10000 paths) | `{ op, to, done, skipped }` — one transaction: all move (into folder `to`, keeping names) or delete, or none do. A path inside another listed folder goes with it and is `skipped`, as is a move to where a path already is |
 | `GET /api/file?path=/a/b.md[&version=n]` | | `{ path, version, head_version, content, nbytes, nlines, updated_at, updated_by }` |
 | `GET /api/chunks?path=…[&version=n]` | | `[{ ord, hash, byte_from, nbytes, line_from, nlines }]` |
 | `GET /api/history?path=…` | | `[{ version, author, ts, message, nbytes, kind, base_version }]` oldest first |

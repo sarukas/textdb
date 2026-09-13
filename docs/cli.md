@@ -108,7 +108,7 @@ environment and its own author name, and the instructions in
 | `config` | Show settings and their sources |
 | `import DIR [--prefix /p] [--ext md,markdown,mdx,txt] [--batch 500]` | Load matching files; unchanged files make no new version. Hidden directories and `node_modules` are skipped |
 | `export PREFIX DIR` | Write every file under a folder to disk |
-| `ls [PATH]` | One folder: folders first, then files with size and line count |
+| `ls [PATH] [-l] [-s KEY] [-r] [-R]` | One folder: folders first, then files with size and line count. `-l` adds words, versions, last update, and a file's authors (commits each) or a folder's contents; a folder's size, lines, words and versions are totals of everything below it. `--sort` by `name`, `type`, `size`, `lines`, `words`, `versions`, `created`, `updated` or `authors`; `-r` reverses; `-R` lists everything below the folder by path |
 | `tree [PATH] [-L DEPTH] [-d]` | The folder tree with file counts and sizes; `--json` gives a flat, path-sorted list |
 | `stat PATH` | Kind, version, size, lines, last update and author |
 | `cat PATH [-n] [--lines A:B] [--version V] [--section HEADING]` | Content; `-n` numbers lines under a header `PATH vN · lines A-B of T` |
@@ -166,7 +166,8 @@ EOF
 |---|---|
 | writes | `{"path", "version", "kind"}` |
 | `cat` | `{"path", "version", "nlines", "from", "to", "content"}` |
-| `ls`, `tree` | `[{"path", "name", "kind", "nbytes", "nlines", "updated_at"}]` |
+| `ls` | `[{"path", "name", "kind", "nbytes", "nlines", "updated_at", "nwords", "versions", "created_at", "updated_by", "files", "folders", "authors": [{"author", "commits", "last_ts"}]}]`; `files`/`folders` only for folders, `authors` only for files |
+| `tree` | `[{"path", "name", "kind", "nbytes", "nlines", "updated_at"}]` |
 | `stat` | `{"path", "kind", "version", "nbytes", "nlines", "updated_at", "updated_by"}` |
 | `history` | time-ordered `[{"type": "version", "version", "author", "ts", "message", "nbytes", "kind", "base_version"} \| {"type": "path", "id", "ts", "op", "old_path", "new_path", "via", "version", "author"}]`; `op` is `rename`, `move` or `delete`, `via` the folder the operation named when the file went along with it, `version` the file's version at the time. With `--versions-only`, the version objects without `type` |
 | `setting` | `{"path_history": {"value": "on" \| "off" \| null, "effective": true \| false}}` |

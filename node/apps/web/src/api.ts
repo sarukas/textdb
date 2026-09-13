@@ -10,13 +10,62 @@ export interface Info {
 
 export type NodeKind = "file" | "folder";
 
+/** A file or folder in a listing. A folder's size, lines, words and versions are totals over every file below it. */
 export interface LsEntry {
+  id: number;
   name: string;
   path: string;
   kind: NodeKind;
   nbytes: number | null;
   nlines: number | null;
+  nwords: number | null;
+  /** A file's version; a folder's total of versions below it. */
+  versions: number;
+  /** A file's last commit or move; a folder's latest change, to it or anywhere below. */
   updated_at: string | null;
+  updated_by: string | null;
+  created_at: string;
+  /** Folder: files and folders anywhere below it. */
+  files: number | null;
+  folders: number | null;
+  nauthors: number | null;
+  /** File: who committed to it, most commits first. */
+  authors: AuthorCount[];
+}
+
+export interface AuthorCount {
+  author: string | null;
+  commits: number;
+  first_ts: string;
+  last_ts: string;
+}
+
+export type SortKey = "name" | "type" | "size" | "lines" | "words" | "versions" | "created" | "updated" | "authors";
+
+export interface ListQuery {
+  sort: SortKey;
+  order: "asc" | "desc";
+  offset: number;
+  limit: number;
+  recursive?: boolean;
+  name?: string;
+  author?: string;
+  type?: string;
+  kind?: NodeKind;
+}
+
+export interface ListPage {
+  path: string;
+  total: number;
+  offset: number;
+  entries: LsEntry[];
+}
+
+export interface BulkResult {
+  op: "move" | "delete";
+  to: string | null;
+  done: string[];
+  skipped: string[];
 }
 
 export interface FileDoc {
@@ -141,6 +190,16 @@ async function request<T>(method: string, url: string, body?: unknown, signal?: 
 export const api = {
   info: () => request<Info>("GET", "/api/info"),
   ls: (path: string, signal?: AbortSignal) => request<LsEntry[]>("GET", `/api/ls?${qs({ path })}`, undefined, signal),
+  list: (path: string, q: ListQuery, signal?: AbortSignal) =>
+    request<ListPage>(
+      "GET",
+      `/api/list?${qs({ path, ...q, recursive: q.recursive ? 1 : undefined })}`,
+      undefined,
+      signal,
+    ),
+  entry: (path: string, signal?: AbortSignal) => request<LsEntry>("GET", `/api/entry?${qs({ path })}`, undefined, signal),
+  bulk: (body: { op: "move" | "delete"; paths: string[]; to?: string; author?: string }) =>
+    request<BulkResult>("POST", "/api/bulk", body),
   file: (path: string, version?: number) => request<FileDoc>("GET", `/api/file?${qs({ path, version })}`),
   chunks: (path: string, version?: number) => request<Chunk[]>("GET", `/api/chunks?${qs({ path, version })}`),
   history: (path: string) => request<HistoryEntry[]>("GET", `/api/history?${qs({ path })}`),

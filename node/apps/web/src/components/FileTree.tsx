@@ -1,20 +1,11 @@
-import {
-  Fragment,
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-  type KeyboardEvent,
-  type MouseEvent,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from "react";
 import { api, ApiError, type ChangeEvent, type LsEntry, type TrashEntry } from "../api";
 import { authorHue } from "../live/color";
 import { ancestorsOf, isWithin, parentOf } from "../live/paths";
 import { relativeTime } from "../live/time";
 import type { FeedHub } from "../state/hub";
 import { actionFor, type PathAction, type TrashAction } from "../tree/actions";
+import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
 import { ensureRowVisible, VirtualList } from "./VirtualList";
 
 const ROW = 24;
@@ -27,8 +18,11 @@ const isTrashKey = (key: string) => key.startsWith(TRASH);
 interface Props {
   hub: FeedHub;
   openPath: string | null;
+  /** The folder shown in the central listing, when one is. */
+  openFolder: string | null;
   openTrashId: number | null;
   onOpen: (path: string, line?: number) => void;
+  onOpenFolder: (path: string) => void;
   onOpenTrash: (id: number) => void;
   onAction: (action: PathAction) => void;
   onTrashAction: (action: TrashAction) => void;
@@ -51,25 +45,6 @@ interface Marker {
   until: number;
   seq: number;
   op: string;
-}
-
-interface MenuItem {
-  label: string;
-  hint?: string;
-  danger?: boolean;
-  /** Draw a separator above this item. */
-  separated?: boolean;
-  disabled?: boolean;
-  run: () => void;
-}
-
-interface MenuState {
-  x: number;
-  y: number;
-  /** The row the menu belongs to. */
-  key: string;
-  label: string;
-  items: MenuItem[];
 }
 
 /**
@@ -135,7 +110,17 @@ function useLists<T>(fetchList: (key: string) => Promise<T[]>, onGone?: (key: st
   return { data, dataRef, load, drop };
 }
 
-export function FileTree({ hub, openPath, openTrashId, onOpen, onOpenTrash, onAction, onTrashAction }: Props) {
+export function FileTree({
+  hub,
+  openPath,
+  openFolder,
+  openTrashId,
+  onOpen,
+  onOpenFolder,
+  onOpenTrash,
+  onAction,
+  onTrashAction,
+}: Props) {
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const collapse = useCallback(
     (key: string) =>
@@ -309,10 +294,12 @@ export function FileTree({ hub, openPath, openTrashId, onOpen, onOpenTrash, onAc
 
   // ---- reveal the open file ------------------------------------------------------------------
 
+  // The open file, or else the folder in the central listing.
+  const revealPath = openPath ?? (openFolder && openFolder !== "/" ? openFolder : null);
   useEffect(() => {
-    if (!openPath) return;
+    if (!revealPath) return;
     let cancelled = false;
-    const dirs = ancestorsOf(openPath);
+    const dirs = ancestorsOf(revealPath);
     void (async () => {
       await load("/");
       for (const dir of dirs) {
@@ -320,13 +307,13 @@ export function FileTree({ hub, openPath, openTrashId, onOpen, onOpenTrash, onAc
         await load(dir);
       }
       if (cancelled) return;
-      pendingReveal.current = openPath;
+      pendingReveal.current = revealPath;
       setExpanded((prev) => (dirs.every((d) => prev.has(d)) ? new Set(prev) : new Set([...prev, ...dirs])));
     })();
     return () => {
       cancelled = true;
     };
-  }, [openPath, load]);
+  }, [revealPath, load]);
 
   useEffect(() => {
     const target = pendingReveal.current;
@@ -352,8 +339,14 @@ export function FileTree({ hub, openPath, openTrashId, onOpen, onOpenTrash, onAc
     return row?.type === "trash-root" ? TRASH : null;
   };
 
+  /** A folder opens in the central listing and expands; its twisty (or ←/→) only expands or collapses. */
   const activate = (row: Row | undefined) => {
     if (!row || row.type === "status") return;
+    if (row.type === "entry" && row.entry.kind === "folder") {
+      onOpenFolder(row.entry.path);
+      if (!row.open) toggle(row.entry.path);
+      return;
+    }
     const key = expandKey(row);
     if (key) toggle(key);
     else if (row.type === "entry") onOpen(row.entry.path);
@@ -379,7 +372,12 @@ export function FileTree({ hub, openPath, openTrashId, onOpen, onOpenTrash, onAc
           key: row.key,
           label: row.entry.name,
           items: [
-            expandOrOpen(folder),
+            ...(folder
+              ? [
+                  { label: "Open folder", hint: "Enter", run: () => onOpenFolder(row.entry.path) },
+                  { label: row.open ? "Collapse" : "Expand", hint: row.open ? "←" : "→", run: () => toggle(row.entry.path) },
+                ]
+              : [expandOrOpen(false)]),
             ...(folder
               ? []
               : [
@@ -602,6 +600,7 @@ export function FileTree({ hub, openPath, openTrashId, onOpen, onOpenTrash, onAc
           const folder = entry.kind === "folder";
           const mark = markers.current.get(entry.path);
           const markLive = mark && mark.until > now;
+          const isSelected = folder ? openPath === null && entry.path === openFolder : entry.path === openPath;
           return (
             <div
               key={row.key}
@@ -609,13 +608,25 @@ export function FileTree({ hub, openPath, openTrashId, onOpen, onOpenTrash, onAc
               role="treeitem"
               aria-level={row.depth + 1}
               aria-expanded={folder ? row.open : undefined}
-              aria-selected={entry.path === openPath}
-              className={`tree-row${activeClass}${entry.path === openPath ? " selected" : ""}`}
+              aria-selected={isSelected}
+              className={`tree-row${activeClass}${isSelected ? " selected" : ""}`}
               style={{ ...style, paddingLeft: pad }}
               title={entry.path}
               {...rowEvents(i, row)}
             >
-              <span className={`twisty${folder ? (row.open ? " open" : "") : " none"}`} aria-hidden="true" />
+              <span
+                className={`twisty${folder ? (row.open ? " open" : "") : " none"}`}
+                aria-hidden="true"
+                onClick={
+                  folder
+                    ? (e) => {
+                        e.stopPropagation();
+                        setActive(i);
+                        toggle(entry.path);
+                      }
+                    : undefined
+                }
+              />
               <span className={folder ? "icon icon-folder" : "icon icon-file"} aria-hidden="true" />
               <span className="tree-name">{entry.name}</span>
               {markLive && (
@@ -626,85 +637,7 @@ export function FileTree({ hub, openPath, openTrashId, onOpen, onOpenTrash, onAc
           );
         }}
       />
-      {menu && <TreeMenu {...menu} onClose={closeMenu} />}
+      {menu && <ContextMenu {...menu} onClose={closeMenu} />}
     </>
-  );
-}
-
-interface MenuProps extends MenuState {
-  onClose: (refocus: boolean) => void;
-}
-
-/** A row's context menu: kept inside the window, closed by Escape, a click elsewhere or a choice. */
-function TreeMenu({ x, y, label, items, onClose }: MenuProps) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState({ left: x, top: y });
-
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    setPos({
-      left: Math.max(4, Math.min(x, window.innerWidth - r.width - 4)),
-      top: Math.max(4, Math.min(y, window.innerHeight - r.height - 4)),
-    });
-    el.querySelector<HTMLElement>("[role=menuitem]:not(:disabled)")?.focus();
-  }, [x, y]);
-
-  useEffect(() => {
-    const away = (e: Event) => {
-      if (!ref.current?.contains(e.target as Node)) onClose(false);
-    };
-    const leave = () => onClose(false);
-    window.addEventListener("mousedown", away, true);
-    window.addEventListener("resize", leave);
-    window.addEventListener("blur", leave);
-    return () => {
-      window.removeEventListener("mousedown", away, true);
-      window.removeEventListener("resize", leave);
-      window.removeEventListener("blur", leave);
-    };
-  }, [onClose]);
-
-  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    const enabled = Array.from(ref.current?.querySelectorAll<HTMLElement>("[role=menuitem]:not(:disabled)") ?? []);
-    const at = enabled.indexOf(document.activeElement as HTMLElement);
-    if (e.key === "Escape" || e.key === "Tab") onClose(true);
-    else if (e.key === "ArrowDown") enabled[(at + 1) % enabled.length]?.focus();
-    else if (e.key === "ArrowUp") enabled[(at - 1 + enabled.length) % enabled.length]?.focus();
-    else return;
-    e.preventDefault();
-    e.stopPropagation();
-  };
-
-  return (
-    <div
-      ref={ref}
-      className="menu"
-      role="menu"
-      aria-label={`Actions for ${label}`}
-      style={pos}
-      onKeyDown={onKeyDown}
-      onContextMenu={(e) => e.preventDefault()}
-    >
-      {items.map((item) => (
-        <Fragment key={item.label}>
-          {item.separated && <div role="separator" />}
-          <button
-            type="button"
-            role="menuitem"
-            className={item.danger ? "danger" : undefined}
-            disabled={item.disabled}
-            onClick={() => {
-              onClose(false);
-              item.run();
-            }}
-          >
-            {item.label}
-            {item.hint && <kbd>{item.hint}</kbd>}
-          </button>
-        </Fragment>
-      ))}
-    </div>
   );
 }

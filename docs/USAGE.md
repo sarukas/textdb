@@ -27,7 +27,8 @@ INSERT INTO kb.file(path, content, updated_by) VALUES ('/clients/acme/notes.md',
 SELECT content, version FROM kb.file WHERE path = '/clients/acme/notes.md';
 SELECT kb.lines('/clients/acme/notes.md', 3, 3);              -- 1-based inclusive line range
 SELECT kb.section('/clients/acme/notes.md', 'Acme');           -- text of a heading's section (markdown)
-SELECT * FROM kb.ls('/clients');                                -- one folder level
+SELECT * FROM kb.ls('/clients');                                -- one folder level, with words, versions, authors, folder totals
+SELECT path, nwords FROM kb.ls('/clients', true) WHERE kind = 'file' ORDER BY nwords DESC LIMIT 10;  -- everything below, largest first
 SELECT path, nbytes FROM kb.file WHERE path LIKE '/clients/%'; -- subtree (see the note below)
 
 -- write whole content (the trigger diffs OLD → NEW and commits the edit set)
@@ -154,7 +155,9 @@ SELECT textdb_append('/a.md', 'tail' || char(10));
 SELECT textdb_content('/a.md'), textdb_content('/a.md', 1);
 SELECT textdb_lines('/a.md', 2, 2), textdb_section('/a.md', 'A'), textdb_diff('/a.md', 1, 2);
 SELECT * FROM textdb_history('/a.md');
-SELECT * FROM textdb_ls('/');
+SELECT * FROM textdb_ls('/');                              -- words, versions, authors (JSON), folder totals
+SELECT path, nwords FROM textdb_ls('/', 1) WHERE kind = 'file' ORDER BY nwords DESC LIMIT 10;
+SELECT textdb_entry('/notes');                             -- one folder's totals as JSON
 -- A whole subtree: give `kb` a range on `path` and it seeks the index. Write it as a range
 -- rather than `substr(path, 1, length(?) + 1) = ? || '/'` or `path LIKE ? || '/%'`: those are
 -- functions of the column, so they cost a full scan of the store. `'0'` is the byte after

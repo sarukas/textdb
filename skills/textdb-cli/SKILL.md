@@ -31,6 +31,9 @@ output.
 textdb tree -L 2                         # top of the tree with file counts
 textdb tree guides -d                    # folders only under /guides
 textdb ls guides/api
+textdb ls -l guides                      # + words, versions, last update, authors; folders show totals below them
+textdb ls -R -l --sort updated -r guides # everything below /guides, most recently changed first
+textdb ls -l --sort words guides --json  # machine-readable, with authors and folder file counts
 textdb search 'rate limit' -p guides     # path:line: snippet — terms ANDed, "phrase", prefix*
 textdb stat guides/api/index.md          # version, size, lines, last author
 ```

@@ -13,7 +13,8 @@ The HTTP API and the client semantics are specified in [`live-app.md`](live-app.
 
 | Area | What you get |
 |---|---|
-| **Tree** | Folders and files, loaded lazily and virtualised; a dot marks what just changed and who changed it. Right-click, the row's `⋯` button or the menu key opens Open, Download, Replace with a file, Rename or move (`F2`) and Delete (`Del`) |
+| **Tree** | Folders and files, loaded lazily and virtualised; a dot marks what just changed and who changed it. Clicking a folder opens it in the folder view (its arrow only expands). Right-click, the row's `⋯` button or the menu key opens Open, Download, Replace with a file, Rename or move (`F2`) and Delete (`Del`) |
+| **Folder view** | The centre shows the open folder GitHub-style: a path bar (breadcrumbs; click beside them or press `F4` to type a path, with completion — text that is not a path filters the folder), and a table of its files and subfolders that scrolls through any number of entries, loading 200 at a time. Sort by name, type, size, lines, words, versions, created, updated or authors; choose columns. A folder's figures are totals of everything below it. The filter takes a name or glob plus `author:`, `type:` and `is:file`/`is:folder`; *Subfolders* lists everything below; *Contents* searches the text of the folder's files. Select with the checkboxes, `Space`, `Shift`/`Ctrl`-click or `Ctrl+A`, then move or delete the selection in one transaction. Changes from others update rows in place; new, removed or reordered rows wait behind a *N changes · Refresh* button. Keys: arrows, `Enter` opens, `Backspace` or `Alt+↑` goes up, `F2`, `Del`, `Shift+F10` |
 | **Document** | *Preview* (rendered markdown; *Chunks* shows the content-defined chunk boundaries), *Edit* (CodeMirror; `Ctrl/Cmd+S` saves against the version you started from, so concurrent commits are rebased or merged, and a real conflict opens a panel with base, theirs and yours), *History* (versions with author, time and how each landed, the renames, moves and deletes between them, any version read-only, any two diffed unified or split). Header buttons: Download, Replace…, Rename…, Delete… |
 | **Live changes** | A remote commit to the open document is applied in place — in the editor on top of your unsaved changes — and flashed with the author's colour and `agent-7 · v12 · rebased`. A moved document follows its file; a deleted one says so |
 | **Activity** | Every change in the store, newest first; *Others only* hides your own; an import collapses to one row |
@@ -24,8 +25,10 @@ The HTTP API and the client semantics are specified in [`live-app.md`](live-app.
 | **Download / replace** | Download a file (the version shown). Replace a file with one from your computer: the dialog shows how many lines it adds and removes, then commits it as the next version |
 | **Author** | The name in the header is recorded on your saves, imports, moves and deletes |
 
-Deep links: `#/guides/intro.md` opens a file, `#/guides/intro.md:42` scrolls to line 42,
-`#trash:8144` opens a trashed file.
+Deep links: `#/guides/` opens a folder (`#/` the root), `#/guides/intro.md` a file,
+`#/guides/intro.md:42` scrolls to line 42, `#trash:8144` opens a trashed file. The browser's
+Back and Forward buttons move between them. Sort order and chosen columns are remembered per
+browser.
 
 ## Requirements
 
@@ -114,7 +117,9 @@ npm run seed -- --db ../../kb.db --files 2000
 TEXTDB_DB=../../kb.db npm start
 ```
 
-1. Open <http://127.0.0.1:4317>, set your name in the header, open a file from the tree.
+1. Open <http://127.0.0.1:4317>, set your name in the header. The root folder is listed in the
+   centre: sort by *Words*, tick *Subfolders* and scroll through every file; type
+   `author:seed type:md` in the filter. Open a file from the tree or the table.
 2. In a second terminal, start an agent on that file — the simulator, or a real one with the
    CLI (see [Working with an external agent](cli.md#working-with-an-external-agent)):
 

@@ -27,9 +27,11 @@ psycopg, JDBC, …). Python: `pip install -e python/` from the repo gives `textd
 
 | Shell habit | textdb SQL |
 |---|---|
-| `ls /clients` | `SELECT * FROM kb.ls('/clients');` |
+| `ls /clients` | `SELECT * FROM kb.ls('/clients');` (a folder row's `nbytes`, `nlines`, `nwords`, `versions`, `files`, `folders` total everything below it; a file's `authors` is jsonb, most commits first) |
+| `ls -lt` / `ls -R` | `SELECT path, updated_at FROM kb.ls('/clients') ORDER BY updated_at DESC;` / `SELECT path FROM kb.ls('/clients', true);` |
 | `find /clients -name '*.md'` | `SELECT path FROM kb.file WHERE path LIKE '/clients/%' AND path LIKE '%.md' ORDER BY path;` |
-| `du -sh /clients` | `SELECT nbytes_total FROM kb.folder WHERE path = '/clients';` |
+| `du -sh /clients` | `SELECT nbytes FROM kb.entry WHERE path = '/clients';` (kept current; no subtree scan) |
+| `wc -w notes.md` | `SELECT nwords FROM kb.entry WHERE path = '/clients/acme/notes.md';` |
 | `cat notes.md` | `SELECT content FROM kb.file WHERE path = '/clients/acme/notes.md';` |
 | `sed -n '40,60p' notes.md` | `SELECT kb.lines('/clients/acme/notes.md', 40, 60);` |
 | `head -20 notes.md` / `tail -20 notes.md` | `SELECT kb.lines(p, 1, 20)` / `SELECT kb.lines(p, nlines - 19, nlines) FROM kb.file WHERE path = p` |
@@ -72,6 +74,11 @@ SELECT kb.section('/clients/acme/notes.md', 'Open questions');               -- 
 ```
 
 `kb.lines` and `kb.section` cost O(fragment); `content` costs the whole document.
+
+Folder totals are written as insert-only rows in `kb.folder_delta` so concurrent commits never
+wait on a shared parent folder; `kb.entry` adds them in. A maintenance job can fold them with
+`SELECT kb.compact_folder_totals();`; `SELECT kb.rebuild_folder_totals();` recomputes every
+folder from its files if a move raced a commit inside the moved folder.
 
 ## Change
 

@@ -1,5 +1,5 @@
 /** Renaming, moving and deleting files and folders from the UI. */
-import type { PurgeStats, Stat, TrashEntry } from "../api";
+import type { BulkResult, PurgeStats, Stat, TrashEntry } from "../api";
 import { formatBytes } from "../import/select";
 import { isWithin } from "../live/paths";
 
@@ -9,6 +9,25 @@ export interface PathAction {
   kind: "file" | "folder";
   /** download: the version to save; HEAD when absent. */
   version?: number;
+}
+
+export interface BulkItem {
+  path: string;
+  kind: "file" | "folder";
+  /** Files it holds: 1 for a file. */
+  files: number;
+}
+
+/** Moving or deleting several selected files and folders at once. */
+export interface BulkAction {
+  op: "move" | "delete";
+  items: BulkItem[];
+}
+
+/** "Moved 3 items to /archive" or "Deleted 12 items". */
+export function bulkSummary(r: BulkResult): string {
+  const n = count(r.done.length, "item");
+  return r.op === "move" ? `Moved ${n} to ${r.to}` : `Deleted ${n}`;
 }
 
 /** Removing one trash entry for good, or everything in the trash. */

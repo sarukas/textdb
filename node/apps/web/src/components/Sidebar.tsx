@@ -8,8 +8,10 @@ import { SearchResults } from "./SearchResults";
 interface Props {
   hub: FeedHub;
   openPath: string | null;
+  openFolder: string | null;
   openTrashId: number | null;
   onOpen: (path: string, line?: number) => void;
+  onOpenFolder: (path: string) => void;
   onOpenTrash: (id: number) => void;
   onAction: (action: PathAction) => void;
   onTrashAction: (action: TrashAction) => void;
@@ -22,7 +24,17 @@ interface SearchState {
   error: string | null;
 }
 
-export function Sidebar({ hub, openPath, openTrashId, onOpen, onOpenTrash, onAction, onTrashAction }: Props) {
+export function Sidebar({
+  hub,
+  openPath,
+  openFolder,
+  openTrashId,
+  onOpen,
+  onOpenFolder,
+  onOpenTrash,
+  onAction,
+  onTrashAction,
+}: Props) {
   const [query, setQuery] = useState("");
   const [search, setSearch] = useState<SearchState | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -100,8 +112,10 @@ export function Sidebar({ hub, openPath, openTrashId, onOpen, onOpenTrash, onAct
         <FileTree
           hub={hub}
           openPath={openPath}
+          openFolder={openFolder}
           openTrashId={openTrashId}
           onOpen={onOpen}
+          onOpenFolder={onOpenFolder}
           onOpenTrash={onOpenTrash}
           onAction={onAction}
           onTrashAction={onTrashAction}

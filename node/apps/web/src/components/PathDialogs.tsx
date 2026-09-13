@@ -1,12 +1,31 @@
 import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { api, ApiError, type FileDoc, type PurgeStats, type Stat, type TrashEntry, type WriteResult } from "../api";
+import {
+  api,
+  ApiError,
+  type BulkResult,
+  type FileDoc,
+  type PurgeStats,
+  type Stat,
+  type TrashEntry,
+  type WriteResult,
+} from "../api";
+import { folderPath } from "../nav/hash";
 import { lineChange, type LineChange } from "../doc/transfer";
 import { formatBytes } from "../import/select";
 import { readText } from "../import/source";
 import { baseName, isWithin, parentOf } from "../live/paths";
 import { relativeTime } from "../live/time";
 import { effectiveAuthor } from "../state/useAuthor";
-import { checkMove, count, describeStat, nameRange, type PathAction, type TrashAction } from "../tree/actions";
+import {
+  checkMove,
+  count,
+  describeStat,
+  nameRange,
+  type BulkAction,
+  type BulkItem,
+  type PathAction,
+  type TrashAction,
+} from "../tree/actions";
 
 /** A folder this large asks for its name to be typed before it is deleted. */
 const TYPE_TO_CONFIRM_FILES = 50;
@@ -240,6 +259,178 @@ export function DeleteDialog({ target, author, openPath, onClose, onDeleted }: D
         <label className="field">
           <span>
             Type <span className="mono">{name}</span> to confirm
+          </span>
+          <input value={typed} onChange={(e) => setTyped(e.target.value)} readOnly={busy} spellCheck={false} autoFocus />
+        </label>
+      )}
+      {error && (
+        <p className="error-text" role="alert">
+          {error}
+        </p>
+      )}
+    </PathDialog>
+  );
+}
+
+interface BulkProps {
+  action: BulkAction;
+  author: string;
+  openPath: string | null;
+  onClose: () => void;
+  onDone: (result: BulkResult) => void;
+}
+
+/** The first few names of a selection, and how many more. */
+function BulkList({ items }: { items: BulkItem[] }) {
+  const shown = items.slice(0, 6);
+  return (
+    <ul className="bulk-list">
+      {shown.map((i) => (
+        <li key={i.path}>
+          <span className={i.kind === "folder" ? "icon icon-folder" : "icon icon-file"} aria-hidden="true" />
+          <span className="mono">{i.path}</span>
+        </li>
+      ))}
+      {items.length > shown.length && <li className="muted">and {count(items.length - shown.length, "more item")}</li>}
+    </ul>
+  );
+}
+
+export function BulkMoveDialog({ action, author, onClose, onDone }: BulkProps) {
+  const { items } = action;
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [value, setValue] = useState(() => parentOf(items[0]?.path ?? "/"));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const to = folderPath(value);
+  const into = items.find((i) => i.kind === "folder" && (i.path === to || isWithin(i.path, to)));
+  const reason = !value.trim()
+    ? "Enter the destination folder."
+    : value.split("/").some((s) => s === "." || s === "..")
+      ? "A path cannot contain “.” or “..” segments."
+      : into
+        ? `${into.path} cannot move inside itself.`
+        : null;
+  const already = items.every((i) => parentOf(i.path) === to);
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (reason || already || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      onDone(await api.bulk({ op: "move", paths: items.map((i) => i.path), to, author: effectiveAuthor(author) }));
+    } catch (err) {
+      setError(message(err));
+      setBusy(false);
+      inputRef.current?.focus();
+    }
+  };
+
+  return (
+    <PathDialog
+      title={`Move ${count(items.length, "item")}`}
+      busy={busy}
+      onClose={onClose}
+      onSubmit={(e) => void submit(e)}
+      onShown={() => inputRef.current?.select()}
+      foot={
+        <>
+          <button type="button" className="btn" onClick={onClose} disabled={busy}>
+            Cancel
+          </button>
+          <button type="submit" className="btn btn-primary" disabled={!!reason || already || busy}>
+            {busy ? "Moving…" : "Move"}
+          </button>
+        </>
+      }
+    >
+      <label className="field">
+        <span>Destination folder</span>
+        <input
+          ref={inputRef}
+          value={value}
+          onChange={(e) => {
+            setValue(e.target.value);
+            setError(null);
+          }}
+          aria-invalid={!!reason}
+          readOnly={busy}
+          spellCheck={false}
+        />
+        {reason ? (
+          <small className="error-text">{reason}</small>
+        ) : already ? (
+          <small>Everything selected is already there.</small>
+        ) : (
+          <small>Missing folders are created. Names stay the same, and history moves along. All move, or none do.</small>
+        )}
+      </label>
+      <BulkList items={items} />
+      {error && (
+        <p className="error-text" role="alert">
+          {error}
+        </p>
+      )}
+    </PathDialog>
+  );
+}
+
+export function BulkDeleteDialog({ action, author, openPath, onClose, onDone }: BulkProps) {
+  const { items } = action;
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const [typed, setTyped] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const files = items.reduce((n, i) => n + i.files, 0);
+  const folders = items.filter((i) => i.kind === "folder").length;
+  const mustType = files >= TYPE_TO_CONFIRM_FILES;
+  const ready = !mustType || typed.trim() === "delete";
+  const closesOpen = openPath !== null && items.some((i) => i.path === openPath || isWithin(i.path, openPath));
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!ready || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      onDone(await api.bulk({ op: "delete", paths: items.map((i) => i.path), author: effectiveAuthor(author) }));
+    } catch (err) {
+      setError(message(err));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <PathDialog
+      title={`Delete ${count(items.length, "item")}`}
+      busy={busy}
+      onClose={onClose}
+      onSubmit={(e) => void submit(e)}
+      onShown={() => cancelRef.current?.focus()}
+      foot={
+        <>
+          <button ref={cancelRef} type="button" className="btn" onClick={onClose} disabled={busy}>
+            Cancel
+          </button>
+          <button type="submit" className="btn btn-danger-solid" disabled={!ready || busy}>
+            {busy ? "Deleting…" : `Delete ${count(files, "file")}`}
+          </button>
+        </>
+      }
+    >
+      <BulkList items={items} />
+      <p>
+        {folders > 0
+          ? `The ${count(folders, "folder")} go with everything inside them: ${count(files, "file")} in all.`
+          : `${count(files, "file")} ${files === 1 ? "is" : "are"} deleted.`}{" "}
+        Everything moves to the trash with its history, readable until it is permanently removed.
+      </p>
+      {closesOpen && <p>The open document is among them and is closed, unsaved changes included.</p>}
+      {mustType && (
+        <label className="field">
+          <span>
+            Type <span className="mono">delete</span> to confirm
           </span>
           <input value={typed} onChange={(e) => setTyped(e.target.value)} readOnly={busy} spellCheck={false} autoFocus />
         </label>
