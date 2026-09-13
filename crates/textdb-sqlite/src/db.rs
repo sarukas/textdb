@@ -605,10 +605,20 @@ impl<'c> TextDb<'c> {
     }
 
     pub fn read(&self, path: &str) -> Result<Vec<u8>> {
+        Ok((*self.read_shared(path)?.0).clone())
+    }
+
+    /// HEAD content as the cache holds it, with whether it is valid UTF-8.
+    ///
+    /// The `Vec`-returning `read` copies the whole document for its caller to copy again
+    /// into SQLite. Anything handing bytes straight back — the scalar functions, the
+    /// virtual table's content column — wants the shared buffer and the UTF-8 answer that
+    /// came with it, since both are properties of content the cache is keyed by.
+    pub fn read_shared(&self, path: &str) -> Result<(std::sync::Arc<Vec<u8>>, bool)> {
         let path = normalize_path(path)?;
         let n = self.file_by_path(&path)?;
         let root = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
-        Ok((*self.storage().document(&root)?.0).clone())
+        self.storage().document(&root)
     }
 
     pub fn root_of_version(&self, file_id: i64, version: u64) -> Result<Hash> {
@@ -624,10 +634,25 @@ impl<'c> TextDb<'c> {
 
     /// Content at a historical version; works for tombstoned files too.
     pub fn read_version(&self, path: &str, version: u64) -> Result<Vec<u8>> {
+        Ok((*self.read_version_shared(path, version)?.0).clone())
+    }
+
+    /// As `read_version`, returning the cached buffer and its UTF-8 flag.
+    ///
+    /// Two statements, deliberately. Folding them into one join or one correlated subquery
+    /// was tried and is much worse, because neither can use an index for the part that makes
+    /// the lookup cheap. `{p}node_path` is a *partial* index (`WHERE deleted_at IS NULL`),
+    /// and a historical read has to find tombstoned files too, so any formulation that
+    /// expresses "live row first, else the most recently deleted one" as an `ORDER BY` loses
+    /// the index and sorts. Measured over 300 files: two statements 3.6 us, subquery 17.4 us
+    /// (scans `node`), join 39.4 us (scans `commit`, whose primary key starts at `file_id`
+    /// and cannot serve a filter on `version` alone). `node_by_path_any` instead tries the
+    /// indexed live lookup first and only falls back to the scan when the path is not live.
+    pub fn read_version_shared(&self, path: &str, version: u64) -> Result<(std::sync::Arc<Vec<u8>>, bool)> {
         let path = normalize_path(path)?;
         let n = self.node_by_path_any(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let root = self.root_of_version(n.id, version)?;
-        Ok((*self.storage().document(&root)?.0).clone())
+        self.storage().document(&root)
     }
 
     /// Replace the whole content (`UPDATE kb SET content = …`). The diff OLD→NEW is

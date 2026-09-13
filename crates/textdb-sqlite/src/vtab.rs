@@ -108,13 +108,26 @@ pub struct KbTab {
     /// An earlier attempt at this was reverted for leaving the database file unreleasable;
     /// `closing_a_connection_with_a_kb_table_releases_the_file` is the regression test it
     /// did not have.
-    conn: Connection,
+    ///
+    /// Shared rather than private so the scalar SQL functions, which get a throwaway handle
+    /// per call and cannot safely keep one of their own, can prepare through it too — see
+    /// `storage::shared`.
+    conn: std::rc::Rc<Connection>,
 }
 
 impl KbTab {
     /// The table's own handle. Use this wherever a statement is worth caching.
     fn conn(&self) -> &Connection {
         &self.conn
+    }
+}
+
+impl Drop for KbTab {
+    fn drop(&mut self) {
+        // `xDisconnect`, which `sqlite3_close` runs before it looks for unfinalized
+        // statements. Releasing here is what keeps the cached statements from outliving the
+        // window in which finalizing them is still free.
+        crate::storage::release_shared_conn(self.db);
     }
 }
 
@@ -143,7 +156,7 @@ unsafe impl<'vtab> VTab<'vtab> for KbTab {
     ) -> Result<(Cow<'static, CStr>, Self)> {
         let prefix = parse_prefix(&args[3.min(args.len())..])?;
         let handle = unsafe { db.handle() };
-        let conn = unsafe { Connection::from_handle(handle) }?;
+        let conn = unsafe { crate::storage::register_shared_conn(handle) }?;
         Ok((
             Cow::Borrowed(KB_SCHEMA),
             KbTab {
@@ -530,7 +543,13 @@ pub struct FnTab {
     /// `storage.rs` prepare everything through `prepare_cached`, and a `Connection` built
     /// per call throws that cache away before it can be used twice. `textdb_search` runs
     /// several statements per call, so it was recompiling all of them every time.
-    conn: Connection,
+    conn: std::rc::Rc<Connection>,
+}
+
+impl Drop for FnTab {
+    fn drop(&mut self) {
+        crate::storage::release_shared_conn(self.db);
+    }
 }
 
 unsafe impl<'vtab> VTab<'vtab> for FnTab {
@@ -547,7 +566,7 @@ unsafe impl<'vtab> VTab<'vtab> for FnTab {
     ) -> Result<(Cow<'static, CStr>, Self)> {
         let spec = aux.ok_or_else(|| Error::ModuleError("missing function spec".into()))?;
         let handle = unsafe { db.handle() };
-        let conn = unsafe { Connection::from_handle(handle) }?;
+        let conn = unsafe { crate::storage::register_shared_conn(handle) }?;
         Ok((
             Cow::Borrowed(spec.kind.schema()),
             FnTab {

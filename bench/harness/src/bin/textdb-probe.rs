@@ -306,6 +306,63 @@ fn probe_statements() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `textdb_content` / `textdb_lines` are scalar SQL functions, which get a fresh
+/// `Connection` per call and so cannot reuse a statement cache the way the virtual tables
+/// now do. This splits their cost into the SQL entry point, the lookups and the work.
+fn probe_scalar() -> anyhow::Result<()> {
+    let s = open_stores()?;
+    println!("## scalar — per-call cost of the scalar function entry point\n");
+    for size in [8 << 10usize, 1 << 20] {
+        let body = corpus(size, 11);
+        let l = label(size);
+        let path = format!("/{}/a.txt", l);
+        s.td.execute(
+            "INSERT INTO kb(path, content, author) VALUES (?1, ?2, 'probe')",
+            params![&path, &body],
+        )?;
+        s.td.execute(
+            "UPDATE kb SET content = ?1 WHERE path = ?2",
+            params![edit_one_line(&body), &path],
+        )?;
+        s.base
+            .execute("INSERT INTO doc(path, body) VALUES (?1, ?2)", params![&path, &body])?;
+        let reps = if size >= 1 << 20 { 200 } else { 3000 };
+        // Warm every cache these paths use.
+        let _: String = s.td.query_row("SELECT textdb_content(?1, 1)", params![&path], |r| r.get(0))?;
+        let _: String = s.td.query_row("SELECT content FROM kb WHERE path = ?1", params![&path], |r| r.get(0))?;
+
+        let f_version = timed(reps, |_| {
+            let _: String = s.td.query_row("SELECT textdb_content(?1, 1)", params![&path], |r| r.get(0)).unwrap();
+        });
+        let f_head = timed(reps, |_| {
+            let _: String = s.td.query_row("SELECT textdb_content(?1)", params![&path], |r| r.get(0)).unwrap();
+        });
+        let vtab = timed(reps, |_| {
+            let _: String = s.td.query_row("SELECT content FROM kb WHERE path = ?1", params![&path], |r| r.get(0)).unwrap();
+        });
+        let b_version = timed(reps, |_| {
+            let _: String = s
+                .base
+                .query_row(
+                    "SELECT body FROM doc_rev WHERE doc_id = (SELECT id FROM doc WHERE path = ?1) AND version = 1",
+                    params![&path],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        });
+        // A scalar function that does no textdb work at all, for the floor.
+        let floor = timed(reps, |_| {
+            let _: i64 = s.td.query_row("SELECT length(?1)", params![&path], |r| r.get(0)).unwrap();
+        });
+        println!(
+            "  {:>6}  textdb_content(path, 1) {:8.4} ms | textdb_content(path) {:8.4} | kb content column {:8.4} | baseline {:8.4} ({:.2}x) | bare scalar fn {:8.4}",
+            l, f_version, f_head, vtab, b_version, f_version / b_version, floor
+        );
+    }
+    println!();
+    Ok(())
+}
+
 /// Prefix queries are written `substr(path, 1, length(?1) + 1) = ?1 || '/'`, which no
 /// index can serve. The same predicate as a range over `path` uses `{p}node_path`.
 fn probe_prefix() -> anyhow::Result<()> {
@@ -489,6 +546,7 @@ fn main() -> anyhow::Result<()> {
     match which.as_str() {
         "ops" => probe_ops()?,
         "statements" => probe_statements()?,
+        "scalar" => probe_scalar()?,
         "prefix" => probe_prefix()?,
         "writepath" => probe_writepath()?,
         "diff" => probe_diff(false)?,
@@ -496,13 +554,14 @@ fn main() -> anyhow::Result<()> {
         "all" => {
             probe_ops()?;
             probe_statements()?;
+            probe_scalar()?;
             probe_prefix()?;
             probe_writepath()?;
             probe_diff(false)?;
         }
         other => {
             eprintln!("unknown probe '{}'", other);
-            eprintln!("usage: textdb-probe [all|ops|statements|prefix|writepath|diff|diff-big]");
+            eprintln!("usage: textdb-probe [all|ops|statements|scalar|prefix|writepath|diff|diff-big]");
             std::process::exit(2);
         }
     }

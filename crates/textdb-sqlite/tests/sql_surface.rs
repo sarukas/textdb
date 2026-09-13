@@ -405,6 +405,26 @@ fn closing_a_connection_with_a_kb_table_releases_the_file() {
         .query_row("SELECT count(*) FROM kb WHERE path >= '/' AND path < '0'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(n, 1);
+    // The scalar and table-valued functions prepare through the *same* shared handle, so
+    // they add statements to the cache the table's teardown is responsible for. Warm each
+    // kind, or the close below would only be testing the table's own statements.
+    for _ in 0..2 {
+        let _: String = conn
+            .query_row("SELECT textdb_content('/a.md', 1)", [], |r| r.get(0))
+            .unwrap();
+        let _: String = conn.query_row("SELECT textdb_lines('/a.md', 1, 1)", [], |r| r.get(0)).unwrap();
+        let _: i64 = conn
+            .query_row("SELECT count(*) FROM textdb_history('/a.md')", [], |r| r.get(0))
+            .unwrap();
+        let _: i64 = conn.query_row("SELECT count(*) FROM textdb_ls('/')", [], |r| r.get(0)).unwrap();
+        let _: i64 = conn
+            .query_row("SELECT count(*) FROM textdb_search('x', '/')", [], |r| r.get(0))
+            .unwrap();
+    }
+    // A write through a scalar function too: those take a transaction on the shared handle.
+    let _: i64 = conn
+        .query_row("SELECT textdb_edit('/a.md', 'x', 'xy')", [], |r| r.get(0))
+        .unwrap();
 
     // This is the assertion: `close` must succeed, not return SQLITE_BUSY.
     conn.close().expect("connection with a kb table must close cleanly");
@@ -501,4 +521,32 @@ fn sections_stay_findable_across_edits_that_do_not_change_structure() {
     let (secs, links, fm) = counts();
     assert_eq!((secs, links, fm), (3, 2, 0), "frontmatter row should be gone");
     assert!(section("Deep").unwrap().contains("delta"));
+}
+
+/// The scalar functions borrow a handle a `textdb` table registered. With no table on the
+/// connection there is nothing to borrow, and they must still work on their own — this is
+/// the fallback path in `with_db`, which nothing else exercises.
+#[test]
+fn scalar_functions_work_without_a_virtual_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kb.db");
+    let conn = Connection::open(&file).unwrap();
+    // The shadow tables through the Rust API, so no virtual table is ever created and
+    // nothing registers the handle; then the functions on their own.
+    let db = TextDb::open(&conn, "kb_").unwrap();
+    db.create("/a.md", b"alpha\nbeta\n", None, None).unwrap();
+    drop(db);
+    textdb_sqlite::functions::register_functions(&conn, "kb_").unwrap();
+    let content: String = conn
+        .query_row("SELECT textdb_content('/a.md')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(content, "alpha\nbeta\n");
+    let lines: String = conn.query_row("SELECT textdb_lines('/a.md', 2, 2)", [], |r| r.get(0)).unwrap();
+    assert_eq!(lines, "beta\n");
+    let v: i64 = conn
+        .query_row("SELECT textdb_edit('/a.md', 'beta', 'BETA')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 2);
+    conn.close().unwrap();
+    std::fs::remove_file(&file).expect("file must be deletable with no table registered either");
 }
