@@ -10,11 +10,16 @@ This repository is the proof of concept described in [`docs/spec.md`](docs/spec.
 
 - **Install:** [`docs/INSTALL.md`](docs/INSTALL.md) · **Use:** [`docs/USAGE.md`](docs/USAGE.md)
 - **Benchmark results:** [`bench/RESULTS.md`](bench/RESULTS.md) (raw data in `bench/results/`)
+- **Command line:** [`docs/cli.md`](docs/cli.md) — `textdb` for SQLite and Postgres stores: tree, cat, search,
+  line-range and anchored edits that rebase over concurrent writers, history, hunks, and `watch` for live changes.
+- **Live corpus app:** [`docs/live-app.md`](docs/live-app.md) — a Node server and web UI where an agent's edits
+  appear in the open viewer or editor as they land, attributed, with version history and diffs.
 - **Python library:** [`python/`](python/README.md) — `Corpus.open("sqlite:///kb.db" | "postgresql://…")`,
   file/folder loaders, anchored edits, conflict handling, CLI.
 - **Skills for AI agents:** [`skills/textdb-install`](skills/textdb-install/SKILL.md),
   [`skills/textdb-use-postgres`](skills/textdb-use-postgres/SKILL.md),
-  [`skills/textdb-use-sqlite`](skills/textdb-use-sqlite/SKILL.md) — copy a folder into `.claude/skills/`
+  [`skills/textdb-use-sqlite`](skills/textdb-use-sqlite/SKILL.md),
+  [`skills/textdb-cli`](skills/textdb-cli/SKILL.md) — copy a folder into `.claude/skills/`
   (project) or `~/.claude/skills/` (user) to make it available as a slash command.
 
 ## Layout
@@ -26,6 +31,8 @@ This repository is the proof of concept described in [`docs/spec.md`](docs/spec.
 | `crates/textdb-sqlite` | SQLite binding: shadow tables, `CREATE VIRTUAL TABLE kb USING textdb(...)`, table-valued and scalar functions, FTS5 on chunks |
 | `crates/textdb-sqlite-ext` | Loadable SQLite extension (`libtextdb_sqlite_ext.so`) for Python, the `sqlite3` shell, any language |
 | `crates/textdb-pg` | Postgres 16 extension (pgrx): schema `kb`, updatable views `kb.file`/`kb.folder`/`kb.file_version`, functions, SQLSTATEs `TX001`/`TX002` |
+| `crates/textdb-cli` | The `textdb` command line, over SQLite (compiled in) or Postgres |
+| `node/` | Live corpus app: `packages/textdb` (client over `node:sqlite`), `apps/server` (HTTP + server-sent events), `apps/web` (React + CodeMirror UI) |
 | `python/` | Python library `textdb` with swappable Postgres/SQLite backends, loaders, CLI |
 | `bench/harness` | The test suite runner and six backends (`fs`, `fs-git`, `sql-text-sqlite`, `sql-text-pg`, `textdb-sqlite`, `textdb-pg`) |
 | `bench/harness/tests/*.toml` | The test matrix as data |
