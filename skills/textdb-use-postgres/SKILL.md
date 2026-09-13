@@ -47,7 +47,8 @@ psycopg, JDBC, …). Python: `pip install -e python/` from the repo gives `textd
 | `mv notes.md notes-2026.md` | `UPDATE kb.file SET path = '/clients/acme/notes-2026.md' WHERE path = '/clients/acme/notes.md';` |
 | `mv /clients/acme /archive/acme` | `UPDATE kb.folder SET path = '/archive/acme' WHERE path = '/clients/acme';` |
 | `rm notes.md` / `rm -r /archive` | `DELETE FROM kb.file WHERE path = …;` / `DELETE FROM kb.folder WHERE path = '/archive';` (tombstones; history stays) |
-| `git log notes.md` | `SELECT * FROM kb.history('/clients/acme/notes.md');` |
+| `mv` with attribution | `SELECT kb.move('/clients/acme', '/archive/acme', 'me');` · `SELECT kb.remove('/archive/old', 'me');` |
+| `git log notes.md` | `SELECT * FROM kb.history('/clients/acme/notes.md');` and `SELECT * FROM kb.path_history('/clients/acme/notes.md');` (renames, moves, deletes) |
 | `git show HEAD~3:notes.md` | `SELECT kb.content('/clients/acme/notes.md', version - 3) FROM kb.file WHERE path = …;` |
 | `git diff v1 v2 -- notes.md` | `SELECT kb.diff('/clients/acme/notes.md', 1, 2);` |
 | `git tag before-migration` | `SELECT kb.checkpoint('before-migration');` |
@@ -109,3 +110,19 @@ SELECT kb.diff('/clients/acme/notes.md', 3, 7);
 SELECT version, author, ts FROM kb.file_version WHERE path = '/clients/acme/notes.md' ORDER BY version DESC LIMIT 5;
 SELECT kb.checkpoint('before-bulk-rewrite');
 ```
+
+### Renames, moves and deletes
+
+Every rename, move and delete is recorded for each node it touched (a folder's move gives
+each file inside an entry with `via` = the folder), unless path history is off. They are not
+versions.
+
+```sql
+SELECT op, old_path, new_path, via, version, author, ts FROM kb.path_history('/clients/acme/notes.md');
+SELECT kb.path_history_enabled();                 -- session setting, else store setting, else true
+SET textdb.path_history = off;                    -- this session only, e.g. for a scripted reorganisation
+SELECT kb.set_setting('path_history', 'off');     -- the store default for everyone; NULL restores on
+```
+
+Postgres has no trash functions yet: a deleted file's versions stay readable with
+`kb.content(path, version)` and `kb.history(path)`.

@@ -44,6 +44,62 @@ can be written without the leading slash (`guides/a.md` means `/guides/a.md`), o
 `MSYS_NO_PATHCONV=1`. `textdb` refuses a drive-letter path with this explanation rather than
 reporting it as not found.
 
+## Working with an external agent
+
+The CLI is all an agent needs: no server, no daemon, no SDK. Give each agent its own shell
+environment and its own author name, and the instructions in
+[`skills/textdb-cli/SKILL.md`](../skills/textdb-cli/SKILL.md).
+
+1. **Build once:** `cargo build --release -p textdb-cli` gives `target/release/textdb`
+   (`textdb.exe` on Windows). On Windows a running binary is locked, so if you keep
+   rebuilding while agents work, point the agents at a copy.
+2. **Set the agent's environment** in the shell its commands run in:
+
+   ```sh
+   export TEXTDB_STORE=/srv/corpus/kb.db           # a SQLite file, or postgres://user@host/db
+   export TEXTDB_AUTHOR=agent-7                    # one name per agent: history, the log and the web UI show it
+   export MSYS_NO_PATHCONV=1                       # Git Bash on Windows only
+   export PATH=/path/to/textdb/target/release:$PATH
+   textdb config                                   # prints store, author and path history, and where each came from
+   ```
+
+   Windows `cmd` (a `set` value takes no quotes; the setting lasts for that window):
+
+   ```bat
+   set TEXTDB_STORE=C:\data\kb.db
+   set TEXTDB_AUTHOR=agent-7
+   set PATH=C:\path\to\textdb\target\release;%PATH%
+   textdb config
+   ```
+
+   PowerShell: `$env:TEXTDB_STORE = 'C:\data\kb.db'; $env:TEXTDB_AUTHOR = 'agent-7'`. In `cmd`
+   and PowerShell a store path such as `/guides/a.md` reaches the program unchanged — only Git
+   Bash rewrites it. For multi-line text in `cmd`, put it in a file and pass `-f FILE`
+   (`echo … |` would add CRLF line endings).
+
+3. **Give it the instructions.** For Claude Code, copy `skills/textdb-cli` into the project's
+   `.claude/skills/` (or `~/.claude/skills/`); any other agent gets the contents of `SKILL.md`
+   in its prompt. A one-line brief that works:
+
+   > The documents are in a textdb store; use only the `textdb` command, as described in
+   > SKILL.md. Read with `textdb cat -n`, edit with `replace-lines -b <version>` or
+   > `edit --old/--new`, and on exit status 3 rebuild your change on the `theirs` text from
+   > the error and retry with the new version.
+
+4. **The loop it should follow:** find (`tree`, `ls`, `search`) → read (`cat -n`, remember
+   `vN` from the header) → change (`replace-lines PATH FROM TO -b N`, `edit --old … --new …`,
+   `append` for journals) → check (`hunks PATH`, `history PATH`). Add `--json` to any command
+   for machine-readable output; a refused write exits with 3 (conflict, payload has `theirs`
+   and `current_version`), 4 (store busy: retry), 5 (not found), 6 (invalid edit).
+5. **Follow what others do:** `textdb watch --json -p /some/folder` prints one JSON line per
+   change as it commits (SQLite: within ~100 ms; Postgres: on `NOTIFY`), and
+   `textdb log --since SEQ` reads the change log from a known point.
+6. **Alongside the web app:** the agent and the [demo app](demo-app.md) share the store file
+   directly; the agent's commits appear in open browsers attributed to `TEXTDB_AUTHOR`. The
+   server does not need to be running for the CLI to work.
+7. **Reorganising in bulk:** `--path-history off` (or `TEXTDB_PATH_HISTORY=off`) keeps a large
+   scripted reshuffle out of every file's history for that command.
+
 ## Commands
 
 | Command | What it does |

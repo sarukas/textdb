@@ -18,6 +18,9 @@ export TEXTDB_AUTHOR=agent-<name>        # your writes are attributed to this na
 export MSYS_NO_PATHCONV=1               # Git Bash on Windows only: stops "/a.md" being rewritten
 ```
 
+Run `textdb config` once to check the store, your author name and whether renames, moves and
+deletes are recorded in history, and where each setting came from.
+
 Paths look like `/folder/file.md`. Writing them without the leading slash (`folder/file.md`)
 also works and is immune to shell rewriting. Add `--json` to any command for machine-readable
 output.
@@ -98,6 +101,25 @@ textdb log --since 0 --limit 50          # recent changes across the corpus
 textdb watch -p guides --json            # follow changes live (runs until stopped)
 ```
 
+`history` lists versions and, between them, the renames, moves and deletes that touched the
+file — also those of a folder it was in (`renamed … (with /old-folder)`). In `--json` each
+entry has `"type": "version"` or `"type": "path"` (`op`: `rename`, `move`, `delete`);
+`--versions-only` gives versions alone. A deleted file's history is still found at the path it
+was deleted from.
+
+## Reorganise
+
+```sh
+textdb mv guides/draft.md guides/published/intro.md   # a file or a whole folder; history moves with it
+textdb rm guides/old                                  # a file or a whole folder, recursively
+textdb setting                                        # path_history: on (default) or off for this store
+textdb --path-history off mv archive/2024 archive/y2024   # keep one bulk reshuffle out of history
+```
+
+`rm` is not final: deleted files keep their content and versions in the store's trash, where
+people can read and restore-by-copy them in the web app until someone permanently removes
+them. Moving or deleting a folder touches everything inside it — check with `tree` first.
+
 ## Rules
 
 1. Read with `cat -n` and pass the header's version as `-b` for line-number edits.
@@ -106,3 +128,4 @@ textdb watch -p guides --json            # follow changes live (runs until stopp
    that lacks `-b`.
 4. Use `append` for journals and logs.
 5. Use your own `TEXTDB_AUTHOR`, so the changes you make are attributed to you.
+6. Do not `rm` or `mv` folders you were not asked to reorganise; people are browsing them.

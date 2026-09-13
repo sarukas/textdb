@@ -1,5 +1,8 @@
 # Live corpus app — contract
 
+This is the contract between the store, the server and the web UI. To build, start and
+configure the app, and for what it does, see [`demo-app.md`](demo-app.md).
+
 The exercise: ingest a large markdown corpus into a textdb SQLite store, browse it as a file
 tree, view and edit a document in the browser, and watch an agent edit the same document from
 the command line — with the agent's changes appearing in the open viewer or editor as they
