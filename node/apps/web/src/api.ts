@@ -61,6 +61,74 @@ export interface ListPage {
   entries: LsEntry[];
 }
 
+/** The last `textdb sync` of a folder with its directory. */
+export interface SyncState {
+  dir: string;
+  seq: number;
+  synced_at: string;
+  author: string | null;
+  git: { commit: string | null; branch: string | null; remote: string | null; clean: boolean } | null;
+  /** Files changed, added or deleted in the store since. */
+  changed: number;
+  conflicts: string[];
+}
+
+export interface SyncLink {
+  prefix: string;
+  dir: string;
+  exists: boolean;
+  running: boolean;
+  last: SyncState | null;
+}
+
+export interface SyncLinks {
+  available: boolean;
+  reason: string | null;
+  links: SyncLink[];
+}
+
+export interface SyncChanges {
+  new: string[];
+  changed: string[];
+  deleted: string[];
+}
+
+export interface SyncNote {
+  path: string;
+  reason: string;
+}
+
+/** What `textdb sync --json` reports, planned (`dry_run`) or done. */
+export interface SyncReport {
+  prefix: string;
+  dir: string;
+  dry_run: boolean;
+  first_sync: boolean;
+  base_commit?: string;
+  to_disk: SyncChanges;
+  to_textdb: SyncChanges;
+  moved: { from: string; to: string }[];
+  merged: string[];
+  conflicts: string[];
+  unresolved: string[];
+  kept: SyncNote[];
+  unchanged: number;
+  skipped: SyncNote[];
+  failed: SyncNote[];
+  problems: { path: string; kind: string; detail: string; platforms: string[]; blocking: boolean }[];
+  stopped: boolean;
+  seq: number | null;
+  git: {
+    commit: string | null;
+    branch: string | null;
+    remote: string | null;
+    clean: boolean;
+    authors_from: string | null;
+    committed: string | null;
+    commit_error: string | null;
+  } | null;
+}
+
 /** A file an export writes, relative to the exported folder. */
 export interface ExportFileInfo {
   rel: string;
@@ -227,6 +295,13 @@ export const api = {
     return new Uint8Array(await res.arrayBuffer());
   },
   exportZipUrl: (path: string) => `/api/export/zip?${qs({ path })}`,
+  syncLinks: () => request<SyncLinks>("GET", "/api/sync/links"),
+  sync: (body: { prefix: string; dry_run?: boolean; commit?: boolean; base?: string | undefined; author?: string }) =>
+    request<SyncReport>("POST", "/api/sync", body),
+  syncConflict: (prefix: string, rel: string) =>
+    request<{ rel: string; text: string }>("GET", `/api/sync/conflict?${qs({ prefix, rel })}`),
+  syncResolve: (body: { prefix: string; rel: string; keep: "textdb" | "disk"; author?: string }) =>
+    request<SyncReport>("POST", "/api/sync/resolve", body),
   file: (path: string, version?: number) => request<FileDoc>("GET", `/api/file?${qs({ path, version })}`),
   chunks: (path: string, version?: number) => request<Chunk[]>("GET", `/api/chunks?${qs({ path, version })}`),
   history: (path: string) => request<HistoryEntry[]>("GET", `/api/history?${qs({ path })}`),

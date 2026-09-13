@@ -8,7 +8,7 @@ import {
   type KeyboardEvent,
   type MouseEvent,
 } from "react";
-import { api, ApiError, type AuthorCount, type LsEntry, type SearchHit } from "../api";
+import { api, ApiError, type AuthorCount, type LsEntry, type SearchHit, type SyncLink } from "../api";
 import {
   COLUMNS,
   PAGE,
@@ -52,6 +52,9 @@ interface Props {
   onOpenFile: (path: string, line?: number) => void;
   onAction: (action: PathAction) => void;
   onBulk: (action: BulkAction) => void;
+  /** The server syncs this folder with a directory. */
+  syncLink?: SyncLink | null;
+  onSync?: (prefix: string) => void;
 }
 
 /** The rows fetched so far for one query, page by page. */
@@ -106,7 +109,7 @@ function readSort(raw: string | null): Sort {
  * scrolls. Changes from anyone update rows in place; rows that appear or would reorder wait
  * behind a "Refresh" so the list does not jump under the pointer.
  */
-export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBulk }: Props) {
+export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBulk, syncLink, onSync }: Props) {
   const now = useNow(30_000);
   const label = path === "/" ? "all files" : baseName(path);
   const [sort, setSort] = useState<Sort>(() => stored("textdb.folderSort", readSort));
@@ -715,6 +718,17 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
           >
             Export…
           </button>
+          {syncLink && onSync && (
+            <button
+              type="button"
+              className="btn btn-small"
+              onClick={() => onSync(syncLink.prefix)}
+              disabled={syncLink.running}
+              title={`Sync ${label} with ${syncLink.dir}`}
+            >
+              {syncLink.running ? "Syncing…" : "Sync…"}
+            </button>
+          )}
         </div>
       </div>
 
@@ -730,6 +744,29 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
           )}
           {filtered && listing.total !== null && !stale && <strong> · {count(listing.total, "match", "matches")}</strong>}
         </span>
+        {syncLink && (
+          <span className="sync-badge" title={syncLink.dir}>
+            {syncLink.last ? (
+              <>
+                synced
+                {syncLink.last.git?.commit && (
+                  <>
+                    {" "}
+                    at <span className="mono">{syncLink.last.git.commit.slice(0, 7)}</span>
+                    {syncLink.last.git.branch ? ` (${syncLink.last.git.branch})` : ""}
+                  </>
+                )}{" "}
+                {relativeTime(syncLink.last.synced_at, now)}
+                {syncLink.last.changed > 0 && ` · ${count(syncLink.last.changed, "file")} changed here since`}
+                {syncLink.last.conflicts.length > 0 && (
+                  <strong className="error-text"> · {count(syncLink.last.conflicts.length, "conflict")}</strong>
+                )}
+              </>
+            ) : (
+              "not synced yet"
+            )}
+          </span>
+        )}
         {pending > 0 && !contents && (
           <button type="button" className="pending-pill" onClick={() => setNonce((n) => n + 1)} title="Reload the list in the chosen order">
             {count(pending, "change")} · Refresh
@@ -737,7 +774,18 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
         )}
       </div>
 
-      {gone && (
+      {gone && syncLink && !syncLink.last ? (
+        <div className="notice" role="status">
+          <span>
+            This folder is set up to sync with <span className="mono">{syncLink.dir}</span>; the first sync brings its files in.
+          </span>
+          {onSync && (
+            <button type="button" className="btn btn-small" onClick={() => onSync(syncLink.prefix)}>
+              Sync…
+            </button>
+          )}
+        </div>
+      ) : gone && (
         <div className="notice notice-deleted" role="alert">
           <span>This folder no longer exists; it was deleted or moved away.</span>
           <button type="button" className="btn btn-small" onClick={goUp}>
@@ -799,7 +847,9 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
           />
           {(listing.total === null || total === 0 || (listing.error && !stale)) && (
             <div className="fgrid-empty">
-              {listing.error ? (
+              {listing.error && gone && syncLink && !syncLink.last ? (
+                "Nothing here yet."
+              ) : listing.error ? (
                 <>
                   <span className="error-text">{listing.error}</span>{" "}
                   <button type="button" className="btn btn-small" onClick={() => setNonce((n) => n + 1)}>

@@ -7,10 +7,12 @@ import {
   type Info,
   type PurgeStats,
   type Subscription,
+  type SyncLinks,
 } from "./api";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { DocumentPane, type Mode, type OpenDoc } from "./components/DocumentPane";
 import { ExportDialog } from "./components/ExportDialog";
+import { SyncDialog } from "./components/SyncDialog";
 import { FolderView } from "./components/FolderView";
 import { Header } from "./components/Header";
 import { ImportDialog } from "./components/ImportDialog";
@@ -75,6 +77,21 @@ export function App() {
   const [replacing, setReplacing] = useState<{ path: string; file: File } | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const replaceTarget = useRef<string | null>(null);
+  const [syncLinks, setSyncLinks] = useState<SyncLinks | null>(null);
+  /** The folder being synced. */
+  const [syncing, setSyncing] = useState<string | null>(null);
+  const loadSyncLinks = useCallback(() => {
+    api.syncLinks().then(setSyncLinks, () => setSyncLinks(null));
+  }, []);
+  useEffect(loadSyncLinks, [loadSyncLinks]);
+  // Commits move the "changed here since" counts of synced folders.
+  const hasSyncLinks = (syncLinks?.links.length ?? 0) > 0;
+  useEffect(() => {
+    if (!hasSyncLinks) return;
+    const timer = setTimeout(loadSyncLinks, 1500);
+    return () => clearTimeout(timer);
+  }, [lastSeq, hasSyncLinks, loadSyncLinks]);
+  const syncLink = syncing === null ? undefined : syncLinks?.links.find((l) => l.prefix === syncing);
 
   // Download and replace need no dialog of their own before the browser's: the file picker has
   // to open within the click that asked for it.
@@ -249,6 +266,18 @@ export function App() {
       />
       {importing && <ImportDialog author={author} onClose={() => setImporting(false)} onOpen={openFile} />}
       {exporting !== null && <ExportDialog key={exporting} path={exporting} onClose={() => setExporting(null)} />}
+      {syncLink && (
+        <SyncDialog
+          key={syncLink.prefix}
+          link={syncLink}
+          author={author}
+          onOpenFile={openFile}
+          onClose={() => {
+            setSyncing(null);
+            loadSyncLinks();
+          }}
+        />
+      )}
       {pathAction?.op === "move" && (
         <MoveDialog
           key={pathAction.path}
@@ -378,6 +407,8 @@ export function App() {
               onOpenFile={openFile}
               onAction={onPathAction}
               onBulk={setBulkAction}
+              syncLink={syncLinks?.links.find((l) => l.prefix === (folder ?? "/")) ?? null}
+              onSync={setSyncing}
             />
           )}
         </section>

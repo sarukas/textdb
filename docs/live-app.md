@@ -76,6 +76,10 @@ Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./
 | `POST /api/export/hashes` | `{ paths: [...] }` (at most 1000) | `{ hashes: [{ path, sha256 }] }` — SHA-256 of each file's stored bytes, so a client can compare with a file on disk without downloading it |
 | `GET /api/export/file?path=/a/b.md` | | the file's stored bytes, unchanged (`application/octet-stream`): line endings and byte-order mark as imported |
 | `GET /api/export/zip?path=/a` | | a zip of every file below the folder, entries named relative to it, streamed as it is built |
+| `GET /api/sync/links` | | `{ available, reason, links: [{ prefix, dir, exists, running, last }] }` — the folders the server syncs (`TEXTDB_SYNC`); `last` is `null` before the first sync, else `{ dir, seq, synced_at, author, git: { commit, branch, remote, clean } \| null, changed, conflicts }` with `changed` counting files changed, added or deleted in the store since |
+| `POST /api/sync` | `{ prefix, dry_run?, commit?, base?, author? }` | the `textdb sync --json` report: `{ to_disk, to_textdb: { new, changed, deleted }, moved, merged, conflicts, unresolved, kept, unchanged, skipped, failed, problems, stopped, seq, git }`, also when there are conflicts or blocking names. One sync per folder at a time (503 `TX002` otherwise); an unknown folder is 404 |
+| `GET /api/sync/conflict?prefix=/a&rel=b.md` | | `{ rel, text }` — a file the last sync left conflict markers in, as it is on disk; any other path is 404 |
+| `POST /api/sync/resolve` | `{ prefix, rel, keep: "textdb" \| "disk", author? }` | keeps that side of every conflict in the file on disk, then syncs; the sync report |
 | `GET /api/file?path=/a/b.md[&version=n]` | | `{ path, version, head_version, content, nbytes, nlines, updated_at, updated_by }` |
 | `GET /api/chunks?path=…[&version=n]` | | `[{ ord, hash, byte_from, nbytes, line_from, nlines }]` |
 | `GET /api/history?path=…` | | `[{ version, author, ts, message, nbytes, kind, base_version }]` oldest first |

@@ -19,10 +19,18 @@ import {
   queryString,
 } from './params.ts';
 import { webApp } from './static.ts';
+import type { SyncService } from './sync.ts';
 
 export interface AppOptions {
   webDist: string;
   pingMs: number;
+  /** Folders synced with directories on this machine; null when none are set up. */
+  sync?: SyncService | null;
+}
+
+function syncService(sync: SyncService | null | undefined): SyncService {
+  if (!sync) throw new NotFound('no folders are set up for sync: set TEXTDB_SYNC on the server');
+  return sync;
 }
 
 const MAX_BULK_PATHS = 10_000;
@@ -108,6 +116,30 @@ export function createApp(corpus: Corpus, hub: ChangeHub, options: AppOptions): 
 
   app.get('/api/stat', (c) => c.json(corpus.stat(queryString(c, 'path'))));
   app.get('/api/entry', (c) => c.json(corpus.entry(queryString(c, 'path'))));
+
+  // Sync with directories on this machine, configured by the operator (TEXTDB_SYNC).
+  const sync = options.sync;
+  app.get('/api/sync/links', (c) =>
+    c.json(sync ? sync.list() : { available: false, reason: 'No folders are set up for sync: set TEXTDB_SYNC on the server.', links: [] }),
+  );
+  app.post('/api/sync', async (c) => {
+    const body = await jsonBody(c);
+    const report = await syncService(sync).run(bodyString(body, 'prefix'), {
+      dryRun: body.dry_run === true,
+      commit: body.commit === true,
+      base: bodyOptionalString(body, 'base'),
+      author: bodyOptionalString(body, 'author'),
+    });
+    return c.json(report);
+  });
+  app.get('/api/sync/conflict', (c) => c.json(syncService(sync).conflict(queryString(c, 'prefix'), queryString(c, 'rel'))));
+  app.post('/api/sync/resolve', async (c) => {
+    const body = await jsonBody(c);
+    const keep = body.keep;
+    if (keep !== 'textdb' && keep !== 'disk') throw badRequest('keep must be textdb or disk');
+    const report = await syncService(sync).resolve(bodyString(body, 'prefix'), bodyString(body, 'rel'), keep, bodyOptionalString(body, 'author'));
+    return c.json(report);
+  });
 
   // Export. A client compares what is on its disk with these, then fetches only what differs.
   app.get('/api/export/files', (c) => {

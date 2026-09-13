@@ -1475,6 +1475,95 @@ a.btn.disabled {
   pointer-events: none;
 }
 
+/* ---- sync ---- */
+.sync-dialog .stats {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+.export-changed,
+.export-merged,
+.export-moved {
+  color: var(--warn);
+}
+.export-deleted,
+.export-failed {
+  color: var(--danger);
+}
+.link-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.link-button:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.sync-base {
+  display: flex;
+  gap: 6px;
+}
+.sync-base input {
+  flex: 1;
+  min-width: 0;
+}
+.sync-commit {
+  margin-top: 4px;
+}
+.sync-conflicts ul {
+  max-height: 340px;
+  margin: 6px 0 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+  font-size: 12px;
+}
+.sync-conflict-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 0;
+}
+.sync-conflict-row .mono {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.sync-conflict-actions {
+  display: flex;
+  flex: none;
+  gap: 4px;
+}
+.sync-conflict-text {
+  max-height: 240px;
+  margin: 2px 0 8px;
+  padding: 8px 10px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre;
+}
+.sync-conflict-text .marker {
+  color: var(--danger);
+  font-weight: 600;
+}
+.sync-badge {
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sync-badge::before {
+  content: "⇄ ";
+}
+
 /* ---- rename, move, delete ---- */
 .dialog-narrow {
   width: min(500px, calc(100vw - 32px));

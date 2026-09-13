@@ -5,6 +5,7 @@ export {
   type BulkResult,
   Corpus,
   type ExportFile,
+  type SyncState,
   type OpenOptions,
   type PathEvent,
   type PurgeStats,

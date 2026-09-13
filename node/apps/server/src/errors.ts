@@ -9,7 +9,18 @@ export interface ErrorBody {
   conflict?: Record<string, unknown>;
 }
 
+/** An error in the store's terms raised by the server itself, e.g. one the textdb CLI reported. */
+export class CodedError extends Error {
+  readonly code: ErrorCode;
+
+  constructor(code: ErrorCode, message: string) {
+    super(message);
+    this.code = code;
+  }
+}
+
 export function errorResponse(c: Context, error: unknown): Response {
+  if (error instanceof CodedError) return c.json({ code: error.code, message: error.message }, STATUS[error.code]);
   const err = toTextdbError(error);
   const body: ErrorBody = { code: err.code, message: err.message };
   if (err instanceof Conflict) body.conflict = err.payload;

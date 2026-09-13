@@ -1,0 +1,159 @@
+import { execFile } from 'node:child_process';
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { type Corpus, type ErrorCode, NotFound, type SyncState } from '@textdb/node';
+import type { SyncLinkConfig } from './config.ts';
+import { badRequest, CodedError } from './errors.ts';
+import { resolveMarkers } from './markers.ts';
+
+/** `--base` values: commit ids and ordinary ref names, nothing git could take for an option. */
+const REV = /^[\w.~^@{}/+-]+$/;
+
+export interface SyncLinkState extends SyncLinkConfig {
+  exists: boolean;
+  /** A sync of this folder is running. */
+  running: boolean;
+  last: SyncState | null;
+}
+
+export interface SyncLinks {
+  available: boolean;
+  /** Why syncing is unavailable. */
+  reason: string | null;
+  links: SyncLinkState[];
+}
+
+export interface RunOptions {
+  dryRun?: boolean;
+  commit?: boolean;
+  base?: string | undefined;
+  author?: string | undefined;
+}
+
+/** The textdb CLI: `TEXTDB_CLI`, else the repository's release or debug build. */
+export function findCli(explicit: string | undefined): string | null {
+  if (explicit) return existsSync(explicit) ? explicit : null;
+  const exe = process.platform === 'win32' ? 'textdb.exe' : 'textdb';
+  for (const profile of ['release', 'debug']) {
+    // node/apps/server/src → the repository root.
+    const candidate = fileURLToPath(new URL(`../../../../target/${profile}/${exe}`, import.meta.url));
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function runCli(cli: string, args: string[]): Promise<{ stdout: string; stderr: string; status: number }> {
+  const env = { ...process.env };
+  // The store, author and settings come from the arguments, never from the server's environment.
+  for (const name of ['TEXTDB_STORE', 'TEXTDB_AUTHOR', 'TEXTDB_PATH_HISTORY']) delete env[name];
+  return new Promise((resolve, reject) => {
+    execFile(cli, args, { env, maxBuffer: 256 * 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
+      const code = (error as { code?: unknown } | null)?.code;
+      if (error && typeof code !== 'number') return reject(error);
+      resolve({ stdout, stderr, status: typeof code === 'number' ? code : 0 });
+    });
+  });
+}
+
+/**
+ * Syncs the folders listed in `TEXTDB_SYNC` with their directories by running `textdb sync`, so
+ * the web UI gets exactly the CLI's behaviour: three-way merge, conflict markers, git authors and
+ * commits. One sync per folder at a time.
+ */
+export class SyncService {
+  readonly links: SyncLinkConfig[];
+  private readonly corpus: Corpus;
+  private readonly cli: string | null;
+  private readonly running = new Set<string>();
+
+  constructor(corpus: Corpus, links: SyncLinkConfig[], cli: string | null) {
+    this.corpus = corpus;
+    this.links = links;
+    this.cli = cli;
+  }
+
+  list(): SyncLinks {
+    return {
+      available: this.cli !== null,
+      reason: this.cli ? null : 'The textdb CLI was not found: build it (cargo build --release -p textdb-cli) or set TEXTDB_CLI.',
+      links: this.links.map((link) => ({
+        ...link,
+        exists: existsSync(link.dir),
+        running: this.running.has(link.prefix),
+        last: this.state(link),
+      })),
+    };
+  }
+
+  async run(prefix: string, options: RunOptions): Promise<unknown> {
+    const link = this.link(prefix);
+    if (!this.cli) throw badRequest(this.list().reason ?? 'syncing is unavailable');
+    if (options.base !== undefined && (!REV.test(options.base) || options.base.startsWith('-'))) {
+      throw badRequest(`base must name a commit: ${options.base}`);
+    }
+    if (this.running.has(prefix)) throw new CodedError('TX002', `${prefix} is being synced already; try again when it finishes`);
+    this.running.add(prefix);
+    try {
+      const args = ['--store', this.corpus.db, '--json'];
+      if (options.author) args.push('--author', options.author);
+      args.push('sync');
+      if (options.dryRun) args.push('--dry-run');
+      if (options.commit) args.push('--commit');
+      if (options.base) args.push('--base', options.base);
+      args.push('--', link.prefix, link.dir);
+      const { stdout, stderr, status } = await runCli(this.cli, args);
+      let parsed: Record<string, unknown> | null = null;
+      try {
+        parsed = JSON.parse(stdout) as Record<string, unknown>;
+      } catch {
+        // Not JSON: reported below.
+      }
+      // A report comes back whatever the exit status: conflicts (3) and blocked names (6) included.
+      if (parsed && 'to_disk' in parsed) return parsed;
+      const code = typeof parsed?.code === 'string' && /^TX00[0-4]$/.test(parsed.code) ? (parsed.code as ErrorCode) : 'TX000';
+      const message = typeof parsed?.message === 'string' ? parsed.message : (stderr || stdout).trim().slice(0, 2000);
+      throw new CodedError(code, message || `textdb sync exited with status ${status}`);
+    } finally {
+      this.running.delete(prefix);
+    }
+  }
+
+  /** A file the last sync left conflict markers in, as it is on disk. */
+  conflict(prefix: string, rel: string): { rel: string; text: string } {
+    return { rel, text: readFileSync(this.conflictFile(prefix, rel), 'utf8') };
+  }
+
+  /** Keep one side of every conflict in `rel`, then sync, so the resolution reaches the store. */
+  async resolve(prefix: string, rel: string, keep: 'textdb' | 'disk', author: string | undefined): Promise<unknown> {
+    const file = this.conflictFile(prefix, rel);
+    if (this.running.has(prefix)) throw new CodedError('TX002', `${prefix} is being synced already; try again when it finishes`);
+    writeFileSync(file, resolveMarkers(readFileSync(file, 'utf8'), keep));
+    return this.run(prefix, { author });
+  }
+
+  private link(prefix: string): SyncLinkConfig {
+    const link = this.links.find((l) => l.prefix === prefix);
+    if (!link) throw new NotFound(`${prefix} is not a folder this server syncs (TEXTDB_SYNC)`);
+    return link;
+  }
+
+  private state(link: SyncLinkConfig): SyncState | null {
+    let dir = link.dir;
+    try {
+      dir = realpathSync.native(link.dir);
+    } catch {
+      // Not there (yet): the record, if any, is under the configured path.
+    }
+    return this.corpus.syncState(link.prefix, dir);
+  }
+
+  /** Only files the last sync recorded as conflicted can be read or rewritten. */
+  private conflictFile(prefix: string, rel: string): string {
+    const link = this.link(prefix);
+    if (!this.state(link)?.conflicts.includes(rel)) {
+      throw new NotFound(`${rel} has no conflict markers from a sync of ${prefix}`);
+    }
+    return path.join(link.dir, ...rel.split('/'));
+  }
+}

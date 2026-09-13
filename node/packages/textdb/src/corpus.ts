@@ -104,6 +104,33 @@ export interface PurgeStats {
   bytes: number;
 }
 
+/** The last `textdb sync` of a folder with a directory. */
+export interface SyncState {
+  dir: string;
+  /** The store's last change number after the sync. */
+  seq: number;
+  synced_at: string;
+  author: string | null;
+  /** The checkout the directory was in; null when it is not in one. */
+  git: { commit: string | null; branch: string | null; remote: string | null; clean: boolean } | null;
+  /** Files changed, added or deleted in the store since. */
+  changed: number;
+  /** Files the sync wrote conflict markers into. */
+  conflicts: string[];
+}
+
+interface SyncRow {
+  id: number;
+  dir: string;
+  seq: number;
+  synced_at: string;
+  author: string | null;
+  git_commit: string | null;
+  git_branch: string | null;
+  git_remote: string | null;
+  git_clean: number | null;
+}
+
 /** A file an export writes, relative to the exported folder. */
 export interface ExportFile {
   path: string;
@@ -435,6 +462,60 @@ export class Corpus {
     if (!row) throw new NotFound(`not found: ${filePath}`);
     if (row.content instanceof Uint8Array) return row.content;
     return new TextEncoder().encode(typeof row.content === 'string' ? row.content : '');
+  }
+
+  /**
+   * What `textdb sync` recorded for the folder `prefix` and the directory `dir` (named as the CLI
+   * names it: absolute, links resolved): when, at which git commit, how many files changed in the
+   * store since, and which files it left conflict markers in. `null` before the first sync.
+   */
+  syncState(prefix: string, dir: string): SyncState | null {
+    let row: SyncRow | undefined;
+    try {
+      row = this.sql.get<SyncRow>(
+        'SELECT id, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean FROM kb_sync ' +
+          'WHERE prefix = ? AND (dir = ? OR (? AND lower(dir) = lower(?)))',
+        prefix,
+        dir,
+        process.platform === 'win32' ? 1 : 0,
+        dir,
+      );
+    } catch (error) {
+      // The CLI creates the sync tables the first time it opens the store.
+      if (error instanceof Error && /no such table/i.test(error.message)) return null;
+      throw error;
+    }
+    if (!row) return null;
+    const base = prefix === '/' ? '' : prefix;
+    // Files whose version is not the one synced, plus synced files no longer in the store.
+    const changed = Number(
+      this.sql.value(
+        `SELECT (SELECT count(*) FROM kb_node n LEFT JOIN kb_sync_file f ON f.sync_id = ?1 AND f.rel = substr(n.path, ?2)
+                  WHERE n.kind = 1 AND n.deleted_at IS NULL AND n.path > ?3 AND n.path < ?4
+                    AND (f.version IS NULL OR f.version <> n.version))
+              + (SELECT count(*) FROM kb_sync_file f WHERE f.sync_id = ?1
+                  AND NOT EXISTS (SELECT 1 FROM kb_node n WHERE n.path = ?3 || f.rel AND n.deleted_at IS NULL))`,
+        row.id,
+        base.length + 2,
+        `${base}/`,
+        `${base}0`,
+      ),
+    );
+    const conflicts = this.sql
+      .all<{ rel: string }>('SELECT rel FROM kb_sync_file WHERE sync_id = ? AND conflict = 1 ORDER BY rel', row.id)
+      .map((r) => r.rel);
+    return {
+      dir: row.dir,
+      seq: row.seq,
+      synced_at: row.synced_at,
+      author: row.author,
+      git:
+        row.git_clean === null
+          ? null
+          : { commit: row.git_commit, branch: row.git_branch, remote: row.git_remote, clean: row.git_clean === 1 },
+      changed,
+      conflicts,
+    };
   }
 
   /**
