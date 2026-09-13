@@ -80,22 +80,46 @@ pub fn diff_seq<T: PartialEq>(a: &[T], b: &[T], max_d: usize) -> Vec<Hunk> {
         .collect()
 }
 
+/// Start of depth `d`'s row in the flat trace: rows have length `2d + 3`, so the rows
+/// before `d` occupy `sum(2i + 3) = d * (d + 2)` entries.
+#[inline]
+const fn trace_row_start(d: usize) -> usize {
+    d * (d + 2)
+}
+
 /// Classic Myers forward algorithm with a trace, returning hunks. `None` if D > max_d.
+///
+/// Both the furthest-reaching array and the trace are sized by the *distance bound*, not
+/// by the inputs. At depth `d` only diagonals in `[-d, d]` can have been reached and the
+/// backtrack reads one diagonal either side, so a row of `2d + 3` entries holds everything
+/// ever read back. Sizing them `2 * (n + m) + 3` instead — and cloning a full-width row per
+/// diagonal — costs `O(D * (N + M))` in memory and memory traffic even when `D` is tiny
+/// next to the inputs. That is not a constant factor: a 1 MiB document with 569 scattered
+/// one-line changes spent 560 ms and a quarter of a gigabyte there, an 8 MiB document with
+/// 1182 changes 42 seconds and 7 GiB, and more than that was killed by the OOM reaper
+/// before the `max_d` fallback could fire — the fallback only triggers after `max_d` rows
+/// have already been allocated. Banded, the same three cases cost 6.4 ms, 40.7 ms and a
+/// bounded fallback, and the trace is `O(D^2)` regardless of document size.
+///
+/// The trace is one flat `Vec`, grown a row at a time: depth `d`'s entry for diagonal `k`
+/// lives at `trace_row_start(d) + (k + d + 1)`, where `k` spans `[-d - 1, d + 1]`.
 fn myers<T: PartialEq>(a: &[T], b: &[T], max_d: usize) -> Option<Vec<Hunk>> {
     let n = a.len() as i64;
     let m = b.len() as i64;
     let max = (n + m) as usize;
-    let off = max as i64 + 1;
-    let width = 2 * max + 3;
+    let band = max.min(max_d);
+    let off = band as i64 + 1;
+    let width = 2 * band + 3;
     let mut v = vec![0i64; width];
-    let mut trace: Vec<Vec<i64>> = Vec::new();
+    let mut trace: Vec<i64> = Vec::new();
     let mut found = false;
     let mut d_final = 0usize;
     'outer: for d in 0..=max {
         if d > max_d {
             return None;
         }
-        trace.push(v.clone());
+        let lo = (off - d as i64 - 1) as usize;
+        trace.extend_from_slice(&v[lo..lo + 2 * d + 3]);
         let mut k = -(d as i64);
         while k <= d as i64 {
             let idx = (k + off) as usize;
@@ -126,15 +150,15 @@ fn myers<T: PartialEq>(a: &[T], b: &[T], max_d: usize) -> Option<Vec<Hunk>> {
     let mut y = m;
     let mut ops: Vec<(i64, i64, u8)> = Vec::new(); // (x, y, kind) kind: 0 del a[x], 1 ins b[y]
     for d in (0..=d_final).rev() {
-        let vprev = &trace[d];
+        let row = &trace[trace_row_start(d)..trace_row_start(d) + 2 * d + 3];
+        let at = |kk: i64| row[(kk + d as i64 + 1) as usize];
         let k = x - y;
-        let idx = (k + off) as usize;
-        let prev_k = if k == -(d as i64) || (k != d as i64 && vprev[idx - 1] < vprev[idx + 1]) {
+        let prev_k = if k == -(d as i64) || (k != d as i64 && at(k - 1) < at(k + 1)) {
             k + 1
         } else {
             k - 1
         };
-        let prev_x = vprev[(prev_k + off) as usize];
+        let prev_x = at(prev_k);
         let prev_y = prev_x - prev_k;
         while x > prev_x && y > prev_y {
             x -= 1;

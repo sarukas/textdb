@@ -115,6 +115,79 @@ proptest! {
         let as_edits: Vec<Edit> = runs.iter().map(|r| Edit::new(r.a_from, r.a_to, bb[r.b_from as usize..r.b_to as usize].to_vec())).collect();
         prop_assert_eq!(apply_ref(&bytes, &as_edits), bb);
     }
+
+    /// `byte_edits` is the whole-document write path (`UPDATE kb SET content = …`), so its
+    /// edits must reconstruct the target exactly — including when the changes are scattered
+    /// and the common prefix/suffix trim buys nothing, which is the case the banded Myers
+    /// arrays are sized for.
+    #[test]
+    fn p7_byte_edits_reconstructs_scattered_changes(
+        bytes in text_strategy(30_000),
+        seed in any::<u64>(),
+        every in 1usize..9,
+    ) {
+        let other = scatter_lines(&bytes, every, seed);
+        let edits = byte_edits(&bytes, &other);
+        prop_assert_eq!(apply_ref(&bytes, &edits), other.clone());
+        // And in the other direction, which reverses which side is longer.
+        let back = byte_edits(&other, &bytes);
+        prop_assert_eq!(apply_ref(&other, &back), bytes);
+    }
+}
+
+/// Change every `every`-th line of `bytes`, leaving the rest alone.
+fn scatter_lines(bytes: &[u8], every: usize, seed: u64) -> Vec<u8> {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / every.max(1) + 16);
+    for (i, line) in bytes.split_inclusive(|&b| b == b'\n').enumerate() {
+        if i % every == 0 {
+            match rng.gen_range(0..3) {
+                0 => out.extend_from_slice(b"CHANGED "), // prefix
+                1 => {}                                  // delete the line
+                _ => {
+                    out.extend_from_slice(line);
+                    out.extend_from_slice(b"INSERTED\n"); // add one after
+                    continue;
+                }
+            }
+        }
+        out.extend_from_slice(line);
+    }
+    out
+}
+
+/// The working arrays of `myers` are sized by the distance bound, so a large document with
+/// many scattered one-line changes costs `O(D^2)` rather than `O(D * (N + M))`. Sized by the
+/// inputs instead, this case took 42 seconds and 7 GiB of resident memory, and a slightly
+/// larger one was killed by the OOM reaper before `max_d` could fall back — so this test is
+/// a guard against a crash, not only against a slowdown.
+///
+/// The assertion is deliberately loose: it only has to fail if the quadratic-in-input
+/// behaviour comes back, and that costs three orders of magnitude, not a factor of two.
+#[test]
+fn byte_edits_scattered_changes_stay_bounded() {
+    let mut bytes = Vec::new();
+    for i in 0..120_000 {
+        bytes.extend_from_slice(format!("line {:06} lorem ipsum dolor sit amet consectetur adipiscing\n", i).as_bytes());
+    }
+    assert!(bytes.len() > 7 << 20, "document should be ~8 MiB, got {}", bytes.len());
+    let other = scatter_lines(&bytes, 100, 99);
+    let t = std::time::Instant::now();
+    let edits = byte_edits(&bytes, &other);
+    let elapsed = t.elapsed();
+    eprintln!(
+        "8 MiB document, {} changed lines -> {} edits in {:?}",
+        120_000 / 100,
+        edits.len(),
+        elapsed
+    );
+    assert_eq!(apply_ref(&bytes, &edits), other, "edits must reconstruct the target");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "byte_edits took {:?}; the Myers arrays are probably sized by the inputs again",
+        elapsed
+    );
 }
 
 /// P3: a single contiguous edit produces ≤ ⌈len(replacement)/min⌉ + 3 new leaves in
