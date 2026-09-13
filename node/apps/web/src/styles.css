@@ -1528,6 +1528,18 @@ kbd {
   cursor: default;
 }
 
+.line-add,
+.line-del {
+  font-family: var(--mono);
+  font-weight: 600;
+}
+.line-add {
+  color: var(--accent);
+}
+.line-del {
+  color: var(--danger);
+}
+
 /* ---- trash ---- */
 .icon-trash {
   width: 10px;

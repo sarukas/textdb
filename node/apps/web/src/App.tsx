@@ -12,12 +12,13 @@ import { ActivityFeed } from "./components/ActivityFeed";
 import { DocumentPane, type Mode, type OpenDoc } from "./components/DocumentPane";
 import { Header } from "./components/Header";
 import { ImportDialog } from "./components/ImportDialog";
-import { DeleteDialog, MoveDialog, PurgeDialog } from "./components/PathDialogs";
+import { DeleteDialog, MoveDialog, PurgeDialog, ReplaceDialog } from "./components/PathDialogs";
+import { downloadText } from "./doc/transfer";
 import { Sidebar } from "./components/Sidebar";
 import { useToast } from "./components/Toasts";
 import { TrashDocument } from "./components/TrashDocument";
 import { addToFeed, type FeedItem } from "./live/activity";
-import { isWithin } from "./live/paths";
+import { baseName, isWithin } from "./live/paths";
 import { purgeSummary, type PathAction, type TrashAction } from "./tree/actions";
 import { FeedHub } from "./state/hub";
 import { OwnWrites } from "./state/ownWrites";
@@ -60,6 +61,28 @@ export function App() {
   const [trashAction, setTrashAction] = useState<TrashAction | null>(null);
   const [trashDoc, setTrashDoc] = useState<number | null>(trashFromHash);
   const toast = useToast();
+  const [replacing, setReplacing] = useState<{ path: string; file: File } | null>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const replaceTarget = useRef<string | null>(null);
+
+  // Download and replace need no dialog of their own before the browser's: the file picker has
+  // to open within the click that asked for it.
+  const onPathAction = useCallback(
+    (action: PathAction) => {
+      if (action.op === "download") {
+        api.file(action.path, action.version).then(
+          (f) => downloadText(baseName(f.path), f.content),
+          (e: unknown) => toast(`Could not download ${action.path}: ${e instanceof Error ? e.message : String(e)}`, "error"),
+        );
+      } else if (action.op === "replace") {
+        replaceTarget.current = action.path;
+        fileInput.current?.click();
+      } else {
+        setPathAction(action);
+      }
+    },
+    [toast],
+  );
   const [open, setOpen] = useState<OpenDoc | null>(fromHash);
   const [mode, setMode] = useState<Mode>("preview");
   const [feedOpen, setFeedOpen] = useState(readFeedOpen);
@@ -213,6 +236,35 @@ export function App() {
           onMoved={() => setPathAction(null)}
         />
       )}
+      <input
+        ref={fileInput}
+        type="file"
+        hidden
+        onChange={(e) => {
+          const file = e.currentTarget.files?.[0];
+          const path = replaceTarget.current;
+          e.currentTarget.value = "";
+          if (file && path) setReplacing({ path, file });
+        }}
+      />
+      {replacing && (
+        <ReplaceDialog
+          key={`${replacing.path}:${replacing.file.name}`}
+          path={replacing.path}
+          file={replacing.file}
+          author={author}
+          onClose={() => setReplacing(null)}
+          onReplaced={(path, result) => {
+            setReplacing(null);
+            toast(
+              result.kind === "noop"
+                ? `${baseName(path)} is unchanged`
+                : `Replaced ${baseName(path)}: v${result.version}${result.kind === "direct" ? "" : ` · ${result.kind}`}`,
+              "ok",
+            );
+          }}
+        />
+      )}
       {trashAction && (
         <PurgeDialog
           key={trashAction.op === "empty" ? "empty" : trashAction.entry.id}
@@ -240,7 +292,7 @@ export function App() {
             openTrashId={trashDoc}
             onOpen={openFile}
             onOpenTrash={openTrash}
-            onAction={setPathAction}
+            onAction={onPathAction}
             onTrashAction={setTrashAction}
           />
         </aside>
@@ -263,7 +315,7 @@ export function App() {
               own={own}
               author={author}
               onPathChange={onPathChange}
-              onAction={setPathAction}
+              onAction={onPathAction}
             />
           ) : (
             <div className="empty welcome">

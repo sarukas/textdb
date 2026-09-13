@@ -146,6 +146,22 @@ export function DocumentPane({ open, mode, onMode, hub, own, author, onPathChang
             <button
               type="button"
               className="btn btn-ghost btn-small"
+              onClick={() => onAction({ op: "download", path: state.path, kind: "file", version: state.version })}
+              title={`Download v${state.version} as saved${state.dirty ? " (without your unsaved changes)" : ""}`}
+            >
+              Download
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost btn-small"
+              onClick={() => onAction({ op: "replace", path: state.path, kind: "file" })}
+              title="Upload a file from this computer as the next version"
+            >
+              Replace…
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost btn-small"
               onClick={() => onAction({ op: "move", path: state.path, kind: "file" })}
               title="Rename or move this file"
             >

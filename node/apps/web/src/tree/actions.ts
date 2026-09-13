@@ -4,9 +4,11 @@ import { formatBytes } from "../import/select";
 import { isWithin } from "../live/paths";
 
 export interface PathAction {
-  op: "move" | "delete";
+  op: "move" | "delete" | "download" | "replace";
   path: string;
   kind: "file" | "folder";
+  /** download: the version to save; HEAD when absent. */
+  version?: number;
 }
 
 /** Removing one trash entry for good, or everything in the trash. */

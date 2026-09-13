@@ -1,6 +1,8 @@
 import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { api, type PurgeStats, type Stat, type TrashEntry } from "../api";
+import { api, ApiError, type FileDoc, type PurgeStats, type Stat, type TrashEntry, type WriteResult } from "../api";
+import { lineChange, type LineChange } from "../doc/transfer";
 import { formatBytes } from "../import/select";
+import { readText } from "../import/source";
 import { baseName, isWithin, parentOf } from "../live/paths";
 import { relativeTime } from "../live/time";
 import { effectiveAuthor } from "../state/useAuthor";
@@ -353,6 +355,133 @@ export function PurgeDialog({ action, author, onClose, onDone }: PurgeProps) {
       {error && (
         <p className="error-text" role="alert">
           {error}
+        </p>
+      )}
+    </PathDialog>
+  );
+}
+
+interface ReplaceProps {
+  path: string;
+  file: File;
+  author: string;
+  onClose: () => void;
+  onReplaced: (path: string, result: WriteResult) => void;
+}
+
+type Compared = { current: FileDoc; text: string; change: LineChange } | { error: string };
+
+/** Upload a file as the next version of `path`, after showing how much it changes. */
+export function ReplaceDialog({ path, file, author, onClose, onReplaced }: ReplaceProps) {
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const [compared, setCompared] = useState<Compared | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<{ text: string; stale: boolean } | null>(null);
+  const [rev, setRev] = useState(0);
+
+  useEffect(() => {
+    let live = true;
+    Promise.all([api.file(path), readText(file)]).then(
+      ([current, read]) => {
+        if (!live) return;
+        if ("skip" in read) {
+          setCompared({ error: `${file.name} cannot replace a document: ${read.skip}. Only UTF-8 text can.` });
+        } else {
+          setCompared({ current, text: read.text, change: lineChange(current.content, read.text) });
+        }
+      },
+      (e: unknown) => live && setCompared({ error: message(e) }),
+    );
+    return () => {
+      live = false;
+    };
+  }, [path, file, rev]);
+
+  const ok = compared !== null && "current" in compared ? compared : null;
+  const same = ok !== null && ok.text === ok.current.content;
+  const ready = ok !== null && !same;
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!ok || same || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await api.write({
+        path,
+        content: ok.text,
+        base_version: ok.current.head_version,
+        author: effectiveAuthor(author),
+        message: `replaced with ${file.name}`,
+      });
+      onReplaced(path, result);
+    } catch (err) {
+      const stale = err instanceof ApiError && err.status === 409;
+      setError({
+        text: stale ? "Someone changed the same lines while you were choosing the file. Compare again with the latest version." : message(err),
+        stale,
+      });
+      setBusy(false);
+    }
+  };
+
+  return (
+    <PathDialog
+      title="Replace with a file"
+      busy={busy}
+      onClose={onClose}
+      onSubmit={(e) => void submit(e)}
+      onShown={() => cancelRef.current?.focus()}
+      foot={
+        <>
+          {error?.stale && (
+            <button
+              type="button"
+              className="btn spacer"
+              onClick={() => {
+                setError(null);
+                setCompared(null);
+                setRev((r) => r + 1);
+              }}
+            >
+              Compare again
+            </button>
+          )}
+          <button ref={cancelRef} type="button" className="btn" onClick={onClose} disabled={busy}>
+            Cancel
+          </button>
+          <button type="submit" className="btn btn-primary" disabled={!ready || busy}>
+            {busy ? "Replacing…" : "Replace"}
+          </button>
+        </>
+      }
+    >
+      <p className="confirm-path">
+        <strong>{path}</strong>
+      </p>
+      {compared === null ? (
+        <p>Reading {file.name}…</p>
+      ) : "error" in compared ? (
+        <p className="error-text">{compared.error}</p>
+      ) : same ? (
+        <p>
+          <strong>{file.name}</strong> is the same as the current version, v{compared.current.head_version}. There is nothing to
+          replace.
+        </p>
+      ) : (
+        <>
+          <p>
+            <strong>{file.name}</strong> ({formatBytes(file.size)}) becomes the next version after v{compared.current.head_version}:{" "}
+            <span className="line-add">+{compared.change.added.toLocaleString()}</span>{" "}
+            <span className="line-del">−{compared.change.removed.toLocaleString()}</span> lines. Earlier versions stay in the
+            history.
+          </p>
+          <p>If this document is open with unsaved edits, they are kept on top of the new version.</p>
+        </>
+      )}
+      {error && (
+        <p className="error-text" role="alert">
+          {error.text}
         </p>
       )}
     </PathDialog>

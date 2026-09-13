@@ -380,7 +380,13 @@ export function FileTree({ hub, openPath, openTrashId, onOpen, onOpenTrash, onAc
           label: row.entry.name,
           items: [
             expandOrOpen(folder),
-            { label: "Rename or move…", hint: "F2", run: () => onAction(actionFor("move", row.entry)) },
+            ...(folder
+              ? []
+              : [
+                  { label: "Download", run: () => onAction(actionFor("download", row.entry)) },
+                  { label: "Replace with a file…", run: () => onAction(actionFor("replace", row.entry)) },
+                ]),
+            { label: "Rename or move…", hint: "F2", separated: !folder, run: () => onAction(actionFor("move", row.entry)) },
             { label: folder ? "Delete folder…" : "Delete file…", hint: "Del", danger: true, separated: true, run: () => remove(row) },
           ],
         };

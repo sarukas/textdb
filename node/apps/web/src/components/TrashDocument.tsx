@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, ApiError, type HistoryEntry, type TrashEntry, type TrashFile } from "../api";
 import { md } from "../doc/markdown";
+import { downloadText } from "../doc/transfer";
 import { formatBytes } from "../import/select";
 import { authorStyle } from "../live/color";
 import { relativeTime } from "../live/time";
@@ -121,6 +122,14 @@ export function TrashDocument({ id, hub, onPurge, onClose }: Props) {
           </span>
         </div>
         <div className="doc-actions">
+          <button
+            type="button"
+            className="btn btn-ghost btn-small"
+            onClick={() => downloadText(entry.name, file.content)}
+            title={`Download v${file.version}`}
+          >
+            Download
+          </button>
           <button type="button" className="btn btn-ghost btn-small danger" onClick={() => onPurge(entry)}>
             Permanently remove…
           </button>
