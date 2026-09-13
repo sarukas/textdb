@@ -10,13 +10,16 @@ This repository is the proof of concept described in [`docs/spec.md`](docs/spec.
 
 - **Install:** [`docs/INSTALL.md`](docs/INSTALL.md) · **Use:** [`docs/USAGE.md`](docs/USAGE.md)
 - **Benchmark results:** [`bench/RESULTS.md`](bench/RESULTS.md) (raw data in `bench/results/`)
-- **Command line:** [`docs/cli.md`](docs/cli.md) — `textdb` for SQLite and Postgres stores: tree, cat, search,
-  line-range and anchored edits that rebase over concurrent writers, history with renames/moves/deletes, hunks,
-  and `watch` for live changes. [Working with an external agent](docs/cli.md#working-with-an-external-agent).
+- **Command line:** [`docs/cli.md`](docs/cli.md) — `textdb` for SQLite and Postgres stores: `ls -l` sorted by
+  size, words, versions, update time or authors, tree, cat, search, line-range and anchored edits that rebase
+  over concurrent writers, history with renames/moves/deletes, hunks, and `watch` for live changes.
+  [Working with an external agent](docs/cli.md#working-with-an-external-agent).
 - **Demo app:** [`docs/demo-app.md`](docs/demo-app.md) — build, start and configure the live corpus app: a Node
   server and web UI where an agent's edits appear in the open viewer or editor as they land, attributed, with
-  history and diffs, folder import, rename/move/delete, a trash, download and replace. HTTP API and client
-  semantics: [`docs/live-app.md`](docs/live-app.md).
+  history and diffs. A GitHub-style folder view lists any folder with infinite scroll, sortable by name, type,
+  size, lines, words, versions, created, updated and authors, with filters, content search and bulk move/delete;
+  plus folder import, rename/move/delete, a trash, download and replace. HTTP API and client semantics:
+  [`docs/live-app.md`](docs/live-app.md).
 - **Python library:** [`python/`](python/README.md) — `Corpus.open("sqlite:///kb.db" | "postgresql://…")`,
   file/folder loaders, anchored edits, conflict handling, CLI.
 - **Skills for AI agents:** [`skills/textdb-install`](skills/textdb-install/SKILL.md),
@@ -70,8 +73,11 @@ SELECT textdb_edit('/notes/a.md', 'ALPHA', 'beta');                             
 SELECT * FROM textdb_search('beta', '/notes');
 SELECT * FROM textdb_history('/notes/a.md');
 SELECT textdb_content('/notes/a.md', 1), textdb_diff('/notes/a.md', 1, 2);
-UPDATE kb SET path = '/archive/notes' WHERE path = '/notes';                              -- move a folder
-DELETE FROM kb WHERE path = '/archive';                                                   -- tombstone
+SELECT name, kind, nbytes, nwords, versions, authors FROM textdb_ls('/notes');            -- words, authors; folders total their subtree
+SELECT path, nwords FROM textdb_ls('/', 1) WHERE kind = 'file' ORDER BY nwords DESC LIMIT 10;  -- recursive
+SELECT textdb_move('/notes', '/archive/notes', 'alice');                                  -- move a folder, recorded in path history
+SELECT * FROM textdb_path_history('/archive/notes/a.md');                                 -- renames, moves, deletes
+SELECT textdb_delete('/archive', 'alice');                                                -- to the trash; textdb_trash(), textdb_purge(id)
 ```
 
 Postgres:
@@ -83,6 +89,9 @@ SELECT kb.edit(f, 'ALPHA', 'beta') FROM kb.file f WHERE f.path = '/notes/a.md';
 SELECT * FROM kb.search('beta', '/notes');
 SELECT version, author FROM kb.history('/notes/a.md');
 SELECT content FROM kb.file_version WHERE path = '/notes/a.md' AND version = 1;
+SELECT name, kind, nbytes, nwords, versions, authors FROM kb.ls('/notes');   -- folders total their subtree
+SELECT kb.move('/notes', '/archive/notes', 'alice');
+SELECT * FROM kb.path_history('/archive/notes/a.md');
 ```
 
 A conflicting concurrent edit raises SQLSTATE `TX001` whose `DETAIL` is a JSON payload
