@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .base import Backend, Bytes, to_bytes, to_text
-from ..errors import TextdbError, from_message
+from ..errors import NotFound, TextdbError, from_message
 
 _CANDIDATES = [
     "libtextdb_sqlite_ext.so", "libtextdb_sqlite_ext.dylib", "textdb_sqlite_ext.dll",
@@ -96,19 +96,19 @@ class SqliteBackend(Backend):
     @_wrap
     def move(self, src: str, dst: str) -> None:
         if self.conn.execute("UPDATE kb SET path = ? WHERE path = ?", (dst, src)).rowcount == 0:
-            raise TextdbError(f"not found: {src}", "TX003")
+            raise NotFound(f"not found: {src}")
 
     @_wrap
     def delete(self, path: str) -> None:
         if self.conn.execute("DELETE FROM kb WHERE path = ?", (path,)).rowcount == 0:
-            raise TextdbError(f"not found: {path}", "TX003")
+            raise NotFound(f"not found: {path}")
 
     # read ----------------------------------------------------------------------
     @_wrap
     def read(self, path: str):
         row = self.conn.execute("SELECT content, version FROM kb WHERE path = ? AND kind = 'file'", (path,)).fetchone()
         if row is None:
-            raise TextdbError(f"not found: {path}", "TX003")
+            raise NotFound(f"not found: {path}")
         return to_bytes(row[0] if row[0] is not None else b""), int(row[1])
 
     @_wrap
@@ -139,7 +139,7 @@ class SqliteBackend(Backend):
         n = self.conn.execute("UPDATE kb SET content = ?, base_version = ?, author = ? WHERE path = ?",
                               (_param(content), base_version, author, path)).rowcount
         if n == 0:
-            raise TextdbError(f"not found: {path}", "TX003")
+            raise NotFound(f"not found: {path}")
         return int(self._one("SELECT version FROM kb WHERE path = ?", (path,)))
 
     @_wrap

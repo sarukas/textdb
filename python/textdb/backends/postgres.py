@@ -3,7 +3,7 @@
 from typing import Any, Dict, List, Optional
 
 from .base import Backend, Bytes, to_text
-from ..errors import TextdbError, from_code
+from ..errors import NotFound, TextdbError, from_code
 
 try:  # psycopg 3
     import psycopg as _pg  # type: ignore
@@ -75,20 +75,20 @@ class PostgresBackend(Backend):
     def move(self, src: str, dst: str) -> None:
         if self._exec("UPDATE kb.file SET path = %s WHERE path = %s", (dst, src)) == 0:
             if self._exec("UPDATE kb.folder SET path = %s WHERE path = %s", (dst, src)) == 0:
-                raise TextdbError(f"not found: {src}", "TX003")
+                raise NotFound(f"not found: {src}")
 
     @_wrap
     def delete(self, path: str) -> None:
         if self._exec("DELETE FROM kb.file WHERE path = %s", (path,)) == 0:
             if self._exec("DELETE FROM kb.folder WHERE path = %s", (path,)) == 0:
-                raise TextdbError(f"not found: {path}", "TX003")
+                raise NotFound(f"not found: {path}")
 
     # read ----------------------------------------------------------------------
     @_wrap
     def read(self, path: str):
         rows = self._rows("SELECT content, version FROM kb.file WHERE path = %s", (path,))
         if not rows:
-            raise TextdbError(f"not found: {path}", "TX003")
+            raise NotFound(f"not found: {path}")
         return (rows[0][0] or "").encode("utf-8"), int(rows[0][1])
 
     @_wrap
@@ -119,7 +119,7 @@ class PostgresBackend(Backend):
         n = self._exec("UPDATE kb.file SET content = %s, base_version = %s, updated_by = %s WHERE path = %s",
                        (to_text(content), base_version, author, path))
         if n == 0:
-            raise TextdbError(f"not found: {path}", "TX003")
+            raise NotFound(f"not found: {path}")
         return int(self._one("SELECT version FROM kb.file WHERE path = %s", (path,)))
 
     @_wrap
