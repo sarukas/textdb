@@ -95,15 +95,19 @@ fn concurrent_counter_never_regresses() {
                         continue; // absorbed: an identical concurrent edit already landed
                     }
                     committed.fetch_add(1, Ordering::Relaxed);
-                    // The head counter right after our commit. Racy by nature, which is
-                    // fine: we only ever claim a regression against a value already seen.
+                    // The head counter right after our commit, compared with the highest value
+                    // any writer had observed *before this read began*. That value was committed
+                    // before our snapshot opened, so a head below it is a real regression. The
+                    // highest value at the time of the comparison is not: another writer may
+                    // commit and record a newer value while our older snapshot is being read.
+                    let floor = highest.load(Ordering::SeqCst);
                     if let Ok(body) = conn.query_row("SELECT content FROM kb WHERE path = ?1", params![PATH], |r| {
                         r.get::<_, String>(0)
                     }) {
                         if let Some(now) = counter_of(&body) {
-                            let prev = highest.fetch_max(now, Ordering::SeqCst);
-                            if now < prev {
-                                regressions.lock().unwrap().push((prev, now));
+                            highest.fetch_max(now, Ordering::SeqCst);
+                            if now < floor {
+                                regressions.lock().unwrap().push((floor, now));
                             }
                         }
                     }
