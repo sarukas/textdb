@@ -223,6 +223,18 @@ fn scalar_write_and_replace_lines_report_how_the_commit_landed() {
     );
     let content: String = conn.query_row("SELECT textdb_content('/s.md')", [], |r| r.get(0)).unwrap();
     assert_eq!(content, "one\nTWO\n");
+    // Drivers that bind every number as a double (node:sqlite) still address lines and versions,
+    // but a fractional line number is refused rather than truncated.
+    let line: String = conn.query_row("SELECT textdb_lines('/s.md', 2.0, 2.0)", [], |r| r.get(0)).unwrap();
+    assert_eq!(line, "TWO\n");
+    let old: String = conn.query_row("SELECT textdb_content('/s.md', 1.0)", [], |r| r.get(0)).unwrap();
+    assert_eq!(old, "one\ntwo\n");
+    assert!(conn.query_row("SELECT textdb_lines('/s.md', 1.5, 2)", [], |r| r.get::<_, String>(0)).is_err());
+    // An empty author is no author.
+    conn.query_row("SELECT textdb_append('/s.md', 'three' || char(10), '')", [], |_| Ok(())).unwrap();
+    let author: Option<String> =
+        conn.query_row("SELECT author FROM textdb_history('/s.md') ORDER BY version DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(author, None);
 }
 
 #[test]

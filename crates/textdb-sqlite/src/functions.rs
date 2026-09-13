@@ -53,10 +53,17 @@ fn opt_i64(ctx: &Context, i: usize) -> Result<Option<i64>> {
     }
     Ok(match ctx.get_raw(i) {
         ValueRef::Integer(n) => Some(n),
-        ValueRef::Real(f) => Some(f as i64),
+        // Some drivers bind every number as a double (Node's node:sqlite does), so a
+        // whole-valued REAL is an integer here; a fractional one is not.
+        ValueRef::Real(f) if f.fract() == 0.0 => Some(f as i64),
         ValueRef::Text(t) => std::str::from_utf8(t).ok().and_then(|s| s.trim().parse().ok()),
-        ValueRef::Null | ValueRef::Blob(_) => None,
+        ValueRef::Real(_) | ValueRef::Null | ValueRef::Blob(_) => None,
     })
+}
+
+/// Argument `i` as an integer, required.
+fn arg_i64(ctx: &Context, i: usize) -> Result<i64> {
+    opt_i64(ctx, i)?.ok_or_else(|| Error::UserFunctionError(format!("argument {} must be an integer", i + 1).into()))
 }
 
 /// Argument `i` as text, `None` when absent or NULL.
@@ -118,7 +125,7 @@ pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
         }
         let path = arg_str(ctx, 0)?;
         let (bytes, utf8) = if ctx.len() >= 2 && ctx.get_raw(1) != ValueRef::Null {
-            let v: i64 = ctx.get(1)?;
+            let v = arg_i64(ctx, 1)?;
             with_db(ctx, h, &p, |db| db.read_version_shared(&path, v as u64))?
         } else {
             with_db(ctx, h, &p, |db| db.read_shared(&path))?
@@ -128,8 +135,8 @@ pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
     let p = prefix.to_string();
     conn.create_scalar_function("textdb_lines", 3, flags, move |ctx| {
         let path = arg_str(ctx, 0)?;
-        let from: i64 = ctx.get(1)?;
-        let to: i64 = ctx.get(2)?;
+        let from = arg_i64(ctx, 1)?;
+        let to = arg_i64(ctx, 2)?;
         let bytes = with_db(ctx, h, &p, |db| db.lines(&path, from.max(0) as u64, to.max(0) as u64))?;
         Ok(text_or_blob(bytes))
     })?;
@@ -143,8 +150,8 @@ pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
     let p = prefix.to_string();
     conn.create_scalar_function("textdb_diff", 3, flags, move |ctx| {
         let path = arg_str(ctx, 0)?;
-        let v1: i64 = ctx.get(1)?;
-        let v2: i64 = ctx.get(2)?;
+        let v1 = arg_i64(ctx, 1)?;
+        let v2 = arg_i64(ctx, 2)?;
         with_db(ctx, h, &p, |db| db.diff(&path, v1 as u64, v2 as u64))
     })?;
     let p = prefix.to_string();
@@ -155,7 +162,9 @@ pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
         let path = arg_str(ctx, 0)?;
         let old = arg_bytes(ctx, 1)?;
         let new = arg_bytes(ctx, 2)?;
-        let author = if ctx.len() >= 4 { Some(arg_str(ctx, 3)?) } else { None };
+        // NULL or '' both mean "no author", so callers that always pass the argument do not
+        // record an empty name.
+        let author = opt_str(ctx, 3)?.filter(|a| !a.is_empty());
         let r = with_db(ctx, h, &p, |db| db.edit(&path, &old, &new, author.as_deref()))?;
         Ok(r.version as i64)
     })?;
@@ -166,7 +175,7 @@ pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
         }
         let path = arg_str(ctx, 0)?;
         let tail = arg_bytes(ctx, 1)?;
-        let author = if ctx.len() >= 3 { Some(arg_str(ctx, 2)?) } else { None };
+        let author = opt_str(ctx, 2)?.filter(|a| !a.is_empty());
         let r = with_db(ctx, h, &p, |db| db.append(&path, &tail, author.as_deref()))?;
         Ok(r.version as i64)
     })?;
@@ -199,8 +208,8 @@ pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
             ));
         }
         let path = arg_str(ctx, 0)?;
-        let from: i64 = ctx.get(1)?;
-        let to: i64 = ctx.get(2)?;
+        let from = arg_i64(ctx, 1)?;
+        let to = arg_i64(ctx, 2)?;
         let text = arg_bytes(ctx, 3)?;
         let base = opt_i64(ctx, 4)?.map(|v| v.max(0) as u64);
         let author = opt_str(ctx, 5)?;

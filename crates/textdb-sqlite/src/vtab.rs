@@ -697,8 +697,8 @@ unsafe impl VTabCursor for FnCursor<'_> {
             FnKind::Search => {
                 let q = s(&hidden[0]).unwrap_or_default();
                 let prefix = s(&hidden[1]).unwrap_or_else(|| "/".into());
-                let lim = match &hidden[2] {
-                    Some(Value::Integer(i)) => *i as usize,
+                let lim = match hidden_i64(&hidden[2]) {
+                    Some(i) => i.max(0) as usize,
                     _ => 100,
                 };
                 db.search(&q, &prefix, lim)
