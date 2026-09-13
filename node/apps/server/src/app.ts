@@ -5,6 +5,7 @@ import { errorResponse } from './errors.ts';
 import { eventStream } from './events.ts';
 import type { ChangeHub } from './hub.ts';
 import {
+  bodyImportFiles,
   bodyInt,
   bodyOptionalInt,
   bodyOptionalString,
@@ -76,6 +77,12 @@ export function createApp(corpus: Corpus, hub: ChangeHub, options: AppOptions): 
       { baseVersion: bodyOptionalInt(body, 'base_version'), author: bodyOptionalString(body, 'author') },
     );
     return c.json(result);
+  });
+
+  app.post('/api/import', async (c) => {
+    const body = await jsonBody(c);
+    const files = bodyImportFiles(body);
+    return c.json(corpus.importBatch(files, { author: bodyOptionalString(body, 'author') }));
   });
 
   app.get('/api/events', (c) => eventStream(c, hub, options.pingMs));

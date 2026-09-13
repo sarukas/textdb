@@ -62,6 +62,7 @@ Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./
 | `GET /api/search?q=…[&prefix=/][&limit=50]` | | `[{ path, line, snippet, rank }]` |
 | `PUT /api/file` | `{ path, content, base_version?, author?, message? }` | `{ version, kind }` — rebased over concurrent commits; 409 with `conflict` when the same lines changed |
 | `POST /api/replace-lines` | `{ path, from, to, text, base_version?, author? }` | `{ version, kind }` |
+| `POST /api/import` | `{ files: [{ path, content }], author? }` (at most 5000 files) | `{ created, updated, unchanged, failed, failures: [{ path, code, message }] }` — one transaction, message `import`; unchanged files make no version; a refused file is listed and the rest still land |
 | `GET /api/events[?since=seq]` | `Last-Event-ID` honoured | Server-sent events, see below |
 
 ### `GET /api/events`

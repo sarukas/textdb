@@ -63,6 +63,14 @@ export interface WriteResult {
   kind: CommitKind | "noop";
 }
 
+export interface ImportResult {
+  created: number;
+  updated: number;
+  unchanged: number;
+  failed: number;
+  failures: { path: string; code: string; message: string }[];
+}
+
 export interface ConflictInfo {
   path: string;
   region_line_from: number;
@@ -142,6 +150,8 @@ export const api = {
     request<SearchHit[]>("GET", `/api/search?${qs({ q, prefix: opts.prefix, limit: opts.limit })}`, undefined, opts.signal),
   write: (body: { path: string; content: string; base_version?: number; author?: string; message?: string }) =>
     request<WriteResult>("PUT", "/api/file", body),
+  importBatch: (body: { author?: string; files: { path: string; content: string }[] }) =>
+    request<ImportResult>("POST", "/api/import", body),
 };
 
 export type ConnectionState = "connecting" | "live" | "offline";

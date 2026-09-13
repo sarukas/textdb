@@ -34,6 +34,25 @@ export interface AuthorOptions {
   author?: string;
 }
 
+export interface ImportFile {
+  path: string;
+  content: string;
+}
+
+export interface ImportFailure {
+  path: string;
+  code: string;
+  message: string;
+}
+
+export interface ImportStats {
+  created: number;
+  updated: number;
+  unchanged: number;
+  failed: number;
+  failures: ImportFailure[];
+}
+
 export function openCorpus(options: OpenOptions): Corpus {
   const extension = resolveExtension(options.extension);
   const db = options.db === ':memory:' ? options.db : path.resolve(options.db);
@@ -212,6 +231,30 @@ export class Corpus {
   feed(since: number, limit?: number): Change[] {
     const args = limit === undefined ? [since] : [since, limit];
     return this.sql.all<Change>(`SELECT * FROM textdb_feed(${placeholders(args)})`, ...args);
+  }
+
+  /**
+   * Creates or updates many files in one transaction, recorded with the message `import`.
+   * Unchanged files make no new version. A file the store refuses (a bad path, a folder in
+   * the way) is reported and the rest still land: each write runs under its own savepoint.
+   */
+  importBatch(files: readonly ImportFile[], options: AuthorOptions = {}): ImportStats {
+    const stats: ImportStats = { created: 0, updated: 0, unchanged: 0, failed: 0, failures: [] };
+    this.transaction(() => {
+      for (const file of files) {
+        try {
+          const result = this.write(file.path, file.content, { author: options.author, message: 'import' });
+          if (result.kind === 'noop') stats.unchanged++;
+          else if (result.version === 1) stats.created++;
+          else stats.updated++;
+        } catch (error) {
+          if (!(error instanceof TextdbError)) throw error;
+          stats.failed++;
+          stats.failures.push({ path: file.path, code: error.code, message: error.message });
+        }
+      }
+    });
+    return stats;
   }
 
   /** Runs `fn` inside `BEGIN IMMEDIATE … COMMIT`, rolling back if it throws. */

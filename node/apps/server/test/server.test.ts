@@ -162,6 +162,32 @@ describe('http api', () => {
     res = await api('GET', '/assets/missing.js');
     assert.equal(res.status, 404);
   });
+
+  test('imports a batch of files in one request', async () => {
+    const files = [
+      { path: '/imported/a.md', content: '# A\n' },
+      { path: '/imported/deep/b.md', content: '# B\n' },
+      { path: '/imported/../escape.md', content: 'no\n' },
+    ];
+    let res = await api('POST', '/api/import', { author: 'human', files });
+    assert.equal(res.status, 200);
+    assert.deepEqual([res.body.created, res.body.updated, res.body.unchanged, res.body.failed], [2, 0, 0, 1]);
+    assert.deepEqual([res.body.failures[0].path, res.body.failures[0].code], ['/imported/../escape.md', 'TX004']);
+
+    // Importing again is idempotent, and a changed file becomes a new version.
+    res = await api('POST', '/api/import', { author: 'human', files: [files[0], { ...files[1]!, content: '# B, revised\n' }] });
+    assert.deepEqual([res.body.created, res.body.updated, res.body.unchanged, res.body.failed], [0, 1, 1, 0]);
+    res = await api('GET', '/api/history?path=/imported/deep/b.md');
+    assert.deepEqual(res.body.map((h: { version: number; author: string; message: string }) => [h.version, h.author, h.message]), [
+      [1, 'human', 'import'],
+      [2, 'human', 'import'],
+    ]);
+
+    res = await api('POST', '/api/import', { files: [] });
+    assert.deepEqual([res.status, res.body.code], [400, 'TX004']);
+    res = await api('POST', '/api/import', { files: [{ path: '/x.md' }] });
+    assert.deepEqual([res.status, res.body.message], [400, 'files[0] must be an object with string path and content']);
+  });
 });
 
 describe('event stream', () => {

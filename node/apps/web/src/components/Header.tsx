@@ -9,6 +9,7 @@ interface Props {
   lastSeq: number;
   author: string;
   onAuthor: (name: string) => void;
+  onImport: () => void;
 }
 
 const STATE_LABEL: Record<ConnectionState, string> = {
@@ -17,7 +18,7 @@ const STATE_LABEL: Record<ConnectionState, string> = {
   offline: "Offline",
 };
 
-export function Header({ info, connection, lastSeq, author, onAuthor }: Props) {
+export function Header({ info, connection, lastSeq, author, onAuthor, onImport }: Props) {
   const db = info?.db ?? "";
   return (
     <header className="header">
@@ -47,6 +48,9 @@ export function Header({ info, connection, lastSeq, author, onAuthor }: Props) {
           </>
         )}
       </div>
+      <button type="button" className="btn btn-small import-button" onClick={onImport}>
+        Import folder…
+      </button>
       <label className="author-field">
         <span className="author-chip" style={authorStyle(effectiveAuthor(author))} aria-hidden="true" />
         <span className="visually-hidden">Author name</span>

@@ -3,7 +3,9 @@ import { api, subscribe, type ChangeEvent, type ConnectionState, type Info, type
 import { ActivityFeed } from "./components/ActivityFeed";
 import { DocumentPane, type Mode, type OpenDoc } from "./components/DocumentPane";
 import { Header } from "./components/Header";
+import { ImportDialog } from "./components/ImportDialog";
 import { Sidebar } from "./components/Sidebar";
+import { addToFeed, type FeedItem } from "./live/activity";
 import { FeedHub } from "./state/hub";
 import { OwnWrites } from "./state/ownWrites";
 import { useAuthor } from "./state/useAuthor";
@@ -33,7 +35,8 @@ export function App() {
   const [info, setInfo] = useState<Info | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [lastSeq, setLastSeq] = useState(0);
-  const [events, setEvents] = useState<ChangeEvent[]>([]);
+  const [feed, setFeed] = useState<FeedItem[]>([]);
+  const [importing, setImporting] = useState(false);
   const [open, setOpen] = useState<OpenDoc | null>(fromHash);
   const [mode, setMode] = useState<Mode>("preview");
   const [feedOpen, setFeedOpen] = useState(readFeedOpen);
@@ -55,7 +58,7 @@ export function App() {
       pending.current = [];
       if (!batch.length) return;
       setLastSeq((s) => Math.max(s, batch[batch.length - 1]!.seq));
-      setEvents((prev) => [...batch.reverse(), ...prev].slice(0, FEED_CAP));
+      setFeed((prev) => addToFeed(prev, batch, FEED_CAP));
     };
     const refreshInfo = () => {
       if (infoTimer.current) clearTimeout(infoTimer.current);
@@ -138,7 +141,15 @@ export function App() {
 
   return (
     <div className={`app${feedOpen ? "" : " feed-collapsed"}`}>
-      <Header info={info} connection={connection} lastSeq={lastSeq} author={author} onAuthor={setAuthor} />
+      <Header
+        info={info}
+        connection={connection}
+        lastSeq={lastSeq}
+        author={author}
+        onAuthor={setAuthor}
+        onImport={() => setImporting(true)}
+      />
+      {importing && <ImportDialog author={author} onClose={() => setImporting(false)} onOpen={openFile} />}
       <main className="workspace">
         <aside className="sidebar" aria-label="Files and search">
           <Sidebar hub={hub} openPath={open?.path ?? null} onOpen={openFile} />
@@ -166,7 +177,7 @@ export function App() {
           )}
         </section>
         <aside className="activity-wrap" aria-label="Activity feed">
-          <ActivityFeed events={events} author={author} own={own} open={feedOpen} onToggle={toggleFeed} onOpen={openFile} />
+          <ActivityFeed items={feed} author={author} own={own} open={feedOpen} onToggle={toggleFeed} onOpen={openFile} />
         </aside>
       </main>
     </div>

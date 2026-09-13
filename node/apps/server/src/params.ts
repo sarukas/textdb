@@ -49,6 +49,22 @@ export function bodyInt(body: Record<string, unknown>, name: string): number {
   return value as number;
 }
 
+/** Files in one import request; the web UI sends a few megabytes at a time. */
+const MAX_IMPORT_FILES = 5000;
+
+export function bodyImportFiles(body: Record<string, unknown>): { path: string; content: string }[] {
+  const files = body.files;
+  if (!Array.isArray(files) || files.length === 0) throw badRequest('files must be a non-empty array');
+  if (files.length > MAX_IMPORT_FILES) throw badRequest(`at most ${MAX_IMPORT_FILES} files per request`);
+  return files.map((file: unknown, i) => {
+    const f = (typeof file === 'object' && file !== null ? file : {}) as Record<string, unknown>;
+    if (typeof f.path !== 'string' || typeof f.content !== 'string') {
+      throw badRequest(`files[${i}] must be an object with string path and content`);
+    }
+    return { path: f.path, content: f.content };
+  });
+}
+
 export function bodyOptionalInt(body: Record<string, unknown>, name: string): number | undefined {
   const value = body[name];
   return value === undefined || value === null ? undefined : bodyInt(body, name);
