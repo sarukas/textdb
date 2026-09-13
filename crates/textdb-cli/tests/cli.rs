@@ -138,6 +138,13 @@ fn import_browse_edit_by_line_and_handle_conflicts() {
     let last = log.as_array().unwrap().last().unwrap().clone();
     assert_eq!((last["op"].as_str(), last["author"].as_str(), last["commit_kind"].as_str()), (Some("commit"), Some("agent-7"), Some("rebased")));
 
+    // Markdown list items start with a hyphen; they are text, not flags.
+    ok(textdb(&store).args(["edit", "/docs/guide/deep/notes.md", "--old", "- two", "--new", "- two\n- three"]), None);
+    ok(textdb(&store).args(["append", "/docs/guide/deep/notes.md", "- four"]), None);
+    ok(textdb(&store).args(["replace-lines", "/docs/guide/deep/notes.md", "5", "5", "--text", "- ONE\n"]), None);
+    let notes = ok(textdb(&store).args(["cat", "/docs/guide/deep/notes.md"]), None).stdout;
+    assert_eq!(notes, "# Notes\n\n## Todo\n\n- ONE\n- two\n- three\n- four\n");
+
     // Write from stdin, move, delete.
     ok(textdb(&store).args(["write", "/docs/new.md", "-m", "draft"]), Some("# New\n"));
     ok(textdb(&store).args(["mv", "/docs/new.md", "/archive/new.md"]), None);

@@ -155,9 +155,11 @@ enum Cmd {
     Edit {
         #[arg(value_parser = store_path)]
         path: String,
-        #[arg(long, conflicts_with_all = ["old_file", "stdin_json"])]
+        // `allow_hyphen_values`: markdown list items start with "- ", which clap would
+        // otherwise take for a flag.
+        #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["old_file", "stdin_json"])]
         old: Option<String>,
-        #[arg(long, conflicts_with_all = ["new_file", "stdin_json"])]
+        #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["new_file", "stdin_json"])]
         new: Option<String>,
         #[arg(long, conflicts_with = "stdin_json")]
         old_file: Option<PathBuf>,
@@ -176,7 +178,7 @@ enum Cmd {
         /// The version the line numbers refer to (see `cat -n`).
         #[arg(long, short = 'b')]
         base_version: Option<i64>,
-        #[arg(long, short = 't', conflicts_with = "file")]
+        #[arg(long, short = 't', allow_hyphen_values = true, conflicts_with = "file")]
         text: Option<String>,
         #[arg(long, short = 'f')]
         file: Option<PathBuf>,
@@ -185,6 +187,7 @@ enum Cmd {
     Append {
         #[arg(value_parser = store_path)]
         path: String,
+        #[arg(allow_hyphen_values = true)]
         text: Option<String>,
     },
     /// Versions of a file, oldest first.
