@@ -4,7 +4,9 @@
 //! `link`, `frontmatter`, `checkpoint`), updatable views `kb.file`, `kb.folder`,
 //! `kb.file_version` (INSTEAD OF triggers), and the functions `kb.content`, `kb.lines`,
 //! `kb.section`, `kb.edit`, `kb.append`, `kb.diff`, `kb.ls`, `kb.search`, `kb.history`,
-//! `kb.export`, `kb.checkpoint`. All algorithms come from `textdb-core`; this crate only
+//! `kb.export`, `kb.checkpoint`, and for live clients the change feed (`kb.change`,
+//! `kb.feed`, `kb.last_seq`, NOTIFY channel `textdb_change`), `kb.hunks`, `kb.chunks`,
+//! `kb.write`, `kb.replace_lines`, `kb.move`, `kb.remove`. All algorithms come from `textdb-core`; this crate only
 //! persists through SPI and owns the SQL grammar.
 
 use pgrx::prelude::*;
@@ -39,7 +41,25 @@ INSERT INTO kb.node(parent_id, name, kind, path) VALUES (NULL, '', 0, '/');
 CREATE TABLE kb.commit (
   file_id bigint NOT NULL, version bigint NOT NULL, root bytea NOT NULL, parent_root bytea NULL,
   author text, ts timestamptz NOT NULL DEFAULT now(), message text, nbytes bigint, nlines bigint,
+  kind text,                -- direct, rebased, merged
+  base_version bigint,      -- the version the writer started from (NULL for version 1)
   PRIMARY KEY (file_id, version)
+);
+-- Change feed: one row per create, commit, mkdir, move and delete, written in the same
+-- transaction as the change; each row is also announced with pg_notify('textdb_change', seq).
+CREATE TABLE kb.change (
+  seq          bigserial PRIMARY KEY,
+  ts           timestamptz NOT NULL DEFAULT now(),
+  op           text NOT NULL,        -- create, commit, mkdir, move, delete
+  node_id      bigint NOT NULL,
+  node_kind    smallint NOT NULL,    -- 0 folder, 1 file
+  path         text NOT NULL,        -- the path after the change
+  old_path     text,                 -- move: the path before
+  version      bigint,               -- create, commit: the new version
+  base_version bigint,               -- commit: the version the writer started from
+  commit_kind  text,                 -- create, commit: direct, rebased, merged
+  author       text,
+  message      text
 );
 CREATE TABLE kb.chunk (
   id bigserial PRIMARY KEY, hash bytea NOT NULL UNIQUE, bytes bytea NOT NULL, nlines int NOT NULL
@@ -105,6 +125,10 @@ CREATE VIEW kb.file_version AS
          c.author, c.ts, c.message
   FROM kb.commit c JOIN kb.node n ON n.id = c.file_id;
 
+-- Attributed namespace changes (recorded in the change feed with `author`).
+CREATE FUNCTION kb.move(from_path text, to_path text, author text DEFAULT NULL) RETURNS void LANGUAGE sql VOLATILE AS $$ SELECT kb._move(from_path, to_path, author) $$;
+CREATE FUNCTION kb.remove(path text, author text DEFAULT NULL) RETURNS void LANGUAGE sql VOLATILE AS $$ SELECT kb._remove(path, author) $$;
+
 CREATE FUNCTION kb.file_iud() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
@@ -114,14 +138,14 @@ BEGIN
     RETURN NEW;
   ELSIF TG_OP = 'UPDATE' THEN
     IF NEW.path IS DISTINCT FROM OLD.path THEN
-      PERFORM kb._rename(OLD.path, NEW.path);
+      PERFORM kb.move(OLD.path, NEW.path, NEW.updated_by);
     END IF;
     IF NEW.base_version IS NOT NULL OR NEW.content IS DISTINCT FROM OLD.content THEN
       PERFORM kb._update_content(NEW.path, coalesce(NEW.content, ''), NEW.base_version, NEW.updated_by, 'update');
     END IF;
     RETURN NEW;
   ELSE
-    PERFORM kb._delete(OLD.path);
+    PERFORM kb.remove(OLD.path, NULL::text);
     RETURN OLD;
   END IF;
 END $$;
@@ -133,10 +157,10 @@ BEGIN
     PERFORM kb._mkdir(NEW.path);
     RETURN NEW;
   ELSIF TG_OP = 'UPDATE' THEN
-    IF NEW.path IS DISTINCT FROM OLD.path THEN PERFORM kb._rename(OLD.path, NEW.path); END IF;
+    IF NEW.path IS DISTINCT FROM OLD.path THEN PERFORM kb.move(OLD.path, NEW.path, NULL::text); END IF;
     RETURN NEW;
   ELSE
-    PERFORM kb._delete(OLD.path);
+    PERFORM kb.remove(OLD.path, NULL::text);
     RETURN OLD;
   END IF;
 END $$;
@@ -151,6 +175,16 @@ BEGIN
   END IF;
   RETURN (r->>'version')::bigint;
 END $$;
+-- As kb._check, but returns the whole outcome `{"version": n, "kind": "direct|rebased|merged|noop"}`.
+CREATE FUNCTION kb._check_j(r jsonb) RETURNS jsonb LANGUAGE plpgsql AS $$
+BEGIN
+  IF r ? 'code' THEN
+    RAISE EXCEPTION USING ERRCODE = r->>'code', MESSAGE = r->>'message', DETAIL = coalesce(r->>'detail', '');
+  END IF;
+  RETURN r;
+END $$;
+CREATE FUNCTION kb.write(path text, content text, base_version bigint DEFAULT NULL, author text DEFAULT NULL, message text DEFAULT NULL) RETURNS jsonb LANGUAGE sql VOLATILE AS $$ SELECT kb._check_j(kb._write_j(path, content, base_version, author, message)) $$;
+CREATE FUNCTION kb.replace_lines(path text, l_from bigint, l_to bigint, body text, base_version bigint DEFAULT NULL, author text DEFAULT NULL) RETURNS jsonb LANGUAGE sql VOLATILE AS $$ SELECT kb._check_j(kb._replace_lines_j(path, l_from, l_to, body, base_version, author)) $$;
 CREATE FUNCTION kb._update_content(path text, content text, base_version bigint, author text, message text) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb._check(kb._update_content_j(path, content, base_version, author, message)) $$;
 CREATE FUNCTION kb.edit(path text, old text, new text, author text) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb._check(kb._edit_j(path, old, new, author)) $$;
 CREATE FUNCTION kb.append(path text, tail text, author text) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb._check(kb._append_j(path, tail, author)) $$;
@@ -176,8 +210,8 @@ mod kb {
     use pgrx::datum::DatumWithOid;
     use textdb_core::commit::{commit, commit_append, CommitKind, Committed};
     use textdb_core::myers::byte_edits;
-    use textdb_core::tree::{leaves, materialize, totals};
-    use textdb_core::{unified_diff, ChunkParams, Edit, Hash, Storage, StructureExtractor, TextdbError};
+    use textdb_core::tree::{leaves, locate_line, materialize, materialize_range, totals};
+    use textdb_core::{unified_diff, ChunkParams, Edit, Hash, LineHunk, Storage, StructureExtractor, TextdbError};
     use textdb_md::MarkdownExtractor;
 
     use crate::store::{normalize_path, parent_of, name_of, raise, spi_err, to_hash, NodeRow, SpiStorage};
@@ -202,12 +236,17 @@ mod kb {
         }
     }
 
-    /// Outcome of a write as JSON for the PL/pgSQL wrapper `kb._check`, which turns an error
-    /// object into `RAISE EXCEPTION USING ERRCODE = …` (pgrx re-raises panics as XX000, so
-    /// custom SQLSTATEs must be raised from SQL).
-    fn json_result(r: Result<i64, TextdbError>) -> pgrx::JsonB {
+    fn storage_err(e: pgrx::spi::Error) -> TextdbError {
+        TextdbError::Storage(e.to_string())
+    }
+
+    /// Outcome of a write as JSON for the PL/pgSQL wrappers `kb._check` / `kb._check_j`, which
+    /// turn an error object into `RAISE EXCEPTION USING ERRCODE = …` (pgrx re-raises panics as
+    /// XX000, so custom SQLSTATEs must be raised from SQL). Success is
+    /// `{"version": n, "kind": "direct|rebased|merged|noop"}`.
+    fn json_result(r: Result<(i64, CommitKind), TextdbError>) -> pgrx::JsonB {
         pgrx::JsonB(match r {
-            Ok(v) => serde_json::json!({ "version": v }),
+            Ok((v, k)) => serde_json::json!({ "version": v, "kind": k.as_str() }),
             Err(e) => {
                 let detail = match &e {
                     TextdbError::Conflict(c) => serde_json::to_string(c).unwrap_or_default(),
@@ -270,33 +309,79 @@ mod kb {
     #[pg_extern(volatile)]
     fn _mkdir(path: &str) -> i64 {
         let path = ok(normalize_path(path));
-        ensure_folder(&path)
+        ok(ensure_folder(&path))
     }
 
-    fn ensure_folder(path: &str) -> i64 {
+    /// `mkdir -p` of a normalized path; each folder it creates gets a `mkdir` feed row.
+    fn ensure_folder(path: &str) -> Result<i64, TextdbError> {
         if let Some(n) = node_by_path(path) {
             if n.kind != 0 {
-                fail(TextdbError::InvalidEdit(format!("{} is a file", path)));
+                return Err(TextdbError::InvalidEdit(format!("{} is a file", path)));
             }
-            return n.id;
+            return Ok(n.id);
         }
         if path == "/" {
-            fail(TextdbError::Storage("root folder missing".into()));
+            return Err(TextdbError::Storage("root folder missing".into()));
         }
-        let parent = ensure_folder(parent_of(path));
-        Spi::get_one_with_args::<i64>(
+        let parent = ensure_folder(parent_of(path))?;
+        let id = Spi::get_one_with_args::<i64>(
             "INSERT INTO kb.node(parent_id, name, kind, path) VALUES ($1, $2, 0, $3) RETURNING id",
             &[parent.into(), name_of(path).into(), path.into()],
         )
-        .unwrap_or_else(|e| spi_err(e))
-        .expect("id")
+        .map_err(storage_err)?
+        .ok_or_else(|| TextdbError::Storage("folder insert returned no id".into()))?;
+        record_change("mkdir", id, 0, path, None, None, None, None, None, None);
+        Ok(id)
     }
 
-    fn record_commit(file_id: i64, path: &str, c: &Committed, parent_root: Option<&Hash>, author: Option<&str>, message: Option<&str>) {
+    /// Append one row to the change feed and announce its `seq` on the `textdb_change`
+    /// channel. Runs inside the calling statement's transaction, so the row and the
+    /// notification exist exactly when the change commits.
+    #[allow(clippy::too_many_arguments)]
+    fn record_change(
+        op: &str,
+        node_id: i64,
+        node_kind: i16,
+        path: &str,
+        old_path: Option<&str>,
+        version: Option<i64>,
+        base_version: Option<i64>,
+        commit_kind: Option<&str>,
+        author: Option<&str>,
+        message: Option<&str>,
+    ) {
+        Spi::run_with_args(
+            "WITH c AS (INSERT INTO kb.change(op, node_id, node_kind, path, old_path, version, base_version, commit_kind, author, message) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING seq) SELECT pg_notify('textdb_change', seq::text) FROM c",
+            &[
+                op.into(),
+                node_id.into(),
+                node_kind.into(),
+                path.into(),
+                old_path.into(),
+                version.into(),
+                base_version.into(),
+                commit_kind.into(),
+                author.into(),
+                message.into(),
+            ],
+        )
+        .unwrap_or_else(|e| spi_err(e));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_commit(
+        file_id: i64,
+        path: &str,
+        c: &Committed,
+        parent_root: Option<&Hash>,
+        base_version: Option<i64>,
+        author: Option<&str>,
+        message: Option<&str>,
+    ) {
         let st = SpiStorage::new();
         let (nbytes, nlines) = ok(totals(&st, &c.root));
         Spi::run_with_args(
-            "INSERT INTO kb.commit(file_id, version, root, parent_root, author, message, nbytes, nlines) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO kb.commit(file_id, version, root, parent_root, author, message, nbytes, nlines, kind, base_version) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
             &[
                 file_id.into(),
                 (c.version as i64).into(),
@@ -306,9 +391,13 @@ mod kb {
                 message.into(),
                 (nbytes as i64).into(),
                 (nlines as i64).into(),
+                c.kind.as_str().into(),
+                base_version.into(),
             ],
         )
         .unwrap_or_else(|e| spi_err(e));
+        let op = if c.version == 1 { "create" } else { "commit" };
+        record_change(op, file_id, 1, path, None, Some(c.version as i64), base_version, Some(c.kind.as_str()), author, message);
         Spi::run_with_args(
             "UPDATE kb.node SET nbytes = $1, nlines = $2, updated_by = $3 WHERE id = $4",
             &[(nbytes as i64).into(), (nlines as i64).into(), author.into(), file_id.into()],
@@ -367,21 +456,25 @@ mod kb {
     /// Create a file (parents created), commit version 1.
     #[pg_extern(volatile)]
     fn _create(path: &str, content: &str, author: Option<&str>, message: Option<&str>) -> i64 {
-        let path = ok(normalize_path(path));
+        ok(create_impl(path, content, author, message))
+    }
+
+    fn create_impl(path: &str, content: &str, author: Option<&str>, message: Option<&str>) -> Result<i64, TextdbError> {
+        let path = normalize_path(path)?;
         if node_by_path(&path).is_some() {
-            fail(TextdbError::InvalidEdit(format!("{} already exists", path)));
+            return Err(TextdbError::InvalidEdit(format!("{} already exists", path)));
         }
-        let parent = ensure_folder(parent_of(&path));
+        let parent = ensure_folder(parent_of(&path))?;
         let id = Spi::get_one_with_args::<i64>(
             "INSERT INTO kb.node(parent_id, name, kind, path, updated_by) VALUES ($1, $2, 1, $3, $4) RETURNING id",
             &[parent.into(), name_of(&path).into(), path.as_str().into(), author.into()],
         )
-        .unwrap_or_else(|e| spi_err(e))
-        .expect("id");
+        .map_err(storage_err)?
+        .ok_or_else(|| TextdbError::Storage("file insert returned no id".into()))?;
         let mut st = SpiStorage::new();
-        let (root, chunks) = ok(textdb_core::build_with_chunks(&mut st, &P, content.as_bytes()));
-        if !ok(st.cas_root(id as u64, None, &root)) {
-            fail(TextdbError::Storage("initial CAS failed".into()));
+        let (root, chunks) = textdb_core::build_with_chunks(&mut st, &P, content.as_bytes())?;
+        if !st.cas_root(id as u64, None, &root)? {
+            return Err(TextdbError::Storage("initial CAS failed".into()));
         }
         let c = Committed {
             version: 1,
@@ -390,21 +483,95 @@ mod kb {
             new_chunks: chunks,
             retries: 0,
         };
-        record_commit(id, &path, &c, None, author, message);
-        1
+        record_commit(id, &path, &c, None, None, author, message);
+        Ok(1)
     }
 
     /// Upsert: create, or update content (identical content → no new version).
     #[pg_extern(volatile)]
     fn _upsert(path: &str, content: &str, author: Option<&str>, message: Option<&str>) -> i64 {
-        let path = ok(normalize_path(path));
+        ok(write_impl(path, content, None, author, message)).0
+    }
+
+    /// Create the file, or replace its content exactly as `_update_content_j` does.
+    /// JSON outcome `{version, kind}`; `kb.write(...)` (SQL) raises from it.
+    #[pg_extern(volatile)]
+    fn _write_j(path: &str, content: &str, base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> pgrx::JsonB {
+        json_result(write_impl(path, content, base_version, author, message))
+    }
+
+    fn write_impl(path: &str, content: &str, base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
+        let path = normalize_path(path)?;
         match node_by_path(&path) {
-            None => _create(&path, content, author, message),
-            Some(_) => match update_content_impl(&path, content, None, author, message) {
-                Ok(v) => v,
-                Err(e) => fail(e),
-            },
+            None => Ok((create_impl(&path, content, author, message)?, CommitKind::Direct)),
+            Some(_) => update_content_impl(&path, content, base_version, author, message),
         }
+    }
+
+    /// Replace lines `[l_from, l_to]` (1-based, inclusive) with `body`, where the numbers refer
+    /// to `base_version` (HEAD when NULL). `l_to = l_from - 1` inserts in front of `l_from`;
+    /// `l_from` one past the last line appends. Committed with that base version, so commits
+    /// that landed elsewhere in the meantime are rebased over (or TX001 on the same lines).
+    /// JSON outcome; `kb.replace_lines(...)` (SQL) raises from it.
+    #[pg_extern(volatile)]
+    fn _replace_lines_j(path: &str, l_from: i64, l_to: i64, body: &str, base_version: Option<i64>, author: Option<&str>) -> pgrx::JsonB {
+        json_result(replace_lines_impl(path, l_from, l_to, body, base_version, author))
+    }
+
+    fn replace_lines_impl(path: &str, l_from: i64, l_to: i64, body: &str, base_version: Option<i64>, author: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
+        let path = normalize_path(path)?;
+        let from = l_from.max(0) as u64;
+        let to = l_to.max(0) as u64;
+        if from == 0 || to + 1 < from {
+            return Err(TextdbError::InvalidEdit(format!("invalid line range {}-{}", from, to)));
+        }
+        let n = file_by_path_r(&path)?;
+        let base_v = base_version.map_or(n.version, |v| v.max(0));
+        let root = match n.root {
+            Some(r) if base_v == n.version => r,
+            _ => root_of_version_r(n.id, base_v as u64)?,
+        };
+        let edit = {
+            let st = SpiStorage::new();
+            let (len, newlines) = totals(&st, &root)?;
+            let unterminated = len > 0 && materialize_range(&st, &root, len - 1, len)? != b"\n";
+            let nlines = newlines + unterminated as u64;
+            if from - 1 > nlines || to > nlines {
+                return Err(TextdbError::InvalidEdit(format!(
+                    "lines {}-{} are outside {}, which has {} lines at version {}",
+                    from, to, path, nlines, base_v
+                )));
+            }
+            let mut replacement = body.as_bytes().to_vec();
+            let start = match locate_line(&st, &root, from - 1)? {
+                Some(off) => off,
+                // Appending after a last line with no newline: supply one, or the new text
+                // would run on from that line instead of following it.
+                None => {
+                    replacement.insert(0, b'\n');
+                    len
+                }
+            };
+            let end = if to < from { start } else { locate_line(&st, &root, to)?.unwrap_or(len) };
+            Edit::new(start, end, replacement)
+        };
+        commit_edits_impl(&path, &[edit], Some(base_v), author, Some("replace-lines"))
+    }
+
+    /// Commit a byte-range edit set expressed against `base_version` (or HEAD).
+    fn commit_edits_impl(path: &str, edits: &[Edit], base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
+        let n = file_by_path_r(path)?;
+        let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.to_string()))?;
+        let base = match base_version {
+            Some(v) if v != n.version => root_of_version_r(n.id, v as u64)?,
+            _ => cur,
+        };
+        let mut st = SpiStorage::new();
+        let c = commit(&mut st, &P, n.id as u64, path, &base, edits, RETRIES)?;
+        if c.kind != CommitKind::NoOp {
+            record_commit(n.id, path, &c, Some(&cur), Some(base_version.unwrap_or(n.version)), author, message);
+        }
+        Ok((c.version as i64, c.kind))
     }
 
     /// Whole-content update: diff against `base_version` (or HEAD) → edit set → commit with rebase.
@@ -414,7 +581,7 @@ mod kb {
         json_result(update_content_impl(path, content, base_version, author, message))
     }
 
-    fn update_content_impl(path: &str, content: &str, base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> Result<i64, TextdbError> {
+    fn update_content_impl(path: &str, content: &str, base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
         let path = normalize_path(path)?;
         let n = file_by_path_r(&path)?;
         let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
@@ -426,13 +593,13 @@ mod kb {
         let old = materialize(&st, &base)?;
         let edits = byte_edits(&old, content.as_bytes());
         if edits.is_empty() && base == cur {
-            return Ok(n.version);
+            return Ok((n.version, CommitKind::NoOp));
         }
         let c = commit(&mut st, &P, n.id as u64, &path, &base, &edits, RETRIES)?;
         if c.kind != CommitKind::NoOp {
-            record_commit(n.id, &path, &c, Some(&cur), author, message);
+            record_commit(n.id, &path, &c, Some(&cur), Some(base_version.unwrap_or(n.version)), author, message);
         }
-        Ok(c.version as i64)
+        Ok((c.version as i64, c.kind))
     }
 
     fn root_of_version(file_id: i64, version: u64) -> Hash {
@@ -454,7 +621,7 @@ mod kb {
         json_result(edit_impl(path, old, new, author))
     }
 
-    fn edit_impl(path: &str, old: &str, new: &str, author: Option<&str>) -> Result<i64, TextdbError> {
+    fn edit_impl(path: &str, old: &str, new: &str, author: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
         let path = normalize_path(path)?;
         let n = file_by_path_r(&path)?;
         let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
@@ -464,9 +631,9 @@ mod kb {
         let edits = [Edit::new(pos as u64, (pos + old.len()) as u64, new.as_bytes().to_vec())];
         let c = commit(&mut st, &P, n.id as u64, &path, &cur, &edits, RETRIES)?;
         if c.kind != CommitKind::NoOp {
-            record_commit(n.id, &path, &c, Some(&cur), author, Some("edit"));
+            record_commit(n.id, &path, &c, Some(&cur), Some(n.version), author, Some("edit"));
         }
-        Ok(c.version as i64)
+        Ok((c.version as i64, c.kind))
     }
 
     fn find_unique(content: &[u8], old: &[u8]) -> Result<usize, TextdbError> {
@@ -495,59 +662,83 @@ mod kb {
         json_result(append_impl(path, tail, author))
     }
 
-    fn append_impl(path: &str, tail: &str, author: Option<&str>) -> Result<i64, TextdbError> {
+    fn append_impl(path: &str, tail: &str, author: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
         let path = normalize_path(path)?;
         let n = file_by_path_r(&path)?;
         let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let mut st = SpiStorage::new();
         let c = commit_append(&mut st, &P, n.id as u64, &path, tail.as_bytes(), RETRIES)?;
         if c.kind != CommitKind::NoOp {
-            record_commit(n.id, &path, &c, Some(&cur), author, Some("append"));
+            record_commit(n.id, &path, &c, Some(&cur), Some(n.version), author, Some("append"));
         }
-        Ok(c.version as i64)
+        Ok((c.version as i64, c.kind))
     }
 
     /// Rename/move a file or folder: subtree path rewrite in one statement, ids stable.
     #[pg_extern(volatile)]
     fn _rename(from: &str, to: &str) {
-        let from = ok(normalize_path(from));
-        let to = ok(normalize_path(to));
+        ok(rename_impl(from, to, None))
+    }
+
+    /// As `_rename`, attributing the move in the change feed (`kb.move` in SQL).
+    #[pg_extern(volatile)]
+    fn _move(from_path: &str, to_path: &str, author: Option<&str>) {
+        ok(rename_impl(from_path, to_path, author))
+    }
+
+    fn rename_impl(from: &str, to: &str, author: Option<&str>) -> Result<(), TextdbError> {
+        let from = normalize_path(from)?;
+        let to = normalize_path(to)?;
         if from == "/" || to == "/" {
-            fail(TextdbError::InvalidEdit("cannot move the root".into()));
+            return Err(TextdbError::InvalidEdit("cannot move the root".into()));
         }
-        let src = node_by_path(&from).unwrap_or_else(|| fail(TextdbError::NotFound(from.clone())));
+        let src = node_by_path(&from).ok_or_else(|| TextdbError::NotFound(from.clone()))?;
         if to == from || to.starts_with(&format!("{}/", from)) {
-            fail(TextdbError::InvalidEdit(format!("cannot move {} into itself", from)));
+            return Err(TextdbError::InvalidEdit(format!("cannot move {} into itself", from)));
         }
         if node_by_path(&to).is_some() {
-            fail(TextdbError::InvalidEdit(format!("{} already exists", to)));
+            return Err(TextdbError::InvalidEdit(format!("{} already exists", to)));
         }
-        let parent = ensure_folder(parent_of(&to));
+        let parent = ensure_folder(parent_of(&to))?;
         Spi::run_with_args(
             "UPDATE kb.node SET path = $2 || substr(path, length($1) + 1), updated_at = now() WHERE path LIKE kb._subtree_like($1) AND deleted_at IS NULL",
             &[from.as_str().into(), to.as_str().into()],
         )
-        .unwrap_or_else(|e| spi_err(e));
+        .map_err(storage_err)?;
         Spi::run_with_args(
             "UPDATE kb.node SET path = $1, name = $2, parent_id = $3, updated_at = now() WHERE id = $4",
             &[to.as_str().into(), name_of(&to).into(), parent.into(), src.id.into()],
         )
-        .unwrap_or_else(|e| spi_err(e));
+        .map_err(storage_err)?;
+        record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, None);
+        Ok(())
     }
 
     /// Tombstone a file or folder subtree; content and history retained.
     #[pg_extern(volatile)]
     fn _delete(path: &str) {
-        let path = ok(normalize_path(path));
+        ok(delete_impl(path, None))
+    }
+
+    /// As `_delete`, attributing the change in the feed (`kb.remove` in SQL).
+    #[pg_extern(volatile)]
+    fn _remove(path: &str, author: Option<&str>) {
+        ok(delete_impl(path, author))
+    }
+
+    fn delete_impl(path: &str, author: Option<&str>) -> Result<(), TextdbError> {
+        let path = normalize_path(path)?;
         if path == "/" {
-            fail(TextdbError::InvalidEdit("cannot delete the root".into()));
+            return Err(TextdbError::InvalidEdit("cannot delete the root".into()));
         }
-        node_by_path(&path).unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
+        let n = node_by_path(&path).ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         Spi::run_with_args(
             "UPDATE kb.node SET deleted_at = now() WHERE (path = $1 OR path LIKE kb._subtree_like($1)) AND deleted_at IS NULL",
             &[path.as_str().into()],
         )
-        .unwrap_or_else(|e| spi_err(e));
+        .map_err(storage_err)?;
+        record_change("delete", n.id, n.kind, &path, None, None, None, None, author, None);
+        Ok(())
     }
 
     /// Content of a file at HEAD or at `version` (works for tombstoned files).
@@ -645,12 +836,26 @@ mod kb {
     #[pg_extern(stable)]
     fn history(
         path: &str,
-    ) -> TableIterator<'static, (name!(version, i64), name!(author, Option<String>), name!(ts, pgrx::datum::TimestampWithTimeZone), name!(message, Option<String>))> {
+    ) -> TableIterator<
+        'static,
+        (
+            name!(version, i64),
+            name!(author, Option<String>),
+            name!(ts, pgrx::datum::TimestampWithTimeZone),
+            name!(message, Option<String>),
+            name!(kind, Option<String>),
+            name!(base_version, Option<i64>),
+        ),
+    > {
         let path = ok(normalize_path(path));
         let n = NodeRow::by_path(&path, true).unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
         let rows: Vec<_> = Spi::connect(|client| {
             let t = client
-                .select("SELECT version, author, ts, message FROM kb.commit WHERE file_id = $1 ORDER BY version", None, &[n.id.into()])
+                .select(
+                    "SELECT version, author, ts, message, kind, base_version FROM kb.commit WHERE file_id = $1 ORDER BY version",
+                    None,
+                    &[n.id.into()],
+                )
                 .unwrap_or_else(|e| spi_err(e));
             let mut v = Vec::new();
             for r in t {
@@ -659,11 +864,191 @@ mod kb {
                     r.get::<String>(2).unwrap_or_else(|e| spi_err(e)),
                     r.get::<pgrx::datum::TimestampWithTimeZone>(3).unwrap_or_else(|e| spi_err(e)).expect("ts"),
                     r.get::<String>(4).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<String>(5).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<i64>(6).unwrap_or_else(|e| spi_err(e)),
                 ));
             }
             v
         });
         TableIterator::new(rows)
+    }
+
+    /// Line hunks turning version `v1` into `v2`, 1-based lines. Defaults: `v2` = HEAD,
+    /// `v1` = `v2 - 1`. Version 0 is the empty document (one whole-document hunk).
+    #[pg_extern(stable)]
+    fn hunks(
+        path: &str,
+        v1: default!(Option<i64>, "NULL"),
+        v2: default!(Option<i64>, "NULL"),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(old_from, i64),
+            name!(old_count, i64),
+            name!(new_from, i64),
+            name!(new_count, i64),
+            name!(old_text, String),
+            name!(new_text, String),
+        ),
+    > {
+        let path = ok(normalize_path(path));
+        let n = NodeRow::by_path(&path, true).unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
+        let (v1, v2) = match (v1, v2) {
+            (Some(a), Some(b)) => (a, b),
+            (a, b) => {
+                let b = b.unwrap_or(n.version);
+                (a.unwrap_or(b - 1), b)
+            }
+        };
+        let rows: Vec<(i64, i64, i64, i64, String, String)> = ok(hunks_between(&n, v1.max(0) as u64, v2.max(0) as u64))
+            .into_iter()
+            .map(|h| {
+                (
+                    h.old_from as i64 + 1,
+                    h.old_count as i64,
+                    h.new_from as i64 + 1,
+                    h.new_count as i64,
+                    String::from_utf8_lossy(&h.old_text).into_owned(),
+                    String::from_utf8_lossy(&h.new_text).into_owned(),
+                )
+            })
+            .collect();
+        TableIterator::new(rows)
+    }
+
+    /// 0-based hunks between two versions of `n`; version 0 is the empty document, for
+    /// which no root is stored (and a read must not write one).
+    fn hunks_between(n: &NodeRow, v1: u64, v2: u64) -> Result<Vec<LineHunk>, TextdbError> {
+        if v1 == v2 {
+            return Ok(Vec::new());
+        }
+        let st = SpiStorage::new();
+        if v1 == 0 || v2 == 0 {
+            let root = root_of_version_r(n.id, v1.max(v2))?;
+            let text = materialize(&st, &root)?;
+            if text.is_empty() {
+                return Ok(Vec::new());
+            }
+            let count = textdb_core::myers::split_lines(&text).len() as u64;
+            let (old_count, new_count, old_text, new_text) =
+                if v1 == 0 { (0, count, Vec::new(), text) } else { (count, 0, text, Vec::new()) };
+            return Ok(vec![LineHunk {
+                old_from: 0,
+                old_count,
+                new_from: 0,
+                new_count,
+                old_text,
+                new_text,
+            }]);
+        }
+        let a = root_of_version_r(n.id, v1)?;
+        let b = root_of_version_r(n.id, v2)?;
+        textdb_core::line_hunks(&st, &a, &b)
+    }
+
+    /// The chunks of a file at `version` (HEAD when NULL) in document order; unchanged
+    /// content keeps its hash across versions. `line_from` is 1-based, `hash` is hex.
+    #[pg_extern(stable)]
+    fn chunks(
+        path: &str,
+        version: default!(Option<i64>, "NULL"),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(ord, i64),
+            name!(hash, String),
+            name!(byte_from, i64),
+            name!(nbytes, i64),
+            name!(line_from, i64),
+            name!(nlines, i64),
+        ),
+    > {
+        let path = ok(normalize_path(path));
+        let root = match version {
+            None => {
+                let n = file_by_path(&path);
+                n.root.unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())))
+            }
+            Some(v) => {
+                let n = NodeRow::by_path(&path, true).unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
+                root_of_version(n.id, v.max(0) as u64)
+            }
+        };
+        let st = SpiStorage::new();
+        let rows: Vec<(i64, String, i64, i64, i64, i64)> = ok(leaves(&st, &root))
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| {
+                (
+                    i as i64,
+                    textdb_core::hash::hex(&l.hash),
+                    l.byte_off as i64,
+                    l.nbytes as i64,
+                    l.line_off as i64 + 1,
+                    l.nlines as i64,
+                )
+            })
+            .collect();
+        TableIterator::new(rows)
+    }
+
+    /// Change-feed rows with `seq > since`, oldest first, at most `lim` of them.
+    #[pg_extern(stable)]
+    fn feed(
+        since: default!(i64, 0),
+        lim: default!(i64, 10000),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(seq, i64),
+            name!(ts, pgrx::datum::TimestampWithTimeZone),
+            name!(op, String),
+            name!(path, String),
+            name!(old_path, Option<String>),
+            name!(node_kind, String),
+            name!(version, Option<i64>),
+            name!(base_version, Option<i64>),
+            name!(commit_kind, Option<String>),
+            name!(author, Option<String>),
+            name!(message, Option<String>),
+        ),
+    > {
+        let rows: Vec<_> = Spi::connect(|client| {
+            let t = client
+                .select(
+                    "SELECT seq, ts, op, path, old_path, node_kind, version, base_version, commit_kind, author, message FROM kb.change WHERE seq > $1 ORDER BY seq LIMIT $2",
+                    None,
+                    &[since.into(), lim.max(0).into()],
+                )
+                .unwrap_or_else(|e| spi_err(e));
+            let mut v = Vec::new();
+            for r in t {
+                let kind: i16 = r.get(6).unwrap_or_else(|e| spi_err(e)).unwrap_or(1);
+                v.push((
+                    r.get::<i64>(1).unwrap_or_else(|e| spi_err(e)).unwrap_or(0),
+                    r.get::<pgrx::datum::TimestampWithTimeZone>(2).unwrap_or_else(|e| spi_err(e)).expect("ts"),
+                    r.get::<String>(3).unwrap_or_else(|e| spi_err(e)).unwrap_or_default(),
+                    r.get::<String>(4).unwrap_or_else(|e| spi_err(e)).unwrap_or_default(),
+                    r.get::<String>(5).unwrap_or_else(|e| spi_err(e)),
+                    if kind == 1 { "file".to_string() } else { "folder".to_string() },
+                    r.get::<i64>(7).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<i64>(8).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<String>(9).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<String>(10).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<String>(11).unwrap_or_else(|e| spi_err(e)),
+                ));
+            }
+            v
+        });
+        TableIterator::new(rows)
+    }
+
+    /// Newest `seq` in the change feed, 0 when it is empty.
+    #[pg_extern(stable)]
+    fn last_seq() -> i64 {
+        Spi::get_one::<i64>("SELECT coalesce(max(seq), 0) FROM kb.change")
+            .unwrap_or_else(|e| spi_err(e))
+            .unwrap_or(0)
     }
 
     #[pg_extern(stable)]
