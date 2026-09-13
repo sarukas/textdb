@@ -1,4 +1,4 @@
-/** Which files a folder import picks up, where they land, and how they are sent. */
+/** Which files a folder import picks up and where they land. */
 
 export const DEFAULT_EXTENSIONS = ["md", "markdown", "mdx", "txt"];
 
@@ -36,27 +36,6 @@ export function normalizePrefix(input: string): string | null {
 
 export function destPath(prefix: string, rel: string): string {
   return prefix === "/" ? `/${rel}` : `${prefix}/${rel}`;
-}
-
-/**
- * Group files into requests of at most `maxBytes` of content or `maxFiles` files, keeping
- * their order. A file larger than `maxBytes` travels alone.
- */
-export function planBatches<T extends { size: number }>(files: readonly T[], maxBytes: number, maxFiles: number): T[][] {
-  const batches: T[][] = [];
-  let current: T[] = [];
-  let bytes = 0;
-  for (const file of files) {
-    if (current.length > 0 && (bytes + file.size > maxBytes || current.length >= maxFiles)) {
-      batches.push(current);
-      current = [];
-      bytes = 0;
-    }
-    current.push(file);
-    bytes += file.size;
-  }
-  if (current.length > 0) batches.push(current);
-  return batches;
 }
 
 export function formatBytes(n: number): string {

@@ -9,7 +9,14 @@ import {
   normalizePrefix,
   parseExtensions,
 } from "../import/select";
-import { canPickDirectory, folderFromFileList, pickFolder, type PickedFile, type PickedFolder } from "../import/source";
+import {
+  canPickDirectory,
+  errorText,
+  folderFromFileList,
+  pickFolder,
+  type PickedFile,
+  type PickedFolder,
+} from "../import/source";
 import { effectiveAuthor } from "../state/useAuthor";
 
 interface Props {
@@ -23,8 +30,6 @@ type Step =
   | { kind: "scanning"; found: number }
   | { kind: "review"; folder: PickedFolder }
   | { kind: "importing"; prefix: string; files: readonly PickedFile[]; progress: ImportProgress };
-
-const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 export function ImportDialog({ author, onClose, onOpen }: Props) {
   const dialogRef = useRef<HTMLDialogElement>(null);
@@ -49,7 +54,10 @@ export function ImportDialog({ author, onClose, onOpen }: Props) {
     () => (step.kind === "review" ? step.folder.files.filter((f) => includeFile(f.rel, extensions)) : []),
     [step, extensions],
   );
-  const selectionBytes = selection.reduce((n, f) => n + f.size, 0);
+  // Sizes are known up front only when the browser handed over the files themselves.
+  const selectionBytes = selection.every((f) => f.size !== null)
+    ? selection.reduce((n, f) => n + (f.size ?? 0), 0)
+    : null;
   const prefix = normalizePrefix(prefixInput);
 
   const chosen = (folder: PickedFolder | null) => {
@@ -150,12 +158,26 @@ export function ImportDialog({ author, onClose, onOpen }: Props) {
       )}
 
       {step.kind === "scanning" && (
-        <div className="dialog-body">
-          <p>
-            Reading the folder… <strong className="mono">{step.found.toLocaleString()}</strong> files found
-          </p>
-          <progress className="progress" aria-label="Reading the folder" />
-        </div>
+        <>
+          <div className="dialog-body">
+            <p role="status" aria-live="polite">
+              Listing the folder… <strong className="mono">{step.found.toLocaleString()}</strong> files found
+            </p>
+            <progress className="progress" aria-label="Listing the folder" />
+          </div>
+          <div className="dialog-foot">
+            <button
+              type="button"
+              className="btn"
+              onClick={() => {
+                scanRef.current?.abort();
+                setStep({ kind: "pick" });
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        </>
       )}
 
       {step.kind === "review" && (
@@ -163,9 +185,29 @@ export function ImportDialog({ author, onClose, onOpen }: Props) {
           <div className="dialog-body">
             <p className="import-summary">
               <strong>{step.folder.name}</strong> — <strong>{selection.length.toLocaleString()}</strong> of{" "}
-              {step.folder.files.length.toLocaleString()} files, <strong>{formatBytes(selectionBytes)}</strong>. Hidden
-              folders and <span className="mono">node_modules</span> are not read.
+              {step.folder.files.length.toLocaleString()} files
+              {selectionBytes !== null && (
+                <>
+                  , <strong>{formatBytes(selectionBytes)}</strong>
+                </>
+              )}
+              . Hidden folders and <span className="mono">node_modules</span> are not read.
             </p>
+            {step.folder.unreadable.length > 0 && (
+              <details className="failures">
+                <summary className="error-text">
+                  {step.folder.unreadable.length.toLocaleString()}{" "}
+                  {step.folder.unreadable.length === 1 ? "entry" : "entries"} could not be read and will be left out
+                </summary>
+                <ul>
+                  {step.folder.unreadable.slice(0, 200).map((u) => (
+                    <li key={u.rel} title={`${u.rel || step.folder.name}: ${u.reason}`}>
+                      <span className="mono">{u.rel || step.folder.name}</span> <span className="muted">— {u.reason}</span>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
             <label className="field">
               <span>Into folder</span>
               <input
@@ -235,8 +277,7 @@ function ImportProgressView({ step, onCancel, onClose, onAgain, onOpenFirst }: P
   const finished = p.finishedAt !== null;
   const seconds = ((p.finishedAt ?? Date.now()) - p.startedAt) / 1000;
   const rate = seconds > 0 ? p.doneFiles / seconds : 0;
-  const bytesRate = seconds > 0 ? p.doneBytes / seconds : 0;
-  const remaining = bytesRate > 0 ? (p.totalBytes - p.doneBytes) / bytesRate : null;
+  const remaining = rate > 0 ? (p.totalFiles - p.doneFiles) / rate : null;
   const headline: Record<typeof p.state, string> = {
     running: `Importing into ${step.prefix}`,
     cancelling: "Stopping after the current batch…",
@@ -260,14 +301,13 @@ function ImportProgressView({ step, onCancel, onClose, onAgain, onOpenFirst }: P
         </p>
         <progress
           className="progress"
-          value={p.doneBytes}
-          max={Math.max(p.totalBytes, 1)}
+          value={p.doneFiles}
+          max={Math.max(p.totalFiles, 1)}
           aria-label="Import progress"
         />
         <div className="progress-line">
           <span>
-            {p.doneFiles.toLocaleString()} / {p.totalFiles.toLocaleString()} files · {formatBytes(p.doneBytes)} /{" "}
-            {formatBytes(p.totalBytes)}
+            {p.doneFiles.toLocaleString()} / {p.totalFiles.toLocaleString()} files · {formatBytes(p.sentBytes)} sent
           </span>
           <span>
             {Math.round(rate).toLocaleString()} files/s ·{" "}
