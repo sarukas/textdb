@@ -602,6 +602,10 @@ impl<'c> TextDb<'c> {
                 self.write_structure(file_id, c.version as i64, &s)?;
             }
         }
+        if c.version == 1 {
+            // Links elsewhere may have been waiting for a file of this name.
+            self.relink(&[crate::links::name_key(path)], &[])?;
+        }
         Ok(())
     }
 
@@ -637,7 +641,7 @@ impl<'c> TextDb<'c> {
             }
             return Ok(());
         }
-        for t in ["section", "link", "frontmatter"] {
+        for t in ["section", "frontmatter"] {
             self.conn
                 .prepare_cached(&format!("DELETE FROM {}{} WHERE file_id = ?1", self.p, t))
                 .map_err(sql_err)?
@@ -673,27 +677,7 @@ impl<'c> TextDb<'c> {
                 .execute(rusqlite::params_from_iter(vals))
                 .map_err(sql_err)?;
         }
-        for batch in s.links.chunks(MAX_ROWS_PER_BATCH) {
-            let mut sql = format!("INSERT INTO {}link(file_id, version, target_path, line) VALUES ", self.p);
-            for i in 0..batch.len() {
-                if i > 0 {
-                    sql.push(',');
-                }
-                sql.push_str("(?,?,?,?)");
-            }
-            let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(batch.len() * 4);
-            for l in batch {
-                vals.push(file_id.into());
-                vals.push(version.into());
-                vals.push(l.target_path.clone().into());
-                vals.push((l.line as i64).into());
-            }
-            self.conn
-                .prepare_cached(&sql)
-                .map_err(sql_err)?
-                .execute(rusqlite::params_from_iter(vals))
-                .map_err(sql_err)?;
-        }
+        self.write_link_rows(file_id, version, &s.links)?;
         if let Some(fm) = &s.frontmatter {
             self.conn
                 .prepare_cached(&format!(
@@ -704,6 +688,8 @@ impl<'c> TextDb<'c> {
                 .execute(params![file_id, version, fm.to_string()])
                 .map_err(sql_err)?;
         }
+        // This file's links, and links to its headings, which may have changed.
+        self.relink_where("l.file_id = ?1 OR (l.resolved_id = ?1 AND l.anchor IS NOT NULL)", vec![file_id.into()])?;
         Ok(())
     }
 
@@ -739,7 +725,7 @@ impl<'c> TextDb<'c> {
         let mut st = self
             .conn
             .prepare_cached(&format!(
-                "SELECT target_path, line FROM {}link WHERE file_id = ?1 ORDER BY rowid",
+                "SELECT target_path, line, kind, anchor, alias, external FROM {}link WHERE file_id = ?1 ORDER BY rowid",
                 self.p
             ))
             .map_err(sql_err)?;
@@ -748,8 +734,15 @@ impl<'c> TextDb<'c> {
             let Some(r) = rows.next().map_err(sql_err)? else {
                 return Ok(false);
             };
-            let stored: (String, i64) = (r.get(0).map_err(sql_err)?, r.get(1).map_err(sql_err)?);
-            if stored != (l.target_path.clone(), l.line as i64) {
+            let stored = textdb_core::Link {
+                target_path: r.get(0).map_err(sql_err)?,
+                line: r.get::<_, i64>(1).map_err(sql_err)? as u64,
+                kind: r.get::<_, Option<String>>(2).map_err(sql_err)?.unwrap_or_default(),
+                anchor: r.get(3).map_err(sql_err)?,
+                alias: r.get(4).map_err(sql_err)?,
+                external: r.get::<_, i64>(5).map_err(sql_err)? != 0,
+            };
+            if &stored != l {
                 return Ok(false);
             }
         }
@@ -955,6 +948,7 @@ impl<'c> TextDb<'c> {
             }
             let parent = db.ensure_folder(parent_of(&to))?;
             let now = Self::now();
+            let before = db.files_at(&from)?;
             let moved = db.subtree_totals(src.id)?;
             db.add_to_ancestors(&from, &moved.neg(), &now)?;
             let seq = db.record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, db.message.as_deref())?;
@@ -981,6 +975,11 @@ impl<'c> TextDb<'c> {
                 .execute(params![to, name_of(&to), parent, now, src.id])
                 .map_err(sql_err)?;
             db.add_to_ancestors(&to, &moved, &now)?;
+            let after = db.files_at(&to)?;
+            let mut names: Vec<String> = before.iter().chain(&after).map(|(_, p)| crate::links::name_key(p)).collect();
+            names.sort();
+            names.dedup();
+            db.relink(&names, &after.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
             Ok(())
         })
     }
@@ -999,6 +998,7 @@ impl<'c> TextDb<'c> {
             }
             let n = db.node_by_path(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
             let now = Self::now();
+            let files = db.files_at(&path)?;
             let gone = db.subtree_totals(n.id)?;
             db.add_to_ancestors(&path, &gone.neg(), &now)?;
             let seq = db.record_change("delete", n.id, n.kind, &path, None, None, None, None, author, db.message.as_deref())?;
@@ -1015,6 +1015,8 @@ impl<'c> TextDb<'c> {
                 .map_err(sql_err)?
                 .execute(params![path, now, lo, hi])
                 .map_err(sql_err)?;
+            let names: Vec<String> = files.iter().map(|(_, p)| crate::links::name_key(p)).collect();
+            db.relink(&names, &files.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
             Ok(())
         })
     }

@@ -12,9 +12,17 @@ pub struct Section {
 
 #[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Link {
+    /// The target as written, without `#anchor`, `|alias` or query; markdown links decoded.
     pub target_path: String,
     /// 1-based line.
     pub line: u64,
+    /// `wiki`, `embed`, `md` or `image`.
+    pub kind: String,
+    /// `heading` or `^block` after `#`.
+    pub anchor: Option<String>,
+    pub alias: Option<String>,
+    /// A URL, email address, query or numbered reference rather than a document.
+    pub external: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]

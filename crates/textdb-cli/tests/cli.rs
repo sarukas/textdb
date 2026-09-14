@@ -270,6 +270,58 @@ fn messages_create_paths_search_grep_and_empty_folders() {
 }
 
 #[test]
+fn links_resolve_and_stay_current_as_files_come_and_go() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let status = |store: &std::path::Path| -> Vec<(String, Option<String>)> {
+        let rows = ok(textdb(store).args(["--json", "links", "/acc/acme.md"]), None).json();
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["status"].as_str().unwrap().to_string(), r["resolved"].as_str().map(str::to_string)))
+            .collect()
+    };
+    let s = |st: &str, to: Option<&str>| (st.to_string(), to.map(str::to_string));
+    ok(textdb(&store).args(["write", "/notes/Plan.md"]), Some("# Plan\n\n## Next steps\n"));
+    ok(
+        textdb(&store).args(["write", "/acc/acme.md"]),
+        Some("[[Plan]] [[Plan#Next steps]] [[plan#Nope]]\n[x](../notes/Plan.md) [[Missing]] ![[deck.pdf]]\n[g](https://x.y) | [[notes/Plan\\|p]] |\n"),
+    );
+    let plan = Some("/notes/Plan.md");
+    assert_eq!(
+        status(&store),
+        [s("ok", plan), s("ok", plan), s("anchor-missing", plan), s("ok", plan), s("broken", None), s("not-in-store", None), s("external", None), s("ok", plan)]
+    );
+    assert_eq!(ok(textdb(&store).args(["--json", "backlinks", "/notes/Plan.md"]), None).json().as_array().unwrap().len(), 5);
+    let broken = ok(textdb(&store).args(["links", "--broken", "/acc"]), None).stdout;
+    assert_eq!(
+        broken,
+        "/acc/acme.md:1: [[plan#Nope]] -> /notes/Plan.md (anchor-missing)\n/acc/acme.md:2: [[Missing]] (broken)\n/acc/acme.md:2: ![[deck.pdf]] (not-in-store)\n"
+    );
+    // A synced directory holding the PDF: only the two real problems remain.
+    let disk = tmp.path().join("vault");
+    std::fs::create_dir_all(disk.join("acc")).unwrap();
+    std::fs::write(disk.join("acc/deck.pdf"), b"%PDF").unwrap();
+    let checked = ok(textdb(&store).args(["--json", "links", "--broken", "--dir", disk.to_str().unwrap()]), None).json();
+    assert_eq!(checked.as_array().unwrap().len(), 2, "{checked}");
+
+    // A new file resolves links that waited for it; a second file of the same name makes them ambiguous.
+    ok(textdb(&store).args(["write", "/Missing.md"]), Some("here\n"));
+    assert_eq!(status(&store)[4], s("ok", Some("/Missing.md")));
+    ok(textdb(&store).args(["write", "/other/Plan.md"]), Some("# Other\n"));
+    assert_eq!(status(&store)[0], s("ambiguous", plan));
+    ok(textdb(&store).args(["rm", "/other/Plan.md"]), None);
+    assert_eq!(status(&store)[0], s("ok", plan));
+
+    // Moving the target away breaks the links written to its old name and path.
+    ok(textdb(&store).args(["mv", "/notes/Plan.md", "/archive/Plan-old.md"]), None);
+    let after = status(&store);
+    assert_eq!((after[0].0.as_str(), after[3].0.as_str(), after[7].0.as_str()), ("broken", "broken", "broken"));
+    let view = ok(textdb(&store).args(["--json", "sql", "SELECT kind, alias, status, resolved FROM links WHERE target = 'Missing'"]), None).json();
+    assert_eq!(view["rows"][0]["resolved"], "/Missing.md", "{view}");
+}
+
+#[test]
 fn several_line_ranges_make_one_commit() {
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("kb.db");

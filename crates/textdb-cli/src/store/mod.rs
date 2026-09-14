@@ -163,6 +163,23 @@ pub struct Hit {
     pub rank: f64,
 }
 
+/// A link as `links` and `backlinks` list it.
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkRow {
+    /// The file the link is written in.
+    pub path: String,
+    pub line: i64,
+    /// `wiki`, `embed`, `md` or `image`.
+    pub kind: String,
+    pub target: String,
+    pub anchor: Option<String>,
+    pub alias: Option<String>,
+    /// `ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store` or `external`.
+    pub status: Option<String>,
+    /// The file it points to.
+    pub resolved: Option<String>,
+}
+
 /// Lines `from..=to` (1-based) as numbered in the base version become `text`; `to = from - 1`
 /// inserts before `from`. Several make one commit (`replace-lines --stdin-json`, `meta`).
 #[derive(Debug, Clone, Deserialize)]
@@ -383,6 +400,11 @@ pub trait Store {
         author: Option<&str>,
         message: Option<&str>,
     ) -> Result<Written>;
+    /// The links written in the file at `path` or files below it; only those with one of
+    /// `statuses` unless it is empty.
+    fn links(&mut self, path: &str, statuses: &[&str]) -> Result<Vec<LinkRow>>;
+    /// Links, in any file, that resolve to the file at `path` or a file below it.
+    fn backlinks(&mut self, path: &str) -> Result<Vec<LinkRow>>;
     fn history(&mut self, path: &str) -> Result<Vec<Commit>>;
     fn diff(&mut self, path: &str, v1: i64, v2: i64) -> Result<String>;
     fn hunks(&mut self, path: &str, v1: i64, v2: i64) -> Result<Vec<Hunk>>;

@@ -21,6 +21,36 @@ pub struct SqliteStore {
     data_version: Option<i64>,
 }
 
+impl SqliteStore {
+    fn link_rows(&self, cond: &str, args: [String; 3]) -> Result<Vec<super::LinkRow>> {
+        let p = DEFAULT_PREFIX;
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT n.path, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status, r.path \
+                 FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL \
+                 LEFT JOIN {p}node r ON r.id = l.resolved_id AND r.deleted_at IS NULL \
+                 WHERE {cond} ORDER BY n.path, l.line, l.rowid"
+            ))
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                Ok(super::LinkRow {
+                    path: r.get(0)?,
+                    line: r.get(1)?,
+                    kind: r.get(2)?,
+                    target: r.get(3)?,
+                    anchor: r.get(4)?,
+                    alias: r.get(5)?,
+                    status: r.get(6)?,
+                    resolved: r.get(7)?,
+                })
+            })
+            .map_err(sql)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(sql)
+    }
+}
+
 fn sql(e: rusqlite::Error) -> StoreError {
     StoreError::other(e)
 }
@@ -330,6 +360,29 @@ impl Store for SqliteStore {
         Ok(written(self.db().with_message(message).replace_line_ranges(path, &ranges, base_version.map(version), author)?))
     }
 
+    fn links(&mut self, path: &str, statuses: &[&str]) -> Result<Vec<super::LinkRow>> {
+        let path = normalize_path(path)?;
+        let (lo, hi) = subtree_bounds(&path).unwrap_or_else(|| ("/".into(), "0".into()));
+        let only = if statuses.is_empty() {
+            String::new()
+        } else {
+            format!(" AND l.status IN ({})", statuses.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(","))
+        };
+        self.link_rows(&format!("(n.path = ?1 OR (n.path >= ?2 AND n.path < ?3)){only}"), [path, lo, hi])
+    }
+
+    fn backlinks(&mut self, path: &str) -> Result<Vec<super::LinkRow>> {
+        let path = normalize_path(path)?;
+        let (lo, hi) = subtree_bounds(&path).unwrap_or_else(|| ("/".into(), "0".into()));
+        self.link_rows(
+            &format!(
+                "l.target_path <> '' AND l.resolved_id IN (SELECT id FROM {DEFAULT_PREFIX}node WHERE kind = 1 AND deleted_at IS NULL \
+                 AND (path = ?1 OR (path >= ?2 AND path < ?3)))"
+            ),
+            [path, lo, hi],
+        )
+    }
+
     fn mv(&mut self, from: &str, to: &str, author: Option<&str>, message: Option<&str>) -> Result<()> {
         Ok(self.db().with_message(message).rename_by(from, to, author)?)
     }
@@ -620,7 +673,9 @@ fn sql_views(p: &str) -> String {
            SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to
            FROM {p}section s JOIN {p}node n ON n.id = s.file_id AND n.deleted_at IS NULL;
          CREATE TEMP VIEW IF NOT EXISTS links AS
-           SELECT n.path, l.target_path AS target, l.line FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL;
+           SELECT n.path, l.target_path AS target, l.line, l.kind, l.anchor, l.alias, l.status, r.path AS resolved
+           FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL
+           LEFT JOIN {p}node r ON r.id = l.resolved_id AND r.deleted_at IS NULL;
          CREATE TEMP VIEW IF NOT EXISTS commits AS
            SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines
            FROM {p}commit c JOIN {p}node n ON n.id = c.file_id AND n.deleted_at IS NULL;

@@ -11,6 +11,7 @@
 
 pub mod db;
 pub mod functions;
+pub mod links;
 pub mod path_history;
 pub mod schema;
 pub mod stats;

@@ -71,7 +71,14 @@ CREATE TABLE IF NOT EXISTS {p}section (
 CREATE INDEX IF NOT EXISTS {p}section_file ON {p}section(file_id, version);
 CREATE TABLE IF NOT EXISTS {p}link (
   file_id INTEGER NOT NULL, version INTEGER NOT NULL,
-  target_path TEXT NOT NULL, line INTEGER NOT NULL
+  target_path TEXT NOT NULL, line INTEGER NOT NULL,
+  kind        TEXT,                           -- wiki, embed, md, image
+  anchor      TEXT,                           -- heading or ^block after #
+  alias       TEXT,
+  external    INTEGER NOT NULL DEFAULT 0,     -- URL, email, query, numbered reference
+  target_name TEXT,                           -- last segment, lower case, without .md (see links.rs)
+  resolved_id INTEGER,                        -- the file it points to
+  status      TEXT                            -- ok, ambiguous, anchor-missing, broken, not-in-store, external
 );
 CREATE INDEX IF NOT EXISTS {p}link_file ON {p}link(file_id, version);
 CREATE TABLE IF NOT EXISTS {p}frontmatter (
@@ -178,7 +185,24 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("node", "t_words", "INTEGER NOT NULL DEFAULT 0"),
     ("node", "t_versions", "INTEGER NOT NULL DEFAULT 0"),
     ("node", "t_updated_at", "TEXT NULL"),
+    ("link", "kind", "TEXT"),
+    ("link", "anchor", "TEXT"),
+    ("link", "alias", "TEXT"),
+    ("link", "external", "INTEGER NOT NULL DEFAULT 0"),
+    ("link", "target_name", "TEXT"),
+    ("link", "resolved_id", "INTEGER"),
+    ("link", "status", "TEXT"),
 ];
+
+/// Indexes on columns an older store gains in `migrate`, so they are created after them.
+fn index_sql(p: &str) -> String {
+    format!(
+        "CREATE INDEX IF NOT EXISTS {p}link_target_name ON {p}link(target_name);
+         CREATE INDEX IF NOT EXISTS {p}link_resolved ON {p}link(resolved_id);
+         CREATE INDEX IF NOT EXISTS {p}node_lower_name ON {p}node(lower(name)) WHERE deleted_at IS NULL;
+         CREATE INDEX IF NOT EXISTS {p}node_lower_path ON {p}node(lower(path)) WHERE deleted_at IS NULL;"
+    )
+}
 
 /// Bring a store created by an earlier build up to this schema. Idempotent; returns the
 /// number of columns it had to add.
@@ -202,16 +226,22 @@ pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> 
         }
     }
     if missing.is_empty() {
+        conn.execute_batch(&index_sql(p))?;
         return Ok(0);
     }
     let backfill = missing.iter().any(|(table, _, _)| **table == "node");
+    let backfill_links = missing.iter().any(|(table, _, _)| **table == "link");
     conn.execute_batch("SAVEPOINT textdb_migrate")?;
     let run = || -> rusqlite::Result<()> {
         for (table, column, decl) in &missing {
             conn.execute_batch(&format!("ALTER TABLE {p}{table} ADD COLUMN {column} {decl}"))?;
         }
+        conn.execute_batch(&index_sql(p))?;
         if backfill {
             crate::stats::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+        }
+        if backfill_links {
+            crate::links::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
         }
         Ok(())
     };

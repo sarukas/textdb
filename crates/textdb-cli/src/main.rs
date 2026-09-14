@@ -26,6 +26,7 @@ use store::{Change, Commit, Entry, ImportStats, PathEvent, Store, StoreError, Wr
 type Result<T> = std::result::Result<T, StoreError>;
 
 mod git;
+mod links;
 mod meta;
 mod portable;
 mod search;
@@ -316,6 +317,25 @@ enum Cmd {
         #[arg(long, short = 'm')]
         message: Option<String>,
     },
+    /// The links written in a file, or in every file below a folder, with what each points to:
+    /// ok, ambiguous (several files match; the nearest is shown), anchor-missing, broken,
+    /// not-in-store (PDFs, images, other files a text store does not hold) or external.
+    Links {
+        #[arg(value_parser = store_path, default_value = "/")]
+        path: String,
+        /// Only links that do not resolve: broken, anchor-missing and not-in-store.
+        #[arg(long)]
+        broken: bool,
+        /// The directory the store is synced with: links to files the store does not hold are
+        /// looked for there, and only listed when missing.
+        #[arg(long, requires = "broken")]
+        dir: Option<PathBuf>,
+    },
+    /// The links in any file that point to a file, or to a file below a folder.
+    Backlinks {
+        #[arg(value_parser = store_path)]
+        path: String,
+    },
     /// Read or change front matter, one top-level key at a time; the other lines of the file are
     /// left exactly as they are.
     Meta {
@@ -411,6 +431,18 @@ enum Cmd {
 }
 
 fn main() {
+    // One large `match` over every command: an unoptimised build outgrows Windows' 1 MiB main
+    // thread stack, so run on a thread with room to spare.
+    let status = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(cli_main)
+        .expect("start the main thread")
+        .join()
+        .unwrap_or(101);
+    std::process::exit(status);
+}
+
+fn cli_main() -> i32 {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let json = cli.json;
@@ -422,7 +454,7 @@ fn main() {
         }
     };
     let _ = std::io::stdout().flush();
-    std::process::exit(status);
+    status
 }
 
 fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
@@ -608,6 +640,8 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             let w = st.edit(&path, &old, &new, author, message.as_deref())?;
             emit_written(&path, &w, json)
         }
+        Cmd::Links { path, broken, dir } => links::links(st, &path, broken, dir.as_deref(), json),
+        Cmd::Backlinks { path } => links::backlinks(st, &path, json),
         Cmd::Meta { op } => match op {
             MetaOp::Get { path, key } => meta::get(st, &path, key.as_deref(), json),
             MetaOp::Set {

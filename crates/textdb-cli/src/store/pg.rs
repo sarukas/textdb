@@ -485,6 +485,14 @@ impl Store for PgStore {
         self.write(path, &spliced, Some(v), author, Some(message.unwrap_or("replace-lines")))
     }
 
+    fn links(&mut self, _path: &str, _statuses: &[&str]) -> Result<Vec<super::LinkRow>> {
+        Err(StoreError::other("links are resolved in SQLite stores only for now"))
+    }
+
+    fn backlinks(&mut self, _path: &str) -> Result<Vec<super::LinkRow>> {
+        Err(StoreError::other("backlinks are resolved in SQLite stores only for now"))
+    }
+
     fn mv(&mut self, from: &str, to: &str, author: Option<&str>, message: Option<&str>) -> Result<()> {
         self.client.execute("SELECT kb.move($1, $2, $3)", &[&from, &to, &author]).map_err(pg)?;
         let (from, to) = (normalize_path(from)?, normalize_path(to)?);

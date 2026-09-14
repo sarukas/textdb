@@ -7,6 +7,7 @@
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use textdb_core::structure::{Link, Section, Structure, StructureExtractor};
 
+pub mod links;
 mod yaml;
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -100,7 +101,6 @@ pub fn extract(bytes: &[u8]) -> Structure {
         line: u64,
     }
     let mut headings: Vec<Heading> = Vec::new();
-    let mut links: Vec<Link> = Vec::new();
     let mut cur: Option<(u32, usize, String)> = None; // (level, start_off, text)
     for (ev, range) in parser {
         match ev {
@@ -121,44 +121,20 @@ pub fn extract(bytes: &[u8]) -> Structure {
                     });
                 }
             }
-            Event::Start(Tag::Link { dest_url, .. }) => {
-                let d = dest_url.to_string();
-                if !d.contains("://") && !d.starts_with('#') && !d.starts_with("mailto:") && !d.is_empty() {
-                    links.push(Link {
-                        target_path: d,
-                        line: line_of(&starts, range.start + body_off),
-                    });
-                }
-            }
             _ => {}
         }
     }
-    // Wikilinks `[[target]]` / `[[target|alias]]` scanned on raw text as well, because the
-    // parser only reports them when the feature is enabled and the syntax is well formed.
-    let mut i = 0;
-    let b = bytes;
-    while i + 4 <= b.len() {
-        if &b[i..i + 2] == b"[[" {
-            if let Some(end) = b[i + 2..].windows(2).position(|w| w == b"]]") {
-                let inner = &b[i + 2..i + 2 + end];
-                if !inner.contains(&b'\n') && !inner.is_empty() {
-                    let target = String::from_utf8_lossy(inner);
-                    let target = target.split('|').next().unwrap_or("").trim().to_string();
-                    let line = line_of(&starts, i);
-                    if !links.iter().any(|l| l.target_path == target && l.line == line) {
-                        links.push(Link {
-                            target_path: target,
-                            line,
-                        });
-                    }
-                }
-                i += 2 + end + 2;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    links.sort_by_key(|l| l.line);
+    let links: Vec<Link> = links::scan(bytes)
+        .into_iter()
+        .map(|l| Link {
+            target_path: l.target,
+            line: line_of(&starts, l.offset),
+            kind: l.kind.to_string(),
+            anchor: l.anchor,
+            alias: l.alias,
+            external: l.external,
+        })
+        .collect();
 
     // Sections: each heading spans until the next heading of the same or higher level.
     let mut sections = Vec::new();
@@ -228,7 +204,8 @@ mod tests {
             ]
         );
         let links: Vec<_> = s.links.iter().map(|l| (l.target_path.clone(), l.line)).collect();
-        assert_eq!(links, vec![("Other Note".to_string(), 8), ("./x.md".to_string(), 8)]);
+        assert_eq!(links, vec![("Other Note".to_string(), 8), ("./x.md".to_string(), 8), ("https://example.com".to_string(), 8)]);
+        assert!(s.links[2].external && !s.links[1].external);
         let fm = s.frontmatter.clone().unwrap();
         assert_eq!(fm["title"], "Test doc");
         assert_eq!(fm["tags"], serde_json::json!(["a", "b"]));
