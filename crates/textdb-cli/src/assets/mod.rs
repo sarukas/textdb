@@ -227,8 +227,32 @@ struct Scan {
     store_pointers: BTreeMap<String, (i64, Parsed)>,
 }
 
+/// `inner` relative to `outer` (`/`-separated), when it is inside it or is it.
+fn dir_inside(outer: &Path, inner: &Path) -> Option<String> {
+    let (o, i) = (crate::sync::dir_key(outer), crate::sync::dir_key(inner));
+    let sep = std::path::MAIN_SEPARATOR;
+    let (o, i) = if cfg!(windows) { (o.to_lowercase(), i.to_lowercase()) } else { (o, i) };
+    let o = o.trim_end_matches(sep);
+    if i == o {
+        return Some(String::new());
+    }
+    i.strip_prefix(o).and_then(|r| r.strip_prefix(sep)).map(|r| r.replace(sep, "/"))
+}
+
 fn scan(st: &mut dyn Store, v: &Vault) -> Result<Scan> {
-    let (disk, nested) = walk(&v.dir)?;
+    let (mut disk, nested) = walk(&v.dir)?;
+    // An asset store kept inside the vault holds copies, not assets of it.
+    for s in st.asset_stores()? {
+        let Ok(d) = driver::open(&s) else { continue };
+        let Some(rel) = d.local_root().and_then(|root| dir_inside(&v.dir, root)) else { continue };
+        eprintln!("warning: asset store {} keeps its files in {}, inside {}: they are left out", s.name, rel, v.dir.display());
+        if rel.is_empty() {
+            disk.clear();
+        } else {
+            let inside = format!("{}/", rel.to_lowercase());
+            disk.retain(|r, _| !r.to_lowercase().starts_with(&inside));
+        }
+    }
     let classifier = Classifier::load(&v.dir, &nested);
     for w in &classifier.warnings {
         eprintln!("warning: {w}");
@@ -267,6 +291,9 @@ struct VaultCache {
     seen: BTreeMap<String, String>,
     #[serde(skip)]
     path: Option<PathBuf>,
+    /// Where an older build kept this cache, removed once it is saved here.
+    #[serde(skip)]
+    legacy: Option<PathBuf>,
     #[serde(skip)]
     dirty: bool,
     /// Hash every file afresh.
@@ -287,14 +314,25 @@ impl VaultCache {
         let (host, dir) = (host(), crate::sync::dir_key(&v.dir));
         let key = pointer::hex(&sha2::Sha256::digest(format!("{}\n{dir}", host.to_lowercase()).as_bytes()));
         let path = driver::binding::cache_dir().map(|d| d.join(format!("assets-{}.json", &key[..16])));
-        let mut c: VaultCache = path
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|t| serde_json::from_str::<VaultCache>(&t).ok())
-            .filter(|c| c.host.eq_ignore_ascii_case(&host) && c.dir == dir)
-            .unwrap_or_default();
-        (c.path, c.host, c.dir) = (path, host, dir);
+        let mine = |c: &VaultCache| c.host.eq_ignore_ascii_case(&host) && c.dir == dir;
+        let mut c = path.as_deref().and_then(Self::read).filter(mine);
+        let mut legacy = None;
+        if c.is_none() {
+            // Builds before this one kept it in the config directory, keyed by the directory only.
+            let old_key = pointer::hex(&sha2::Sha256::digest(dir.as_bytes()));
+            let old = driver::binding::config_dir().map(|d| d.join("cache").join(format!("assets-{}.json", &old_key[..16])));
+            if let Some(found) = old.as_deref().and_then(Self::read) {
+                (c, legacy) = (Some(found), old);
+            }
+        }
+        let mut c = c.unwrap_or_default();
+        c.dirty = legacy.is_some();
+        (c.path, c.legacy, c.host, c.dir) = (path, legacy, host, dir);
         c
+    }
+
+    fn read(path: &Path) -> Option<VaultCache> {
+        std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok())
     }
 
     fn trusted(size: u64, mtime: i64, entry: (u64, i64)) -> bool {
@@ -343,7 +381,13 @@ impl VaultCache {
 
     fn save(&self) {
         if let (true, Some(path)) = (self.dirty, &self.path) {
-            let Ok(text) = serde_json::to_string(self) else { return };
+            // Another process may have saved meanwhile: what it learnt and this one did not is kept.
+            let mut merged = Self::read(path).filter(|c| c.host == self.host && c.dir == self.dir).unwrap_or_default();
+            merged.files.extend(self.files.clone());
+            merged.sniffed.extend(self.sniffed.clone());
+            merged.seen.extend(self.seen.clone());
+            (merged.host, merged.dir) = (self.host.clone(), self.dir.clone());
+            let Ok(text) = serde_json::to_string(&merged) else { return };
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -351,6 +395,8 @@ impl VaultCache {
             let part = driver::partial(path);
             if std::fs::write(&part, text).and_then(|_| std::fs::rename(&part, path)).is_err() {
                 let _ = std::fs::remove_file(&part);
+            } else if let Some(old) = &self.legacy {
+                let _ = std::fs::remove_file(old);
             }
         }
     }
@@ -635,6 +681,12 @@ struct Written {
 /// the assets naming it.
 type Locations = HashMap<(String, String), BTreeSet<String>>;
 
+/// A location as [`Locations`] keys it: without case, since Windows and macOS keep `a.png` and
+/// `A.png` in the same file.
+fn location_key(location: &str) -> String {
+    location.to_lowercase()
+}
+
 fn pointer_locations(st: &mut dyn Store) -> Result<Locations> {
     let mut found: Locations = HashMap::new();
     for head in st.file_heads("/")? {
@@ -643,7 +695,7 @@ fn pointer_locations(st: &mut dyn Store) -> Result<Locations> {
         }
         if let Ok(p) = Pointer::parse(&st.read(&head.path, None)?.0) {
             let path = asset_path(&head.path).to_string();
-            found.entry((p.store.clone(), p.item.clone().unwrap_or_else(|| path.clone()))).or_default().insert(path);
+            found.entry((p.store.clone(), location_key(p.item.as_deref().unwrap_or(&path)))).or_default().insert(path);
         }
     }
     Ok(found)
@@ -692,13 +744,23 @@ fn push_one(
         Err(e) => return Outcome::Failed(format!("{}: {e}", item.path)),
     };
     let old = item.pointer.as_ref();
-    // The upload replaces the bytes at the asset's path only when they are its own pointer's and
-    // no other pointer names them; anything else there is kept, and the upload goes next to it.
-    let shared = in_use.get(&(store.clone(), item.path.clone())).is_some_and(|users| users.iter().any(|u| u != &item.path));
-    let replaces = old
-        .filter(|p| !shared && p.store == store && p.item.as_deref().unwrap_or(&item.path) == item.path)
-        .map(|p| p.sha256.as_str());
-    let provider_item = match d.put(&item.path, &src, &sha, replaces) {
+    // The upload replaces the asset's own bytes where they are kept (its path, or the item its
+    // pointer names), unless another pointer names them too; otherwise it goes to the asset's
+    // path, next to anything already there.
+    let shared = |location: &str| {
+        in_use
+            .get(&(store.clone(), location_key(location)))
+            .is_some_and(|users| users.iter().any(|u| !u.eq_ignore_ascii_case(&item.path)))
+    };
+    let own = old
+        .filter(|p| p.store == store)
+        .map(|p| (p.item.clone().unwrap_or_else(|| item.path.clone()), p.sha256.as_str()))
+        .filter(|(location, _)| !shared(location));
+    let (target, replaces) = match &own {
+        Some((location, sha)) => (location.clone(), Some(*sha)),
+        None => (item.path.clone(), None),
+    };
+    let provider_item = match d.put(&target, &src, &sha, replaces) {
         Ok(id) => id,
         Err(e) => return Outcome::Failed(format!("{}: {}", item.path, e.message)),
     };
@@ -1048,11 +1110,16 @@ fn exact_pattern(rel: &str) -> String {
 /// Lines for the single files `patterns` get wrong: one that is not an asset they would ignore (a
 /// document under a `binary` rule, say), and an asset they would not (one only its bytes show).
 fn single_file_lines(root: &Path, files: &Files, classifier: &Classifier, cache: &mut VaultCache, patterns: &[String]) -> Vec<String> {
-    let mut b = GitignoreBuilder::new("");
-    for p in patterns {
-        let _ = b.add_line(None, p);
-    }
-    let Ok(ignore) = b.build() else { return Vec::new() };
+    // Checked as git on Linux matches (case matters) and on Windows and macOS (it does not).
+    let matcher = |insensitive: bool| {
+        let mut b = GitignoreBuilder::new("");
+        b.case_insensitive(insensitive).ok();
+        for p in patterns {
+            let _ = b.add_line(None, p);
+        }
+        b.build().ok()
+    };
+    let (Some(exact), Some(folded)) = (matcher(false), matcher(true)) else { return Vec::new() };
     let mut out = Vec::new();
     for (rel, &(size, mtime)) in files {
         let name = rel.rsplit('/').next().unwrap_or(rel);
@@ -1062,8 +1129,11 @@ fn single_file_lines(root: &Path, files: &Files, classifier: &Classifier, cache:
             Class::Document => false,
             Class::Ignore | Class::Pointer => continue,
         };
-        if asset != ignore.matched_path_or_any_parents(rel, false).is_ignore() {
-            out.push(format!("{}{}", if asset { "" } else { "!" }, exact_pattern(rel)));
+        let ignored = [&exact, &folded].map(|m| m.matched_path_or_any_parents(rel, false).is_ignore());
+        if asset && !(ignored[0] && ignored[1]) {
+            out.push(exact_pattern(rel));
+        } else if !asset && (ignored[0] || ignored[1]) {
+            out.push(format!("!{}", exact_pattern(rel)));
         }
     }
     out

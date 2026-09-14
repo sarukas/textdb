@@ -257,13 +257,17 @@ document `NAME.tdbasset` sits where the file belongs. Links to them resolve to t
 editing a `.tdbasset` file:
 
 ```sh
-textdb assets status guides                 # ok / new / modified / not-pulled for the synced directory
+textdb assets status guides                 # ok / new / modified / outdated / conflict / not-pulled here
 textdb assets push guides -m "diagrams"     # upload new and changed files, then commit their pointers
 textdb assets pull --linked-from guides/api # fetch the files those notes link to
 textdb assets verify guides                 # exit 1 if a hash does not match here or in the asset store
 ```
 
-Exit 3 from `assets push` means a pointer changed in the store meanwhile: `sync`, then push again.
+Exit 3 from `assets push` means something was left for a conflict: a pointer changed or was deleted
+in the store since this directory synced (`sync`, then push again), or the file here is neither the
+pointer's bytes nor what this directory last had (`conflict`: move it aside and `pull` to compare;
+`push --force` only when this copy should replace the asset store's). A push never overwrites
+bytes another pointer still names: it puts the new ones next to them.
 
 ## Reorganise
 

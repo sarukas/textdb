@@ -793,6 +793,13 @@ impl Store for SqliteStore {
         tx.commit().map_err(sql)?;
         Ok(true)
     }
+
+    fn rename_sync_dir(&mut self, prefix: &str, from: &str, to: &str) -> Result<()> {
+        self.conn
+            .execute(&format!("UPDATE {DEFAULT_PREFIX}sync SET dir = ?3 WHERE prefix = ?1 AND dir = ?2"), [prefix, from, to])
+            .map(|_| ())
+            .map_err(sql)
+    }
 }
 
 /// The views `textdb sql` offers: the live store by path, without internal ids or deleted files.

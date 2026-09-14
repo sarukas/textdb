@@ -534,7 +534,13 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     if o.commit && repo.is_none() {
         return Err(StoreError::invalid(format!("--commit needs {} to be in a git checkout", o.dir.display())));
     }
-    let stored = find_sync_base(st, &prefix, &key)?;
+    let mut stored = find_sync_base(st, &prefix, &key)?;
+    // A base an older build recorded under another form of the directory's name takes this one,
+    // so the sync saves over it rather than next to it.
+    if let Some(b) = stored.as_mut().filter(|b| b.dir != key && !o.dry_run) {
+        st.rename_sync_dir(&prefix, &b.dir, &key)?;
+        b.dir = key.clone();
+    }
     if stored.is_some() && o.base_rev.is_some() {
         return Err(StoreError::invalid(format!(
             "{prefix} has been synced with {key} before and has a base already; --base is for the first sync only"

@@ -531,6 +531,9 @@ pub trait Store {
     /// Put `files` in the base of `prefix` synced with `dir`, replacing the rows of the same paths
     /// and leaving the others, and when it was synced, as they are; `false` when there is no base.
     fn put_sync_files(&mut self, prefix: &str, dir: &str, files: &[BaseFile]) -> Result<bool>;
+    /// Record the base of `prefix` synced with `from` as synced with `to` (the same directory
+    /// under another form of its name).
+    fn rename_sync_dir(&mut self, prefix: &str, from: &str, to: &str) -> Result<()>;
     /// Run one statement with `params` bound as text, read-only unless `write`. The views
     /// `files`, `folders`, `frontmatter`, `sections`, `links`, `commits` and `authors` are there
     /// to query; in SQLite, `:author` is bound to `author`.

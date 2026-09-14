@@ -843,13 +843,37 @@ fn assets_push_keeps_bytes_in_use_and_records_only_what_it_wrote() {
     let other = run(&mut t(&["--json", "sync", "--dry-run", "/w1", dw]), None).json();
     assert_eq!(other["to_textdb"]["new"], serde_json::json!(["z.png.tdbasset"]), "{other}");
 
+    // Items that differ only in case are the same file on Windows and macOS: a push never
+    // replaces bytes another pointer names under another case.
+    let c = tmp.path().join("c");
+    std::fs::create_dir_all(c.join("img")).unwrap();
+    let dc = c.to_str().unwrap();
+    std::fs::write(c.join("img/Logo.png"), b"\x89PNG L1").unwrap();
+    ok(&mut t(&["sync", "/c", dc]), None);
+    ok(&mut t(&["assets", "push", "--dir", dc]), None);
+    ok(&mut t(&["mv", "/c/img/Logo.png.tdbasset", "/c/img/x.png.tdbasset"]), None);
+    ok(&mut t(&["sync", "/c", dc]), None);
+    let _ = std::fs::remove_file(c.join("img/Logo.png"));
+    std::fs::write(c.join("img/logo.png"), b"\x89PNG L1").unwrap();
+    ok(&mut t(&["assets", "push", "--dir", dc]), None);
+    std::fs::write(c.join("img/logo.png"), b"\x89PNG L2").unwrap();
+    ok(&mut t(&["assets", "push", "--dir", dc]), None);
+    let _ = std::fs::remove_file(c.join("img/x.png"));
+    ok(&mut t(&["assets", "pull", "--dir", dc]), None);
+    assert_eq!(std::fs::read(c.join("img/x.png")).unwrap(), b"\x89PNG L1");
+    assert_eq!(ok(&mut t(&["--json", "assets", "verify", "--dir", dc]), None).json()["problems"], 0);
+
     // The .gitignore block leaves documents under a `binary` rule to git, and names assets only
     // their bytes show.
     std::fs::create_dir_all(v.join("assets")).unwrap();
     std::fs::write(v.join("assets/readme.md"), "# r\n").unwrap();
     std::fs::write(v.join("assets/pic.raw"), b"raw").unwrap();
     std::fs::write(v.join("data.bin"), b"\0\x01").unwrap();
-    std::fs::write(v.join(".gitattributes"), "assets/* binary\n").unwrap();
+    std::fs::create_dir_all(v.join("raw")).unwrap();
+    std::fs::write(v.join("raw/readme.md"), "# raw\n").unwrap();
+    std::fs::create_dir_all(v.join("docs/photos.png")).unwrap();
+    std::fs::write(v.join("docs/photos.png/notes.md"), "# p\n").unwrap();
+    std::fs::write(v.join(".gitattributes"), "assets/* binary\nraw binary\n").unwrap();
     ok(&mut t(&["assets", "gitignore", "--dir", d]), None);
     let gi = std::fs::read_to_string(v.join(".gitignore")).unwrap();
     assert!(gi.contains("\n/.textdb/trash/\n") && gi.contains("\n!/assets/readme.md\n") && gi.contains("\n/data.bin\n"), "{gi}");
@@ -858,6 +882,9 @@ fn assets_push_keeps_bytes_in_use_and_records_only_what_it_wrote() {
         let ignored = |rel: &str| Command::new("git").arg("-C").arg(&v).args(["check-ignore", "-q", rel]).status().unwrap().success();
         for (rel, want) in [
             ("assets/readme.md", false),
+            ("raw/readme.md", false),
+            ("docs/photos.png/notes.md", false),
+            ("docs/photos.png/q.png.tdbasset", false),
             ("assets/pic.raw", true),
             ("data.bin", true),
             (".textdb/trash/x/img/a.png", true),

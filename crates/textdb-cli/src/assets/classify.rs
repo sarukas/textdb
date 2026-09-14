@@ -282,7 +282,9 @@ impl Classifier {
     pub fn gitignore_patterns(&self) -> Vec<String> {
         // What pull moved aside in the vault.
         let mut out = vec!["/.textdb/trash/".to_string()];
-        out.extend(ASSET_EXTS.iter().map(|e| format!("*.{}", any_case(e))));
+        // Each asset pattern is followed by its negation as a directory: rules match files only,
+        // and git never looks inside an ignored directory for the documents and pointers there.
+        out.extend(ASSET_EXTS.iter().flat_map(|e| [format!("*.{}", any_case(e)), format!("!*.{}/", any_case(e))]));
         for layer in &self.layers {
             for rule in &layer.rules {
                 let (mut set, mut decided, mut binary) = (None, false, false);
@@ -310,9 +312,7 @@ impl Classifier {
                 };
                 if asset {
                     out.push(pattern.clone());
-                    if pattern.contains('/') || pattern.contains("**") {
-                        out.push(format!("!{pattern}/"));
-                    }
+                    out.push(format!("!{pattern}/"));
                 } else {
                     out.push(format!("!{pattern}"));
                 }
@@ -365,7 +365,8 @@ mod tests {
         let p = c.gitignore_patterns();
         let at = |s: &str| p.iter().position(|x| x == s).unwrap_or_else(|| panic!("{s} not in {p:?}"));
         assert!(at("*.[pP][nN][gG]") < at("!*.svg") && at("!*.svg") < at("/Sub/**/*.svg"), "{p:?}");
-        assert!(at("/exports/**") < at("!/exports/**/"));
+        assert!(at("/exports/**") < at("!/exports/**/") && at("*.bin") < at("!*.bin/"));
+        assert_eq!(at("!*.[pP][nN][gG]/"), at("*.[pP][nN][gG]") + 1);
         assert!(at("!*.log") > 0 && at("*.bin") > 0 && at("!/Sub/**/*.MD") > 0);
         assert_eq!(p.last().map(String::as_str), Some("!*.tdbasset"));
     }

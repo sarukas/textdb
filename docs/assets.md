@@ -135,9 +135,12 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
   Desktop / OneDrive clients in mirror mode). Item = path. Copies go through a hidden partial file
   (`.NAME.PID-NANOS.tdbpart`), flushed and renamed into place, and are hashed after the copy; bytes
   a push replaces move to `<root>/.textdb-trash/<yyyymmdd-HHMMSS>-<nanos>-<pid>-<n>/…`. A push
-  replaces only the bytes of the asset's own pointer, and only when no other pointer (one moved
-  in the store, say) names them; anything else at that path is kept and the upload goes next to
-  it as `NAME (<first 8 of its sha256>).ext`, which the pointer's item records.
+  replaces only the asset's own bytes where they are kept (its path, or the item its pointer
+  names), and only when no other pointer names them (locations compared without case); anything
+  else is kept and the upload goes to the asset's path, next to what is there, as
+  `NAME (<first 8 of its sha256>).ext`, which the pointer's item records. What a push moved to
+  the trash is hashed again, and put back when another push replaced it meanwhile. An asset
+  store folder inside the vault is left out of the vault's assets.
 - Hashes of local files are cached per computer and directory in the local cache directory
   (`TEXTDB_CONFIG_DIR/cache`, else `%LOCALAPPDATA%\textdb`, `$XDG_CACHE_HOME/textdb` or
   `~/.cache/textdb`; `assets-*.json`, written atomically), by size and modification time, and only
@@ -148,7 +151,8 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
   on upload, so for those textdb tracks the provider's version tag instead of comparing hashes.
 
 What a vault last had of each asset (to tell a local edit from a remote one) is kept in the same
-cache, keyed by host and directory and never roaming with a profile. Losing it is safe: a file
+cache, keyed by host and directory and never roaming with a profile (a cache an older build kept
+in the config directory is taken over; processes saving at once merge what each learnt). Losing it is safe: a file
 that differs from its pointer is then a `conflict` until it is pulled or pushed with `--force`.
 Push records the pointers it wrote in this directory's sync base for the vault's folder only (the
 base's time and other files stay), refuses a pointer the store deleted since that sync, and checks

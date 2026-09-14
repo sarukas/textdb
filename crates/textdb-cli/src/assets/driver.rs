@@ -47,6 +47,10 @@ pub trait Driver {
     fn put(&self, path: &str, src: &Path, sha256: &str, replaces: Option<&str>) -> Result<Option<String>>;
     /// Copy the stored file to `dest`, which must not exist.
     fn get(&self, path: &str, item: Option<&str>, dest: &Path) -> Result<()>;
+    /// The folder on this computer the store keeps its files in, for a local store.
+    fn local_root(&self) -> Option<&Path> {
+        None
+    }
 }
 
 fn io(what: impl std::fmt::Display, e: std::io::Error) -> StoreError {
@@ -101,9 +105,27 @@ impl LocalDriver {
         }
     }
 
-    /// Copy `src` to `path` through a checked partial file; with `replace`, what is there moves to
-    /// the trash first, else the name must be free.
-    fn place(&self, path: &str, src: &Path, sha256: &str, replace: bool) -> Result<()> {
+    /// Keep `src` next to `path`, under the first [`beside`] name that is free or holds these bytes.
+    fn put_beside(&self, path: &str, src: &Path, sha256: &str) -> Result<Option<String>> {
+        let mut n = 1;
+        loop {
+            let alt = beside(path, sha256, n);
+            match self.hash(&alt, None)? {
+                Some((sha, _)) if sha == sha256 => return Ok(Some(alt)),
+                Some(_) => n += 1,
+                None => {
+                    self.place(&alt, src, sha256, None)?;
+                    return Ok(Some(alt));
+                }
+            }
+        }
+    }
+
+    /// Copy `src` to `path` through a checked partial file. With `replace`, what is there moves to
+    /// the trash first, and must hash to `replace`; else the name must be free. `false` when what
+    /// was there turned out to be other bytes (another push got there first): it is put back, and
+    /// nothing is placed.
+    pub(crate) fn place(&self, path: &str, src: &Path, sha256: &str, replace: Option<&str>) -> Result<bool> {
         let dest = self.file(path)?;
         // The new copy first, complete and checked, next to where it goes; only then does the copy
         // it replaces move to the trash. A copy that fails leaves the store as it was.
@@ -117,7 +139,7 @@ impl LocalDriver {
             let _ = std::fs::remove_file(&part);
             return Err(e);
         }
-        if replace && dest.exists() {
+        if let (Some(expected), true) = (replace, dest.exists()) {
             let trashed = self.trash_for(path);
             let moved = trashed
                 .parent()
@@ -127,12 +149,20 @@ impl LocalDriver {
                 let _ = std::fs::remove_file(&part);
                 return Err(io(format!("moving {} to the trash", dest.display()), e));
             }
+            // The copy took a while: what went to the trash must still be what this push replaces.
+            if !matches!(hash_file(&trashed), Ok((sha, _)) if sha == expected) {
+                let _ = std::fs::remove_file(&part);
+                return match rename_new(&trashed, &dest) {
+                    Ok(()) => Ok(false),
+                    Err(e) => Err(io(format!("{} changed during this push; the copy found there is kept at {}", dest.display(), trashed.display()), e)),
+                };
+            }
         }
         if let Err(e) = rename_new(&part, &dest) {
             let _ = std::fs::remove_file(&part);
             return Err(io(format!("putting {} in place", dest.display()), e));
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -220,21 +250,18 @@ impl Driver for LocalDriver {
         // store still finds them.
         match self.hash(path, None)? {
             Some((sha, _)) if sha == sha256 => Ok(Some(path.to_string())),
-            None => self.place(path, src, sha256, false).map(|_| Some(path.to_string())),
-            Some((sha, _)) if Some(sha.as_str()) == replaces => self.place(path, src, sha256, true).map(|_| Some(path.to_string())),
-            Some(_) => {
-                // Bytes something else may still name: kept, and these go next to them.
-                let mut n = 1;
-                loop {
-                    let alt = beside(path, sha256, n);
-                    match self.hash(&alt, None)? {
-                        Some((sha, _)) if sha == sha256 => return Ok(Some(alt)),
-                        Some(_) => n += 1,
-                        None => return self.place(&alt, src, sha256, false).map(|_| Some(alt)),
-                    }
-                }
-            }
+            None => self.place(path, src, sha256, None).map(|_| Some(path.to_string())),
+            Some((sha, _)) if Some(sha.as_str()) == replaces => match self.place(path, src, sha256, replaces)? {
+                true => Ok(Some(path.to_string())),
+                false => self.put_beside(path, src, sha256),
+            },
+            // Bytes something else may still name: kept, and these go next to them.
+            Some(_) => self.put_beside(path, src, sha256),
         }
+    }
+
+    fn local_root(&self) -> Option<&Path> {
+        Some(&self.root)
     }
 
     fn get(&self, path: &str, item: Option<&str>, dest: &Path) -> Result<()> {
@@ -402,6 +429,10 @@ mod tests {
         assert_eq!(d.hash("/acc/a.png", None).unwrap().unwrap().0, sha2);
         assert_eq!(d.put("/acc/a.png", &src, &sha5, Some(&sha1)).unwrap().as_deref(), Some(beside.as_str()), "found there, not copied again");
         assert_eq!(walk(&root.join(TRASH)).len(), 4, "one, two!, three and four! were each replaced once; five replaced nothing");
+        // Another push replaced the bytes while this one copied: they are put back, not trashed.
+        assert!(!d.place("/acc/a.png", &src, &sha5, Some(&sha1)).unwrap());
+        assert_eq!(d.hash("/acc/a.png", None).unwrap().unwrap().0, sha2);
+        assert_eq!(walk(&root.join(TRASH)).len(), 4);
         std::fs::write(&src, b"two!").unwrap();
         let out = tmp.join("vault/acc/a.png");
         d.get("/acc/a.png", None, &out).unwrap();

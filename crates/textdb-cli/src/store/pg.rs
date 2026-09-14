@@ -1059,6 +1059,14 @@ impl Store for PgStore {
         Ok(true)
     }
 
+    fn rename_sync_dir(&mut self, prefix: &str, from: &str, to: &str) -> Result<()> {
+        self.ensure_sync_tables()?;
+        self.client
+            .execute("UPDATE kb.sync SET dir = $3 WHERE prefix = $1 AND dir = $2", &[&prefix, &from, &to])
+            .map(|_| ())
+            .map_err(pg)
+    }
+
     fn feed(&mut self, since: i64, limit: i64) -> Result<Vec<Change>> {
         let rows = self
             .client
