@@ -92,6 +92,8 @@ fn write_read_move_and_history() {
     ok(textdb(&db).args(["replace-lines", "/notes/a.md", "3", "3", "--text", "two\n", "-m", "second"]), None);
     assert_eq!(ok(textdb(&db).args(["cat", "/notes/a.md"]), None).stdout, "# A\n\ntwo\n");
     ok(textdb(&db).args(["mv", "/notes/a.md", "/archive/a.md"]), None);
+    let listed = ok(textdb(&db).args(["--json", "ls", "/archive"]), None).json();
+    assert_eq!(listed[0]["name"], "a.md", "{listed}");
     let history = ok(textdb(&db).args(["--json", "history", "--versions-only", "/archive/a.md"]), None).json();
     let messages: Vec<&str> = history.as_array().unwrap().iter().map(|c| c["message"].as_str().unwrap_or("")).collect();
     assert_eq!(messages, ["first", "second"]);

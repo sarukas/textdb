@@ -301,7 +301,7 @@ CREATE VIEW kb.entry AS
 CREATE FUNCTION kb.ls(path text, recursive boolean DEFAULT false) RETURNS SETOF kb.entry LANGUAGE sql STABLE AS $$
   SELECT e.* FROM kb.node d JOIN kb.entry e
     ON CASE WHEN recursive THEN e.path <> '/' AND (d.path = '/' OR e.path LIKE kb._subtree_like(d.path)) ELSE e.parent_id = d.id END
-  WHERE d.id = kb._node_id(path)
+  WHERE d.id = kb._node_id($1)   -- $1: `path` alone would be the tables' columns
   ORDER BY CASE WHEN recursive THEN e.path ELSE e.name END
 $$;
 
