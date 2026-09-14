@@ -8,10 +8,12 @@
 //! deleted: `target_name` (the last segment of the target, lower case, without `.md`) finds
 //! those rows without resolving every link in the store.
 
+use std::collections::{BTreeMap, HashSet};
+
 use rusqlite::types::Value;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use textdb_core::storage::Result;
-use textdb_core::{Link, StructureExtractor};
+use textdb_core::{Edit, Link, StructureExtractor, TextdbError};
 
 use crate::db::{parent_of, subtree_bounds, to_hash, TextDb};
 use crate::storage::sql_err;
@@ -48,6 +50,41 @@ impl LinkUpdates {
             Self::Rewrite => "rewrite",
         }
     }
+}
+
+/// A link that pointed at a file a move took elsewhere, and no longer reaches it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkChange {
+    /// The file the link is written in, after the move.
+    pub path: String,
+    pub line: i64,
+    pub kind: String,
+    /// The target as it was written.
+    pub target: String,
+    /// Where the file it pointed at is now.
+    pub now_at: String,
+    /// The version of `path` the link was rewritten in; `None` when it was only reported.
+    pub version: Option<u64>,
+}
+
+/// A resolved link captured before a move.
+pub(crate) struct Pointing {
+    rowid: i64,
+    file_id: i64,
+    line: i64,
+    kind: String,
+    target: String,
+    resolved_id: i64,
+}
+
+/// `target` (`/a/b/c.md`) relative to the folder `folder` (`/a/x`): `../b/c.md`.
+pub fn relative(folder: &str, target: &str) -> String {
+    let a: Vec<&str> = folder.split('/').filter(|s| !s.is_empty()).collect();
+    let b: Vec<&str> = target.split('/').filter(|s| !s.is_empty()).collect();
+    let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count().min(b.len().saturating_sub(1));
+    let mut parts: Vec<&str> = vec![".."; a.len() - common];
+    parts.extend(&b[common..]);
+    parts.join("/")
 }
 
 /// Extensions of files a store of text documents does not hold.
@@ -276,6 +313,162 @@ impl<'c> TextDb<'c> {
         Ok(())
     }
 
+    /// What a move does to links: this handle's choice, else the store's `link_updates`
+    /// setting, else [`LinkUpdates::DEFAULT`].
+    pub fn link_updates_mode(&self) -> Result<LinkUpdates> {
+        if let Some(mode) = self.link_updates {
+            return Ok(mode);
+        }
+        Ok(self.setting(LINK_UPDATES_SETTING)?.as_deref().and_then(LinkUpdates::parse).unwrap_or(LinkUpdates::DEFAULT))
+    }
+
+    /// Resolved links to the files `moved` or written in them, before they move.
+    pub(crate) fn links_into(&self, moved: &[(i64, String)]) -> Result<Vec<Pointing>> {
+        let mut out = Vec::new();
+        for chunk in moved.chunks(500) {
+            let marks = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+            let mut st = self
+                .conn
+                .prepare(&format!(
+                    "SELECT l.rowid, l.file_id, l.line, coalesce(l.kind, ''), l.target_path, l.resolved_id \
+                     FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL \
+                     WHERE l.resolved_id IS NOT NULL AND l.target_path <> '' AND (l.resolved_id IN ({marks}) OR l.file_id IN ({marks}))",
+                    p = self.p
+                ))
+                .map_err(sql_err)?;
+            let rows = st
+                .query_map(rusqlite::params_from_iter(chunk.iter().map(|(id, _)| *id)), |r| {
+                    Ok(Pointing { rowid: r.get(0)?, file_id: r.get(1)?, line: r.get(2)?, kind: r.get(3)?, target: r.get(4)?, resolved_id: r.get(5)? })
+                })
+                .map_err(sql_err)?;
+            for row in rows {
+                out.push(row.map_err(sql_err)?);
+            }
+        }
+        out.sort_by_key(|p| p.rowid);
+        out.dedup_by_key(|p| p.rowid);
+        Ok(out)
+    }
+
+    fn live_path(&self, id: i64) -> Result<Option<(String, Option<Vec<u8>>)>> {
+        self.conn
+            .prepare_cached(&format!("SELECT path, root FROM {}node WHERE id = ?1 AND deleted_at IS NULL", self.p))
+            .map_err(sql_err)?
+            .query_row(params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .map_err(sql_err)
+    }
+
+    /// The target to write, in the style `raw` was written, for a link in `source` to `target`.
+    fn new_target(&self, kind: &str, raw: &str, angle: bool, source: &str, target: &str) -> Result<String> {
+        let keep_md = raw.to_ascii_lowercase().ends_with(".md");
+        let strip = |p: &str| if keep_md { p.to_string() } else { p.strip_suffix(".md").unwrap_or(p).to_string() };
+        let folder = parent_of(source);
+        Ok(match kind {
+            "wiki" | "embed" => {
+                if !raw.contains('/') {
+                    let name = target.rsplit('/').next().unwrap_or(target);
+                    if self.live_files("lower(name) = lower(?1)", name)?.len() <= 1 {
+                        strip(name)
+                    } else {
+                        strip(&target[1..])
+                    }
+                } else if raw.starts_with("./") || raw.starts_with("../") {
+                    strip(&relative(folder, target))
+                } else {
+                    strip(&target[1..])
+                }
+            }
+            _ => {
+                let path = if raw.starts_with('/') {
+                    target.to_string()
+                } else {
+                    let rel = relative(folder, target);
+                    if raw.starts_with("./") && !rel.starts_with("../") { format!("./{rel}") } else { rel }
+                };
+                let path = strip(&path);
+                if angle {
+                    path
+                } else {
+                    path.replace('%', "%25").replace(' ', "%20").replace('(', "%28").replace(')', "%29")
+                }
+            }
+        })
+    }
+
+    /// After a move from `from` to `to`: the links in `pointing` that no longer reach the file
+    /// they did, rewritten (one commit per linking file) when `mode` says so.
+    pub(crate) fn follow_move(&self, pointing: Vec<Pointing>, from: &str, to: &str, mode: LinkUpdates, author: Option<&str>) -> Result<Vec<LinkChange>> {
+        let mut by_file: BTreeMap<i64, Vec<Pointing>> = BTreeMap::new();
+        for p in pointing {
+            let now: Option<i64> = self
+                .conn
+                .prepare_cached(&format!("SELECT resolved_id FROM {}link WHERE rowid = ?1", self.p))
+                .map_err(sql_err)?
+                .query_row(params![p.rowid], |r| r.get(0))
+                .optional()
+                .map_err(sql_err)?
+                .flatten();
+            if now != Some(p.resolved_id) {
+                by_file.entry(p.file_id).or_default().push(p);
+            }
+        }
+        let message = format!("links: {from} -> {to}");
+        let mut changes = Vec::new();
+        for (file_id, links) in by_file {
+            let Some((source, root)) = self.live_path(file_id)? else {
+                continue;
+            };
+            let mut rewritten = HashSet::new();
+            let mut version = None;
+            if mode == LinkUpdates::Rewrite {
+                let root = root.ok_or_else(|| TextdbError::NotFound(source.clone()))?;
+                let doc = self.storage().document(&to_hash(&root)?)?.0;
+                let starts: Vec<usize> = std::iter::once(0).chain(doc.iter().enumerate().filter(|(_, b)| **b == b'\n').map(|(i, _)| i + 1)).collect();
+                let mut edits = Vec::new();
+                let mut paired = HashSet::new();
+                for span in textdb_md::links::scan(&doc) {
+                    let line = match starts.binary_search(&span.offset) {
+                        Ok(i) => i + 1,
+                        Err(i) => i,
+                    } as i64;
+                    let Some(range) = span.range.clone() else { continue };
+                    // Rows are in document order, as the spans are: pair each span with the first
+                    // row of its line, kind and target not already paired.
+                    let Some(p) = links
+                        .iter()
+                        .find(|p| p.line == line && p.kind == span.kind && p.target == span.target && !paired.contains(&p.rowid))
+                    else {
+                        continue;
+                    };
+                    paired.insert(p.rowid);
+                    let Some((target, _)) = self.live_path(p.resolved_id)? else { continue };
+                    let raw = String::from_utf8_lossy(&doc[range.clone()]).to_string();
+                    let new = self.new_target(span.kind, &raw, span.angle, &source, &target)?;
+                    if new != raw {
+                        edits.push(Edit::new(range.start as u64, range.end as u64, new.into_bytes()));
+                        rewritten.insert(p.rowid);
+                    }
+                }
+                if !edits.is_empty() {
+                    version = Some(self.commit_edits(&source, &edits, None, author, Some(&message))?.version);
+                }
+            }
+            for p in &links {
+                let now_at = self.live_path(p.resolved_id)?.map(|(path, _)| path).unwrap_or_default();
+                changes.push(LinkChange {
+                    path: source.clone(),
+                    line: p.line,
+                    kind: p.kind.clone(),
+                    target: p.target.clone(),
+                    now_at,
+                    version: if rewritten.contains(&p.rowid) { version } else { None },
+                });
+            }
+        }
+        Ok(changes)
+    }
+
     /// The live files at or below `path`, as `(id, path)`.
     pub(crate) fn files_at(&self, path: &str) -> Result<Vec<(i64, String)>> {
         let (lo, hi) = subtree_bounds(path).unwrap_or_else(|| ("/".to_string(), "0".to_string()));
@@ -328,5 +521,9 @@ mod tests {
         assert_eq!(name_key("/Acc/Jazz Pakistan.MD"), "jazz pakistan.md".strip_suffix(".md").unwrap());
         assert_eq!(name_key("Notes/Plan.md"), "plan");
         assert_eq!(heading_key("Next steps"), heading_key("next-steps"));
+        assert_eq!(relative("/acc", "/archive/2026/Plan.md"), "../archive/2026/Plan.md");
+        assert_eq!(relative("/notes", "/notes/Plan.md"), "Plan.md");
+        assert_eq!(relative("/", "/Plan.md"), "Plan.md");
+        assert_eq!(relative("/a/b", "/a/b/c/d.md"), "c/d.md");
     }
 }

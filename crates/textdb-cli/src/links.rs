@@ -6,21 +6,59 @@ use std::path::Path;
 use textdb_sqlite::db::parent_of;
 use textdb_sqlite::links::join;
 
-use crate::store::{LinkRow, Store};
+use crate::store::{LinkRow, MovedLink, Store};
 use crate::{emit_json, out, Result};
 
 /// Statuses `links --broken` lists.
 pub const BROKEN: &[&str] = &["broken", "anchor-missing", "not-in-store"];
 
 /// How a link is written, from its parts.
-pub fn written(l: &LinkRow) -> String {
-    let anchor = l.anchor.as_ref().map(|a| format!("#{a}")).unwrap_or_default();
-    match l.kind.as_str() {
-        "wiki" => format!("[[{}{anchor}]]", l.target),
-        "embed" => format!("![[{}{anchor}]]", l.target),
-        "image" => format!("![]({}{anchor})", l.target),
-        _ => format!("[]({}{anchor})", l.target),
+fn shape(kind: &str, target: &str, anchor: Option<&str>) -> String {
+    let anchor = anchor.map(|a| format!("#{a}")).unwrap_or_default();
+    match kind {
+        "wiki" => format!("[[{target}{anchor}]]"),
+        "embed" => format!("![[{target}{anchor}]]"),
+        "image" => format!("![]({target}{anchor})"),
+        _ => format!("[]({target}{anchor})"),
     }
+}
+
+pub fn written(l: &LinkRow) -> String {
+    shape(&l.kind, &l.target, l.anchor.as_deref())
+}
+
+/// What `mv` says about the links that pointed at what moved.
+pub fn moved_text(from: &str, links: &[MovedLink]) -> String {
+    let files = |ls: &[&MovedLink]| ls.iter().map(|l| l.path.as_str()).collect::<HashSet<_>>().len();
+    let (done, left): (Vec<&MovedLink>, Vec<&MovedLink>) = links.iter().partition(|l| l.version.is_some());
+    let mut s = String::new();
+    if !done.is_empty() {
+        s.push_str(&format!("rewrote {} links in {} files\n", done.len(), files(&done)));
+    }
+    if !left.is_empty() {
+        s.push_str(&format!(
+            "{} links in {} files pointed to what moved from {from} and no longer do (--update-links rewrites them):\n",
+            left.len(),
+            files(&left)
+        ));
+        for l in left {
+            s.push_str(&format!("  {}:{}: {} (now {})\n", l.path, l.line, shape(&l.kind, &l.target, None), l.now_at));
+        }
+    }
+    s
+}
+
+/// What `rm` says about the links that pointed into what it deleted.
+pub fn deleted_text(links: &[LinkRow]) -> String {
+    if links.is_empty() {
+        return String::new();
+    }
+    let files = links.iter().map(|l| l.path.as_str()).collect::<HashSet<_>>().len();
+    let mut s = format!("{} links in {files} files pointed here and are now broken:\n", links.len());
+    for l in links {
+        s.push_str(&format!("  {}:{}: {}\n", l.path, l.line, written(l)));
+    }
+    s
 }
 
 fn line_of(l: &LinkRow) -> String {

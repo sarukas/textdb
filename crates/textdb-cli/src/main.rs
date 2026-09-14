@@ -416,6 +416,13 @@ enum Cmd {
         /// Keep folders the move leaves empty.
         #[arg(long)]
         keep_empty_folders: bool,
+        /// Rewrite the links that pointed at what moved (default: the store's `link_updates`
+        /// setting, which lists them unless set to `rewrite` or `off`).
+        #[arg(long, conflicts_with = "no_update_links")]
+        update_links: bool,
+        /// Leave links alone, without listing them.
+        #[arg(long)]
+        no_update_links: bool,
     },
     /// Delete a file or folder; its history stays readable. Folders the delete leaves empty are
     /// removed.
@@ -837,16 +844,20 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             to,
             message,
             keep_empty_folders,
+            update_links,
+            no_update_links,
         } => {
-            st.mv(&from, &to, author, message.as_deref())?;
+            let update = if update_links { Some(true) } else if no_update_links { Some(false) } else { None };
+            let moved_links = st.mv_links(&from, &to, author, message.as_deref(), update)?;
             let removed = if keep_empty_folders { Vec::new() } else { prune_empty_folders(st, &from, author)? };
             if json {
-                return emit_json(&json!({ "moved": from, "to": to, "removed_empty_folders": removed }));
+                return emit_json(&json!({ "moved": from, "to": to, "removed_empty_folders": removed, "links": moved_links }));
             }
             let mut s = format!("moved {from} -> {to}\n");
             for folder in &removed {
                 s.push_str(&format!("removed empty folder {folder}\n"));
             }
+            s.push_str(&links::moved_text(&from, &moved_links));
             out(s.as_bytes())
         }
         Cmd::Rm {
@@ -854,15 +865,24 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             message,
             keep_empty_folders,
         } => {
+            // Links from elsewhere into what is deleted, unless the store turned link reports off.
+            let broken: Vec<store::LinkRow> = match st.setting(textdb_sqlite::links::LINK_UPDATES_SETTING) {
+                Ok(mode) if mode.as_deref() != Some("off") => {
+                    let inside = format!("{path}/");
+                    st.backlinks(&path).unwrap_or_default().into_iter().filter(|l| l.path != path && !l.path.starts_with(&inside)).collect()
+                }
+                _ => Vec::new(),
+            };
             st.rm(&path, author, message.as_deref())?;
             let removed = if keep_empty_folders { Vec::new() } else { prune_empty_folders(st, &path, author)? };
             if json {
-                return emit_json(&json!({ "deleted": path, "removed_empty_folders": removed }));
+                return emit_json(&json!({ "deleted": path, "removed_empty_folders": removed, "broken_links": broken }));
             }
             let mut s = format!("deleted {path}\n");
             for folder in &removed {
                 s.push_str(&format!("removed empty folder {folder}\n"));
             }
+            s.push_str(&links::deleted_text(&broken));
             out(s.as_bytes())
         }
         Cmd::Setting { key, value } => {
@@ -871,6 +891,13 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
                 st.set_setting(&key, if v == "default" { None } else { Some(v.as_str()) })?;
             }
             let stored = st.setting(&key)?;
+            if key == textdb_sqlite::links::LINK_UPDATES_SETTING {
+                let effective = stored.clone().unwrap_or_else(|| textdb_sqlite::links::LinkUpdates::DEFAULT.as_str().to_string());
+                if json {
+                    return emit_json(&json!({ key.as_str(): { "value": stored, "effective": effective } }));
+                }
+                return line(format!("{key}  {}", stored.unwrap_or_else(|| format!("{effective} (default)"))));
+            }
             let effective = st.path_history_enabled()?;
             if json {
                 return emit_json(&json!({ key.as_str(): { "value": stored, "effective": effective } }));

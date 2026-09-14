@@ -384,7 +384,28 @@ impl Store for SqliteStore {
     }
 
     fn mv(&mut self, from: &str, to: &str, author: Option<&str>, message: Option<&str>) -> Result<()> {
-        Ok(self.db().with_message(message).rename_by(from, to, author)?)
+        use textdb_sqlite::links::LinkUpdates;
+        Ok(self.db().with_message(message).with_link_updates(Some(LinkUpdates::Off)).rename_by(from, to, author)?)
+    }
+
+    fn mv_links(&mut self, from: &str, to: &str, author: Option<&str>, message: Option<&str>, update: Option<bool>) -> Result<Vec<super::MovedLink>> {
+        use textdb_sqlite::links::LinkUpdates;
+        let mode = update.map(|rewrite| if rewrite { LinkUpdates::Rewrite } else { LinkUpdates::Off });
+        Ok(self
+            .db()
+            .with_message(message)
+            .with_link_updates(mode)
+            .rename_links(from, to, author)?
+            .into_iter()
+            .map(|c| super::MovedLink {
+                path: c.path,
+                line: c.line,
+                kind: c.kind,
+                target: c.target,
+                now_at: c.now_at,
+                version: c.version.map(|v| v as i64),
+            })
+            .collect())
     }
 
     fn rm(&mut self, path: &str, author: Option<&str>, message: Option<&str>) -> Result<()> {

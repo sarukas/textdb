@@ -322,6 +322,55 @@ fn links_resolve_and_stay_current_as_files_come_and_go() {
 }
 
 #[test]
+fn moves_report_or_rewrite_the_links_that_pointed_at_what_moved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let cat = |p: &str| ok(textdb(&store).args(["cat", p]), None).stdout;
+    let acme = "See [[Plan]], [[Plan#Next steps|next]] and [plan](../notes/Plan.md#next-steps).\n| [[notes/Plan\\|p]] |\n";
+    let index = "[[Plan]] ![[Plan]] [p](Plan.md)\n";
+    ok(textdb(&store).args(["write", "/notes/Plan.md"]), Some("# Plan\n\n## Next steps\n"));
+    ok(textdb(&store).args(["write", "/acc/acme.md"]), Some(acme));
+    ok(textdb(&store).args(["write", "/notes/index.md"]), Some(index));
+
+    // By default a move lists the links it leaves behind and changes nothing.
+    let moved = ok(textdb(&store).args(["mv", "/notes/Plan.md", "/archive/2026/Plan-v1.md"]), None).stdout;
+    assert!(moved.contains("7 links in 2 files pointed to what moved from /notes/Plan.md and no longer do"), "{moved}");
+    assert!(moved.contains("  /acc/acme.md:1: [[Plan]] (now /archive/2026/Plan-v1.md)\n"), "{moved}");
+    assert_eq!((cat("/acc/acme.md"), cat("/notes/index.md")), (acme.to_string(), index.to_string()));
+
+    // Moving it back without touching links makes them resolve again.
+    let back = ok(textdb(&store).args(["mv", "--no-update-links", "/archive/2026/Plan-v1.md", "/notes/Plan.md"]), None).stdout;
+    assert!(!back.contains("links"), "{back}");
+    assert_eq!(ok(textdb(&store).args(["--json", "links", "--broken"]), None).json(), serde_json::json!([]));
+
+    // --update-links rewrites each link in the style it was written, one commit per file.
+    let rewrote = ok(textdb(&store).args(["mv", "--update-links", "/notes/Plan.md", "/archive/2026/Plan-v1.md"]), None).stdout;
+    assert!(rewrote.contains("rewrote 7 links in 2 files"), "{rewrote}");
+    assert_eq!(
+        cat("/acc/acme.md"),
+        "See [[Plan-v1]], [[Plan-v1#Next steps|next]] and [plan](../archive/2026/Plan-v1.md#next-steps).\n| [[archive/2026/Plan-v1\\|p]] |\n"
+    );
+    assert_eq!(cat("/notes/index.md"), "[[Plan-v1]] ![[Plan-v1]] [p](../archive/2026/Plan-v1.md)\n");
+    assert_eq!(ok(textdb(&store).args(["--json", "links", "--broken"]), None).json(), serde_json::json!([]));
+    let history = ok(textdb(&store).args(["--json", "history", "--versions-only", "/acc/acme.md"]), None).json();
+    assert_eq!(history[1]["message"], "links: /notes/Plan.md -> /archive/2026/Plan-v1.md");
+
+    // With the store setting, every move rewrites; spaces are encoded in markdown links.
+    ok(textdb(&store).args(["setting", "link_updates", "rewrite"]), None);
+    assert_eq!(ok(textdb(&store).args(["setting", "link_updates"]), None).stdout, "link_updates  rewrite\n");
+    assert_eq!(run(textdb(&store).args(["setting", "link_updates", "sometimes"]), None).status, 6);
+    ok(textdb(&store).args(["mv", "/archive/2026/Plan-v1.md", "/archive/My Plan.md"]), None);
+    assert_eq!(
+        cat("/acc/acme.md"),
+        "See [[My Plan]], [[My Plan#Next steps|next]] and [plan](../archive/My%20Plan.md#next-steps).\n| [[archive/My Plan\\|p]] |\n"
+    );
+
+    // Deleting it lists the links that are now broken.
+    let deleted = ok(textdb(&store).args(["rm", "/archive/My Plan.md"]), None).stdout;
+    assert!(deleted.contains("7 links in 2 files pointed here and are now broken"), "{deleted}");
+}
+
+#[test]
 fn several_line_ranges_make_one_commit() {
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("kb.db");

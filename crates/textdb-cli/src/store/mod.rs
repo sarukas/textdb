@@ -163,6 +163,21 @@ pub struct Hit {
     pub rank: f64,
 }
 
+/// A link that pointed at what a move took elsewhere and no longer reaches it.
+#[derive(Debug, Clone, Serialize)]
+pub struct MovedLink {
+    /// The file the link is written in.
+    pub path: String,
+    pub line: i64,
+    pub kind: String,
+    /// The target as it was written.
+    pub target: String,
+    /// Where the file it pointed at is now.
+    pub now_at: String,
+    /// The version the link was rewritten in; absent when only reported.
+    pub version: Option<i64>,
+}
+
 /// A link as `links` and `backlinks` list it.
 #[derive(Debug, Clone, Serialize)]
 pub struct LinkRow {
@@ -457,7 +472,11 @@ pub trait Store {
     fn hunks(&mut self, path: &str, v1: i64, v2: i64) -> Result<Vec<Hunk>>;
     fn chunks(&mut self, path: &str, version: Option<i64>) -> Result<Vec<Chunk>>;
     /// `message` is recorded on the change in the store's change log.
+    /// Links are left as they are (a sync's move follows one made on disk).
     fn mv(&mut self, from: &str, to: &str, author: Option<&str>, message: Option<&str>) -> Result<()>;
+    /// Move, then rewrite (`Some(true)`), leave (`Some(false)`) or do what the store's
+    /// `link_updates` setting says (`None`) with the links that pointed at what moved.
+    fn mv_links(&mut self, from: &str, to: &str, author: Option<&str>, message: Option<&str>, update: Option<bool>) -> Result<Vec<MovedLink>>;
     fn rm(&mut self, path: &str, author: Option<&str>, message: Option<&str>) -> Result<()>;
     /// Renames, moves and deletes of the file or folder at `path`, oldest first.
     fn path_history(&mut self, path: &str) -> Result<Vec<PathEvent>>;

@@ -493,6 +493,12 @@ impl Store for PgStore {
         self.write(path, &spliced, Some(v), author, Some(message.unwrap_or("replace-lines")))
     }
 
+    /// Links are not resolved in Postgres stores yet, so a move leaves them as they are.
+    fn mv_links(&mut self, from: &str, to: &str, author: Option<&str>, message: Option<&str>, _update: Option<bool>) -> Result<Vec<super::MovedLink>> {
+        self.mv(from, to, author, message)?;
+        Ok(Vec::new())
+    }
+
     fn links(&mut self, _path: &str, _statuses: &[&str]) -> Result<Vec<super::LinkRow>> {
         Err(StoreError::other("links are resolved in SQLite stores only for now"))
     }

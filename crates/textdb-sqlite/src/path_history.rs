@@ -10,6 +10,7 @@ use textdb_core::storage::Result;
 use textdb_core::TextdbError;
 
 use crate::db::{normalize_path, subtree_bounds, NodeRow, TextDb};
+use crate::links::{LinkUpdates, LINK_UPDATES_SETTING};
 use crate::storage::sql_err;
 
 /// A rename, move or delete as it touched one file or folder.
@@ -30,7 +31,7 @@ pub struct PathEventRow {
 }
 
 /// The settings a store knows.
-const SETTINGS: &[&str] = &[PATH_HISTORY_SETTING];
+const SETTINGS: &[&str] = &[PATH_HISTORY_SETTING, LINK_UPDATES_SETTING];
 
 fn known(key: &str) -> Result<()> {
     if SETTINGS.contains(&key) {
@@ -57,14 +58,25 @@ impl<'c> TextDb<'c> {
         known(key)?;
         match value {
             Some(v) => {
-                let on = parse_switch(v).ok_or_else(|| TextdbError::InvalidEdit(format!("{key} is on or off, not '{v}'")))?;
+                let value = if key == LINK_UPDATES_SETTING {
+                    LinkUpdates::parse(v)
+                        .map(LinkUpdates::as_str)
+                        .ok_or_else(|| TextdbError::InvalidEdit(format!("{key} is off, report or rewrite, not '{v}'")))?
+                } else {
+                    let on = parse_switch(v).ok_or_else(|| TextdbError::InvalidEdit(format!("{key} is on or off, not '{v}'")))?;
+                    if on {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                };
                 self.conn
                     .prepare_cached(&format!(
                         "INSERT INTO {}setting(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                         self.p
                     ))
                     .map_err(sql_err)?
-                    .execute(params![key, if on { "on" } else { "off" }])
+                    .execute(params![key, value])
                     .map_err(sql_err)?;
             }
             None => {

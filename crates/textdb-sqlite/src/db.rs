@@ -163,6 +163,9 @@ pub struct TextDb<'c> {
     /// The message recorded for edits, appends, line replacements, moves and deletes made
     /// through this handle, instead of their defaults (`edit`, `append`, `replace-lines`, none).
     pub message: Option<String>,
+    /// What moves do to links pointing at what moved (`Some`), or the store's `link_updates`
+    /// setting (`None`).
+    pub link_updates: Option<crate::links::LinkUpdates>,
 }
 
 pub(crate) fn to_hash(v: &[u8]) -> Result<Hash> {
@@ -243,7 +246,14 @@ impl<'c> TextDb<'c> {
             retries: textdb_core::DEFAULT_RETRIES,
             path_history: None,
             message: None,
+            link_updates: None,
         }
+    }
+
+    /// This handle's choice of what moves do to links; `None` follows the store's setting.
+    pub fn with_link_updates(mut self, mode: Option<crate::links::LinkUpdates>) -> Self {
+        self.link_updates = mode;
+        self
     }
 
     /// Record `message` on the edits, appends, line replacements, moves and deletes made
@@ -934,6 +944,13 @@ impl<'c> TextDb<'c> {
 
     /// As [`rename`](Self::rename), attributing the move in the change feed.
     pub fn rename_by(&self, from: &str, to: &str, author: Option<&str>) -> Result<()> {
+        self.rename_links(from, to, author).map(|_| ())
+    }
+
+    /// As [`rename_by`](Self::rename_by), doing to the links that pointed at what moved what
+    /// [`link_updates_mode`](Self::link_updates_mode) says, and returning those that no longer
+    /// reach it (rewritten or not).
+    pub fn rename_links(&self, from: &str, to: &str, author: Option<&str>) -> Result<Vec<crate::links::LinkChange>> {
         let from = normalize_path(from)?;
         let to = normalize_path(to)?;
         self.tx(|db| {
@@ -950,6 +967,8 @@ impl<'c> TextDb<'c> {
             let parent = db.ensure_folder(parent_of(&to))?;
             let now = Self::now();
             let before = db.files_at(&from)?;
+            let mode = db.link_updates_mode()?;
+            let pointing = if mode == crate::links::LinkUpdates::Off { Vec::new() } else { db.links_into(&before)? };
             let moved = db.subtree_totals(src.id)?;
             db.add_to_ancestors(&from, &moved.neg(), &now)?;
             let seq = db.record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, db.message.as_deref())?;
@@ -981,7 +1000,7 @@ impl<'c> TextDb<'c> {
             names.sort();
             names.dedup();
             db.relink(&names, &after.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
-            Ok(())
+            db.follow_move(pointing, &from, &to, mode, author)
         })
     }
 
