@@ -676,11 +676,11 @@ impl Store for SqliteStore {
         let id: i64 = tx
             .query_row(
                 &format!(
-                    "INSERT INTO {p}sync(prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean) \
-                     VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4, ?5, ?6, ?7, ?8) \
+                    "INSERT INTO {p}sync(prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean, rules) \
+                     VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4, ?5, ?6, ?7, ?8, ?9) \
                      ON CONFLICT(prefix, dir) DO UPDATE SET seq = excluded.seq, synced_at = excluded.synced_at, \
                      author = excluded.author, git_commit = excluded.git_commit, git_branch = excluded.git_branch, \
-                     git_remote = excluded.git_remote, git_clean = excluded.git_clean RETURNING id"
+                     git_remote = excluded.git_remote, git_clean = excluded.git_clean, rules = excluded.rules RETURNING id"
                 ),
                 rusqlite::params![
                     base.prefix,
@@ -691,6 +691,7 @@ impl Store for SqliteStore {
                     git.and_then(|g| g.branch.as_deref()),
                     git.and_then(|g| g.remote.as_deref()),
                     git.map(|g| g.clean),
+                    base.rules,
                 ],
                 |r| r.get(0),
             )
@@ -829,7 +830,7 @@ fn run_sql(conn: &Connection, query: &str, params: &[String], author: Option<&st
     })
 }
 
-const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean";
+const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean, rules";
 
 fn sync_row(r: &rusqlite::Row) -> rusqlite::Result<(i64, SyncBase)> {
     let clean: Option<bool> = r.get(9)?;
@@ -843,6 +844,7 @@ fn sync_row(r: &rusqlite::Row) -> rusqlite::Result<(i64, SyncBase)> {
             synced_at: r.get(4)?,
             author: r.get(5)?,
             git: clean.map(|clean| GitState { commit, branch, remote, clean }),
+            rules: r.get(10)?,
             files: Vec::new(),
         },
     ))

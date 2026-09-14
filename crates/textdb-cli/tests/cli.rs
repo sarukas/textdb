@@ -319,6 +319,12 @@ fn links_resolve_and_stay_current_as_files_come_and_go() {
     assert_eq!((after[0].0.as_str(), after[3].0.as_str(), after[7].0.as_str()), ("broken", "broken", "broken"));
     let view = ok(textdb(&store).args(["--json", "sql", "SELECT kind, alias, status, resolved FROM links WHERE target = 'Missing'"]), None).json();
     assert_eq!(view["rows"][0]["resolved"], "/Missing.md", "{view}");
+
+    // Links to folders are neither files nor broken.
+    ok(textdb(&store).args(["write", "/acc/folders.md"]), Some("[[archive/]] [a](../archive) [[nowhere/]]\n"));
+    let folders = ok(textdb(&store).args(["--json", "links", "/acc/folders.md"]), None).json();
+    let statuses: Vec<&str> = folders.as_array().unwrap().iter().map(|r| r["status"].as_str().unwrap()).collect();
+    assert_eq!(statuses, ["folder", "folder", "broken"]);
 }
 
 #[test]
@@ -598,6 +604,52 @@ fn git(dir: &Path, args: &[&str]) -> String {
     let o = Command::new("git").arg("-C").arg(dir).args(args).output().expect("run git");
     assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
     String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+#[test]
+fn sync_stops_when_its_include_rules_changed_and_honours_textdbignore() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    for d in [".claude", "drafts"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    for (rel, text) in [("a.md", "a\n"), ("notes.txt", "t\n"), (".claude/rules.md", "r\n"), ("drafts/x.md", "x\n"), (".textdbignore", "drafts/\n")] {
+        std::fs::write(dir.join(rel), text).unwrap();
+    }
+    let sync = |extra: &[&str]| {
+        let mut cmd = textdb(&store);
+        cmd.args(["--json", "sync"]).args(extra).arg("/").arg(&dir);
+        run(&mut cmd, None)
+    };
+
+    // Markdown only at first; .textdbignore keeps drafts/ out.
+    let first = sync(&["--ext", "md"]);
+    assert_eq!(first.status, 0, "{}", first.stderr);
+    assert_eq!(first.json()["to_textdb"]["new"], serde_json::json!([".claude/rules.md", "a.md"]));
+
+    // Wider extensions would take in notes.txt: the sync stops and lists it.
+    let wider = sync(&[]);
+    assert_eq!(wider.status, 6, "{}", wider.stdout);
+    let w = wider.json();
+    assert_eq!((w["stopped_by_rules"].as_bool(), &w["rules"]["newly_included"]), (Some(true), &serde_json::json!(["notes.txt"])));
+    assert_eq!(run(textdb(&store).args(["stat", "/notes.txt"]), None).status, 5);
+    let accepted = sync(&["--accept-rules"]);
+    assert_eq!(accepted.status, 0, "{}", accepted.stderr);
+    assert_eq!(accepted.json()["to_textdb"]["new"], serde_json::json!(["notes.txt"]));
+    let quiet = sync(&[]).json();
+    assert!(quiet.get("rules").is_none(), "{quiet}");
+
+    // A base saved by a build that recorded no rules skipped hidden folders: files in them are newly included.
+    let conn = rusqlite::Connection::open(&store).unwrap();
+    conn.execute("UPDATE kb_sync SET rules = NULL", []).unwrap();
+    drop(conn);
+    std::fs::create_dir_all(dir.join(".beads")).unwrap();
+    std::fs::write(dir.join(".beads/README.md"), "b\n").unwrap();
+    let legacy = run(textdb(&store).args(["sync", "/"]).arg(&dir), None);
+    assert_eq!(legacy.status, 6, "{}", legacy.stdout);
+    assert!(legacy.stdout.contains("not recorded (an older build") && legacy.stdout.contains("newly included  .beads/README.md"), "{}", legacy.stdout);
+    assert!(legacy.stderr.contains("--accept-rules"), "{}", legacy.stderr);
 }
 
 #[test]

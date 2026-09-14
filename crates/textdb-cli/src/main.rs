@@ -134,6 +134,10 @@ enum Cmd {
         /// Commit the files sync changed on disk, with Textdb-* trailers.
         #[arg(long)]
         commit: bool,
+        /// Take in the files that changed include rules (extensions, skipped folders,
+        /// .textdbignore) add since the last sync; without it such a sync stops and lists them.
+        #[arg(long)]
+        accept_rules: bool,
     },
     /// When a store folder was last synced, what changed in it since, and how it compares with a
     /// git commit (by git blob id).
@@ -520,6 +524,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             base,
             dry_run,
             commit,
+            accept_rules,
         } => sync::sync(
             st,
             sync::Options {
@@ -531,6 +536,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
                 commit,
                 author: cli.author.clone(),
                 store: config::redact(&cli.store),
+                accept_rules,
             },
             json,
         ),

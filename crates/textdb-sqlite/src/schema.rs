@@ -154,6 +154,7 @@ CREATE TABLE IF NOT EXISTS {p}sync (
   git_branch TEXT,
   git_remote TEXT,
   git_clean  INTEGER,                       -- 1: no uncommitted changes; NULL: not a git checkout
+  rules      TEXT,                          -- the include rules of that sync, as JSON (sync.rs Rules)
   UNIQUE (prefix, dir)
 );
 -- Each file both sides agreed on at that sync: its version in the store, the git blob id of its
@@ -198,6 +199,8 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // Batches: the run (`textdb sql --write`) a commit or change belongs to.
     ("commit", "batch", "TEXT NULL"),
     ("change", "batch", "TEXT NULL"),
+    // Sync: the include rules each base was made with.
+    ("sync", "rules", "TEXT"),
 ];
 
 /// Indexes on columns an older store gains in `migrate`, so they are created after them.

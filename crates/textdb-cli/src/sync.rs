@@ -18,7 +18,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use textdb_core::myers::diff3_marked;
 use textdb_sqlite::normalize_path;
@@ -46,6 +46,35 @@ pub struct Options {
     pub author: String,
     /// The store as trailers name it, without a password.
     pub store: String,
+    /// Take in files that a change of include rules adds since the last sync.
+    pub accept_rules: bool,
+}
+
+/// What a sync takes in from disk, recorded with its base so the next sync can tell when it
+/// changed: the extensions, the folders never read, and `.textdbignore`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Rules {
+    pub exts: Vec<String>,
+    pub skip_dirs: Vec<String>,
+    /// Git blob id of `.textdbignore`, when the directory has one.
+    pub ignore_file: Option<String>,
+}
+
+impl Rules {
+    fn describe(&self) -> String {
+        let ignore = if self.ignore_file.is_some() { "; .textdbignore" } else { "" };
+        format!("ext {}; skip {}{ignore}", self.exts.join(","), self.skip_dirs.join(","))
+    }
+}
+
+#[derive(Serialize)]
+pub struct RulesChange {
+    /// `None`: the last sync was made by a build that recorded no rules, and skipped every
+    /// hidden folder.
+    pub before: Option<Rules>,
+    pub now: Rules,
+    /// New files this sync takes in that the last sync's rules left out.
+    pub newly_included: Vec<String>,
 }
 
 /// `md, .TXT` → `["md", "txt"]`.
@@ -396,6 +425,11 @@ pub struct Report {
     pub stopped: bool,
     pub seq: Option<i64>,
     pub git: Option<GitReport>,
+    /// The include rules differ from the last sync's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules: Option<RulesChange>,
+    /// They would take in new files, and `--accept-rules` was not given: nothing was written.
+    pub stopped_by_rules: bool,
 }
 
 fn failure(e: &StoreError) -> String {
@@ -597,6 +631,30 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         let ignored = git::ignored(&o.dir, &plan.candidates);
         plan.candidates.retain(|rel| !ignored.contains(rel));
     }
+    // `.textdbignore` in the directory, in .gitignore syntax: files it matches are not taken in.
+    let ignore_path = o.dir.join(".textdbignore");
+    let ignore_bytes = std::fs::read(&ignore_path).ok();
+    if ignore_bytes.is_some() && !plan.candidates.is_empty() {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(&o.dir);
+        let read = match builder.add(&ignore_path) {
+            Some(e) => Err(e),
+            None => builder.build(),
+        };
+        match read {
+            Ok(gi) => plan.candidates.retain(|rel| !gi.matched_path_or_any_parents(rel, false).is_ignore()),
+            Err(e) => report.skipped.push(note(".textdbignore", format!("not read: {e}"))),
+        }
+    }
+    let rules = {
+        let mut exts = o.exts.clone();
+        exts.sort();
+        exts.dedup();
+        Rules {
+            exts,
+            skip_dirs: SKIP_DIRS.iter().map(|s| s.to_string()).collect(),
+            ignore_file: ignore_bytes.as_deref().map(blob_id),
+        }
+    };
     // A file gone from disk and an identical new one elsewhere is a move: the store moves the
     // file, keeping its history.
     let mut by_blob: HashMap<String, Vec<String>> = HashMap::new();
@@ -659,6 +717,28 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     report.conflicts = plan.conflicts.iter().map(|c| c.0.clone()).collect();
     report.unchanged = plan.keep.len() + plan.adopt.len();
 
+    // Include rules that changed since the last sync must not take in files unnoticed.
+    if let Some(stored) = &stored {
+        let before: Option<Rules> = stored.rules.as_deref().and_then(|r| serde_json::from_str(r).ok());
+        if before.as_ref() != Some(&rules) {
+            let left_out = |rel: &str| {
+                let dirs: Vec<&str> = rel.split('/').rev().skip(1).collect();
+                match &before {
+                    None => dirs.iter().any(|s| s.starts_with('.') || *s == "node_modules"),
+                    Some(b) => dirs.iter().any(|s| b.skip_dirs.iter().any(|d| d == s)) || !eligible(rel, &b.exts),
+                }
+            };
+            let newly_included: Vec<String> = plan
+                .to_textdb
+                .iter()
+                .filter(|(rel, v)| v.is_none() && !heads.contains_key(rel) && !base.contains_key(rel) && left_out(rel))
+                .map(|(rel, _)| rel.clone())
+                .collect();
+            report.stopped_by_rules = !newly_included.is_empty() && !o.accept_rules;
+            report.rules = Some(RulesChange { before, now: rules.clone(), newly_included });
+        }
+    }
+
     let changes = match (repo.as_ref().and_then(|r| r.commit.as_deref()), from_commit.as_deref()) {
         (Some(head), Some(from)) if head != from => git::changes(&o.dir, from, head),
         _ => HashMap::new(),
@@ -673,9 +753,10 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         commit_error: None,
     });
 
-    if !report.stopped && !o.dry_run {
-        apply(&mut sides, &o, &plan, &base, &stored_rows, &heads, &changes, &key, from_commit.as_deref(), &mut report)?;
+    if !report.stopped && !report.stopped_by_rules && !o.dry_run {
+        apply(&mut sides, &o, &plan, &base, &stored_rows, &heads, &changes, &key, from_commit.as_deref(), &mut report, &rules)?;
     }
+    let rules_stop = report.stopped_by_rules && !o.dry_run;
 
     for list in [
         &mut report.to_disk.new,
@@ -691,7 +772,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     let commit_error = report.git.as_ref().and_then(|g| g.commit_error.clone());
     if json {
         emit_json(&report)?;
-        if report.stopped {
+        if report.stopped || rules_stop {
             std::process::exit(6);
         }
         if commit_error.is_some() {
@@ -709,6 +790,14 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             "sync stopped before writing anything: {blocking} {} cannot be written on this computer; rename {} in the store",
             if blocking == 1 { "name" } else { "names" },
             if blocking == 1 { "it" } else { "them" }
+        )));
+    }
+    if rules_stop {
+        let n = report.rules.as_ref().map_or(0, |r| r.newly_included.len());
+        return Err(StoreError::invalid(format!(
+            "sync stopped before writing anything: the include rules changed since the last sync, and {n} {} would be \
+             taken in that it left out (listed above). Pass --accept-rules to take them in, or list them in .textdbignore",
+            if n == 1 { "file" } else { "files" }
         )));
     }
     if let Some(e) = commit_error {
@@ -736,6 +825,7 @@ fn apply(
     key: &str,
     from_commit: Option<&str>,
     report: &mut Report,
+    rules: &Rules,
 ) -> Result<()> {
     let prefix = sides.prefix.clone();
     let dir = o.dir.as_path();
@@ -882,6 +972,7 @@ fn apply(
             remote: r.remote,
             clean: r.clean,
         }),
+        rules: serde_json::to_string(rules).ok(),
         files: rows.into_values().collect(),
     })
 }
@@ -943,6 +1034,14 @@ fn list(s: &mut String, label: &str, items: &[String]) {
 
 fn print_report(r: &Report) -> Result<()> {
     let mut s = String::new();
+    if let Some(rc) = &r.rules {
+        let before = match &rc.before {
+            Some(b) => b.describe(),
+            None => "not recorded (an older build, which skipped every hidden folder)".to_string(),
+        };
+        s.push_str(&format!("{:<15} include rules changed since the last sync: {before} -> {}\n", "rules", rc.now.describe()));
+        list(&mut s, "newly included", &rc.newly_included);
+    }
     list(&mut s, "disk new", &r.to_disk.new);
     list(&mut s, "disk changed", &r.to_disk.changed);
     list(&mut s, "disk deleted", &r.to_disk.deleted);
@@ -968,7 +1067,7 @@ fn print_report(r: &Report) -> Result<()> {
             s.push_str(&format!("{:<15} {}: {} (on {})\n", "warning", p.path, p.detail, on.join(", ")));
         }
     }
-    let verb = if r.stopped {
+    let verb = if r.stopped || (r.stopped_by_rules && !r.dry_run) {
         "nothing synced"
     } else if r.dry_run {
         "dry run, nothing written"

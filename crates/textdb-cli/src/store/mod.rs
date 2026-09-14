@@ -386,6 +386,8 @@ pub struct SyncBase {
     pub author: Option<String>,
     /// `None` when the directory is not in a git checkout.
     pub git: Option<GitState>,
+    /// The include rules the sync used, as JSON; `None` for a base an older build saved.
+    pub rules: Option<String>,
     #[serde(skip)]
     pub files: Vec<BaseFile>,
 }

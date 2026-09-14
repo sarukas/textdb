@@ -58,9 +58,10 @@ CREATE TABLE IF NOT EXISTS kb.sync_file (
   version bigint, blob text NOT NULL, disk_size bigint, disk_mtime bigint,
   conflict boolean NOT NULL DEFAULT false,
   PRIMARY KEY (sync_id, rel)
-);";
+);
+ALTER TABLE kb.sync ADD COLUMN IF NOT EXISTS rules text;";
 
-const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at::text, author, git_commit, git_branch, git_remote, git_clean";
+const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at::text, author, git_commit, git_branch, git_remote, git_clean, rules";
 
 fn sync_row(r: &Row) -> (i64, SyncBase) {
     let clean: Option<bool> = r.get(9);
@@ -78,6 +79,7 @@ fn sync_row(r: &Row) -> (i64, SyncBase) {
                 remote: r.get(8),
                 clean,
             }),
+            rules: r.get(10),
             files: Vec::new(),
         },
     )
@@ -707,12 +709,12 @@ impl Store for PgStore {
         let mut tx = self.client.transaction().map_err(pg)?;
         let id: i64 = tx
             .query_one(
-                "INSERT INTO kb.sync(prefix, dir, seq, author, git_commit, git_branch, git_remote, git_clean) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                "INSERT INTO kb.sync(prefix, dir, seq, author, git_commit, git_branch, git_remote, git_clean, rules) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
                  ON CONFLICT (prefix, dir) DO UPDATE SET seq = excluded.seq, synced_at = now(), author = excluded.author, \
                  git_commit = excluded.git_commit, git_branch = excluded.git_branch, git_remote = excluded.git_remote, \
-                 git_clean = excluded.git_clean RETURNING id",
-                &[&base.prefix, &base.dir, &base.seq, &base.author, &commit, &branch, &remote, &clean],
+                 git_clean = excluded.git_clean, rules = excluded.rules RETURNING id",
+                &[&base.prefix, &base.dir, &base.seq, &base.author, &commit, &branch, &remote, &clean, &base.rules],
             )
             .map_err(pg)?
             .get(0);

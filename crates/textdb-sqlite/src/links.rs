@@ -209,6 +209,22 @@ impl<'c> TextDb<'c> {
         found.sort();
         found.dedup();
         if found.is_empty() {
+            // A link to a folder (`[[accounts/acme/projects/]]`) is not a broken link to a file.
+            let folders = [join(folder, target), join("/", target)];
+            for f in folders.iter().flatten() {
+                let is_folder: bool = self
+                    .conn
+                    .prepare_cached(&format!(
+                        "SELECT count(*) > 0 FROM {}node WHERE kind = 0 AND deleted_at IS NULL AND lower(path) = lower(?1)",
+                        self.p
+                    ))
+                    .map_err(sql_err)?
+                    .query_row(params![f], |r| r.get(0))
+                    .map_err(sql_err)?;
+                if is_folder && f != "/" {
+                    return Ok((None, "folder"));
+                }
+            }
             let ext = target.rsplit('/').next().and_then(|n| n.rsplit_once('.')).map(|(_, e)| e.to_ascii_lowercase());
             let status = if ext.is_some_and(|e| NOT_TEXT.contains(&e.as_str())) { "not-in-store" } else { "broken" };
             return Ok((None, status));
