@@ -79,7 +79,9 @@ struct Disk {
 }
 
 impl Disk {
-    fn read(dir: &Path) -> Result<Disk> {
+    /// The files below `dir`, by the store path they have in the folder `prefix` it holds.
+    fn read(dir: &Path, prefix: &str) -> Result<Disk> {
+        let base = if prefix == "/" { String::new() } else { prefix.to_lowercase() };
         let mut disk = Disk { paths: HashSet::new(), names: HashSet::new() };
         let mut stack = vec![dir.to_path_buf()];
         while let Some(d) = stack.pop() {
@@ -91,7 +93,7 @@ impl Disk {
                         stack.push(entry.path());
                     }
                 } else if let Ok(rel) = entry.path().strip_prefix(dir) {
-                    disk.paths.insert(format!("/{}", rel.to_string_lossy().replace('\\', "/")).to_lowercase());
+                    disk.paths.insert(format!("{base}/{}", rel.to_string_lossy().replace('\\', "/")).to_lowercase());
                     disk.names.insert(name.to_lowercase());
                 }
             }
@@ -116,10 +118,29 @@ impl Disk {
 }
 
 pub fn links(st: &mut dyn Store, path: &str, broken: bool, dir: Option<&Path>, json: bool) -> Result<()> {
-    let mut rows = st.links(path, if broken { BROKEN } else { &[] })?;
+    // With a directory, links to assets whose files are not there are broken too.
+    let statuses: Vec<&str> = match (broken, dir.is_some()) {
+        (true, true) => BROKEN.iter().copied().chain(["ok", "ambiguous"]).collect(),
+        (true, false) => BROKEN.to_vec(),
+        (false, _) => Vec::new(),
+    };
+    let mut rows = st.links(path, &statuses)?;
     if let Some(dir) = dir {
-        let disk = Disk::read(dir)?;
-        rows.retain(|l| l.status.as_deref() != Some("not-in-store") || !disk.has(l));
+        // The directory holds the store folder it was last synced with, else the whole store.
+        let prefix = crate::assets::synced_prefix(st, dir)?.unwrap_or_else(|| "/".to_string());
+        let disk = Disk::read(dir, &prefix)?;
+        rows.retain_mut(|l| match l.status.as_deref() {
+            Some("not-in-store") => !disk.has(l),
+            Some("ok" | "ambiguous") if l.asset => {
+                let missing = l.resolved.as_ref().is_some_and(|r| !disk.paths.contains(&r.to_lowercase()));
+                if missing {
+                    l.status = Some("not-pulled".to_string());
+                }
+                missing || !broken
+            }
+            Some("ok" | "ambiguous") => !broken,
+            _ => true,
+        });
     }
     if json {
         return emit_json(&rows);

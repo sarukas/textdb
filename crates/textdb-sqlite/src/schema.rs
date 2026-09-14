@@ -169,6 +169,15 @@ CREATE TABLE IF NOT EXISTS {p}sync_file (
   conflict   INTEGER NOT NULL DEFAULT 0,    -- 1: conflict markers were written to the file on disk
   PRIMARY KEY (sync_id, rel)
 ) WITHOUT ROWID;
+-- Asset stores (docs/assets.md): where the bytes of assets are kept. Each computer binds a store
+-- to where it reaches it (a folder, an rclone remote); `root` is the store-side identity.
+CREATE TABLE IF NOT EXISTS {p}asset_store (
+  name       TEXT PRIMARY KEY,
+  driver     TEXT NOT NULL,                 -- local, rclone
+  root       TEXT NOT NULL,
+  options    TEXT,                          -- JSON, driver specific
+  created_at TEXT NOT NULL
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS {p}fts USING fts5(text, content='', tokenize='unicode61');
 "#,
         p = p
@@ -268,7 +277,7 @@ pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> 
 pub fn drop_sql(p: &str) -> String {
     [
         "node", "commit", "chunk", "tree_node", "chunk_ref", "section", "link", "frontmatter", "checkpoint", "change", "path_event",
-        "setting", "file_author", "sync", "sync_file", "fts",
+        "setting", "file_author", "sync", "sync_file", "asset_store", "fts",
     ]
     .iter()
     .map(|t| format!("DROP TABLE IF EXISTS {}{};", p, t))

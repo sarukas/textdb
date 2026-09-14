@@ -169,6 +169,13 @@ CREATE TABLE kb.sync_file (
   conflict boolean NOT NULL DEFAULT false,
   PRIMARY KEY (sync_id, rel)
 );
+-- Asset stores (docs/assets.md): where the bytes of assets are kept. Each computer binds a store
+-- to where it reaches it (a folder, an rclone remote); `root` is the store-side identity. The CLI
+-- also creates this IF NOT EXISTS.
+CREATE TABLE kb.asset_store (
+  name text PRIMARY KEY, driver text NOT NULL, root text NOT NULL, options text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
 
 -- Custom SQLSTATEs (spec §7.2): TX001 conflict, TX002 contention, TX003 not found, TX004 invalid edit.
 CREATE FUNCTION kb._raise(code text, msg text, detail text) RETURNS void LANGUAGE plpgsql AS $$

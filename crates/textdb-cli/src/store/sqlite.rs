@@ -44,10 +44,11 @@ impl SqliteStore {
                     alias: r.get(5)?,
                     status: r.get(6)?,
                     resolved: r.get(7)?,
+                    asset: false,
                 })
             })
             .map_err(sql)?;
-        rows.collect::<rusqlite::Result<_>>().map_err(sql)
+        rows.map(|r| r.map(super::asset_link)).collect::<rusqlite::Result<_>>().map_err(sql)
     }
 }
 
@@ -377,7 +378,7 @@ impl Store for SqliteStore {
         self.link_rows(
             &format!(
                 "l.target_path <> '' AND l.resolved_id IN (SELECT id FROM {DEFAULT_PREFIX}node WHERE kind = 1 AND deleted_at IS NULL \
-                 AND (path = ?1 OR (path >= ?2 AND path < ?3)))"
+                 AND (path = ?1 OR path = ?1 || '.tdbasset' OR (path >= ?2 AND path < ?3)))"
             ),
             [path, lo, hi],
         )
@@ -647,6 +648,61 @@ impl Store for SqliteStore {
         Ok(result)
     }
 
+    fn all_sync_bases(&mut self) -> Result<Vec<SyncBase>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!("SELECT {SYNC_COLS} FROM {DEFAULT_PREFIX}sync ORDER BY synced_at DESC"))
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([], sync_row)
+            .map_err(sql)?
+            .map(|r| r.map(|(_, base)| base))
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql)?;
+        Ok(rows)
+    }
+
+    fn asset_stores(&mut self) -> Result<Vec<super::AssetStore>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!("SELECT name, driver, root, options, created_at FROM {DEFAULT_PREFIX}asset_store ORDER BY name"))
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(super::AssetStore {
+                    name: r.get(0)?,
+                    driver: r.get(1)?,
+                    root: r.get(2)?,
+                    options: r.get(3)?,
+                    created_at: r.get(4)?,
+                })
+            })
+            .map_err(sql)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql)
+    }
+
+    fn put_asset_store(&mut self, s: &super::AssetStore) -> Result<()> {
+        self.conn
+            .execute(
+                &format!(
+                    "INSERT INTO {DEFAULT_PREFIX}asset_store(name, driver, root, options, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+                     ON CONFLICT(name) DO UPDATE SET driver = excluded.driver, root = excluded.root, options = excluded.options"
+                ),
+                rusqlite::params![s.name, s.driver, s.root, s.options],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    fn remove_asset_store(&mut self, name: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute(&format!("DELETE FROM {DEFAULT_PREFIX}asset_store WHERE name = ?1"), [name])
+            .map_err(sql)?
+            > 0)
+    }
+
     fn revert_batch(&mut self, batch: &str, author: Option<&str>, skip_changed: bool, dry_run: bool) -> Result<RevertOutcome> {
         let id = new_batch_id(&self.conn)?;
         self.conn.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
@@ -759,7 +815,9 @@ fn sql_views(p: &str) -> String {
            SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to
            FROM {p}section s JOIN {p}node n ON n.id = s.file_id AND n.deleted_at IS NULL;
          CREATE TEMP VIEW IF NOT EXISTS links AS
-           SELECT n.path, l.target_path AS target, l.line, l.kind, l.anchor, l.alias, l.status, r.path AS resolved
+           SELECT n.path, l.target_path AS target, l.line, l.kind, l.anchor, l.alias, l.status,
+                  CASE WHEN r.path LIKE '%.tdbasset' THEN substr(r.path, 1, length(r.path) - 9) ELSE r.path END AS resolved,
+                  r.path LIKE '%.tdbasset' AS asset
            FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL
            LEFT JOIN {p}node r ON r.id = l.resolved_id AND r.deleted_at IS NULL;
          CREATE TEMP VIEW IF NOT EXISTS commits AS

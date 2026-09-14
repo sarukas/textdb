@@ -312,6 +312,64 @@ fn sql_bulk_edits_dry_runs_batches_and_revert() {
 }
 
 #[test]
+fn assets_push_pull_verify_and_links() {
+    let Some(db) = database() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let vault = tmp.path().join("vault");
+    let bucket = tmp.path().join("bucket");
+    let config = tmp.path().join("config");
+    for d in ["notes", "img", "docs"] {
+        std::fs::create_dir_all(vault.join(d)).unwrap();
+    }
+    std::fs::create_dir_all(&bucket).unwrap();
+    std::fs::write(vault.join("notes/a.md"), "![[arch.png]]\n[deck](../docs/deck.pdf)\n").unwrap();
+    std::fs::write(vault.join("img/arch.png"), [137u8, 80, 78, 71, 0, 1]).unwrap();
+    std::fs::write(vault.join("docs/deck.pdf"), b"%PDF-1.4 one").unwrap();
+    let dir = vault.to_str().unwrap();
+    let t = |args: &[&str]| {
+        let mut c = textdb(&db);
+        c.env("TEXTDB_CONFIG_DIR", &config).args(args);
+        c
+    };
+    let status = || ok(&mut t(&["--json", "assets", "status"]), None).json();
+    let first = run(&mut t(&["--json", "sync", "/", dir]), None);
+    assert_eq!(first.status, 0, "{}", first.stderr);
+    assert_eq!(status()["counts"], serde_json::json!({ "new": 2 }));
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", bucket.to_str().unwrap()]), None);
+
+    let pushed = ok(&mut t(&["--json", "assets", "push", "-m", "first assets"]), None).json();
+    assert_eq!(pushed["pushed"].as_array().unwrap().len(), 2, "{pushed}");
+    let pointer = std::fs::read_to_string(vault.join("img/arch.png.tdbasset")).unwrap();
+    assert_eq!(ok(&mut t(&["cat", "/img/arch.png.tdbasset"]), None).stdout, pointer);
+    let links = ok(&mut t(&["--json", "links", "/notes/a.md"]), None).json();
+    assert_eq!(
+        (links[0]["status"].as_str(), links[0]["resolved"].as_str(), links[0]["asset"].as_bool()),
+        (Some("ok"), Some("/img/arch.png"), Some(true)),
+        "{links}"
+    );
+    let view = ok(&mut t(&["--json", "sql", "SELECT resolved, asset FROM links WHERE kind = 'md'"]), None).json();
+    assert_eq!(view["rows"][0], serde_json::json!({ "resolved": "/docs/deck.pdf", "asset": true }), "{view}");
+    assert_eq!(ok(&mut t(&["--json", "backlinks", "/docs/deck.pdf"]), None).json().as_array().unwrap().len(), 1);
+    let again = run(&mut t(&["--json", "sync", "/", dir]), None);
+    assert_eq!(again.status, 0, "{}", again.stdout);
+
+    std::fs::write(vault.join("img/arch.png"), [137u8, 80, 78, 71, 0, 2, 3]).unwrap();
+    ok(&mut t(&["assets", "push", "/img"]), None);
+    let pointer2 = std::fs::read_to_string(vault.join("img/arch.png.tdbasset")).unwrap();
+    let id = |p: &str| p.lines().find_map(|l| l.strip_prefix("id: ")).unwrap().to_string();
+    assert_eq!(id(&pointer2), id(&pointer));
+
+    std::fs::remove_file(vault.join("docs/deck.pdf")).unwrap();
+    assert_eq!(status()["counts"], serde_json::json!({ "not-pulled": 1, "ok": 1 }));
+    ok(&mut t(&["assets", "pull"]), None);
+    assert_eq!(std::fs::read(vault.join("docs/deck.pdf")).unwrap(), b"%PDF-1.4 one");
+    assert_eq!(ok(&mut t(&["--json", "assets", "verify"]), None).json()["problems"], 0);
+    ok(&mut t(&["mv", "--update-links", "/docs/deck.pdf.tdbasset", "/archive/deck.pdf.tdbasset"]), None);
+    assert_eq!(ok(&mut t(&["cat", "/notes/a.md"]), None).stdout, "![[arch.png]]\n[deck](../archive/deck.pdf)\n");
+    assert_eq!(ok(&mut t(&["--json", "assets", "stores"]), None).json()[0]["name"], "team");
+}
+
+#[test]
 fn sync_reconciles_both_sides_merges_and_marks_conflicts() {
     let Some(db) = database() else { return };
     let tmp = tempfile::tempdir().unwrap();

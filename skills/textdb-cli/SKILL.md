@@ -92,7 +92,7 @@ textdb --json sql 'SELECT path, nwords FROM files ORDER BY nwords DESC LIMIT 10'
 | `folders` | `path, name, parent, depth, files, folders, nbytes, nwords, versions, updated_at` (totals below) |
 | `frontmatter` | `path, data` — YAML front matter as JSON: `json_extract(data, '$.key')`, `json_each(data, '$.list')` |
 | `sections` | `path, heading` (`Title / Section`), `level, line_from, line_to` — feed `line_from` to `cat --lines` |
-| `links` | `path, target` (without `#anchor`/`|alias`), `line, kind` (`wiki`, `embed`, `md`, `image`), `anchor, alias, status` (`ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store`, `external`), `resolved` (the file it points to) |
+| `links` | `path, target` (without `#anchor`/`|alias`), `line, kind` (`wiki`, `embed`, `md`, `image`), `anchor, alias, status` (`ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store`, `external`), `resolved` (the file it points to; for an asset, the asset's path), `asset` (it resolves to an asset's pointer) |
 | `commits` | `path, version, author, ts, message, kind, batch` |
 | `authors` | `path, author, commits, first_ts, last_ts` |
 
@@ -250,6 +250,20 @@ textdb mv guides/a.md guides/b.md --update-links   # also rewrite the links that
 
 Without `--update-links`, `mv` lists the links it leaves pointing at the old place (unless the
 store's `link_updates` setting is `rewrite` or `off`); `rm` lists the links it breaks.
+
+Binaries (images, PDFs, office files) are assets: their bytes are in an asset store and a pointer
+document `NAME.tdbasset` sits where the file belongs. Links to them resolve to the pointer
+(`asset: true`, `resolved` is the asset's own path). Work with them through `assets`, never by
+editing a `.tdbasset` file:
+
+```sh
+textdb assets status guides                 # ok / new / modified / not-pulled for the synced directory
+textdb assets push guides -m "diagrams"     # upload new and changed files, then commit their pointers
+textdb assets pull --linked-from guides/api # fetch the files those notes link to
+textdb assets verify guides                 # exit 1 if a hash does not match here or in the asset store
+```
+
+Exit 3 from `assets push` means a pointer changed in the store meanwhile: `sync`, then push again.
 
 ## Reorganise
 

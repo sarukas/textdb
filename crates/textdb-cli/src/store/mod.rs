@@ -191,8 +191,20 @@ pub struct LinkRow {
     pub alias: Option<String>,
     /// `ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store` or `external`.
     pub status: Option<String>,
-    /// The file it points to.
+    /// The file it points to; for an asset, the asset (its pointer is that with `.tdbasset`).
     pub resolved: Option<String>,
+    /// It resolves to an asset.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub asset: bool,
+}
+
+/// A link row as a store holds it, with a link to an asset's pointer shown as the asset.
+pub fn asset_link(mut l: LinkRow) -> LinkRow {
+    if let Some(r) = l.resolved.clone().filter(|r| crate::assets::pointer::is_asset_pointer(r)) {
+        l.resolved = Some(crate::assets::pointer::asset_path(&r).to_string());
+        l.asset = true;
+    }
+    l
 }
 
 /// Lines `from..=to` (1-based) as numbered in the base version become `text`; `to = from - 1`
@@ -524,7 +536,17 @@ pub trait Store {
     fn sql(&mut self, query: &str, params: &[String], author: Option<&str>, write: bool, dry_run: bool) -> Result<SqlResult>;
     /// Undo the changes recorded under `batch`; with `dry_run`, only report what that would do.
     fn revert_batch(&mut self, batch: &str, author: Option<&str>, skip_changed: bool, dry_run: bool) -> Result<RevertOutcome>;
+    /// Every sync base, newest first, without their files.
+    fn all_sync_bases(&mut self) -> Result<Vec<SyncBase>>;
+    /// The asset stores declared in this store, by name.
+    fn asset_stores(&mut self) -> Result<Vec<AssetStore>>;
+    /// Declare an asset store, or change the one of that name.
+    fn put_asset_store(&mut self, store: &AssetStore) -> Result<()>;
+    /// Remove an asset store's declaration; `false` when there was none.
+    fn remove_asset_store(&mut self, name: &str) -> Result<bool>;
 }
+
+pub use crate::assets::driver::AssetStore;
 
 pub fn open(store: &str) -> Result<Box<dyn Store>> {
     Ok(match parse_store(store) {

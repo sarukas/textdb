@@ -66,21 +66,30 @@ item: 1AbCdEf…
 - `id`: UUIDv7, assigned at first push, never reused; survives rename, move and content change.
 - `sha256`: of the raw bytes. `size`: bytes. `type`: media type from the extension.
 - `store`: the name of an asset store configured in the textdb store. `item`: the provider's
-  stable item id (absent for a local-folder store, whose items are addressed by path).
+  stable item id; for a local-folder store, the store path the bytes were put at, so a pointer
+  moved in the store still finds them until a push or stage 2's sync moves them too.
 - Later stages add provider metadata lines (`provider-hash`, `provider-version`) for cheap
   change detection; they are not part of identity.
 - The real file is the pointer's path without `.tdbasset`. The pointer changes only when the
   bytes (or where they are kept) change, so its version history is the asset's history, in
   textdb and in git.
 
-States of an asset in a vault:
+States of an asset in a vault. What the directory last had of each asset (the sha256 it pushed,
+pulled or found matching the pointer) is remembered per vault, and tells a file changed here
+from a pointer changed elsewhere:
 
 | Pointer | Real file | State |
 |---|---|---|
 | yes | same sha256 | `ok` |
-| yes | missing | `not-pulled` |
-| yes | different bytes | `modified` (push to publish) |
-| no | present, classified asset | `new` (push to publish) |
+| yes | missing | `not-pulled` (pull fetches it) |
+| yes | changed since this directory had the pointer's bytes | `modified` (push publishes it) |
+| yes | what this directory last had; the pointer names newer bytes | `outdated` (pull replaces it, the old copy kept in `.textdb/trash/`) |
+| yes | other bytes, not what this directory last had | `conflict` (`push --force` replaces the store's copy; or move it aside and pull) |
+| no | present, classified asset | `new` (push publishes it) |
+
+A file whose name differs from a pointer's only in case is that asset (on Windows and macOS it
+is the same file); a second file differing only in case is a `conflict`. A pointer whose path
+cannot be a file on every system is `invalid-path`.
 
 ## Which files are documents, assets or ignored
 
@@ -113,11 +122,20 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
 - Store table `asset_store(name, driver, root, options)`: `driver` ∈ `local`, `rclone`; `root` is
   the store-side identity (a folder, or an rclone remote path such as `teamdrive:textdb`).
 - Machine binding, because the same shared drive is mounted or configured differently per user:
-  environment `TEXTDB_ASSET_STORE_<NAME>` or the config file, e.g. a local path
-  `G:\Shared drives\Team\textdb` or an rclone remote name. `textdb config` shows it.
+  environment `TEXTDB_ASSET_STORE_<NAME>` (name upper case, other characters `_`), else
+  `asset-stores.json` in the config directory (`TEXTDB_CONFIG_DIR`, else `%APPDATA%\textdb`,
+  `$XDG_CONFIG_HOME/textdb` or `~/.config/textdb`), written by
+  `textdb assets stores --bind NAME=G:\Shared drives\Team\textdb`. A local store without a
+  binding uses its root when that is an absolute path. `textdb assets stores` shows each binding
+  and whether the store is reachable.
 - Layout: the asset at store path `/accounts/acme/arch.png` is kept at `<root>/accounts/acme/arch.png`.
 - **local driver**: plain filesystem operations (works for a NAS, a USB disk, and Google Drive for
-  Desktop / OneDrive clients in mirror mode). Item = path.
+  Desktop / OneDrive clients in mirror mode). Item = path. Copies go through a hidden partial file
+  (`.NAME.PID.tdbpart`), flushed and renamed into place, and are hashed after the copy; bytes a
+  push replaces move to `<root>/.textdb-trash/<yyyymmdd-HHMMSS>/…`.
+- Hashes of local files are cached per vault in the config directory (`cache/assets-*.json`), by
+  size and modification time, and only for files not modified in the last two seconds; `verify`
+  never uses the cache.
 - **rclone driver** (stage 3): runs `rclone` (a single native executable on Windows, macOS and
   Linux) for copy, move, delete (to the provider's trash) and listing with hashes and item ids.
   Google shared drives report SHA-256; SharePoint only its QuickXorHash and rewrites Office files
@@ -129,16 +147,33 @@ What a vault last saw of each asset (to tell a local edit from a remote one) is 
 ## Commands
 
 ```
-textdb assets stores                               list asset stores; add/remove with --add/--remove
-textdb assets status [PATH] [--dir DIR]            ok / not-pulled / modified / new / missing-in-store
-textdb assets push [PATH…] [--dir DIR] [-m MSG]    upload new and modified files, then commit pointers
-textdb assets pull [PATH…] [--linked-from PATH] [--dir DIR]   download what pointers name, verify, put in place
-textdb assets verify [PATH] [--dir DIR]            hash local files and check the asset store has the bytes
-textdb assets gitignore [--dir DIR]                write the managed .gitignore block
-textdb assets migrate-from-git [--dir DIR] [--dry-run]   push git-tracked binaries, git rm --cached, commit
+textdb assets stores [--add NAME [--driver local|rclone] --root ROOT] [--remove NAME] [--bind NAME=LOCATION]
+textdb assets status [PATH] [--dir DIR]            ok / new / modified / not-pulled / invalid-pointer
+textdb assets push [PATH…] [--dir DIR] [--to NAME] [-m MSG] [--dry-run]   upload, verify, then commit pointers
+textdb assets pull [PATH…] [--linked-from PATH] [--dir DIR] [--dry-run]   download, check the hash, put in place
+textdb assets verify [PATH] [--dir DIR]            hash local files and the asset store's copies (exit 1 on problems)
+textdb assets gitignore [PATH] [--dir DIR] [--dry-run]   write the managed .gitignore block
+textdb assets migrate-from-git [--dir DIR] [--dry-run]   push git-tracked binaries, git rm --cached, commit (stage 2)
 ```
 
-`DIR` defaults to the directory a store folder was last synced with. Store-side namespace
+`DIR` defaults to the directory a store folder was last synced with; with `--dir`, `PATH` must be
+in the folder that directory was synced with, and only a directory never synced takes `PATH` as
+the store folder it holds. `push` publishes `new` and `modified` assets (`conflict` ones too with
+`--force`), refuses an asset whose pointer on disk differs from the store's (sync first) or whose
+pointer changed in the store during the push, exits 3 when something was left for a conflict,
+keeps an asset's id when its bytes change, and records the pointers it wrote in the directory's
+sync base, as sync would. One asset failing does not stop the others. `pull` fetches `not-pulled`
+and `outdated` assets, leaves `modified` and `conflict` files alone, and never puts bytes whose
+hash differs from the pointer in place. `verify` counts an asset store it cannot reach as a
+problem.
+
+Which files are candidates at all: besides the rules above, textdb's own and system files are
+never assets — `.git`, `.textdb`, `.trash`, `.textdb-trash`, `.obsidian`, `node_modules`, OS
+folders, `kb.db*`, `.DS_Store`, `._*` AppleDouble files, `~$*` and `.~lock.*` lock files, and
+partial downloads (`.crdownload`, `.part`, `.tmp`, …). Git's `binary` marks a file nothing else
+decides as an asset; `-text` does not. The managed `.gitignore` block is written first in the
+file, so the user's own lines after it take precedence, and it keeps directories matched by asset
+rules visible so the pointers inside them stay in git. Store-side namespace
 operations take the asset's real path: `textdb mv /a/arch.png /b/arch.png` moves the pointer (and
 records the intent); the next sync or push moves the real file on disk and the item in the asset
 store. `textdb rm` deletes the pointer; sync moves the real file to `.textdb/trash/`, push moves the
@@ -167,8 +202,14 @@ The folder-move carry and `left behind` report stay for files textdb ignores.
 ## Links
 
 A link target that is not a document resolves to `<target>.tdbasset` when that pointer exists:
-status `ok`, `resolved` = the real path, kind `asset`. `links --broken --dir` also reports
-`not-pulled` for assets whose real file is missing. Link rewriting on moves covers assets.
+status `ok` (or `ambiguous`), `resolved` = the real path and `asset: true` (the `links` SQL view
+has the same `resolved` and an `asset` column); the kind stays as written, and an anchor
+(`#page=3`) is not checked as a heading. `backlinks` takes the asset's path. `links --broken --dir`
+also reports `not-pulled` for assets whose real file is missing. Link rewriting on moves covers
+assets and writes the asset's name, never the pointer's.
+
+Until stage 2 pairs them, sync carries pointer files like any document (they are eligible whatever
+`--ext` says, and are not part of the recorded include rules), and leaves real files alone.
 
 ## Stages
 

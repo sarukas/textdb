@@ -6,8 +6,29 @@
 //! nearest is taken), `anchor-missing` (the file has no such heading), `folder`, `broken`,
 //! `not-in-store` (a PDF, image or other file a text store does not hold) and `external` (URLs,
 //! email addresses, queries, numbered references).
+//!
+//! An asset (a binary kept in an asset store, see `docs/assets.md`) is held as a pointer document
+//! next to where the file belongs: `deck.pdf` as `deck.pdf.tdbasset`. A link that finds no
+//! document resolves to the pointer of that name, as `ok`.
 
 use textdb_core::TextdbError;
+
+/// The suffix of an asset's pointer document: the pointer of `deck.pdf` is `deck.pdf.tdbasset`.
+pub const ASSET_POINTER_SUFFIX: &str = ".tdbasset";
+
+/// Whether `path` names an asset pointer.
+pub fn is_asset_pointer(path: &str) -> bool {
+    path.len() > ASSET_POINTER_SUFFIX.len() && path.is_char_boundary(path.len() - ASSET_POINTER_SUFFIX.len()) && path[path.len() - ASSET_POINTER_SUFFIX.len()..].eq_ignore_ascii_case(ASSET_POINTER_SUFFIX)
+}
+
+/// The file a pointer stands for (`/a/deck.pdf.tdbasset` → `/a/deck.pdf`); any other path as it is.
+pub fn asset_path(path: &str) -> &str {
+    if is_asset_pointer(path) {
+        &path[..path.len() - ASSET_POINTER_SUFFIX.len()]
+    } else {
+        path
+    }
+}
 
 /// The store setting deciding what a move does to links pointing at what moved.
 pub const LINK_UPDATES_SETTING: &str = "link_updates";
@@ -71,9 +92,9 @@ pub fn parent(path: &str) -> &str {
     }
 }
 
-/// A file name as links find it: lower case, without `.md`.
+/// A file name as links find it: lower case, without `.md`; a pointer as the name of its asset.
 pub fn name_key(path_or_name: &str) -> String {
-    let last = path_or_name.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_lowercase();
+    let last = asset_path(path_or_name.trim_end_matches('/')).rsplit('/').next().unwrap_or("").to_lowercase();
     last.strip_suffix(".md").map(str::to_string).unwrap_or(last)
 }
 
@@ -148,6 +169,43 @@ pub fn resolve(
         });
     }
     let folder = parent(source);
+    let mut found = candidates(l, kind, folder, target, variants)?;
+    // No document: the pointer of an asset by that name.
+    let asset = found.is_empty() && !target.to_ascii_lowercase().ends_with(".md") && {
+        found = candidates(l, kind, folder, target, |p| vec![format!("{p}{ASSET_POINTER_SUFFIX}")])?;
+        !found.is_empty()
+    };
+    if found.is_empty() {
+        // A link to a folder (`[[accounts/acme/projects/]]`) is not a broken link to a file.
+        for f in [join(folder, target), join("/", target)].iter().flatten() {
+            if f != "/" && l.is_folder(f)? {
+                return Ok((None, "folder"));
+            }
+        }
+        let ext = target.rsplit('/').next().and_then(|n| n.rsplit_once('.')).map(|(_, e)| e.to_ascii_lowercase());
+        let status = if ext.is_some_and(|e| NOT_TEXT.contains(&e.as_str())) { "not-in-store" } else { "broken" };
+        return Ok((None, status));
+    }
+    let several = found.len() > 1;
+    // The exact spelling first, then the linking note's folder, then the shortest path.
+    found.sort_by_key(|(_, p)| {
+        let p = asset_path(p);
+        let exact = p.ends_with(target) || p.ends_with(&format!("{target}.md"));
+        (!exact, parent(p) != folder, p.len(), p.to_string())
+    });
+    let id = found[0].0;
+    // An asset's anchor (`#page=3`) is not a heading.
+    if let (Some(a), false) = (anchor, asset) {
+        if !anchor_exists(l, id, a)? {
+            return Ok((Some(id), "anchor-missing"));
+        }
+    }
+    Ok((Some(id), if several { "ambiguous" } else { "ok" }))
+}
+
+/// The live files a link of `kind` written in `folder` to `target` could mean, each spelling of a
+/// path given by `variants`.
+fn candidates(l: &impl Lookup, kind: &str, folder: &str, target: &str, variants: impl Fn(&str) -> Vec<String>) -> Result<Vec<(i64, String)>, TextdbError> {
     let mut found: Vec<(i64, String)> = Vec::new();
     let by_path = |found: &mut Vec<(i64, String)>, p: Option<String>| -> Result<(), TextdbError> {
         for v in p.map(|p| variants(&p)).unwrap_or_default() {
@@ -177,36 +235,15 @@ pub fn resolve(
     }
     found.sort();
     found.dedup();
-    if found.is_empty() {
-        // A link to a folder (`[[accounts/acme/projects/]]`) is not a broken link to a file.
-        for f in [join(folder, target), join("/", target)].iter().flatten() {
-            if f != "/" && l.is_folder(f)? {
-                return Ok((None, "folder"));
-            }
-        }
-        let ext = target.rsplit('/').next().and_then(|n| n.rsplit_once('.')).map(|(_, e)| e.to_ascii_lowercase());
-        let status = if ext.is_some_and(|e| NOT_TEXT.contains(&e.as_str())) { "not-in-store" } else { "broken" };
-        return Ok((None, status));
-    }
-    let several = found.len() > 1;
-    // The exact spelling first, then the linking note's folder, then the shortest path.
-    found.sort_by_key(|(_, p)| {
-        let exact = p.ends_with(target) || p.ends_with(&format!("{target}.md"));
-        (!exact, parent(p) != folder, p.len(), p.clone())
-    });
-    let id = found[0].0;
-    if let Some(a) = anchor {
-        if !anchor_exists(l, id, a)? {
-            return Ok((Some(id), "anchor-missing"));
-        }
-    }
-    Ok((Some(id), if several { "ambiguous" } else { "ok" }))
+    Ok(found)
 }
 
 /// How to write a link's target again, in the style `raw` was written, for a link in `source` to
 /// the file now at `target`: bare names while they stay unique, vault paths, relative markdown
 /// paths, `.md` kept or left out as before, `%20` in markdown links unless in `<…>`.
 pub fn rewritten_target(l: &impl Lookup, kind: &str, raw: &str, angle: bool, source: &str, target: &str) -> Result<String, TextdbError> {
+    // A link to an asset names the file, not its pointer.
+    let target = asset_path(target);
     let keep_md = raw.to_ascii_lowercase().ends_with(".md");
     let strip = |p: &str| if keep_md { p.to_string() } else { p.strip_suffix(".md").unwrap_or(p).to_string() };
     let folder = parent(source);
@@ -214,7 +251,7 @@ pub fn rewritten_target(l: &impl Lookup, kind: &str, raw: &str, angle: bool, sou
         "wiki" | "embed" => {
             if !raw.contains('/') {
                 let name = target.rsplit('/').next().unwrap_or(target);
-                if l.files_by_name(name)?.len() <= 1 {
+                if l.files_by_name(name)?.len() + l.files_by_name(&format!("{name}{ASSET_POINTER_SUFFIX}"))?.len() <= 1 {
                     strip(name)
                 } else {
                     strip(&target[1..])
@@ -290,6 +327,26 @@ mod tests {
         assert_eq!(rewritten_target(&files, "wiki", "Deck", false, "/acc/acme.md", "/solo/Deck.md").unwrap(), "Deck");
         assert_eq!(rewritten_target(&files, "wiki", "Plan", false, "/acc/acme.md", "/notes/Plan.md").unwrap(), "notes/Plan");
         assert_eq!(rewritten_target(&files, "md", "../x.md", false, "/acc/acme.md", "/a b/Plan.md").unwrap(), "../a%20b/Plan.md");
+    }
+
+    #[test]
+    fn links_to_assets_resolve_to_their_pointers() {
+        let files = Files(vec![(1, "/acc/acme.md"), (2, "/acc/deck.pdf.tdbasset"), (3, "/img/arch.png.tdbasset"), (4, "/other/arch.png.tdbasset")], vec![]);
+        let r = |kind, target, anchor| resolve(&files, 1, "/acc/acme.md", kind, target, anchor, false).unwrap();
+        assert_eq!(r("embed", "deck.pdf", None), (Some(2), "ok"));
+        assert_eq!(r("wiki", "deck.pdf", Some("page=3")), (Some(2), "ok"));
+        assert_eq!(r("md", "deck.pdf", None), (Some(2), "ok"));
+        assert_eq!(r("image", "../img/arch.png", None), (Some(3), "ok"));
+        assert_eq!(r("embed", "arch.png", None), (Some(3), "ambiguous"));
+        assert_eq!(r("embed", "img/arch.png", None), (Some(3), "ok"));
+        assert_eq!(r("embed", "missing.png", None), (None, "not-in-store"));
+        assert_eq!(r("wiki", "deck.pdf.md", None), (None, "broken"));
+        assert_eq!(name_key("/acc/Deck.PDF.tdbasset"), "deck.pdf");
+        assert_eq!(asset_path("/acc/deck.pdf.TDBASSET"), "/acc/deck.pdf");
+        assert_eq!(asset_path("/acc/deck.pdf"), "/acc/deck.pdf");
+        assert_eq!(rewritten_target(&files, "embed", "deck.pdf", false, "/acc/acme.md", "/arch/deck.pdf.tdbasset").unwrap(), "deck.pdf");
+        assert_eq!(rewritten_target(&files, "image", "deck.pdf", false, "/acc/acme.md", "/arch/deck.pdf.tdbasset").unwrap(), "../arch/deck.pdf");
+        assert_eq!(rewritten_target(&files, "embed", "arch.png", false, "/acc/acme.md", "/img/arch.png.tdbasset").unwrap(), "img/arch.png");
     }
 
     #[test]

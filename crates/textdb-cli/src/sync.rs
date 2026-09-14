@@ -116,11 +116,15 @@ fn has_markers(bytes: &[u8]) -> bool {
 }
 
 /// A directory as the sync base records it: absolute, without Windows' `\\?\` prefix.
-fn dir_key(dir: &Path) -> String {
+pub fn dir_key(dir: &Path) -> String {
     let abs = std::fs::canonicalize(dir)
         .or_else(|_| std::path::absolute(dir))
         .unwrap_or_else(|_| dir.to_path_buf());
     let s = abs.display().to_string();
+    // A share comes back as `\\?\UNC\server\share\…`: that is `\\server\share\…`.
+    if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{unc}");
+    }
     s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
 }
 
@@ -155,7 +159,9 @@ fn eligible(rel: &str, exts: &[String]) -> bool {
     if segs.iter().any(|s| SKIP_DIRS.contains(s)) {
         return false;
     }
-    exts.iter().any(|e| e == "*")
+    // Asset pointers are documents whatever the extensions (and are not part of the rules).
+    crate::assets::pointer::is_asset_pointer(name)
+        || exts.iter().any(|e| e == "*")
         || Path::new(name)
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
@@ -321,7 +327,7 @@ fn clear_read_only(path: &Path) -> bool {
 }
 
 /// The base row for `rel` as it now is on disk.
-fn base_row(root: &Path, rel: &str, version: Option<i64>, blob: String, conflict: bool) -> BaseFile {
+pub(crate) fn base_row(root: &Path, rel: &str, version: Option<i64>, blob: String, conflict: bool) -> BaseFile {
     let trusted = std::fs::metadata(root.join(rel))
         .ok()
         .map(|m| on_disk(&m))

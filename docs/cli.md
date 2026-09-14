@@ -289,6 +289,38 @@ git -C ~/src/handbook push
 branch, clean or not), what changed in the store since, and how the store compares with `HEAD`
 or `--rev REV`.
 
+## Assets: binaries next to the text
+
+Images, PDFs, office files and other binaries stay out of git and out of the store's text: their
+bytes live in an asset store (a shared folder, or a Google shared drive or SharePoint library
+through rclone), and each has a small pointer document `NAME.tdbasset` next to where the file
+belongs, versioned in the store and in git like any document. The design is in
+[assets.md](assets.md).
+
+```sh
+textdb assets stores --add team --root 'G:\Shared drives\Team\textdb'   # declared once, for everyone
+textdb assets stores --bind team='/Volumes/GoogleDrive/Shared drives/Team/textdb'   # where this computer reaches it
+textdb sync /handbook ~/src/handbook               # the vault: a directory synced with a folder
+textdb assets status /handbook                     # ok, new, modified, not-pulled
+textdb assets push /handbook -m "diagrams"         # upload and check the bytes, then commit the pointers
+textdb assets pull --linked-from /handbook/guides  # only what those notes link to
+textdb assets verify /handbook                     # every hash, here and in the asset store (exit 1 on problems)
+textdb assets gitignore /handbook                  # the managed .gitignore block: assets out, pointers in
+```
+
+- **Which files are assets:** images, PDF, office documents, archives, audio, video, fonts and
+  diagram files by default; the vault's `.gitattributes` decides with a `textdb` attribute
+  (`*.dat textdb=asset`, `*.svg textdb=document`, `*.log textdb=ignore`, `!textdb` for the
+  default), with git's rules for patterns and precedence. A file nothing decides is an asset when
+  it has a NUL byte in its first 8000 bytes.
+- **The directory** is the one the store folder was last synced with; `--dir DIR` names it.
+- **Links** to an asset resolve to its pointer: `links` shows the asset's path with `asset: true`,
+  `backlinks` takes the asset's path, `links --broken --dir DIR` lists assets not pulled into DIR,
+  and `mv --update-links` of a pointer rewrites the links to the asset.
+- **Safety:** a push replaces the asset store's copy only after moving it to the store's
+  `.textdb-trash`, and commits a pointer only once the uploaded copy's hash matches; a pull puts a
+  file in place only after its hash matches, and never replaces a file changed locally.
+
 ## Exit status
 
 | Status | Meaning | What to do |

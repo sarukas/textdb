@@ -25,6 +25,7 @@ use store::{Change, Commit, Entry, ImportStats, PathEvent, Store, StoreError, Wr
 
 type Result<T> = std::result::Result<T, StoreError>;
 
+mod assets;
 mod git;
 mod links;
 mod meta;
@@ -153,6 +154,13 @@ enum Cmd {
         /// Which of the commit's files count as missing from the store.
         #[arg(long, default_value = "md,markdown,mdx,txt")]
         ext: String,
+    },
+    /// Binaries (images, PDFs, office files …) kept in an asset store rather than in git, each with
+    /// a pointer document NAME.tdbasset where it belongs, versioned like any document. See
+    /// docs/assets.md.
+    Assets {
+        #[command(subcommand)]
+        op: AssetsOp,
     },
     /// Run one SQL statement against the store and print its rows. Besides `kb` and the textdb
     /// functions, the views files, folders, frontmatter, sections, links, commits and authors
@@ -702,6 +710,22 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
         }
         Cmd::Links { path, broken, dir } => links::links(st, &path, broken, dir.as_deref(), json),
         Cmd::Backlinks { path } => links::backlinks(st, &path, json),
+        Cmd::Assets { op } => match op {
+            AssetsOp::Stores { add, driver, root, remove, bind } => {
+                assets::stores(st, assets::StoresOptions { add, driver, root, remove, bind }, json)
+            }
+            AssetsOp::Status { path, dir } => assets::status(st, path.as_deref(), dir.as_deref(), json),
+            AssetsOp::Push { paths, dir, to, message, dry_run, force } => assets::push(
+                st,
+                &paths,
+                dir.as_deref(),
+                assets::PushOptions { to: to.as_deref(), message: message.as_deref(), author, dry_run, force },
+                json,
+            ),
+            AssetsOp::Pull { paths, dir, linked_from, dry_run } => assets::pull(st, &paths, dir.as_deref(), linked_from.as_deref(), dry_run, json),
+            AssetsOp::Verify { path, dir } => assets::verify(st, path.as_deref(), dir.as_deref(), json),
+            AssetsOp::Gitignore { path, dir, dry_run } => assets::gitignore(st, path.as_deref(), dir.as_deref(), dry_run, json),
+        },
         Cmd::Meta { op } => match op {
             MetaOp::Get { path, key } => meta::get(st, &path, key.as_deref(), json),
             MetaOp::Set {
@@ -1585,6 +1609,90 @@ fn collect_files(root: &Path, exts: &[String]) -> Result<Vec<(String, PathBuf)>>
     }
     found.sort();
     Ok(found)
+}
+
+#[derive(Subcommand)]
+enum AssetsOp {
+    /// The asset stores declared in the store and how this computer reaches them; declare,
+    /// remove or bind one.
+    Stores {
+        /// Declare an asset store with this name (or change the one of that name).
+        #[arg(long, value_name = "NAME", conflicts_with = "remove")]
+        add: Option<String>,
+        /// Its driver: local (a folder) or rclone.
+        #[arg(long, default_value = "local")]
+        driver: String,
+        /// Where it keeps files: a folder, or an rclone remote path (`teamdrive:textdb`).
+        #[arg(long)]
+        root: Option<String>,
+        /// Remove the declaration of this asset store (its files stay where they are).
+        #[arg(long, value_name = "NAME")]
+        remove: Option<String>,
+        /// Where this computer reaches an asset store: NAME=FOLDER (NAME= removes it). Kept in
+        /// the config directory; TEXTDB_ASSET_STORE_<NAME> overrides it.
+        #[arg(long, value_name = "NAME=LOCATION")]
+        bind: Option<String>,
+    },
+    /// Each asset's state: ok, new (no pointer yet), modified (other bytes than its pointer
+    /// names) or not-pulled (a pointer and no file).
+    Status {
+        /// A store folder or asset; the directory is the one it was last synced with.
+        #[arg(value_parser = store_path)]
+        path: Option<String>,
+        /// The directory (a vault) to look at.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Upload new and changed assets to their asset store, check what arrived, then commit their
+    /// pointers to the store and write them next to the files.
+    Push {
+        #[arg(value_parser = store_path)]
+        paths: Vec<String>,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// The asset store for new assets (needed when several are declared).
+        #[arg(long, value_name = "NAME")]
+        to: Option<String>,
+        /// Message of the pointer commits (default `assets push`).
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        /// Push conflicting files too: their bytes replace the asset store's copy (which goes to
+        /// its trash).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Download the assets whose pointers are here and whose files are not, checking each hash
+    /// before putting the file in place.
+    Pull {
+        #[arg(value_parser = store_path)]
+        paths: Vec<String>,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Only the assets the notes at or below this path link to.
+        #[arg(long, value_name = "PATH", value_parser = store_path)]
+        linked_from: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Hash each asset here and check its asset store holds the bytes its pointer names.
+    Verify {
+        #[arg(value_parser = store_path)]
+        path: Option<String>,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Write the managed block of .gitignore patterns that keeps assets out of git and their
+    /// pointers in.
+    Gitignore {
+        #[arg(value_parser = store_path)]
+        path: Option<String>,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]

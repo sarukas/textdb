@@ -37,7 +37,9 @@ CREATE OR REPLACE TEMP VIEW sections AS
   SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to
   FROM kb.section s JOIN kb.node n ON n.id = s.file_id AND n.deleted_at IS NULL;
 CREATE OR REPLACE TEMP VIEW links AS
-  SELECT n.path, l.target_path AS target, l.line, l.kind, l.anchor, l.alias, l.status, r.path AS resolved
+  SELECT n.path, l.target_path AS target, l.line, l.kind, l.anchor, l.alias, l.status,
+         CASE WHEN lower(r.path) LIKE '%.tdbasset' THEN left(r.path, -9) ELSE r.path END AS resolved,
+         coalesce(lower(r.path) LIKE '%.tdbasset', false) AS asset
   FROM kb.link l JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL
   LEFT JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL;
 CREATE OR REPLACE TEMP VIEW commits AS
@@ -64,6 +66,13 @@ CREATE TABLE IF NOT EXISTS kb.sync_file (
 ALTER TABLE kb.sync ADD COLUMN IF NOT EXISTS rules text;";
 
 const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at::text, author, git_commit, git_branch, git_remote, git_clean, rules";
+
+/// The asset store table, as the extension defines it, for stores installed before it was.
+const ASSET_TABLES: &str = "\
+CREATE TABLE IF NOT EXISTS kb.asset_store (
+  name text PRIMARY KEY, driver text NOT NULL, root text NOT NULL, options text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);";
 
 fn sync_row(r: &Row) -> (i64, SyncBase) {
     let clean: Option<bool> = r.get(9);
@@ -94,6 +103,8 @@ pub struct PgStore {
     sync_ready: bool,
     /// This session has the `textdb sql` views.
     sql_views_ready: bool,
+    /// The asset store table is known to exist.
+    assets_ready: bool,
 }
 
 /// Keep the extension's `TX00n` SQLSTATEs, and the conflict payload it puts in `DETAIL`.
@@ -167,7 +178,16 @@ impl PgStore {
             listening: false,
             sync_ready: false,
             sql_views_ready: false,
+            assets_ready: false,
         })
+    }
+
+    fn ensure_asset_tables(&mut self) -> Result<()> {
+        if !self.assets_ready {
+            self.client.batch_execute(ASSET_TABLES).map_err(pg)?;
+            self.assets_ready = true;
+        }
+        Ok(())
     }
 
     fn ensure_sync_tables(&mut self) -> Result<()> {
@@ -204,7 +224,9 @@ impl PgStore {
                 alias: r.get(5),
                 status: r.get(6),
                 resolved: r.get(7),
+                asset: false,
             })
+            .map(super::asset_link)
             .collect())
     }
 }
@@ -668,7 +690,7 @@ impl Store for PgStore {
     fn backlinks(&mut self, path: &str) -> Result<Vec<LinkRow>> {
         let path = normalize_path(path)?;
         self.link_rows(
-            "l.target_path <> '' AND r.kind = 1 AND ($1 = '/' OR r.path = $1 OR r.path LIKE kb._subtree_like($1))",
+            "l.target_path <> '' AND r.kind = 1 AND ($1 = '/' OR r.path = $1 OR r.path = $1 || '.tdbasset' OR r.path LIKE kb._subtree_like($1))",
             &[&path],
         )
     }
@@ -795,6 +817,50 @@ impl Store for PgStore {
             })
             .collect();
         Ok(Some(base))
+    }
+
+    fn all_sync_bases(&mut self) -> Result<Vec<SyncBase>> {
+        self.ensure_sync_tables()?;
+        let rows = self
+            .client
+            .query(&format!("SELECT {SYNC_COLS} FROM kb.sync ORDER BY synced_at DESC"), &[])
+            .map_err(pg)?;
+        Ok(rows.iter().map(|r| sync_row(r).1).collect())
+    }
+
+    fn asset_stores(&mut self) -> Result<Vec<super::AssetStore>> {
+        self.ensure_asset_tables()?;
+        let rows = self
+            .client
+            .query("SELECT name, driver, root, options, created_at::text FROM kb.asset_store ORDER BY name", &[])
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| super::AssetStore {
+                name: r.get(0),
+                driver: r.get(1),
+                root: r.get(2),
+                options: r.get(3),
+                created_at: r.get(4),
+            })
+            .collect())
+    }
+
+    fn put_asset_store(&mut self, s: &super::AssetStore) -> Result<()> {
+        self.ensure_asset_tables()?;
+        self.client
+            .execute(
+                "INSERT INTO kb.asset_store(name, driver, root, options) VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (name) DO UPDATE SET driver = excluded.driver, root = excluded.root, options = excluded.options",
+                &[&s.name, &s.driver, &s.root, &s.options],
+            )
+            .map_err(pg)?;
+        Ok(())
+    }
+
+    fn remove_asset_store(&mut self, name: &str) -> Result<bool> {
+        self.ensure_asset_tables()?;
+        Ok(self.client.execute("DELETE FROM kb.asset_store WHERE name = $1", &[&name]).map_err(pg)? > 0)
     }
 
     fn revert_batch(&mut self, batch: &str, author: Option<&str>, skip_changed: bool, dry_run: bool) -> Result<RevertOutcome> {
