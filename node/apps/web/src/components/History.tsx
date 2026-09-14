@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, type HistoryEntry, type PathEvent } from "../api";
 import type { DocState } from "../doc/controller";
 import { authorStyle } from "../live/color";
+import { type DiffLayout, readDiffLayout, saveDiffLayout } from "../live/diffLayout";
 import { relativeTime } from "../live/time";
 import { describePathEvent, timeline } from "../live/timeline";
 import { useNow } from "../state/useNow";
@@ -12,7 +13,7 @@ interface Props {
   state: DocState;
 }
 
-export type DiffLayout = "unified" | "split";
+export type { DiffLayout };
 
 export function History({ state }: Props) {
   const { path, feedRev, version } = state;
@@ -21,7 +22,13 @@ export function History({ state }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [compare, setCompare] = useState<number[]>([]);
-  const [layout, setLayout] = useState<DiffLayout>("unified");
+  const [layout, setLayoutState] = useState<DiffLayout>(readDiffLayout);
+  // A version opens on its changes from the one before; this shows its whole text instead.
+  const [showContent, setShowContent] = useState(false);
+  const setLayout = (l: DiffLayout) => {
+    setLayoutState(l);
+    saveDiffLayout(l);
+  };
   const now = useNow(15_000);
 
   useEffect(() => {
@@ -60,7 +67,7 @@ export function History({ state }: Props) {
     <div className="history">
       <div className="history-list" role="list" aria-label="Versions">
         <div className="history-hint">
-          {compare.length === 1 ? "Pick one more version to compare" : "Click to view · tick two to diff"}
+          {compare.length === 1 ? "Pick one more version to compare" : "Click to see what changed · tick two to compare"}
         </div>
         {error && <div className="error-text pad">{error}</div>}
         {!entries && !error && <div className="muted pad">Loading history…</div>}
@@ -101,6 +108,7 @@ export function History({ state }: Props) {
                 onClick={() => {
                   setSelected(h.version);
                   setCompare([]);
+                  setShowContent(false);
                 }}
                 aria-current={isShown ? "true" : undefined}
               >
@@ -130,12 +138,21 @@ export function History({ state }: Props) {
       <div className="history-view">
         {pair ? (
           <DiffView path={path} from={pair[0]} to={pair[1]} layout={layout} onLayout={setLayout} />
+        ) : shown !== null && shown > 1 && !showContent ? (
+          <DiffView
+            path={path}
+            from={shown - 1}
+            to={shown}
+            layout={layout}
+            onLayout={setLayout}
+            onShowContent={() => setShowContent(true)}
+          />
         ) : shown !== null ? (
           <VersionView
             path={path}
             version={shown}
             isHead={shown === head}
-            onDiffPrevious={shown > 1 ? () => setCompare([shown - 1, shown]) : undefined}
+            onDiffPrevious={shown > 1 ? () => setShowContent(false) : undefined}
           />
         ) : (
           <div className="empty">No versions yet.</div>
