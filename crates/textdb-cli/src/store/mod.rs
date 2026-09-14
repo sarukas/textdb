@@ -206,6 +206,15 @@ pub struct Written {
     pub kind: String,
 }
 
+/// What one SQL statement returned.
+#[derive(Debug, Default)]
+pub struct SqlResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    /// With `--write`: changes the store's change log gained (commits, moves, deletes).
+    pub store_changes: Option<i64>,
+}
+
 /// A live file's current version, as `sync` compares it with the sync base.
 #[derive(Debug, Clone)]
 pub struct FileHead {
@@ -342,6 +351,10 @@ pub trait Store {
     fn sync_base(&mut self, prefix: &str, dir: &str) -> Result<Option<SyncBase>>;
     /// Replace the base of `base.prefix` and `base.dir`, files included, in one transaction.
     fn save_sync_base(&mut self, base: &SyncBase) -> Result<()>;
+    /// Run one statement with `params` bound as text, read-only unless `write`. The views
+    /// `files`, `folders`, `frontmatter`, `sections`, `links`, `commits` and `authors` are there
+    /// to query; in SQLite, `:author` is bound to `author`.
+    fn sql(&mut self, query: &str, params: &[String], author: Option<&str>, write: bool) -> Result<SqlResult>;
 }
 
 pub fn open(store: &str) -> Result<Box<dyn Store>> {

@@ -109,6 +109,7 @@ environment and its own author name, and the instructions in
 | `import DIR [--prefix /p] [--ext md,markdown,mdx,txt] [--batch 500]` | Load matching files; unchanged files make no new version. Hidden directories and `node_modules` are skipped |
 | `export PREFIX DIR [--dry-run]` | Write the files under a folder to disk, byte for byte (line endings, BOM). Only new and changed files are written and nothing on disk is deleted, so exporting over a git checkout shows only real changes; an existing file is overwritten in place and keeps its permissions, a symbolic link is left alone. Names that cannot coexist on this computer (differing only in letter case on Windows and macOS, or in Unicode normalization on macOS; Windows reserved names, forbidden characters, trailing dot or space; clashes with what is on disk) stop the export before anything is written, with exit code 6 and the list; problems only on other systems are warnings. `--dry-run` lists what would be written. `--json` gives `{ new, changed, unchanged, skipped, problems, stopped, written, bytes }` |
 | `sync PREFIX DIR [--dry-run] [--commit] [--base REV] [--ext md,markdown,mdx,txt]` | Reconcile a folder with a directory both ways against what both held at the last sync (recorded in the store): changes, new files, deletes and moves on either side are carried across; edits on both sides are merged line by line, and where they overlap the file on disk gets `<<<<<<< textdb` / `>>>>>>> disk` markers (exit code 3) and the store keeps its version until they are resolved. Files never synced are left alone. In a git checkout, changes that came from git are committed to the store under their git author and subject; `--commit` commits what sync wrote to disk with `Textdb-*` trailers. See [Syncing with a git checkout](#syncing-with-a-git-checkout) |
+| `sql [STATEMENT] [-p VALUE]… [--write] [--full]` | One SQL statement (argument or stdin) against the store, printed as a table or, with `--json`, `{ columns, rows, row_count, store_changes }`. Views `files`, `folders`, `frontmatter`, `sections`, `links`, `commits`, `authors` besides `kb` and the `textdb_*` functions. Read-only unless `--write`; see [Querying with SQL](#querying-with-sql) |
 | `git-status PREFIX DIR [--rev REV]` | When the folder was synced and with which commit, what changed in the store since, and how it compares with a commit (`HEAD` by default) by git blob id: same (CRLF-only differences noted), differ, only in textdb, only in git |
 | `ls [PATH] [-l] [-S KEY] [-r] [-R]` | One folder: folders first, then files with size and line count. `-l` adds words, versions, last update, and a file's authors (commits each) or a folder's contents; a folder's size, lines, words and versions are totals of everything below it. `--sort` by `name`, `type`, `size`, `lines`, `words`, `versions`, `created`, `updated` or `authors`; `-r` reverses; `-R` lists everything below the folder by path |
 | `tree [PATH] [-L DEPTH] [-d]` | The folder tree with file counts and sizes; `--json` gives a flat, path-sorted list |
@@ -127,6 +128,62 @@ environment and its own author name, and the instructions in
 | `setting [KEY [VALUE]]` | Show or change a store setting. `path_history` is `on` (default) or `off`; `default` clears it. `--path-history` overrides it for one command |
 | `log [--since SEQ] [--limit N]` | The change log: every create, commit, mkdir, move and delete, in order |
 | `watch [--since SEQ] [-p PREFIX]` | Follow the change log live — one line per change, JSON lines with `--json` |
+
+## Querying with SQL
+
+`textdb sql` runs one statement and prints its rows: a table (values cut at 60 characters;
+`--full` for all of them), or with `--json` `{ columns, rows: [{…}], row_count, store_changes }`.
+The statement comes from the argument or, when it is omitted, stdin — a quoted heredoc avoids
+shell quoting trouble. `-p VALUE` binds the next `?` (`?1` can be reused); in Postgres `$1`, `$2`, …
+receive text, so cast where needed (`$1::int`).
+
+Besides `kb`, the `textdb_*` table-valued functions (`textdb_ls(dir, recursive)`,
+`textdb_search(query, prefix)`, `textdb_history(path)`, …) and scalar functions
+(`textdb_content(path)`, `textdb_section(path, heading)`, …), these views describe the live store
+by path, deleted files left out:
+
+| View | Columns |
+|---|---|
+| `files` | `id, path, name, version, nbytes, nlines, nwords, nauthors, created_at, updated_at, updated_by` |
+| `folders` | `id, path, name, files, folders, nbytes, nlines, nwords, versions, updated_at` — totals of everything below |
+| `frontmatter` | `path, data` — a document's YAML front matter as JSON (text in SQLite: `json_extract`, `json_each`; `jsonb` in Postgres) |
+| `sections` | `path, heading` (`Title / Section / Subsection`), `level, line_from, line_to` |
+| `links` | `path, target` (as written in the document), `line` |
+| `commits` | `path, version, author, ts, message, kind, base_version, nbytes, nlines` |
+| `authors` | `path, author, commits, first_ts, last_ts` |
+
+```sh
+textdb sql <<'SQL'
+SELECT path, json_extract(data, '$.status') AS status
+FROM frontmatter WHERE json_extract(data, '$.type') = 'account' ORDER BY path
+SQL
+textdb sql -p Acme <<'SQL'
+SELECT f.path FROM frontmatter f, json_each(f.data, '$.related_accounts') r WHERE r.value = ?
+SQL
+textdb sql -p guides/intro.md <<'SQL'
+SELECT path, line FROM links WHERE target = ?1 OR target LIKE '%/' || ?1
+SQL
+textdb sql -p '%/ Next steps' 'SELECT path, line_from FROM sections WHERE heading LIKE ?'
+textdb sql 'SELECT path, nwords FROM files ORDER BY nwords DESC LIMIT 10'
+```
+
+Avoid `SELECT content FROM kb` over many files: it reads every document in full. Use the views, or
+`textdb_content(path)` for the few files you need.
+
+**Changing documents.** Statements are read-only unless `--write`. With it, change the store
+through `kb` (`INSERT`, `UPDATE`, `DELETE`) and the functions `textdb_write`, `textdb_edit`,
+`textdb_append`, `textdb_replace_lines`, `textdb_move` and `textdb_delete`: each makes versions,
+history and change-feed entries like any other edit. In SQLite `:author` is bound to `--author`, so
+pass it on. A `--write` statement is all or nothing: if any row fails (an `--old` text that is not
+found, a conflict), every change the statement made is undone. Statements that name the internal
+tables (`kb_*` in SQLite, `kb.node` and friends in Postgres) are refused with `--write`.
+
+```sh
+textdb --author agent-7 sql --write <<'SQL'
+SELECT path, textdb_edit(path, 'status: draft', 'status: published', :author) AS version
+FROM frontmatter WHERE path LIKE '/guides/%' AND json_extract(data, '$.status') = 'draft'
+SQL
+```
 
 ## Syncing with a git checkout
 

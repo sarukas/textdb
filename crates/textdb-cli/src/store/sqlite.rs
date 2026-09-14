@@ -8,8 +8,8 @@ use textdb_sqlite::db::subtree_bounds;
 use textdb_sqlite::{normalize_path, NodeRow, TextDb, DEFAULT_PREFIX};
 
 use super::{
-    Author, BaseFile, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, PathEvent, Result, Stat, Store,
-    StoreError, SyncBase, Written,
+    Author, BaseFile, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, PathEvent, Result, SqlResult, Stat,
+    Store, StoreError, SyncBase, Written,
 };
 
 pub struct SqliteStore {
@@ -520,6 +520,29 @@ impl Store for SqliteStore {
         Ok(Some(base))
     }
 
+    fn sql(&mut self, query: &str, params: &[String], author: Option<&str>, write: bool) -> Result<SqlResult> {
+        self.conn.execute_batch(&sql_views(DEFAULT_PREFIX)).map_err(sql)?;
+        let before = self.db().last_seq()?;
+        // Read-only covers everything the statement runs, the textdb functions' own writes
+        // included. A writing statement runs in one transaction: a row that fails undoes the
+        // rows changed before it.
+        self.conn
+            .execute_batch(if write { "BEGIN IMMEDIATE" } else { "PRAGMA query_only = ON" })
+            .map_err(sql)?;
+        let result = run_sql(&self.conn, query, params, author, write);
+        let end = match (write, result.is_ok()) {
+            (true, true) => "COMMIT",
+            (true, false) => "ROLLBACK",
+            (false, _) => "PRAGMA query_only = OFF",
+        };
+        self.conn.execute_batch(end).map_err(sql)?;
+        let mut result = result?;
+        if write {
+            result.store_changes = Some(self.db().last_seq()? - before);
+        }
+        Ok(result)
+    }
+
     fn save_sync_base(&mut self, base: &SyncBase) -> Result<()> {
         let p = DEFAULT_PREFIX;
         let git = base.git.as_ref();
@@ -562,6 +585,92 @@ impl Store for SqliteStore {
         }
         tx.commit().map_err(sql)
     }
+}
+
+/// The views `textdb sql` offers: the live store by path, without internal ids or deleted files.
+/// Temporary, so they exist on this connection only and never change the store's schema.
+fn sql_views(p: &str) -> String {
+    format!(
+        "CREATE TEMP VIEW IF NOT EXISTS files AS
+           SELECT id, path, name, version, nbytes, nlines, nwords, nauthors, created_at, updated_at, updated_by
+           FROM {p}node WHERE kind = 1 AND deleted_at IS NULL;
+         CREATE TEMP VIEW IF NOT EXISTS folders AS
+           SELECT id, path, name, t_files AS files, t_folders AS folders, t_bytes AS nbytes, t_lines AS nlines,
+                  t_words AS nwords, t_versions AS versions, t_updated_at AS updated_at
+           FROM {p}node WHERE kind = 0 AND deleted_at IS NULL;
+         CREATE TEMP VIEW IF NOT EXISTS frontmatter AS
+           SELECT n.path, f.data FROM {p}frontmatter f JOIN {p}node n ON n.id = f.file_id AND n.deleted_at IS NULL;
+         CREATE TEMP VIEW IF NOT EXISTS sections AS
+           SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to
+           FROM {p}section s JOIN {p}node n ON n.id = s.file_id AND n.deleted_at IS NULL;
+         CREATE TEMP VIEW IF NOT EXISTS links AS
+           SELECT n.path, l.target_path AS target, l.line FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL;
+         CREATE TEMP VIEW IF NOT EXISTS commits AS
+           SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines
+           FROM {p}commit c JOIN {p}node n ON n.id = c.file_id AND n.deleted_at IS NULL;
+         CREATE TEMP VIEW IF NOT EXISTS authors AS
+           SELECT n.path, nullif(a.author, '') AS author, a.commits, a.first_ts, a.last_ts
+           FROM {p}file_author a JOIN {p}node n ON n.id = a.file_id AND n.deleted_at IS NULL;"
+    )
+}
+
+fn sql_value(v: rusqlite::types::ValueRef) -> serde_json::Value {
+    use rusqlite::types::ValueRef;
+    match v {
+        ValueRef::Null => serde_json::Value::Null,
+        ValueRef::Integer(i) => i.into(),
+        ValueRef::Real(f) => serde_json::Number::from_f64(f).map_or(serde_json::Value::Null, serde_json::Value::Number),
+        ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned().into(),
+        ValueRef::Blob(b) => match std::str::from_utf8(b) {
+            Ok(s) => s.into(),
+            Err(_) => serde_json::json!({ "blob_bytes": b.len() }),
+        },
+    }
+}
+
+/// A statement's own error: the SQL is the caller's, so it is reported as invalid input.
+fn statement_error(e: rusqlite::Error, write: bool) -> StoreError {
+    let message = e.to_string();
+    if !write && message.contains("readonly") {
+        StoreError::invalid(format!("{message}: this statement changes the store; run it with --write"))
+    } else {
+        StoreError::invalid(message)
+    }
+}
+
+fn run_sql(conn: &Connection, query: &str, params: &[String], author: Option<&str>, write: bool) -> Result<SqlResult> {
+    let fail = |e: rusqlite::Error| statement_error(e, write);
+    let mut stmt = conn.prepare(query).map_err(fail)?;
+    if !write && !stmt.readonly() {
+        return Err(StoreError::invalid("this statement changes the store; run it with --write"));
+    }
+    let columns: Vec<String> = stmt.column_names().into_iter().map(str::to_string).collect();
+    let names: Vec<Option<String>> = (1..=stmt.parameter_count()).map(|i| stmt.parameter_name(i).map(str::to_string)).collect();
+    let mut values = params.iter();
+    for (i, name) in names.iter().enumerate() {
+        if matches!(name.as_deref(), Some(":author" | "@author" | "$author")) {
+            stmt.raw_bind_parameter(i + 1, author).map_err(fail)?;
+        } else {
+            let value = values.next().ok_or_else(|| {
+                StoreError::invalid(format!("the statement has more placeholders than the {} --param values given", params.len()))
+            })?;
+            stmt.raw_bind_parameter(i + 1, value.as_str()).map_err(fail)?;
+        }
+    }
+    if values.next().is_some() {
+        return Err(StoreError::invalid("more --param values were given than the statement has placeholders"));
+    }
+    let mut rows = stmt.raw_query();
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(fail)? {
+        let values = (0..columns.len()).map(|c| row.get_ref(c).map(sql_value)).collect::<rusqlite::Result<Vec<_>>>();
+        out.push(values.map_err(fail)?);
+    }
+    Ok(SqlResult {
+        columns,
+        rows: out,
+        store_changes: None,
+    })
 }
 
 const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean";

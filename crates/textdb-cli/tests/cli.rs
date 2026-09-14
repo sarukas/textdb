@@ -212,6 +212,82 @@ fn export_writes_only_what_differs_and_stops_on_clashing_names() {
     }
 }
 
+#[test]
+fn sql_reads_through_views_and_writes_only_when_asked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let src = tmp.path().join("src");
+    corpus(&src);
+    ok(textdb(&store).arg("import").arg(&src).args(["--prefix", "/docs"]), None);
+    let account = "---\nentity_type: account\nstatus: active\nrelated_accounts: [globex]\n---\n# Acme\n\n## Next steps\n\nSee [Globex](globex.md) and [[initech]].\n";
+    ok(textdb(&store).args(["--author", "ana", "write", "/accounts/acme.md"]), Some(account));
+    let sql = |args: &[&str], stdin: Option<&str>| {
+        let mut cmd = textdb(&store);
+        cmd.args(["--json", "sql"]).args(args);
+        run(&mut cmd, stdin)
+    };
+
+    let fm = sql(
+        &["SELECT path, json_extract(data, '$.status') AS status FROM frontmatter WHERE json_extract(data, '$.entity_type') = ?", "-p", "account"],
+        None,
+    );
+    assert_eq!(fm.status, 0, "{}", fm.stdout);
+    assert_eq!(fm.json()["rows"], serde_json::json!([{ "path": "/accounts/acme.md", "status": "active" }]));
+    let counted = sql(&["SELECT count(*) AS n FROM files WHERE path LIKE ?", "-p", "/docs/%"], None).json();
+    assert_eq!(counted["rows"][0]["n"], 3, "{counted}");
+    let sections = sql(&["SELECT heading, level FROM sections WHERE path = '/accounts/acme.md' ORDER BY line_from"], None).json();
+    assert_eq!(sections["rows"][1], serde_json::json!({ "heading": "Acme / Next steps", "level": 2 }), "{sections}");
+    let links = sql(&["SELECT target FROM links WHERE path = '/accounts/acme.md'"], None).json();
+    assert!(links["row_count"].as_i64().unwrap() >= 1, "{links}");
+
+    // The textdb functions read too; the statement can come from stdin.
+    let listed = sql(&[], Some("SELECT name, nwords FROM textdb_ls('/docs') ORDER BY name;\n")).json();
+    assert_eq!(listed["columns"], serde_json::json!(["name", "nwords"]), "{listed}");
+    let content = sql(&["SELECT length(textdb_content('/accounts/acme.md')) AS n"], None).json();
+    assert_eq!(content["rows"][0]["n"], account.len());
+    let text = ok(textdb(&store).args(["sql", "SELECT path, nlines FROM files ORDER BY path"]), None).stdout;
+    assert!(text.starts_with("path") && text.contains("/accounts/acme.md") && text.trim_end().ends_with("(4 rows)"), "{text}");
+
+    // Changes need --write and go through the textdb functions, under the author's name.
+    let refused = sql(&["SELECT textdb_append('/accounts/acme.md', '- call back')"], None);
+    assert_eq!(refused.status, 6, "{}", refused.stdout);
+    assert!(refused.stdout.contains("--write"), "{}", refused.stdout);
+    assert_eq!(sql(&["DELETE FROM kb WHERE path = '/accounts/acme.md'"], None).status, 6);
+    let wrote = run(
+        textdb(&store).args([
+            "--json",
+            "--author",
+            "claude",
+            "sql",
+            "--write",
+            "SELECT textdb_append(path, '- call back', :author) AS version FROM files WHERE path = ?",
+            "-p",
+            "/accounts/acme.md",
+        ]),
+        None,
+    );
+    assert_eq!(wrote.status, 0, "{}", wrote.stdout);
+    let wrote = wrote.json();
+    assert_eq!((wrote["rows"][0]["version"].as_i64(), wrote["store_changes"].as_i64()), (Some(2), Some(1)), "{wrote}");
+    let history = ok(textdb(&store).args(["--json", "history", "/accounts/acme.md"]), None).stdout;
+    assert!(history.contains("\"claude\""), "{history}");
+    let internal = sql(&["--write", "DELETE FROM kb_node"], None);
+    assert_eq!(internal.status, 6);
+    assert!(internal.stdout.contains("kb_node"), "{}", internal.stdout);
+    assert_eq!(sql(&["SELECT 1; SELECT 2"], None).status, 6);
+    assert_eq!(sql(&["SELECT ?", "-p", "a", "-p", "b"], None).status, 6);
+
+    // A writing statement is all or nothing: the edit that fails on the second file undoes the first.
+    ok(textdb(&store).args(["write", "/notes/a-draft.md"]), Some("status: draft\n"));
+    ok(textdb(&store).args(["write", "/notes/b-other.md"]), Some("no status\n"));
+    let partial = sql(
+        &["--write", "SELECT textdb_edit(path, 'status: draft', 'status: done', :author) FROM files WHERE path LIKE '/notes/%' ORDER BY path"],
+        None,
+    );
+    assert_eq!(partial.status, 6, "{}", partial.stdout);
+    assert_eq!(ok(textdb(&store).args(["cat", "/notes/a-draft.md"]), None).stdout, "status: draft\n");
+}
+
 fn has_git() -> bool {
     Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success())
 }

@@ -26,6 +26,7 @@ type Result<T> = std::result::Result<T, StoreError>;
 
 mod git;
 mod portable;
+mod sql_query;
 mod sync;
 
 #[derive(Parser)]
@@ -141,6 +142,24 @@ enum Cmd {
         /// Which of the commit's files count as missing from the store.
         #[arg(long, default_value = "md,markdown,mdx,txt")]
         ext: String,
+    },
+    /// Run one SQL statement against the store and print its rows. Besides `kb` and the textdb
+    /// functions, the views files, folders, frontmatter, sections, links, commits and authors
+    /// describe the live store by path. Read-only unless --write.
+    Sql {
+        /// The statement; read from stdin when omitted or `-`.
+        query: Option<String>,
+        /// A value for the next placeholder (`?` in SQLite, `$1`, `$2`, … in Postgres), as text.
+        /// In SQLite, `:author` takes the --author name.
+        #[arg(long = "param", short = 'p', value_name = "VALUE", allow_hyphen_values = true)]
+        params: Vec<String>,
+        /// Allow statements that change the store, through `kb` and the textdb functions, which
+        /// record versions like any other edit. The internal tables stay off limits.
+        #[arg(long)]
+        write: bool,
+        /// Print whole values instead of cutting them at 60 characters.
+        #[arg(long)]
+        full: bool,
     },
     /// List one folder.
     Ls {
@@ -383,6 +402,22 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             },
             json,
         ),
+        Cmd::Sql {
+            query,
+            params,
+            write,
+            full,
+        } => {
+            let statement = match query.as_deref() {
+                None | Some("-") => {
+                    let mut text = String::new();
+                    std::io::stdin().read_to_string(&mut text)?;
+                    text
+                }
+                Some(text) => text.to_string(),
+            };
+            sql_query::run(st, &statement, &params, author, write, full, json)
+        }
         Cmd::GitStatus { prefix, dir, rev, ext } => sync::git_status(st, &prefix, &dir, &rev, &sync::parse_exts(&ext), json),
         Cmd::Ls {
             path,

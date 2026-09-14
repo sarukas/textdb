@@ -1,6 +1,6 @@
 ---
 name: textdb-cli
-description: Browse, read, search and edit markdown/text documents kept in a textdb store (SQLite file or Postgres) with the `textdb` command-line tool — tree, cat with line numbers and versions, full-text search, line-range and anchored edits that rebase over concurrent writers, conflict handling via exit status 3, history, diffs and following live changes. Use when a corpus lives in a textdb store rather than on disk, or when asked to edit documents other people or agents may be editing at the same time.
+description: Browse, read, search and edit markdown/text documents kept in a textdb store (SQLite file or Postgres) with the `textdb` command-line tool — tree, cat with line numbers and versions, full-text search, SQL queries over files, front matter, headings, links and commits, line-range and anchored edits that rebase over concurrent writers, conflict handling via exit status 3, history, diffs and following live changes. Use when a corpus lives in a textdb store rather than on disk, or when asked to edit documents other people or agents may be editing at the same time.
 ---
 
 # Working on a textdb corpus with the `textdb` CLI
@@ -17,6 +17,10 @@ export TEXTDB_STORE=path/to/kb.db       # or postgres://user@host/db
 export TEXTDB_AUTHOR=agent-<name>        # your writes are attributed to this name
 export MSYS_NO_PATHCONV=1               # Git Bash on Windows only: stops "/a.md" being rewritten
 ```
+
+With `MSYS_NO_PATHCONV=1`, give local files and directories (the store, `sync`/`export` targets)
+as Windows (`C:/Users/me/kb.db`) or relative paths: `/c/Users/...` is no longer translated and the
+store will not open.
 
 Run `textdb config` once to check the store, your author name and whether renames, moves and
 deletes are recorded in history, and where each setting came from.
@@ -53,6 +57,55 @@ textdb git-status guides ~/src/repo/guides       # last synced commit; store vs 
 
 Exit code 3 from `sync` means conflict markers were written to files on disk: resolve them there
 (or ask the user), then run `sync` again.
+
+## Ask questions with SQL
+
+For anything `ls`, `tree` and `search` do not answer directly — front matter values, who links
+where, which files have a heading, who changed what — run one `textdb sql` statement instead of
+looping over `cat` or `ls` in the shell. Use a quoted heredoc for the statement and `-p` for values
+(`?`, or `?1` to reuse one); add `--json` when you need to parse the rows.
+
+```sh
+textdb sql <<'SQL'
+SELECT path, json_extract(data, '$.status') AS status
+FROM frontmatter WHERE json_extract(data, '$.type') = 'account' ORDER BY path
+SQL
+textdb sql -p guides/api/index.md <<'SQL'
+SELECT path, line FROM links WHERE target = ?1 OR target LIKE '%/' || ?1   -- who links here
+SQL
+textdb sql -p '%Errors' 'SELECT path, heading, line_from FROM sections WHERE heading LIKE ?'
+textdb sql 'SELECT path, version, author, ts, message FROM commits ORDER BY ts DESC LIMIT 20'
+textdb --json sql 'SELECT path, nwords FROM files ORDER BY nwords DESC LIMIT 10'
+```
+
+| View | Columns |
+|---|---|
+| `files` | `path, name, version, nbytes, nlines, nwords, created_at, updated_at, updated_by` |
+| `folders` | `path, files, folders, nbytes, nwords, versions, updated_at` (totals below) |
+| `frontmatter` | `path, data` — YAML front matter as JSON: `json_extract(data, '$.key')`, `json_each(data, '$.list')` |
+| `sections` | `path, heading` (`Title / Section`), `level, line_from, line_to` — feed `line_from` to `cat --lines` |
+| `links` | `path, target` (as written), `line` |
+| `commits` | `path, version, author, ts, message, kind` |
+| `authors` | `path, author, commits, first_ts, last_ts` |
+
+Also `textdb_search(query, prefix)`, `textdb_ls(dir, recursive)`, `textdb_content(path)`. Do not
+select `content` from `kb` across many files: it reads every document in full.
+
+Statements are read-only unless you pass `--write`. Then change documents only through the textdb
+functions, passing `:author` (bound to your author name) so the edits are attributed:
+
+```sh
+textdb sql --write <<'SQL'
+SELECT path, textdb_edit(path, 'status: draft', 'status: published', :author) AS version
+FROM frontmatter WHERE path LIKE '/guides/%' AND json_extract(data, '$.status') = 'draft'
+SQL
+```
+
+Run the same `SELECT` without the function first to see which files it touches. A `--write`
+statement is all or nothing: if one file fails (the old text is missing or not unique), nothing
+changes; fix the statement and run it again. `textdb_edit(path, old, new, :author)` needs `old` to
+occur exactly once; `textdb_append(path, text, :author)` and
+`textdb_write(path, content, base_version, :author, message)` are the others.
 
 ## Read before you edit
 
@@ -148,3 +201,5 @@ them. Moving or deleting a folder touches everything inside it — check with `t
 4. Use `append` for journals and logs.
 5. Use your own `TEXTDB_AUTHOR`, so the changes you make are attributed to you.
 6. Do not `rm` or `mv` folders you were not asked to reorganise; people are browsing them.
+7. To find things across many files, write one `textdb sql` query rather than a shell loop over
+   `cat`/`ls`; check a `--write` statement's `SELECT` first.

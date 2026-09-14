@@ -6,13 +6,36 @@
 use std::time::Duration;
 
 use postgres::fallible_iterator::FallibleIterator;
+use postgres::types::{ToSql, Type};
 use postgres::{Client, NoTls, Row};
 use textdb_sqlite::normalize_path;
 
 use super::{
-    BaseFile, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, PathEvent, Result, Stat, Store, StoreError,
-    SyncBase, Written,
+    BaseFile, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, PathEvent, Result, SqlResult, Stat, Store,
+    StoreError, SyncBase, Written,
 };
+
+/// The views `textdb sql` offers, as in SQLite: the live store by path. Temporary, so they live
+/// in this session only.
+const SQL_VIEWS: &str = "\
+CREATE OR REPLACE TEMP VIEW files AS
+  SELECT id, path, name, version, nbytes, nlines, nwords, nauthors, created_at, updated_at, updated_by
+  FROM kb.node WHERE kind = 1 AND deleted_at IS NULL;
+CREATE OR REPLACE TEMP VIEW folders AS
+  SELECT id, path, name, files, folders, nbytes, nlines, nwords, versions, updated_at FROM kb.entry WHERE kind = 'folder';
+CREATE OR REPLACE TEMP VIEW frontmatter AS
+  SELECT n.path, f.data FROM kb.frontmatter f JOIN kb.node n ON n.id = f.file_id AND n.deleted_at IS NULL;
+CREATE OR REPLACE TEMP VIEW sections AS
+  SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to
+  FROM kb.section s JOIN kb.node n ON n.id = s.file_id AND n.deleted_at IS NULL;
+CREATE OR REPLACE TEMP VIEW links AS
+  SELECT n.path, l.target_path AS target, l.line FROM kb.link l JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL;
+CREATE OR REPLACE TEMP VIEW commits AS
+  SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines
+  FROM kb.commit c JOIN kb.node n ON n.id = c.file_id AND n.deleted_at IS NULL;
+CREATE OR REPLACE TEMP VIEW authors AS
+  SELECT n.path, nullif(a.author, '') AS author, a.commits, a.first_ts, a.last_ts
+  FROM kb.file_author a JOIN kb.node n ON n.id = a.file_id AND n.deleted_at IS NULL;";
 
 /// The sync base tables, as the extension defines them, for stores installed before they were.
 const SYNC_TABLES: &str = "\
@@ -57,6 +80,8 @@ pub struct PgStore {
     listening: bool,
     /// The sync base tables are known to exist.
     sync_ready: bool,
+    /// This session has the `textdb sql` views.
+    sql_views_ready: bool,
 }
 
 /// Keep the extension's `TX00n` SQLSTATEs, and the conflict payload it puts in `DETAIL`.
@@ -129,6 +154,7 @@ impl PgStore {
             client: Client::connect(url, NoTls).map_err(pg)?,
             listening: false,
             sync_ready: false,
+            sql_views_ready: false,
         })
     }
 
@@ -524,6 +550,47 @@ impl Store for PgStore {
             })
             .collect();
         Ok(Some(base))
+    }
+
+    fn sql(&mut self, query: &str, params: &[String], _author: Option<&str>, write: bool) -> Result<SqlResult> {
+        if !self.sql_views_ready {
+            self.client.batch_execute(SQL_VIEWS).map_err(pg)?;
+            self.sql_views_ready = true;
+        }
+        let before = self.last_seq()?;
+        let types = vec![Type::TEXT; params.len()];
+        let values: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        let first = query
+            .trim_start()
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let mut tx = self.client.build_transaction().read_only(!write).start().map_err(pg)?;
+        let mut result = SqlResult::default();
+        if matches!(first.as_str(), "select" | "with" | "values" | "table") {
+            // Each row as JSON, so any column type comes back without a Rust mapping for it.
+            let inner = tx.prepare_typed(query, &types).map_err(pg)?;
+            result.columns = inner.columns().iter().map(|c| c.name().to_string()).collect();
+            let wrapped = tx
+                .prepare_typed(&format!("SELECT row_to_json(q)::text FROM ({query}) q"), &types)
+                .map_err(pg)?;
+            for row in tx.query(&wrapped, &values).map_err(pg)? {
+                let text: String = row.get(0);
+                let object: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).unwrap_or_default();
+                result
+                    .rows
+                    .push(result.columns.iter().map(|c| object.get(c).cloned().unwrap_or_default()).collect());
+            }
+        } else {
+            let stmt = tx.prepare_typed(query, &types).map_err(pg)?;
+            tx.execute(&stmt, &values).map_err(pg)?;
+        }
+        tx.commit().map_err(pg)?;
+        if write {
+            result.store_changes = Some(self.last_seq()? - before);
+        }
+        Ok(result)
     }
 
     fn save_sync_base(&mut self, base: &SyncBase) -> Result<()> {

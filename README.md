@@ -12,7 +12,8 @@ This repository is the proof of concept described in [`docs/spec.md`](docs/spec.
 - **Benchmark results:** [`bench/RESULTS.md`](bench/RESULTS.md) (raw data in `bench/results/`)
 - **Command line:** [`docs/cli.md`](docs/cli.md) — `textdb` for SQLite and Postgres stores: `ls -l` sorted by
   size, words, versions, update time or authors, tree, cat, search, line-range and anchored edits that rebase
-  over concurrent writers, history with renames/moves/deletes, hunks, `watch` for live changes, and `sync` to
+  over concurrent writers, history with renames/moves/deletes, hunks, `watch` for live changes, `sql` for queries over
+  files, front matter, sections, links and commits, and `sync` to
   reconcile a folder with a git checkout both ways (three-way merge, conflict markers, git authors, commit trailers).
   [Working with an external agent](docs/cli.md#working-with-an-external-agent).
 - **Demo app:** [`docs/demo-app.md`](docs/demo-app.md) — build, start and configure the live corpus app: a Node
