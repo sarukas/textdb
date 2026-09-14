@@ -104,6 +104,35 @@ fn purge_json(s: &crate::trash::PurgeStats) -> String {
     .to_string()
 }
 
+/// `textdb_replace_many`'s list: `[[old, new], [old, new, expected_count], …]`, or objects
+/// `{"old", "new", "count"}`.
+fn parse_replacements(spec: &str) -> std::result::Result<Vec<crate::bulk::Replacement>, String> {
+    use serde_json::Value as J;
+    let usage = "replacements must be a JSON array of [old, new], [old, new, expected_count] or {\"old\", \"new\", \"count\"}";
+    let v: J = serde_json::from_str(spec).map_err(|e| format!("{usage}: {e}"))?;
+    let items = v.as_array().ok_or(usage)?;
+    items
+        .iter()
+        .map(|item| {
+            let (old, new, count) = match item {
+                J::Array(a) if a.len() == 2 || a.len() == 3 => (a[0].as_str(), a[1].as_str(), a.get(2)),
+                J::Object(o) => (o.get("old").and_then(J::as_str), o.get("new").and_then(J::as_str), o.get("count")),
+                _ => return Err(usage.to_string()),
+            };
+            let (Some(old), Some(new)) = (old, new) else { return Err(usage.to_string()) };
+            let expected = match count {
+                None | Some(J::Null) => None,
+                Some(c) => Some(c.as_u64().ok_or(usage)? as usize),
+            };
+            Ok(crate::bulk::Replacement {
+                old: old.as_bytes().to_vec(),
+                new: new.as_bytes().to_vec(),
+                expected,
+            })
+        })
+        .collect()
+}
+
 /// A write's outcome as JSON, `{"version":3,"kind":"rebased"}`. A caller showing how its
 /// commit landed needs the kind as well as the version, and a scalar returns one value.
 fn write_json(r: &crate::db::WriteResult) -> String {
@@ -270,6 +299,49 @@ pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
         let path = arg_str(ctx, 0)?;
         let author = opt_str(ctx, 1)?.filter(|a| !a.is_empty());
         with_db(ctx, h, &p, |db| db.delete_by(&path, author.as_deref()).map(|()| 1i64))
+    })?;
+    // Text replacements that make one version: every occurrence, with the count checked.
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_replace", -1, flags, move |ctx| {
+        if ctx.len() < 3 {
+            return Err(Error::UserFunctionError(
+                "textdb_replace(path, old, new[, expected_count[, author[, message]]])".into(),
+            ));
+        }
+        let path = arg_str(ctx, 0)?;
+        let old = arg_bytes(ctx, 1)?;
+        let new = arg_bytes(ctx, 2)?;
+        let expected = opt_i64(ctx, 3)?.map(|n| n.max(0) as usize);
+        let author = opt_str(ctx, 4)?.filter(|a| !a.is_empty());
+        let message = opt_str(ctx, 5)?;
+        let replacement = crate::bulk::Replacement { old, new, expected };
+        let (w, _) = with_db(ctx, h, &p, |db| db.replace_text(&path, &[replacement], author.as_deref(), message.as_deref()))?;
+        Ok(w.version as i64)
+    })?;
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_replace_many", -1, flags, move |ctx| {
+        if ctx.len() < 2 {
+            return Err(Error::UserFunctionError(
+                "textdb_replace_many(path, replacements_json[, author[, message]])".into(),
+            ));
+        }
+        let path = arg_str(ctx, 0)?;
+        let replacements = parse_replacements(&arg_str(ctx, 1)?).map_err(|e| Error::UserFunctionError(e.into()))?;
+        let author = opt_str(ctx, 2)?.filter(|a| !a.is_empty());
+        let message = opt_str(ctx, 3)?;
+        let (w, _) = with_db(ctx, h, &p, |db| db.replace_text(&path, &replacements, author.as_deref(), message.as_deref()))?;
+        Ok(w.version as i64)
+    })?;
+    // `textdb_batch()` names the batch this connection's writes are recorded under;
+    // `textdb_batch(id)` starts recording under `id`, `textdb_batch(NULL)` stops.
+    conn.create_scalar_function("textdb_batch", -1, flags, move |ctx| {
+        if ctx.len() > 1 {
+            return Err(Error::UserFunctionError("textdb_batch([id])".into()));
+        }
+        if ctx.len() == 1 {
+            crate::bulk::set_batch_for_handle(h, opt_str(ctx, 0)?.as_deref());
+        }
+        Ok(crate::bulk::current_batch_for_handle(h))
     })?;
     // Store settings: `textdb_setting(key)` reads (NULL at the default), `textdb_setting(key,
     // value)` sets and `textdb_setting(key, NULL)` returns it to its default.

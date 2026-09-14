@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS {p}commit (
   nlines       INTEGER,
   kind         TEXT,                          -- direct, rebased, merged
   base_version INTEGER,                       -- the version the writer started from
+  batch        TEXT    NULL,                  -- the run that made it (`textdb sql --write`), see bulk.rs
   PRIMARY KEY (file_id, version)
 );
 CREATE TABLE IF NOT EXISTS {p}chunk (
@@ -105,7 +106,8 @@ CREATE TABLE IF NOT EXISTS {p}change (
   base_version INTEGER NULL,                  -- commit: the version the writer started from
   commit_kind  TEXT    NULL,                  -- create, commit: direct, rebased, merged
   author       TEXT    NULL,
-  message      TEXT    NULL
+  message      TEXT    NULL,
+  batch        TEXT    NULL                   -- the run that made it, as on commit
 );
 CREATE INDEX IF NOT EXISTS {p}change_node ON {p}change(node_id);
 -- Path history (textdb_core::path): one row per node a rename, move or delete touched — the
@@ -185,6 +187,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("node", "t_words", "INTEGER NOT NULL DEFAULT 0"),
     ("node", "t_versions", "INTEGER NOT NULL DEFAULT 0"),
     ("node", "t_updated_at", "TEXT NULL"),
+    // Links: how each is written and what it resolves to (links.rs).
     ("link", "kind", "TEXT"),
     ("link", "anchor", "TEXT"),
     ("link", "alias", "TEXT"),
@@ -192,6 +195,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("link", "target_name", "TEXT"),
     ("link", "resolved_id", "INTEGER"),
     ("link", "status", "TEXT"),
+    // Batches: the run (`textdb sql --write`) a commit or change belongs to.
+    ("commit", "batch", "TEXT NULL"),
+    ("change", "batch", "TEXT NULL"),
 ];
 
 /// Indexes on columns an older store gains in `migrate`, so they are created after them.
@@ -200,7 +206,8 @@ fn index_sql(p: &str) -> String {
         "CREATE INDEX IF NOT EXISTS {p}link_target_name ON {p}link(target_name);
          CREATE INDEX IF NOT EXISTS {p}link_resolved ON {p}link(resolved_id);
          CREATE INDEX IF NOT EXISTS {p}node_lower_name ON {p}node(lower(name)) WHERE deleted_at IS NULL;
-         CREATE INDEX IF NOT EXISTS {p}node_lower_path ON {p}node(lower(path)) WHERE deleted_at IS NULL;"
+         CREATE INDEX IF NOT EXISTS {p}node_lower_path ON {p}node(lower(path)) WHERE deleted_at IS NULL;
+         CREATE INDEX IF NOT EXISTS {p}change_batch ON {p}change(batch) WHERE batch IS NOT NULL;"
     )
 }
 

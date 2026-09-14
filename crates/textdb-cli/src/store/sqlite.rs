@@ -8,8 +8,8 @@ use textdb_sqlite::db::subtree_bounds;
 use textdb_sqlite::{normalize_path, NodeRow, TextDb, DEFAULT_PREFIX};
 
 use super::{
-    Author, BaseFile, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, PathEvent, Result, SqlResult, Stat,
-    Store, StoreError, SyncBase, Written,
+    Author, BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, MovedBack, PathEvent,
+    RestoredFile, Result, RevertOutcome, SqlResult, Stat, Store, StoreError, SyncBase, Written,
 };
 
 pub struct SqliteStore {
@@ -589,27 +589,63 @@ impl Store for SqliteStore {
         Ok(Some(base))
     }
 
-    fn sql(&mut self, query: &str, params: &[String], author: Option<&str>, write: bool) -> Result<SqlResult> {
+    fn sql(&mut self, query: &str, params: &[String], author: Option<&str>, write: bool, dry_run: bool) -> Result<SqlResult> {
         self.conn.execute_batch(&sql_views(DEFAULT_PREFIX)).map_err(sql)?;
         let before = self.db().last_seq()?;
+        let batch = if write { Some(new_batch_id(&self.conn)?) } else { None };
         // Read-only covers everything the statement runs, the textdb functions' own writes
         // included. A writing statement runs in one transaction: a row that fails undoes the
-        // rows changed before it.
+        // rows changed before it, and a dry run undoes them all.
         self.conn
             .execute_batch(if write { "BEGIN IMMEDIATE" } else { "PRAGMA query_only = ON" })
             .map_err(sql)?;
-        let result = run_sql(&self.conn, query, params, author, write);
-        let end = match (write, result.is_ok()) {
+        textdb_sqlite::bulk::set_batch(&self.conn, batch.as_deref());
+        let outcome = (|| -> Result<SqlResult> {
+            let mut result = run_sql(&self.conn, query, params, author, write)?;
+            if write {
+                let db = self.db();
+                result.store_changes = Some(db.last_seq()? - before);
+                if dry_run {
+                    result.dry_run = true;
+                    result.changes = db.changes_after(before)?.into_iter().map(batch_change).collect();
+                }
+            }
+            Ok(result)
+        })();
+        textdb_sqlite::bulk::set_batch(&self.conn, None);
+        let end = match (write, outcome.is_ok() && !dry_run) {
             (true, true) => "COMMIT",
             (true, false) => "ROLLBACK",
             (false, _) => "PRAGMA query_only = OFF",
         };
         self.conn.execute_batch(end).map_err(sql)?;
-        let mut result = result?;
-        if write {
-            result.store_changes = Some(self.db().last_seq()? - before);
+        let mut result = outcome?;
+        if !dry_run && result.store_changes.unwrap_or(0) > 0 {
+            result.batch = batch;
         }
         Ok(result)
+    }
+
+    fn revert_batch(&mut self, batch: &str, author: Option<&str>, skip_changed: bool, dry_run: bool) -> Result<RevertOutcome> {
+        let id = new_batch_id(&self.conn)?;
+        self.conn.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
+        textdb_sqlite::bulk::set_batch(&self.conn, Some(&id));
+        let outcome = self.db().revert_batch(batch, author, skip_changed);
+        textdb_sqlite::bulk::set_batch(&self.conn, None);
+        self.conn
+            .execute_batch(if outcome.is_ok() && !dry_run { "COMMIT" } else { "ROLLBACK" })
+            .map_err(sql)?;
+        let r = outcome?;
+        Ok(RevertOutcome {
+            batch: batch.to_string(),
+            dry_run,
+            revert_batch: (!dry_run).then_some(id),
+            restored: r.restored.into_iter().map(|(path, version)| RestoredFile { path, version }).collect(),
+            removed: r.removed,
+            moved_back: r.moved_back.into_iter().map(|(from, to)| MovedBack { from, to }).collect(),
+            recreated: r.recreated,
+            skipped: r.skipped,
+        })
     }
 
     fn save_sync_base(&mut self, base: &SyncBase) -> Result<()> {
@@ -658,13 +694,41 @@ impl Store for SqliteStore {
 
 /// The views `textdb sql` offers: the live store by path, without internal ids or deleted files.
 /// Temporary, so they exist on this connection only and never change the store's schema.
+/// A batch id: when, and four random hex digits (`20260914-211500-3f9a`).
+fn new_batch_id(conn: &Connection) -> Result<String> {
+    conn.query_row("SELECT strftime('%Y%m%d-%H%M%S', 'now') || '-' || lower(hex(randomblob(2)))", [], |r| r.get(0))
+        .map_err(sql)
+}
+
+fn batch_change(i: textdb_sqlite::bulk::BatchItem) -> BatchChange {
+    BatchChange {
+        op: i.op,
+        path: i.path,
+        old_path: i.old_path,
+        from_version: i.from_version,
+        to_version: i.to_version,
+        diff: i.diff,
+    }
+}
+
 fn sql_views(p: &str) -> String {
     format!(
         "CREATE TEMP VIEW IF NOT EXISTS files AS
-           SELECT id, path, name, version, nbytes, nlines, nwords, nauthors, created_at, updated_at, updated_by
-           FROM {p}node WHERE kind = 1 AND deleted_at IS NULL;
+           SELECT id, path, name,
+                  CASE WHEN length(path) = length(name) + 1 THEN '/' ELSE substr(path, 1, length(path) - length(name) - 1) END AS dir,
+                  length(path) - length(replace(path, '/', '')) AS depth,
+                  CASE WHEN name GLOB '?*.*' THEN lower(substr(name, length(rtrim(name, replace(name, '.', ''))) + 1)) ELSE '' END AS ext,
+                  version, nbytes, nlines, nwords, nauthors, created_at, updated_at, updated_by
+           FROM {p}node WHERE kind = 1 AND deleted_at IS NULL
+           -- No limit really, but a view with one is not flattened into a query with a WHERE: without
+           -- it SQLite may call `textdb_content(path)` in that WHERE on folder rows, which fails.
+           LIMIT -1;
          CREATE TEMP VIEW IF NOT EXISTS folders AS
-           SELECT id, path, name, t_files AS files, t_folders AS folders, t_bytes AS nbytes, t_lines AS nlines,
+           SELECT id, path, name,
+                  CASE WHEN path = '/' THEN NULL WHEN length(path) = length(name) + 1 THEN '/'
+                       ELSE substr(path, 1, length(path) - length(name) - 1) END AS parent,
+                  CASE WHEN path = '/' THEN 0 ELSE length(path) - length(replace(path, '/', '')) END AS depth,
+                  t_files AS files, t_folders AS folders, t_bytes AS nbytes, t_lines AS nlines,
                   t_words AS nwords, t_versions AS versions, t_updated_at AS updated_at
            FROM {p}node WHERE kind = 0 AND deleted_at IS NULL;
          CREATE TEMP VIEW IF NOT EXISTS frontmatter AS
@@ -677,7 +741,7 @@ fn sql_views(p: &str) -> String {
            FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL
            LEFT JOIN {p}node r ON r.id = l.resolved_id AND r.deleted_at IS NULL;
          CREATE TEMP VIEW IF NOT EXISTS commits AS
-           SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines
+           SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines, c.batch
            FROM {p}commit c JOIN {p}node n ON n.id = c.file_id AND n.deleted_at IS NULL;
          CREATE TEMP VIEW IF NOT EXISTS authors AS
            SELECT n.path, nullif(a.author, '') AS author, a.commits, a.first_ts, a.last_ts
@@ -740,7 +804,7 @@ fn run_sql(conn: &Connection, query: &str, params: &[String], author: Option<&st
     Ok(SqlResult {
         columns,
         rows: out,
-        store_changes: None,
+        ..SqlResult::default()
     })
 }
 

@@ -462,6 +462,85 @@ fn sql_reads_through_views_and_writes_only_when_asked() {
     assert_eq!(ok(textdb(&store).args(["cat", "/notes/a-draft.md"]), None).stdout, "status: draft\n");
 }
 
+#[test]
+fn sql_bulk_edits_dry_runs_batches_revert_and_formats() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let a = "---\nentity_name: '[''Account Name'']'\nmeeting_date: \"2025-11-[DD]\"  # UPDATE when known\n---\n# Acme teo-group\n\n- item one\n- item two\nAcme Acme\n";
+    ok(textdb(&store).args(["write", "/p/a.md"]), Some(a));
+    ok(textdb(&store).args(["write", "/p/b.md"]), Some("Acme once\n"));
+    ok(textdb(&store).args(["write", "/p/old/c.md"]), Some("gone soon\n"));
+    let sql = |args: &[&str]| run(textdb(&store).args(["--author", "claude", "sql"]).args(args), None);
+
+    // Front matter values as YAML means them: comment gone, '' unescaped.
+    let fm = sql(&["--format", "tsv", "SELECT json_extract(data, '$.entity_name') AS name, json_extract(data, '$.meeting_date') AS d FROM frontmatter"]);
+    assert_eq!(fm.stdout, "name\td\n['Account Name']\t2025-11-[DD]\n", "{}", fm.stderr);
+
+    // Path helpers, TSV and one value per line.
+    let files = sql(&["--format", "tsv", "SELECT path, dir, depth, ext FROM files ORDER BY path"]);
+    assert_eq!(files.stdout, "path\tdir\tdepth\text\n/p/a.md\t/p\t2\tmd\n/p/b.md\t/p\t2\tmd\n/p/old/c.md\t/p/old\t3\tmd\n");
+    assert_eq!(sql(&["--format", "lines", "SELECT parent FROM folders WHERE path = '/p/old'"]).stdout, "/p\n");
+    assert_eq!(sql(&["--format", "lines", "SELECT name FROM files ORDER BY name"]).stdout, "a.md\nb.md\nc.md\n");
+    assert_eq!(sql(&["--format", "lines", "SELECT name, path FROM files"]).status, 6);
+
+    // A hyphenated term matches as the phrase it is.
+    assert_eq!(sql(&["--format", "lines", "SELECT path FROM textdb_search('teo-group', '/')"]).stdout, "/p/a.md\n");
+
+    // A dry run shows the diffs and writes nothing.
+    let replace_acme = "SELECT textdb_replace(path, 'Acme', 'Globex', NULL, :author) AS v FROM files \
+                        WHERE path LIKE '/p/%' AND instr(textdb_content(path), 'Acme') > 0 ORDER BY path";
+    let preview = sql(&["--write", "--dry-run", replace_acme]);
+    assert_eq!(preview.status, 0, "{}", preview.stderr);
+    assert!(preview.stdout.contains("dry run: 2 changes") && preview.stdout.contains("-Acme once") && preview.stdout.contains("+Globex once"), "{}", preview.stdout);
+    assert_eq!(ok(textdb(&store).args(["cat", "/p/b.md"]), None).stdout, "Acme once\n");
+    // A count that does not match undoes the statement.
+    let wrong = sql(&["--write", "SELECT textdb_replace('/p/a.md', 'Acme', 'Globex', 2, :author)"]);
+    assert_eq!(wrong.status, 6, "{}", wrong.stdout);
+    assert!(wrong.stderr.contains("expected 2 occurrences") && wrong.stderr.contains("found 3"), "{}", wrong.stderr);
+
+    // Several replacements, a move and a delete from a file: one batch, all or nothing.
+    let file = tmp.path().join("bulk.sql");
+    std::fs::write(
+        &file,
+        "SELECT textdb_replace_many('/p/a.md', '[[\"Acme\", \"Globex\", 3], {\"old\": \"- item\", \"new\": \"- point\"}]', :author) AS a,\n\
+         textdb_move('/p/b.md', '/p/b2.md', :author) AS m,\n\
+         textdb_delete('/p/old', :author) AS d;\n",
+    )
+    .unwrap();
+    let wrote = ok(textdb(&store).args(["--json", "--author", "claude", "sql", "--write", "-f"]).arg(&file), None).json();
+    assert_eq!(wrote["store_changes"], 3, "{wrote}");
+    let batch = wrote["batch"].as_str().unwrap().to_string();
+    assert_eq!(ok(textdb(&store).args(["--json", "history", "--versions-only", "/p/a.md"]), None).json().as_array().unwrap().len(), 2);
+    assert!(ok(textdb(&store).args(["cat", "/p/a.md"]), None).stdout.contains("# Globex teo-group\n\n- point one\n- point two\nGlobex Globex\n"));
+    assert_eq!(sql(&["--format", "lines", "SELECT path FROM commits WHERE batch = ?", "-p", &batch]).stdout, "/p/a.md\n");
+
+    // A value starting with "- " works as --old.
+    ok(textdb(&store).args(["edit", "/p/a.md", "--old", "- point two", "--new", "- point 2"]), None);
+
+    // a.md changed since the batch: the revert refuses and changes nothing.
+    let refused = run(textdb(&store).args(["revert-batch", &batch]), None);
+    assert_eq!(refused.status, 6, "{}", refused.stdout);
+    assert!(refused.stderr.contains("/p/a.md") && refused.stderr.contains("--skip-changed"), "{}", refused.stderr);
+    ok(textdb(&store).args(["stat", "/p/b2.md"]), None);
+    let dry = ok(textdb(&store).args(["--json", "revert-batch", "--skip-changed", "--dry-run", &batch]), None).json();
+    assert_eq!(dry["moved_back"], serde_json::json!([{ "from": "/p/b2.md", "to": "/p/b.md" }]), "{dry}");
+    assert_eq!(run(textdb(&store).args(["stat", "/p/b.md"]), None).status, 5);
+    let reverted = ok(textdb(&store).args(["revert-batch", "--skip-changed", &batch]), None).stdout;
+    assert!(reverted.contains("moved back /p/b2.md -> /p/b.md") && reverted.contains("recreated /p/old/c.md") && reverted.contains("skipped: /p/a.md"), "{reverted}");
+    assert_eq!(ok(textdb(&store).args(["cat", "/p/b.md"]), None).stdout, "Acme once\n");
+    assert_eq!(ok(textdb(&store).args(["cat", "/p/old/c.md"]), None).stdout, "gone soon\n");
+
+    // A clean batch goes back exactly, and the table output names the batch.
+    let second = sql(&["--write", "SELECT textdb_replace('/p/b.md', 'once', 'twice', 1, :author) AS v"]);
+    assert_eq!(second.status, 0, "{}", second.stderr);
+    let id = second.stdout.lines().find_map(|l| l.strip_prefix("batch ")).and_then(|l| l.split(':').next()).unwrap().to_string();
+    assert!(second.stdout.contains(&format!("textdb revert-batch {id}")), "{}", second.stdout);
+    let undone = ok(textdb(&store).args(["--json", "revert-batch", &id]), None).json();
+    assert_eq!(undone["restored"][0]["path"], "/p/b.md", "{undone}");
+    assert_eq!(ok(textdb(&store).args(["cat", "/p/b.md"]), None).stdout, "Acme once\n");
+    assert_eq!(run(textdb(&store).args(["revert-batch", "20000101-000000-dead"]), None).status, 5);
+}
+
 fn has_git() -> bool {
     Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success())
 }

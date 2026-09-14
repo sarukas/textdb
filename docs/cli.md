@@ -109,7 +109,8 @@ environment and its own author name, and the instructions in
 | `import DIR [--prefix /p] [--ext md,markdown,mdx,txt] [--batch 500]` | Load matching files; unchanged files make no new version. `.git`, `.textdb`, `.trash` and `node_modules` directories are skipped; other hidden directories (`.claude`, `.github`) are read, as by `sync` |
 | `export PREFIX DIR [--dry-run]` | Write the files under a folder to disk, byte for byte (line endings, BOM). Only new and changed files are written and nothing on disk is deleted, so exporting over a git checkout shows only real changes; an existing file is overwritten in place and keeps its permissions, a symbolic link is left alone. Names that cannot coexist on this computer (differing only in letter case on Windows and macOS, or in Unicode normalization on macOS; Windows reserved names, forbidden characters, trailing dot or space; clashes with what is on disk) stop the export before anything is written, with exit code 6 and the list; problems only on other systems are warnings. `--dry-run` lists what would be written. `--json` gives `{ new, changed, unchanged, skipped, problems, stopped, written, bytes }` |
 | `sync PREFIX DIR [--dry-run] [--commit] [--base REV] [--ext md,markdown,mdx,txt]` | Reconcile a folder with a directory both ways against what both held at the last sync (recorded in the store): changes, new files, deletes and moves on either side are carried across; edits on both sides are merged line by line, and where they overlap the file on disk gets `<<<<<<< textdb` / `>>>>>>> disk` markers (exit code 3) and the store keeps its version until they are resolved. Files never synced are left alone. In a git checkout, changes that came from git are committed to the store under their git author and subject; `--commit` commits what sync wrote to disk with `Textdb-*` trailers. See [Syncing with a git checkout](#syncing-with-a-git-checkout) |
-| `sql [STATEMENT] [-p VALUE]… [--write] [--full]` | One SQL statement (argument or stdin) against the store, printed as a table or, with `--json`, `{ columns, rows, row_count, store_changes }`. Views `files`, `folders`, `frontmatter`, `sections`, `links`, `commits`, `authors` besides `kb` and the `textdb_*` functions. Read-only unless `--write`; see [Querying with SQL](#querying-with-sql) |
+| `sql [STATEMENT \| -f FILE] [-p VALUE]… [--write [--dry-run]] [--format table\|tsv\|lines\|json] [--full]` | One SQL statement (argument, `-f FILE` or stdin) against the store, printed as a table, TSV, one value per line or, with `--json`, `{ columns, rows, row_count, store_changes, batch }`. `--write --dry-run` runs it, prints each file's diff and the moves and deletes, and undoes it all; a real write prints the batch id that `revert-batch` undoes. Views `files`, `folders`, `frontmatter`, `sections`, `links`, `commits`, `authors` besides `kb` and the `textdb_*` functions. Read-only unless `--write`; see [Querying with SQL](#querying-with-sql) |
+| `revert-batch BATCH [--skip-changed] [--dry-run]` | Undo what one `sql --write` run changed: files get their content from before the batch back (as a new version), files it created are deleted, moves are undone, and files it deleted are created again (new files; the deleted ones keep their history in the trash). When anything in the batch changed since, nothing is reverted (exit 6) unless `--skip-changed`, which reverts the rest and lists what it left. The revert is a batch itself. SQLite stores |
 | `git-status PREFIX DIR [--rev REV]` | When the folder was synced and with which commit, what changed in the store since, and how it compares with a commit (`HEAD` by default) by git blob id: same (CRLF-only differences noted), differ, only in textdb, only in git |
 | `ls [PATH] [-l \| -1] [-S KEY] [-r] [-R]` | One folder: folders first, then files with size and line count. `-1` (`--paths`) prints only the paths, one per line, for scripts. `-l` adds words, versions, last update, and a file's authors (commits each) or a folder's contents; a folder's size, lines, words and versions are totals of everything below it. `--sort` by `name`, `type`, `size`, `lines`, `words`, `versions`, `created`, `updated` or `authors`; `-r` reverses; `-R` lists everything below the folder by path |
 | `tree [PATH] [-L DEPTH] [-d]` | The folder tree with file counts and sizes; `--json` gives a flat, path-sorted list |
@@ -136,10 +137,14 @@ environment and its own author name, and the instructions in
 
 ## Querying with SQL
 
-`textdb sql` runs one statement and prints its rows: a table (values cut at 60 characters;
-`--full` for all of them), or with `--json` `{ columns, rows: [{…}], row_count, store_changes }`.
-The statement comes from the argument or, when it is omitted, stdin — a quoted heredoc avoids
-shell quoting trouble. `-p VALUE` binds the next `?` (`?1` can be reused); in Postgres `$1`, `$2`, …
+`textdb sql` runs one statement and prints its rows: a table (values cut at 60 characters, and
+the row count says so when any were; `--full` for all of them), `--format tsv` (a header, then
+tab-separated rows with tabs, newlines and backslashes escaped as `\t`, `\n`, `\\`, NULL empty),
+`--format lines` (one value per line, for a single column: made for `while read` loops), or with
+`--json` `{ columns, rows: [{…}], row_count, store_changes, batch }`. With tsv and lines only the rows
+go to stdout; the change summary goes to stderr. The statement comes from the argument, from a file
+with `-f FILE`, or, when both are omitted, stdin — a file or a quoted heredoc avoids shell quoting
+trouble. `-p VALUE` binds the next `?` (`?1` can be reused); in Postgres `$1`, `$2`, …
 receive text, so cast where needed (`$1::int`).
 
 Besides `kb`, the `textdb_*` table-valued functions (`textdb_ls(dir, recursive)`,
@@ -149,12 +154,12 @@ by path, deleted files left out:
 
 | View | Columns |
 |---|---|
-| `files` | `id, path, name, version, nbytes, nlines, nwords, nauthors, created_at, updated_at, updated_by` |
-| `folders` | `id, path, name, files, folders, nbytes, nlines, nwords, versions, updated_at` — totals of everything below |
+| `files` | `id, path, name, dir` (`/accounts/acme`), `depth` (`/a.md` is 1), `ext` (lower case, `''` without one), `version, nbytes, nlines, nwords, nauthors, created_at, updated_at, updated_by` |
+| `folders` | `id, path, name, parent, depth, files, folders, nbytes, nlines, nwords, versions, updated_at` — totals of everything below |
 | `frontmatter` | `path, data` — a document's YAML front matter as JSON (text in SQLite: `json_extract`, `json_each`; `jsonb` in Postgres) |
 | `sections` | `path, heading` (`Title / Section / Subsection`), `level, line_from, line_to` |
 | `links` | `path, target` (as written in the document), `line` |
-| `commits` | `path, version, author, ts, message, kind, base_version, nbytes, nlines` |
+| `commits` | `path, version, author, ts, message, kind, base_version, nbytes, nlines, batch` (`batch` in SQLite: the `sql --write` run that made it) |
 | `authors` | `path, author, commits, first_ts, last_ts` |
 
 ```sh
@@ -175,6 +180,24 @@ textdb sql 'SELECT path, nwords FROM files ORDER BY nwords DESC LIMIT 10'
 Avoid `SELECT content FROM kb` over many files: it reads every document in full. Use the views, or
 `textdb_content(path)` for the few files you need.
 
+**Patterns.** In `LIKE`, `_` and `%` are wildcards, so `path LIKE '/work_files/%'` also matches
+`/workXfiles/`; escape them (`LIKE '/work\_files/%' ESCAPE '\'`) or compare with `instr`/`substr`, or
+use the `dir`, `depth` and `ext` columns. Character classes such as `[0-9]` only work with `GLOB`
+(case-sensitive, `*` and `?`), never with `LIKE`.
+
+```sh
+textdb sql --format lines "SELECT path FROM files WHERE dir = '/accounts/acme' AND ext = 'md'"
+textdb sql "SELECT substr(dir, 11) AS account, count(*) FROM files WHERE depth = 3 AND path GLOB '/accounts/*' GROUP BY account"
+```
+
+**Full-text search in SQL.** `textdb_search(query, prefix)` returns one row per document that holds
+every term (terms are ANDed per document; `"a phrase"`, `prefix*`; a term with punctuation such as
+`teo-group` or `2026-02` is matched as the phrase of its words, no quoting needed). `line` and
+`snippet` come from one chunk of the document, the best-ranked one for the first term: the line in
+that chunk holding the most terms. The document holds all the terms, but that line may hold only some
+of them, so confirm with `textdb_lines(path, line, line)` before relying on it. The `search` command
+instead checks every line and lists each one that holds a term.
+
 **Changing documents.** Statements are read-only unless `--write`. With it, change the store
 through `kb` (`INSERT`, `UPDATE`, `DELETE`) and the functions `textdb_write`, `textdb_edit`,
 `textdb_append`, `textdb_replace_lines`, `textdb_move` and `textdb_delete`: each makes versions,
@@ -189,6 +212,31 @@ SELECT path, textdb_edit(path, 'status: draft', 'status: published', :author) AS
 FROM frontmatter WHERE path LIKE '/guides/%' AND json_extract(data, '$.status') = 'draft'
 SQL
 ```
+
+| Function (SQLite) | Does |
+|---|---|
+| `textdb_edit(path, old, new[, author])` | Replaces `old`, which must occur exactly once |
+| `textdb_replace(path, old, new[, expected_count[, author[, message]]])` | Replaces every occurrence, as one version. With `expected_count` the file must hold exactly that many, otherwise at least one; a mismatch fails the statement |
+| `textdb_replace_many(path, replacements[, author[, message]])` | Several replacements applied in order, as one version: `replacements` is a JSON array of `["old", "new"]`, `["old", "new", count]` or `{"old", "new", "count"}` |
+| `textdb_append(path, text[, author])`, `textdb_write(path, content[, base_version[, author[, message]]])`, `textdb_replace_lines(path, from, to, text[, base_version[, author]])` | As the commands of the same name |
+| `textdb_move(from, to[, author])`, `textdb_delete(path[, author])` | Move or delete a file or a whole folder, inside the statement's transaction |
+
+```sh
+textdb --author agent-7 sql --write --dry-run <<'SQL'
+SELECT path, textdb_replace_many(path, '[["Acme Corp", "Acme"], ["- [ ] call", "- [x] call", 1]]', :author) AS version
+FROM files WHERE dir = '/accounts/acme' AND instr(textdb_content(path), 'Acme Corp') > 0
+SQL
+textdb --author agent-7 sql --write "SELECT textdb_delete(path, :author) FROM files WHERE path GLOB '/drafts/*' AND nwords = 0"
+```
+
+`--dry-run` runs the statement in its transaction, prints every file's unified diff (and the moves
+and deletes), and rolls it all back; `--json` gives the same as `changes: [{op, path, old_path,
+from_version, to_version, diff}]`. A real `--write` records its commits, moves and deletes under a
+batch id, printed after the statement (`batch 20260914-211500-3f9a: …`) and kept in the `commits`
+view's `batch` column. `textdb revert-batch ID` undoes the batch; `--dry-run` shows what it would do.
+Batches are SQLite only for now; in Postgres, `--dry-run` lists the change-log rows without diffs.
+Another client can record its own batch with `SELECT textdb_batch('id')` before writing and
+`textdb_batch(NULL)` after.
 
 ## Syncing with a git checkout
 

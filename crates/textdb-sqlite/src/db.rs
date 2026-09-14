@@ -516,7 +516,7 @@ impl<'c> TextDb<'c> {
         };
         self.conn
             .prepare_cached(&format!(
-                "INSERT INTO {}commit(file_id, version, root, parent_root, author, ts, message, nbytes, nlines, kind, base_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT INTO {}commit(file_id, version, root, parent_root, author, ts, message, nbytes, nlines, kind, base_version, batch) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 self.p
             ))
             .map_err(sql_err)?
@@ -531,7 +531,8 @@ impl<'c> TextDb<'c> {
                 nbytes as i64,
                 nlines as i64,
                 c.kind.as_str(),
-                base_version
+                base_version,
+                crate::bulk::current_batch(self.conn)
             ])
             .map_err(sql_err)?;
         let op = if c.version == 1 { "create" } else { "commit" };
@@ -1394,8 +1395,8 @@ impl<'c> TextDb<'c> {
     ) -> Result<i64> {
         self.conn
             .prepare_cached(&format!(
-                "INSERT INTO {}change(ts, op, node_id, node_kind, path, old_path, version, base_version, commit_kind, author, message) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT INTO {}change(ts, op, node_id, node_kind, path, old_path, version, base_version, commit_kind, author, message, batch) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 self.p
             ))
             .map_err(sql_err)?
@@ -1410,7 +1411,8 @@ impl<'c> TextDb<'c> {
                 base_version,
                 commit_kind,
                 author,
-                message
+                message,
+                crate::bulk::current_batch(self.conn)
             ])
             .map_err(sql_err)?;
         Ok(self.conn.last_insert_rowid())
@@ -1529,9 +1531,9 @@ impl<'c> TextDb<'c> {
             let leaf = match textdb_core::tree::find_leaf(&st, &root, &hash)? {
                 Some(l) => l,
                 None => {
-                    // The chunk left this file; fall back to a HEAD scan for the first term.
+                    // The chunk left this file; fall back to a HEAD scan for the terms.
                     let body = (*st.document(&root)?.0).clone();
-                    let (line, snippet) = locate_terms(&body, &terms[..1]);
+                    let (line, snippet) = locate_terms(&body, &terms);
                     if snippet.is_empty() {
                         continue;
                     }
@@ -1547,7 +1549,7 @@ impl<'c> TextDb<'c> {
                     continue;
                 }
             };
-            let (line_in_chunk, snippet) = locate_terms(&bytes, &terms[..1]);
+            let (line_in_chunk, snippet) = locate_terms(&bytes, &terms);
             hits.push(Hit {
                 path,
                 line: leaf.line_off as i64 + line_in_chunk as i64 + 1,
@@ -1665,22 +1667,24 @@ pub fn fts5_query(q: &str) -> String {
     query_terms(q).iter().map(|t| fts5_term(t)).collect::<Vec<_>>().join(" AND ")
 }
 
-/// Line (0-based, within the chunk) of the first term occurrence and that line as snippet.
+/// The line (0-based, within `bytes`) holding the most of the query's terms — the first such
+/// line — and that line as the snippet; line 0 when none holds any. Terms are compared as lower
+/// case text, a prefix without its `*`. The chunk is the best-ranked one for the first term, so
+/// it may hold only some of the terms: the document holds them all, not necessarily this line.
 fn locate_terms(bytes: &[u8], terms: &[String]) -> (usize, String) {
-    let text = String::from_utf8_lossy(bytes).to_lowercase();
-    let mut best: Option<usize> = None;
-    for t in terms {
-        let t = t.trim_end_matches('*').to_lowercase();
-        if t.is_empty() {
-            continue;
-        }
-        if let Some(p) = text.find(&t) {
-            best = Some(best.map_or(p, |b| b.min(p)));
+    let raw = String::from_utf8_lossy(bytes);
+    let wanted: Vec<String> = terms.iter().map(|t| t.trim_end_matches('*').to_lowercase()).filter(|t| !t.is_empty()).collect();
+    let (mut best_count, mut best_line) = (0, 0);
+    for (i, line) in raw.lines().enumerate() {
+        let lower = line.to_lowercase();
+        let n = wanted.iter().filter(|t| lower.contains(t.as_str())).count();
+        if n > best_count {
+            (best_count, best_line) = (n, i);
+            if n == wanted.len() {
+                break;
+            }
         }
     }
-    let pos = best.unwrap_or(0);
-    let line = text[..pos].matches('\n').count();
-    let raw = String::from_utf8_lossy(bytes);
-    let snippet = raw.lines().nth(line).unwrap_or("").chars().take(200).collect();
-    (line, snippet)
+    let snippet = raw.lines().nth(best_line).unwrap_or("").chars().take(200).collect();
+    (best_line, snippet)
 }

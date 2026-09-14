@@ -514,7 +514,8 @@ fn an_older_store_is_upgraded_in_place() {
         conn.execute("INSERT INTO kb(path, content) VALUES ('/a.md', 'one')", []).unwrap();
         // Take the store back to the schema this build replaced.
         conn.execute_batch(
-            "DROP TABLE kb_change; ALTER TABLE kb_commit DROP COLUMN kind; ALTER TABLE kb_commit DROP COLUMN base_version;",
+            "DROP TABLE kb_change; ALTER TABLE kb_commit DROP COLUMN kind; ALTER TABLE kb_commit DROP COLUMN base_version; \
+             ALTER TABLE kb_commit DROP COLUMN batch;",
         )
         .unwrap();
         conn.execute_batch("DROP TABLE kb_file_author;").unwrap();
@@ -524,8 +525,9 @@ fn an_older_store_is_upgraded_in_place() {
     }
     let conn = textdb_sqlite::open(path).unwrap();
     let added: i64 = conn.query_row("SELECT textdb_migrate()", [], |r| r.get(0)).unwrap();
-    // commit.kind and commit.base_version, and nine node columns for listings.
-    assert_eq!(added, 11);
+    // commit.kind, commit.base_version and commit.batch, and nine node columns for listings
+    // (change is created whole, with its batch column).
+    assert_eq!(added, 12);
     // ... computed from what the store already holds.
     let (words, authors): (i64, i64) = conn
         .query_row("SELECT nwords, nauthors FROM kb_node WHERE path = '/a.md'", [], |r| Ok((r.get(0)?, r.get(1)?)))
