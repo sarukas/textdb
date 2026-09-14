@@ -9,6 +9,7 @@
 //! ```
 //! The Rust API ([`TextDb`]) offers the same operations without SQL.
 
+pub mod bulk;
 pub mod db;
 pub mod functions;
 pub mod path_history;

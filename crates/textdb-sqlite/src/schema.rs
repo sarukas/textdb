@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS {p}commit (
   nlines       INTEGER,
   kind         TEXT,                          -- direct, rebased, merged
   base_version INTEGER,                       -- the version the writer started from
+  batch        TEXT    NULL,                  -- the run that made it (`textdb sql --write`), see bulk.rs
   PRIMARY KEY (file_id, version)
 );
 CREATE TABLE IF NOT EXISTS {p}chunk (
@@ -98,7 +99,8 @@ CREATE TABLE IF NOT EXISTS {p}change (
   base_version INTEGER NULL,                  -- commit: the version the writer started from
   commit_kind  TEXT    NULL,                  -- create, commit: direct, rebased, merged
   author       TEXT    NULL,
-  message      TEXT    NULL
+  message      TEXT    NULL,
+  batch        TEXT    NULL                   -- the run that made it, as on commit
 );
 CREATE INDEX IF NOT EXISTS {p}change_node ON {p}change(node_id);
 -- Path history (textdb_core::path): one row per node a rename, move or delete touched — the
@@ -178,7 +180,15 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("node", "t_words", "INTEGER NOT NULL DEFAULT 0"),
     ("node", "t_versions", "INTEGER NOT NULL DEFAULT 0"),
     ("node", "t_updated_at", "TEXT NULL"),
+    // Batches: the run (`textdb sql --write`) a commit or change belongs to.
+    ("commit", "batch", "TEXT NULL"),
+    ("change", "batch", "TEXT NULL"),
 ];
+
+/// Indexes on columns an older store gains in `migrate`, so created after them.
+fn added_indexes(p: &str) -> String {
+    format!("CREATE INDEX IF NOT EXISTS {p}change_batch ON {p}change(batch) WHERE batch IS NOT NULL;")
+}
 
 /// Bring a store created by an earlier build up to this schema. Idempotent; returns the
 /// number of columns it had to add.
@@ -202,6 +212,7 @@ pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> 
         }
     }
     if missing.is_empty() {
+        conn.execute_batch(&added_indexes(p))?;
         return Ok(0);
     }
     let backfill = missing.iter().any(|(table, _, _)| **table == "node");
@@ -213,6 +224,7 @@ pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> 
         if backfill {
             crate::stats::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
         }
+        conn.execute_batch(&added_indexes(p))?;
         Ok(())
     };
     match run() {
