@@ -113,7 +113,9 @@ Git's attribute syntax, in the vault's `.gitattributes`, with a `textdb` attribu
 - The rules (with a hash of `.gitattributes`) are recorded with each sync base, so a change is
   reported before it takes in or pushes files unnoticed.
 - `textdb assets gitignore` keeps a managed block in `.gitignore` that ignores the asset patterns
-  and never `*.tdbasset`.
+  and the vault's `.textdb/trash/`, and never `*.tdbasset`. Where the patterns get a file wrong (a
+  document under a `binary` rule, an asset only its bytes show) the block names that file; run
+  it again as files come and go. Push notes pushed assets git does not ignore.
 
 ## Asset stores
 
@@ -131,18 +133,26 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
 - Layout: the asset at store path `/accounts/acme/arch.png` is kept at `<root>/accounts/acme/arch.png`.
 - **local driver**: plain filesystem operations (works for a NAS, a USB disk, and Google Drive for
   Desktop / OneDrive clients in mirror mode). Item = path. Copies go through a hidden partial file
-  (`.NAME.PID.tdbpart`), flushed and renamed into place, and are hashed after the copy; bytes a
-  push replaces move to `<root>/.textdb-trash/<yyyymmdd-HHMMSS>/…`.
-- Hashes of local files are cached per vault in the config directory (`cache/assets-*.json`), by
-  size and modification time, and only for files not modified in the last two seconds; `verify`
-  never uses the cache.
+  (`.NAME.PID-NANOS.tdbpart`), flushed and renamed into place, and are hashed after the copy; bytes
+  a push replaces move to `<root>/.textdb-trash/<yyyymmdd-HHMMSS>-<nanos>-<pid>-<n>/…`. A push
+  replaces only the bytes of the asset's own pointer, and only when no other pointer (one moved
+  in the store, say) names them; anything else at that path is kept and the upload goes next to
+  it as `NAME (<first 8 of its sha256>).ext`, which the pointer's item records.
+- Hashes of local files are cached per computer and directory in the local cache directory
+  (`TEXTDB_CONFIG_DIR/cache`, else `%LOCALAPPDATA%\textdb`, `$XDG_CACHE_HOME/textdb` or
+  `~/.cache/textdb`; `assets-*.json`, written atomically), by size and modification time, and only
+  for files not modified in the last two seconds; `verify` never uses the cache.
 - **rclone driver** (stage 3): runs `rclone` (a single native executable on Windows, macOS and
   Linux) for copy, move, delete (to the provider's trash) and listing with hashes and item ids.
   Google shared drives report SHA-256; SharePoint only its QuickXorHash and rewrites Office files
   on upload, so for those textdb tracks the provider's version tag instead of comparing hashes.
 
-What a vault last saw of each asset (to tell a local edit from a remote one) is kept per vault
-(host + directory) in the store, next to the sync base.
+What a vault last had of each asset (to tell a local edit from a remote one) is kept in the same
+cache, keyed by host and directory and never roaming with a profile. Losing it is safe: a file
+that differs from its pointer is then a `conflict` until it is pulled or pushed with `--force`.
+Push records the pointers it wrote in this directory's sync base for the vault's folder only (the
+base's time and other files stay), refuses a pointer the store deleted since that sync, and checks
+the pointer's version before uploading as well as before committing.
 
 ## Commands
 

@@ -128,6 +128,27 @@ pub fn dir_key(dir: &Path) -> String {
     s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
 }
 
+/// `\\server\share\…` as builds before this one recorded it: `UNC\server\share\…`.
+fn legacy_dir_key(key: &str) -> Option<String> {
+    key.strip_prefix(r"\\").map(|rest| format!(r"UNC\{rest}"))
+}
+
+/// Whether the directory a sync base recorded is the one with [`dir_key`] `key`.
+pub fn is_dir_key(recorded: &str, key: &str) -> bool {
+    let same = |a: &str, b: &str| if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b };
+    same(recorded, key) || legacy_dir_key(key).is_some_and(|l| same(recorded, &l))
+}
+
+/// The base of `prefix` synced with the directory `key`, under the form an older build may have
+/// recorded it in.
+pub fn find_sync_base(st: &mut dyn Store, prefix: &str, key: &str) -> Result<Option<SyncBase>> {
+    match (st.sync_base(prefix, key)?, legacy_dir_key(key)) {
+        (Some(b), _) => Ok(Some(b)),
+        (None, Some(legacy)) => st.sync_base(prefix, &legacy),
+        (None, None) => Ok(None),
+    }
+}
+
 fn store_path(prefix: &str, rel: &str) -> String {
     if prefix == "/" {
         format!("/{rel}")
@@ -513,7 +534,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     if o.commit && repo.is_none() {
         return Err(StoreError::invalid(format!("--commit needs {} to be in a git checkout", o.dir.display())));
     }
-    let stored = st.sync_base(&prefix, &key)?;
+    let stored = find_sync_base(st, &prefix, &key)?;
     if stored.is_some() && o.base_rev.is_some() {
         return Err(StoreError::invalid(format!(
             "{prefix} has been synced with {key} before and has a base already; --base is for the first sync only"
@@ -1343,7 +1364,7 @@ pub fn git_status(st: &mut dyn Store, prefix: &str, dir: &Path, rev: &str, exts:
     let key = dir_key(dir);
     let heads = heads_by_rel(st, &prefix)?;
     let synced = st.sync_bases(&prefix)?;
-    let since_sync = st.sync_base(&prefix, &key)?.map(|b| {
+    let since_sync = find_sync_base(st, &prefix, &key)?.map(|b| {
         let rows: HashMap<&str, &BaseFile> = b.files.iter().map(|f| (f.rel.as_str(), f)).collect();
         let mut c = Changes::default();
         for (rel, h) in &heads {

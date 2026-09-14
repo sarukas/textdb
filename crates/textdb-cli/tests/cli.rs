@@ -770,6 +770,104 @@ fn assets_between_vaults_conflicts_outdated_case_and_junk() {
     ok(&mut t(&["assets", "push", "--dir", d3]), None);
     assert_eq!(ok(&mut t(&["--json", "links", "/p3", "--broken", "--dir", d3]), None).json(), serde_json::json!([]));
     assert_eq!(run(&mut t(&["assets", "status", "/elsewhere", "--dir", d3]), None).status, 6);
+    assert_eq!(run(&mut t(&["assets", "push", "/p3", "/elsewhere", "--dir", d3]), None).status, 6);
+}
+
+#[test]
+fn assets_push_keeps_bytes_in_use_and_records_only_what_it_wrote() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let (v, w, bucket, config) = (tmp.path().join("v"), tmp.path().join("w"), tmp.path().join("bucket"), tmp.path().join("config"));
+    for d in [v.join("img"), w.clone(), bucket.clone()] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.env("TEXTDB_CONFIG_DIR", &config).args(args);
+        c
+    };
+    let d = v.to_str().unwrap();
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", bucket.to_str().unwrap()]), None);
+    std::fs::write(v.join("img/a.png"), b"\x89PNG one").unwrap();
+    ok(&mut t(&["sync", "/", d]), None);
+    ok(&mut t(&["assets", "push", "--dir", d]), None);
+
+    // A pointer moved in the store still names the bytes where they were put: a new file pushed
+    // under the old name goes next to them rather than replacing them.
+    ok(&mut t(&["mv", "/img/a.png.tdbasset", "/old/a.png.tdbasset"]), None);
+    ok(&mut t(&["sync", "/", d]), None);
+    assert_eq!(std::fs::read(v.join("old/a.png")).unwrap(), b"\x89PNG one", "sync carries the file along");
+    std::fs::create_dir_all(v.join("img")).unwrap();
+    std::fs::write(v.join("img/a.png"), b"\x89PNG two").unwrap();
+    ok(&mut t(&["assets", "push", "--dir", d]), None);
+    assert_eq!(std::fs::read(bucket.join("img/a.png")).unwrap(), b"\x89PNG one");
+    std::fs::remove_file(v.join("old/a.png")).unwrap();
+    ok(&mut t(&["assets", "pull", "--dir", d]), None);
+    assert_eq!(std::fs::read(v.join("old/a.png")).unwrap(), b"\x89PNG one");
+    assert_eq!(ok(&mut t(&["--json", "assets", "verify", "--dir", d]), None).json()["problems"], 0);
+
+    // A pointer push cannot write here is not recorded as synced, so the next sync writes it.
+    std::fs::write(v.join("img/a.png"), b"\x89PNG three").unwrap();
+    let on_disk = v.join("img/a.png.tdbasset");
+    let set_readonly = |yes: bool| {
+        let mut p = std::fs::metadata(&on_disk).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        p.set_readonly(yes);
+        std::fs::set_permissions(&on_disk, p).unwrap();
+    };
+    set_readonly(true);
+    let failed = run(&mut t(&["assets", "push", "--dir", d]), None);
+    set_readonly(false);
+    assert_eq!(failed.status, 1, "{}", failed.stdout);
+    ok(&mut t(&["sync", "/", d]), None);
+    assert_eq!(std::fs::read_to_string(&on_disk).unwrap(), ok(&mut t(&["cat", "/img/a.png.tdbasset"]), None).stdout);
+    assert_eq!(ok(&mut t(&["--json", "assets", "status", "--dir", d]), None).json()["counts"], serde_json::json!({ "ok": 2 }));
+
+    // A pointer deleted in the store is not brought back by pushing a changed file.
+    ok(&mut t(&["rm", "/img/a.png.tdbasset"]), None);
+    std::fs::write(v.join("img/a.png"), b"\x89PNG four").unwrap();
+    let refused = run(&mut t(&["assets", "push", "--dir", d]), None);
+    assert_eq!(refused.status, 3, "{}", refused.stdout);
+    assert!(refused.stdout.contains("deleted in the store"), "{}", refused.stdout);
+    assert_eq!(run(&mut t(&["stat", "/img/a.png.tdbasset"]), None).status, 5);
+
+    // Push records its pointers in the base of the folder it pushed to, and leaves the others alone.
+    let dw = w.to_str().unwrap();
+    std::fs::write(w.join("a.md"), "a\n").unwrap();
+    ok(&mut t(&["sync", "/w1", dw]), None);
+    ok(&mut t(&["sync", "/w2", dw]), None);
+    std::fs::write(w.join("z.png"), b"\x89PNG z").unwrap();
+    ok(&mut t(&["assets", "push", "--dir", dw]), None);
+    let s = ok(&mut t(&["--json", "assets", "status", "--dir", dw]), None).json();
+    assert_eq!((s["prefix"].as_str(), &s["counts"]), (Some("/w2"), &serde_json::json!({ "ok": 1 })), "{s}");
+    let other = run(&mut t(&["--json", "sync", "--dry-run", "/w1", dw]), None).json();
+    assert_eq!(other["to_textdb"]["new"], serde_json::json!(["z.png.tdbasset"]), "{other}");
+
+    // The .gitignore block leaves documents under a `binary` rule to git, and names assets only
+    // their bytes show.
+    std::fs::create_dir_all(v.join("assets")).unwrap();
+    std::fs::write(v.join("assets/readme.md"), "# r\n").unwrap();
+    std::fs::write(v.join("assets/pic.raw"), b"raw").unwrap();
+    std::fs::write(v.join("data.bin"), b"\0\x01").unwrap();
+    std::fs::write(v.join(".gitattributes"), "assets/* binary\n").unwrap();
+    ok(&mut t(&["assets", "gitignore", "--dir", d]), None);
+    let gi = std::fs::read_to_string(v.join(".gitignore")).unwrap();
+    assert!(gi.contains("\n/.textdb/trash/\n") && gi.contains("\n!/assets/readme.md\n") && gi.contains("\n/data.bin\n"), "{gi}");
+    if has_git() {
+        git(&v, &["init", "-q"]);
+        let ignored = |rel: &str| Command::new("git").arg("-C").arg(&v).args(["check-ignore", "-q", rel]).status().unwrap().success();
+        for (rel, want) in [
+            ("assets/readme.md", false),
+            ("assets/pic.raw", true),
+            ("data.bin", true),
+            (".textdb/trash/x/img/a.png", true),
+            ("img/a.png", true),
+            ("img/a.png.tdbasset", false),
+            (".gitattributes", false),
+        ] {
+            assert_eq!(ignored(rel), want, "{rel}\n{gi}");
+        }
+    }
 }
 
 fn has_git() -> bool {

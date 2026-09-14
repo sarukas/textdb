@@ -18,7 +18,7 @@ pub mod classify;
 pub mod driver;
 pub mod pointer;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,9 +28,10 @@ use textdb_sqlite::normalize_path;
 
 use classify::{Class, Classifier, IGNORED_DIRS};
 use driver::{AssetStore, Driver};
+use ignore::gitignore::GitignoreBuilder;
 use pointer::{asset_path, hash_file, is_asset_pointer, Pointer, SUFFIX};
 
-use crate::store::{Store, StoreError, SyncBase};
+use crate::store::{BaseFile, Store, StoreError, SyncBase};
 use crate::{emit_json, out, Result};
 
 /// A file modified this recently may change again within its timestamp's resolution, so what is
@@ -47,11 +48,27 @@ fn under(folder: &str, path: &str) -> bool {
     folder == "/" || path == folder || path.starts_with(&format!("{folder}/"))
 }
 
-fn same_dir(a: &str, b: &str) -> bool {
-    if cfg!(windows) {
-        a.eq_ignore_ascii_case(b)
-    } else {
-        a == b
+/// This computer's name, as the environment or the system gives it.
+pub fn host() -> String {
+    let named = |s: String| Some(s.trim().to_string()).filter(|h| !h.is_empty());
+    ["COMPUTERNAME", "HOSTNAME"]
+        .iter()
+        .find_map(|v| std::env::var(v).ok().and_then(named))
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok().and_then(named))
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| named(String::from_utf8_lossy(&o.stdout).into_owned()))
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Refuse store paths outside the vault's folder, which would match nothing.
+fn check_scope(v: &Vault, scope: &[String]) -> Result<()> {
+    match scope.iter().find(|p| !under(&v.prefix, p) && !under(p, &v.prefix)) {
+        Some(p) => Err(StoreError::invalid(format!("{p} is not in {}, the folder {} is synced with", v.prefix, v.dir.display()))),
+        None => Ok(()),
     }
 }
 
@@ -119,7 +136,7 @@ pub fn portable_rel(rel: &str) -> bool {
 /// The store folder the directory `dir` was last synced with.
 pub fn synced_prefix(st: &mut dyn Store, dir: &Path) -> Result<Option<String>> {
     let key = crate::sync::dir_key(dir);
-    Ok(st.all_sync_bases()?.into_iter().find(|b| same_dir(&b.dir, &key)).map(|b| b.prefix))
+    Ok(st.all_sync_bases()?.into_iter().find(|b| crate::sync::is_dir_key(&b.dir, &key)).map(|b| b.prefix))
 }
 
 /// The vault `path` (a store path) belongs to. With `dir`: that directory and the store folder it
@@ -133,7 +150,7 @@ pub fn vault(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>) -> Resu
             return Err(StoreError::invalid(format!("{} is not a directory", dir.display())));
         }
         let key = crate::sync::dir_key(dir);
-        let synced: Vec<&SyncBase> = bases.iter().filter(|b| same_dir(&b.dir, &key)).collect();
+        let synced: Vec<&SyncBase> = bases.iter().filter(|b| crate::sync::is_dir_key(&b.dir, &key)).collect();
         if let Some(newest) = synced.first() {
             let Some(p) = path else {
                 return Ok(Vault { prefix: newest.prefix.clone(), dir: dir.to_path_buf() });
@@ -231,10 +248,16 @@ fn scan(st: &mut dyn Store, v: &Vault) -> Result<Scan> {
     Ok(Scan { classifier, disk, disk_pointers, store_pointers })
 }
 
-/// What a vault learnt about its files, kept per directory in the config directory: hashes and
-/// binary sniffs by size and modification time, and the bytes it last had of each asset.
+/// What a vault learnt about its files, kept per computer and directory in the local cache
+/// directory: hashes and binary sniffs by size and modification time, and the bytes it last had of
+/// each asset. Losing it is safe: files are hashed again, and what the directory last had is
+/// unknown, so a file that differs from its pointer is a conflict until pulled or pushed.
 #[derive(Default, Serialize, Deserialize)]
 struct VaultCache {
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    dir: String,
     #[serde(default)]
     files: BTreeMap<String, Cached>,
     #[serde(default)]
@@ -261,14 +284,16 @@ struct Cached {
 impl VaultCache {
     fn open(v: &Vault) -> VaultCache {
         use sha2::Digest;
-        let key = pointer::hex(&sha2::Sha256::digest(crate::sync::dir_key(&v.dir).as_bytes()));
-        let path = driver::binding::config_dir().map(|d| d.join("cache").join(format!("assets-{}.json", &key[..16])));
+        let (host, dir) = (host(), crate::sync::dir_key(&v.dir));
+        let key = pointer::hex(&sha2::Sha256::digest(format!("{}\n{dir}", host.to_lowercase()).as_bytes()));
+        let path = driver::binding::cache_dir().map(|d| d.join(format!("assets-{}.json", &key[..16])));
         let mut c: VaultCache = path
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|t| serde_json::from_str(&t).ok())
+            .and_then(|t| serde_json::from_str::<VaultCache>(&t).ok())
+            .filter(|c| c.host.eq_ignore_ascii_case(&host) && c.dir == dir)
             .unwrap_or_default();
-        c.path = path;
+        (c.path, c.host, c.dir) = (path, host, dir);
         c
     }
 
@@ -318,11 +343,14 @@ impl VaultCache {
 
     fn save(&self) {
         if let (true, Some(path)) = (self.dirty, &self.path) {
+            let Ok(text) = serde_json::to_string(self) else { return };
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            if let Ok(text) = serde_json::to_string(self) {
-                let _ = std::fs::write(path, text);
+            // Written aside and renamed over, so no one ever reads half of it.
+            let part = driver::partial(path);
+            if std::fs::write(&part, text).and_then(|_| std::fs::rename(&part, path)).is_err() {
+                let _ = std::fs::remove_file(&part);
             }
         }
     }
@@ -489,7 +517,7 @@ fn items(v: &Vault, scan: &Scan, cache: &mut VaultCache, scope: &[String]) -> Re
                     "outdated"
                 } else {
                     item.note.get_or_insert_with(|| {
-                        "other bytes than the pointer names, and not what this directory last had: move the file aside and pull, or push --force to replace the asset store's copy".into()
+                        "other bytes than the pointer names, and not what this directory last had: move the file aside and pull to compare; push --force replaces the asset store's copy with this one".into()
                     });
                     "conflict"
                 };
@@ -603,8 +631,35 @@ struct Written {
     text: String,
 }
 
+/// Every pointer in the store by what it names, its asset store and the item there: the paths of
+/// the assets naming it.
+type Locations = HashMap<(String, String), BTreeSet<String>>;
+
+fn pointer_locations(st: &mut dyn Store) -> Result<Locations> {
+    let mut found: Locations = HashMap::new();
+    for head in st.file_heads("/")? {
+        if !is_asset_pointer(&head.path) {
+            continue;
+        }
+        if let Ok(p) = Pointer::parse(&st.read(&head.path, None)?.0) {
+            let path = asset_path(&head.path).to_string();
+            found.entry((p.store.clone(), p.item.clone().unwrap_or_else(|| path.clone()))).or_default().insert(path);
+        }
+    }
+    Ok(found)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn push_one(st: &mut dyn Store, v: &Vault, drivers: &mut Drivers, o: &PushOptions, cache: &mut VaultCache, item: &Item, written: &mut Vec<Written>) -> Outcome {
+fn push_one(
+    st: &mut dyn Store,
+    v: &Vault,
+    drivers: &mut Drivers,
+    o: &PushOptions,
+    cache: &mut VaultCache,
+    in_use: &Locations,
+    item: &Item,
+    written: &mut Vec<Written>,
+) -> Outcome {
     let names = drivers.names();
     let store = match (o.to, &item.pointer) {
         (Some(n), _) => n.to_string(),
@@ -620,6 +675,12 @@ fn push_one(st: &mut dyn Store, v: &Vault, drivers: &mut Drivers, o: &PushOption
     if item.disk_differs {
         return Outcome::Conflict(format!("{}: its pointer changed in the store since this directory was synced; sync first", item.path));
     }
+    // Checked before the upload as well as before the commit, so a push that lost the race to
+    // another leaves the asset store alone.
+    let pointer_path = format!("{}{SUFFIX}", item.path);
+    if st.stat(&pointer_path).ok().map(|s| s.version) != item.version {
+        return Outcome::Conflict(format!("{}: its pointer changed in the store since this directory was scanned; run it again", item.path));
+    }
     let d = match drivers.get(&store) {
         Ok(d) => d,
         Err(e) => return Outcome::Failed(format!("{}: {e}", item.path)),
@@ -630,11 +691,17 @@ fn push_one(st: &mut dyn Store, v: &Vault, drivers: &mut Drivers, o: &PushOption
         Ok(h) => h,
         Err(e) => return Outcome::Failed(format!("{}: {e}", item.path)),
     };
-    let provider_item = match d.put(&item.path, &src, &sha) {
+    let old = item.pointer.as_ref();
+    // The upload replaces the bytes at the asset's path only when they are its own pointer's and
+    // no other pointer names them; anything else there is kept, and the upload goes next to it.
+    let shared = in_use.get(&(store.clone(), item.path.clone())).is_some_and(|users| users.iter().any(|u| u != &item.path));
+    let replaces = old
+        .filter(|p| !shared && p.store == store && p.item.as_deref().unwrap_or(&item.path) == item.path)
+        .map(|p| p.sha256.as_str());
+    let provider_item = match d.put(&item.path, &src, &sha, replaces) {
         Ok(id) => id,
         Err(e) => return Outcome::Failed(format!("{}: {}", item.path, e.message)),
     };
-    let old = item.pointer.as_ref();
     let p = Pointer {
         id: old.map_or_else(pointer::new_id, |p| p.id.clone()),
         sha256: sha.clone(),
@@ -645,16 +712,17 @@ fn push_one(st: &mut dyn Store, v: &Vault, drivers: &mut Drivers, o: &PushOption
         extra: old.map(|p| p.extra.clone()).unwrap_or_default(),
     };
     // The bytes are in the asset store and checked; now the pointer, unless another push got there first.
-    let pointer_path = format!("{}{SUFFIX}", item.path);
     if st.stat(&pointer_path).ok().map(|s| s.version) != item.version {
-        return Outcome::Conflict(format!("{}: its pointer changed in the store during this push; run it again", item.path));
+        return Outcome::Conflict(format!(
+            "{}: its pointer changed in the store during this push; run it again (anything the upload replaced is in the asset store's trash)",
+            item.path
+        ));
     }
     let text = p.to_text();
     let w = match st.write(&pointer_path, text.as_bytes(), item.version, o.author, Some(o.message.unwrap_or("assets push"))) {
         Ok(w) => w,
         Err(e) => return Outcome::Failed(format!("{}: the bytes are in the asset store, but the pointer was not committed: {}", item.path, e.message)),
     };
-    written.push(Written { path: pointer_path, version: w.version, text: text.clone() });
     if let Ok(meta) = std::fs::metadata(&src) {
         cache.remember(file, meta.len(), mtime_ns(&meta), &sha);
     }
@@ -663,47 +731,65 @@ fn push_one(st: &mut dyn Store, v: &Vault, drivers: &mut Drivers, o: &PushOption
     if let Err(e) = std::fs::write(&on_disk, &text) {
         return Outcome::Failed(format!("{}: the pointer is committed but could not be written to {} ({e}); sync writes it", item.path, on_disk.display()));
     }
-    Outcome::Done(json!({ "path": item.path, "state": item.state, "size": size, "store": store, "version": w.version }))
+    // Recorded as synced only now that both sides have it.
+    written.push(Written { path: pointer_path, version: w.version, text });
+    Outcome::Done(json!({ "path": item.path, "file": file, "state": item.state, "size": size, "store": store, "version": w.version }))
 }
 
-/// Record the pointers push committed and wrote to disk in the sync bases of this directory, as a
-/// sync would have: the next sync then knows both sides agree on them, and a pointer deleted or
-/// moved in the store is deleted or moved on disk rather than taken in again.
-fn record_in_sync_bases(st: &mut dyn Store, v: &Vault, written: &[Written]) -> Result<()> {
+/// This directory's sync base for the vault's folder, without its files, as it was recorded.
+fn recorded_base(st: &mut dyn Store, v: &Vault) -> Result<Option<SyncBase>> {
+    let key = crate::sync::dir_key(&v.dir);
+    Ok(st.all_sync_bases()?.into_iter().find(|b| b.prefix == v.prefix && crate::sync::is_dir_key(&b.dir, &key)))
+}
+
+/// Record the pointers push committed and wrote to disk in this directory's sync base for the
+/// vault's folder, as a sync would have: the next sync then knows both sides agree on them, and a
+/// pointer deleted or moved in the store is deleted or moved on disk rather than taken in again.
+/// Only their rows change; the base's other files, and when it was synced, stay as they are.
+fn record_in_sync_base(st: &mut dyn Store, v: &Vault, written: &[Written]) -> Result<()> {
     if written.is_empty() {
         return Ok(());
     }
-    let key = crate::sync::dir_key(&v.dir);
-    let synced: Vec<SyncBase> = st.all_sync_bases()?.into_iter().filter(|b| same_dir(&b.dir, &key)).collect();
-    for meta in synced {
-        let Some(mut base) = st.sync_base(&meta.prefix, &meta.dir)? else { continue };
-        let root = PathBuf::from(&base.dir);
-        let mut changed = false;
-        for w in written {
-            let Some(rel) = rel_under(&base.prefix, &w.path) else { continue };
-            let row = crate::sync::base_row(&root, &rel, Some(w.version), crate::sync::blob_id(w.text.as_bytes()), false);
-            base.files.retain(|f| f.rel != rel);
-            base.files.push(row);
-            changed = true;
-        }
-        if changed {
-            st.save_sync_base(&base)?;
-        }
-    }
+    let Some(base) = recorded_base(st, v)? else { return Ok(()) };
+    let rows: Vec<BaseFile> = written
+        .iter()
+        .filter_map(|w| {
+            let rel = rel_under(&v.prefix, &w.path)?;
+            Some(crate::sync::base_row(&v.dir, &rel, Some(w.version), crate::sync::blob_id(w.text.as_bytes()), false))
+        })
+        .collect();
+    st.put_sync_files(&base.prefix, &base.dir, &rows)?;
     Ok(())
 }
 
 pub fn push(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, o: PushOptions, json: bool) -> Result<()> {
     let v = vault(st, paths.first().map(String::as_str), dir)?;
+    let scope = scope_of(paths)?;
+    check_scope(&v, &scope)?;
     let scan = scan(st, &v)?;
     let mut cache = VaultCache::open(&v);
-    let scope = scope_of(paths)?;
     let found = items(&v, &scan, &mut cache, &scope)?;
     let mut drivers = Drivers::new(st)?;
     let names = drivers.names();
+    // The pointers this directory's last sync had: one only on disk now was deleted in the store.
+    let synced: HashSet<String> = match recorded_base(st, &v)? {
+        Some(r) => st
+            .sync_base(&r.prefix, &r.dir)?
+            .map(|b| b.files.into_iter().filter(|f| f.version.is_some()).map(|f| f.rel).collect())
+            .unwrap_or_default(),
+        None => HashSet::new(),
+    };
     let (mut pushed, mut conflicts, mut failed, mut bytes) = (Vec::new(), Vec::new(), Vec::new(), 0u64);
     let mut todo = Vec::new();
     for item in found {
+        let deleted = item.pointer.is_some() && item.version.is_none() && synced.contains(&format!("{}{SUFFIX}", item.rel));
+        if deleted && matches!(item.state, "new" | "modified" | "conflict") {
+            conflicts.push(format!(
+                "{}: its pointer was deleted in the store since this directory was synced; sync (which deletes it here), then push the file as a new asset",
+                item.path
+            ));
+            continue;
+        }
         match item.state {
             "new" | "modified" => todo.push(item),
             "conflict" if o.force && item.case_of.is_none() => todo.push(item),
@@ -719,9 +805,10 @@ pub fn push(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, o: PushOpt
             return Err(StoreError::invalid(format!("several asset stores ({}): choose one for new assets with --to", names.join(", "))));
         }
     }
+    let in_use = if todo.is_empty() || o.dry_run { HashMap::new() } else { pointer_locations(st)? };
     let mut written = Vec::new();
     for item in &todo {
-        match push_one(st, &v, &mut drivers, &o, &mut cache, item, &mut written) {
+        match push_one(st, &v, &mut drivers, &o, &mut cache, &in_use, item, &mut written) {
             Outcome::Done(j) => {
                 bytes += j["size"].as_u64().unwrap_or(0);
                 pushed.push(j);
@@ -731,8 +818,20 @@ pub fn push(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, o: PushOpt
         }
     }
     cache.save();
-    if let Err(e) = record_in_sync_bases(st, &v, &written) {
+    if let Err(e) = record_in_sync_base(st, &v, &written) {
         failed.push(format!("the pushed pointers could not be recorded in the sync base ({}); the next sync compares them itself", e.message));
+    }
+    if !o.dry_run && !pushed.is_empty() && crate::git::repo(&v.dir).is_some() {
+        let files: Vec<String> = pushed.iter().filter_map(|p| p["file"].as_str().map(str::to_string)).collect();
+        let ignored = crate::git::ignored(&v.dir, &files);
+        let loose: Vec<&String> = files.iter().filter(|f| !ignored.contains(*f)).collect();
+        if let Some(first) = loose.first() {
+            eprintln!(
+                "note: git does not ignore {} of the pushed assets ({first}{}): `textdb assets gitignore` covers them, and git keeps tracking what it tracks until `git rm --cached`",
+                loose.len(),
+                if loose.len() > 1 { ", …" } else { "" }
+            );
+        }
     }
     if json {
         emit_json(&json!({ "dry_run": o.dry_run, "pushed": pushed, "bytes": bytes, "conflicts": conflicts, "failed": failed }))?;
@@ -761,9 +860,10 @@ pub fn push(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, o: PushOpt
 
 pub fn pull(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, linked_from: Option<&str>, dry_run: bool, json: bool) -> Result<()> {
     let v = vault(st, paths.first().map(String::as_str).or(linked_from), dir)?;
+    let scope = scope_of(paths)?;
+    check_scope(&v, &scope)?;
     let scan = scan(st, &v)?;
     let mut cache = VaultCache::open(&v);
-    let scope = scope_of(paths)?;
     let found = items(&v, &scan, &mut cache, &scope)?;
     let linked: Option<BTreeSet<String>> = match linked_from {
         Some(p) => Some(st.links(p, &[])?.into_iter().filter(|l| l.asset).filter_map(|l| l.resolved).collect()),
@@ -929,6 +1029,46 @@ pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
 const GITIGNORE_BEGIN: &str = "# BEGIN textdb assets (written by `textdb assets gitignore`: binaries live in the asset store, their .tdbasset pointers in git)";
 const GITIGNORE_END: &str = "# END textdb assets";
 
+/// `rel` as a `.gitignore` pattern for that one file: from the top, glob characters escaped.
+fn exact_pattern(rel: &str) -> String {
+    let mut s = String::from("/");
+    for c in rel.chars() {
+        if matches!(c, '\\' | '*' | '?' | '[') {
+            s.push('\\');
+        }
+        s.push(c);
+    }
+    if s.ends_with(' ') {
+        s.pop();
+        s.push_str("\\ ");
+    }
+    s
+}
+
+/// Lines for the single files `patterns` get wrong: one that is not an asset they would ignore (a
+/// document under a `binary` rule, say), and an asset they would not (one only its bytes show).
+fn single_file_lines(root: &Path, files: &Files, classifier: &Classifier, cache: &mut VaultCache, patterns: &[String]) -> Vec<String> {
+    let mut b = GitignoreBuilder::new("");
+    for p in patterns {
+        let _ = b.add_line(None, p);
+    }
+    let Ok(ignore) = b.build() else { return Vec::new() };
+    let mut out = Vec::new();
+    for (rel, &(size, mtime)) in files {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        let asset = match classifier.rule_class(rel) {
+            Class::Asset => true,
+            Class::Other => !name.starts_with(".git") && cache.binary(root, rel, size, mtime),
+            Class::Document => false,
+            Class::Ignore | Class::Pointer => continue,
+        };
+        if asset != ignore.matched_path_or_any_parents(rel, false).is_ignore() {
+            out.push(format!("{}{}", if asset { "" } else { "!" }, exact_pattern(rel)));
+        }
+    }
+    out
+}
+
 /// `existing` with the managed block replaced by `block`, or `block` put first, so the lines
 /// written after it (the user's own) take precedence over it.
 fn with_block(existing: &str, block: &str, nl: &str) -> String {
@@ -950,12 +1090,19 @@ pub fn gitignore(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, dry
         Some(d) => d.to_path_buf(),
         None => vault(st, path, None)?.dir,
     };
-    let (_, nested) = walk(&root)?;
+    let (files, nested) = walk(&root)?;
     let classifier = Classifier::load(&root, &nested);
     for w in &classifier.warnings {
         eprintln!("warning: {w}");
     }
-    let patterns = classifier.gitignore_patterns();
+    let mut patterns = classifier.gitignore_patterns();
+    let mut cache = VaultCache::open(&Vault { prefix: "/".to_string(), dir: root.clone() });
+    let single = single_file_lines(&root, &files, &classifier, &mut cache, &patterns);
+    cache.save();
+    // Before the last line, which keeps every pointer in git.
+    let last = patterns.pop();
+    patterns.extend(single.iter().cloned());
+    patterns.extend(last);
     let file = root.join(".gitignore");
     let existing = match std::fs::read_to_string(&file) {
         Ok(t) => t,
@@ -974,7 +1121,7 @@ pub fn gitignore(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, dry
         std::fs::write(&file, &updated).map_err(|e| io_err(file.display(), e))?;
     }
     if json {
-        return emit_json(&json!({ "file": file.display().to_string(), "changed": changed, "dry_run": dry_run, "patterns": patterns }));
+        return emit_json(&json!({ "file": file.display().to_string(), "changed": changed, "dry_run": dry_run, "patterns": patterns, "single_files": single.len() }));
     }
     let what = match (changed, dry_run) {
         (false, _) => "up to date",
@@ -982,9 +1129,10 @@ pub fn gitignore(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, dry
         (true, false) => "updated",
     };
     out(format!(
-        "{}: {what}, {} patterns. Files git already tracks stay tracked until they are removed from its index (git rm --cached).\n",
+        "{}: {what}, {} patterns ({} of them for single files the others get wrong; run it again as files come and go). Files git already tracks stay tracked until they are removed from its index (git rm --cached).\n",
         file.display(),
-        patterns.len()
+        patterns.len(),
+        single.len()
     )
     .as_bytes())
 }

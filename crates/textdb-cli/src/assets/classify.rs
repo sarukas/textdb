@@ -280,7 +280,9 @@ impl Classifier {
     /// visible, so pointers inside them stay in git), each that makes something else a document,
     /// ignored or back to a non-asset default adds a negation, and pointers are never ignored.
     pub fn gitignore_patterns(&self) -> Vec<String> {
-        let mut out: Vec<String> = ASSET_EXTS.iter().map(|e| format!("*.{}", any_case(e))).collect();
+        // What pull moved aside in the vault.
+        let mut out = vec!["/.textdb/trash/".to_string()];
+        out.extend(ASSET_EXTS.iter().map(|e| format!("*.{}", any_case(e))));
         for layer in &self.layers {
             for rule in &layer.rules {
                 let (mut set, mut decided, mut binary) = (None, false, false);

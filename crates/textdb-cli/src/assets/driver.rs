@@ -41,9 +41,10 @@ pub trait Driver {
     fn size(&self, path: &str, item: Option<&str>) -> Result<Option<u64>>;
     /// The stored file's SHA-256 and size, `None` when it is not there. Reads the whole file.
     fn hash(&self, path: &str, item: Option<&str>) -> Result<Option<(String, u64)>>;
-    /// Keep `src`, whose SHA-256 is `sha256`, at `path`: what is there with other bytes goes to
-    /// the trash first. Returns the provider's item id, where it has one.
-    fn put(&self, path: &str, src: &Path, sha256: &str) -> Result<Option<String>>;
+    /// Keep `src`, whose SHA-256 is `sha256`, at `path`. Bytes there whose SHA-256 is `replaces`
+    /// go to the trash first; any other bytes there are kept, and `src` goes next to them. Returns
+    /// the item the bytes are at: the provider's id, or the path for a local store.
+    fn put(&self, path: &str, src: &Path, sha256: &str, replaces: Option<&str>) -> Result<Option<String>>;
     /// Copy the stored file to `dest`, which must not exist.
     fn get(&self, path: &str, item: Option<&str>, dest: &Path) -> Result<()>;
 }
@@ -98,6 +99,52 @@ impl LocalDriver {
             }
             n += 1;
         }
+    }
+
+    /// Copy `src` to `path` through a checked partial file; with `replace`, what is there moves to
+    /// the trash first, else the name must be free.
+    fn place(&self, path: &str, src: &Path, sha256: &str, replace: bool) -> Result<()> {
+        let dest = self.file(path)?;
+        // The new copy first, complete and checked, next to where it goes; only then does the copy
+        // it replaces move to the trash. A copy that fails leaves the store as it was.
+        let part = partial(&dest);
+        let checked = copy_to(src, &part).map_err(|e| io(format!("copying to {}", part.display()), e)).and_then(|_| match hash_file(&part) {
+            Ok((sha, _)) if sha == sha256 => Ok(()),
+            Ok(_) => Err(StoreError::other(format!("{} changed while it was copied to the asset store; push it again", src.display()))),
+            Err(e) => Err(io(part.display(), e)),
+        });
+        if let Err(e) = checked {
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+        if replace && dest.exists() {
+            let trashed = self.trash_for(path);
+            let moved = trashed
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|_| rename_new(&dest, &trashed));
+            if let Err(e) = moved {
+                let _ = std::fs::remove_file(&part);
+                return Err(io(format!("moving {} to the trash", dest.display()), e));
+            }
+        }
+        if let Err(e) = rename_new(&part, &dest) {
+            let _ = std::fs::remove_file(&part);
+            return Err(io(format!("putting {} in place", dest.display()), e));
+        }
+        Ok(())
+    }
+}
+
+/// `/img/a.png` as `/img/a (1a2b3c4d).png`, the start of `sha256` in brackets; `-2`, `-3`… after
+/// it for further ones.
+fn beside(path: &str, sha256: &str, n: u32) -> String {
+    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let short = sha256.get(..8).unwrap_or(sha256);
+    let tag = if n <= 1 { short.to_string() } else { format!("{short}-{n}") };
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{dir}/{stem} ({tag}).{ext}"),
+        _ => format!("{dir}/{name} ({tag})"),
     }
 }
 
@@ -164,45 +211,30 @@ impl Driver for LocalDriver {
         hash_file(&self.file(path)?).map(Some).map_err(|e| io(self.location(path), e))
     }
 
-    fn put(&self, path: &str, src: &Path, sha256: &str) -> Result<Option<String>> {
-        let dest = self.file(path)?;
+    fn put(&self, path: &str, src: &Path, sha256: &str, replaces: Option<&str>) -> Result<Option<String>> {
+        self.file(path)?;
         if !self.root.is_dir() {
             return Err(StoreError::other(format!("the asset store folder {} is not there", self.root.display())));
         }
         // The item of a local store is the path its bytes were put at, so a pointer moved in the
         // store still finds them.
-        let item = Some(path.to_string());
-        if matches!(self.hash(path, None)?, Some((sha, _)) if sha == sha256) {
-            return Ok(item);
-        }
-        // The new copy first, complete and checked, next to where it goes; only then does the copy
-        // it replaces move to the trash. A copy that fails leaves the store as it was.
-        let part = partial(&dest);
-        let checked = copy_to(src, &part).map_err(|e| io(format!("copying to {}", part.display()), e)).and_then(|_| match hash_file(&part) {
-            Ok((sha, _)) if sha == sha256 => Ok(()),
-            Ok(_) => Err(StoreError::other(format!("{} changed while it was copied to the asset store; push it again", src.display()))),
-            Err(e) => Err(io(part.display(), e)),
-        });
-        if let Err(e) = checked {
-            let _ = std::fs::remove_file(&part);
-            return Err(e);
-        }
-        if dest.exists() {
-            let trashed = self.trash_for(path);
-            let moved = trashed
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|_| rename_new(&dest, &trashed));
-            if let Err(e) = moved {
-                let _ = std::fs::remove_file(&part);
-                return Err(io(format!("moving {} to the trash", dest.display()), e));
+        match self.hash(path, None)? {
+            Some((sha, _)) if sha == sha256 => Ok(Some(path.to_string())),
+            None => self.place(path, src, sha256, false).map(|_| Some(path.to_string())),
+            Some((sha, _)) if Some(sha.as_str()) == replaces => self.place(path, src, sha256, true).map(|_| Some(path.to_string())),
+            Some(_) => {
+                // Bytes something else may still name: kept, and these go next to them.
+                let mut n = 1;
+                loop {
+                    let alt = beside(path, sha256, n);
+                    match self.hash(&alt, None)? {
+                        Some((sha, _)) if sha == sha256 => return Ok(Some(alt)),
+                        Some(_) => n += 1,
+                        None => return self.place(&alt, src, sha256, false).map(|_| Some(alt)),
+                    }
+                }
             }
         }
-        if let Err(e) = rename_new(&part, &dest) {
-            let _ = std::fs::remove_file(&part);
-            return Err(io(format!("putting {} in place", dest.display()), e));
-        }
-        Ok(item)
     }
 
     fn get(&self, path: &str, item: Option<&str>, dest: &Path) -> Result<()> {
@@ -234,6 +266,22 @@ pub mod binding {
             Some(PathBuf::from(x))
         } else {
             std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))
+        };
+        base.map(|b| b.join("textdb"))
+    }
+
+    /// Where what this computer learns about its files is kept: `TEXTDB_CONFIG_DIR/cache`, else
+    /// the platform's local (not roaming) cache directory, with `textdb` in it.
+    pub fn cache_dir() -> Option<PathBuf> {
+        if let Some(dir) = std::env::var_os("TEXTDB_CONFIG_DIR").filter(|d| !d.is_empty()) {
+            return Some(PathBuf::from(dir).join("cache"));
+        }
+        let base = if cfg!(windows) {
+            std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+        } else if let Some(x) = std::env::var_os("XDG_CACHE_HOME").filter(|d| !d.is_empty()) {
+            Some(PathBuf::from(x))
+        } else {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache"))
         };
         base.map(|b| b.join("textdb"))
     }
@@ -323,26 +371,38 @@ mod tests {
         let src = tmp.join("a.png");
         std::fs::write(&src, b"one").unwrap();
         let (sha1, _) = hash_file(&src).unwrap();
-        d.put("/acc/a.png", &src, &sha1).unwrap();
+        d.put("/acc/a.png", &src, &sha1, None).unwrap();
         assert_eq!(d.size("/acc/a.png", None).unwrap(), Some(3));
-        assert_eq!(d.put("/acc/a.png", &src, &sha1).unwrap().as_deref(), Some("/acc/a.png"), "the same bytes again copy nothing");
+        assert_eq!(d.put("/acc/a.png", &src, &sha1, None).unwrap().as_deref(), Some("/acc/a.png"), "the same bytes again copy nothing");
         assert_eq!(walk(&root).len(), 1);
         std::fs::write(&src, b"two!").unwrap();
         let (sha2, _) = hash_file(&src).unwrap();
-        d.put("/acc/a.png", &src, &sha2).unwrap();
+        d.put("/acc/a.png", &src, &sha2, Some(&sha1)).unwrap();
         assert_eq!(d.hash("/acc/a.png", None).unwrap().unwrap().0, sha2);
         let trashed: Vec<_> = walk(&root.join(TRASH));
         assert_eq!(trashed.len(), 1, "{trashed:?}");
         assert_eq!(std::fs::read(&trashed[0]).unwrap(), b"one");
         // Replacements within the same second each keep their own copy.
+        let mut last = sha2.clone();
         for bytes in [&b"three"[..], b"four!"] {
             std::fs::write(&src, bytes).unwrap();
-            d.put("/acc/a.png", &src, &hash_file(&src).unwrap().0).unwrap();
+            let sha = hash_file(&src).unwrap().0;
+            d.put("/acc/a.png", &src, &sha, Some(&last)).unwrap();
+            last = sha;
         }
         assert_eq!(walk(&root.join(TRASH)).len(), 3);
         std::fs::write(&src, b"two!").unwrap();
-        d.put("/acc/a.png", &src, &sha2).unwrap();
-        assert!(d.put("/acc/a.png", &src, &sha1).is_err(), "bytes that do not match the hash are refused");
+        d.put("/acc/a.png", &src, &sha2, Some(&last)).unwrap();
+        assert!(d.put("/acc/a.png", &src, &sha1, Some(&sha2)).is_err(), "bytes that do not match the hash are refused");
+        // Bytes the caller does not replace are kept; the new ones go next to them.
+        std::fs::write(&src, b"five").unwrap();
+        let sha5 = hash_file(&src).unwrap().0;
+        let beside = d.put("/acc/a.png", &src, &sha5, None).unwrap().unwrap();
+        assert_eq!(beside, format!("/acc/a ({}).png", &sha5[..8]));
+        assert_eq!(d.hash("/acc/a.png", None).unwrap().unwrap().0, sha2);
+        assert_eq!(d.put("/acc/a.png", &src, &sha5, Some(&sha1)).unwrap().as_deref(), Some(beside.as_str()), "found there, not copied again");
+        assert_eq!(walk(&root.join(TRASH)).len(), 4, "one, two!, three and four! were each replaced once; five replaced nothing");
+        std::fs::write(&src, b"two!").unwrap();
         let out = tmp.join("vault/acc/a.png");
         d.get("/acc/a.png", None, &out).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"two!");

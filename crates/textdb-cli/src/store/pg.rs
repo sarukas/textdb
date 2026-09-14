@@ -1037,6 +1037,28 @@ impl Store for PgStore {
         tx.commit().map_err(pg)
     }
 
+    fn put_sync_files(&mut self, prefix: &str, dir: &str, files: &[BaseFile]) -> Result<bool> {
+        self.ensure_sync_tables()?;
+        let mut tx = self.client.transaction().map_err(pg)?;
+        let Some(row) = tx
+            .query_opt("SELECT id FROM kb.sync WHERE prefix = $1 AND dir = $2 FOR UPDATE", &[&prefix, &dir])
+            .map_err(pg)?
+        else {
+            return Ok(false);
+        };
+        let id: i64 = row.get(0);
+        for f in files {
+            tx.execute("DELETE FROM kb.sync_file WHERE sync_id = $1 AND rel = $2", &[&id, &f.rel]).map_err(pg)?;
+            tx.execute(
+                "INSERT INTO kb.sync_file(sync_id, rel, version, blob, disk_size, disk_mtime, conflict) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[&id, &f.rel, &f.version, &f.blob, &f.disk_size, &f.disk_mtime, &f.conflict],
+            )
+            .map_err(pg)?;
+        }
+        tx.commit().map_err(pg)?;
+        Ok(true)
+    }
+
     fn feed(&mut self, since: i64, limit: i64) -> Result<Vec<Change>> {
         let rows = self
             .client

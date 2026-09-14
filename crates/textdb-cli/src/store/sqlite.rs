@@ -768,6 +768,31 @@ impl Store for SqliteStore {
         }
         tx.commit().map_err(sql)
     }
+
+    fn put_sync_files(&mut self, prefix: &str, dir: &str, files: &[BaseFile]) -> Result<bool> {
+        let p = DEFAULT_PREFIX;
+        let tx = self.conn.transaction().map_err(sql)?;
+        let Some(id) = tx
+            .query_row(&format!("SELECT id FROM {p}sync WHERE prefix = ?1 AND dir = ?2"), [prefix, dir], |r| r.get::<_, i64>(0))
+            .optional()
+            .map_err(sql)?
+        else {
+            return Ok(false);
+        };
+        for f in files {
+            tx.execute(&format!("DELETE FROM {p}sync_file WHERE sync_id = ?1 AND rel = ?2"), rusqlite::params![id, f.rel])
+                .map_err(sql)?;
+            tx.execute(
+                &format!(
+                    "INSERT INTO {p}sync_file(sync_id, rel, version, blob, disk_size, disk_mtime, conflict) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                ),
+                rusqlite::params![id, f.rel, f.version, f.blob, f.disk_size, f.disk_mtime, f.conflict],
+            )
+            .map_err(sql)?;
+        }
+        tx.commit().map_err(sql)?;
+        Ok(true)
+    }
 }
 
 /// The views `textdb sql` offers: the live store by path, without internal ids or deleted files.
