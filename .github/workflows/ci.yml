@@ -46,3 +46,7 @@ jobs:
       - run: cargo test --release -p textdb-cli --test cli_pg
         env:
           TEXTDB_TEST_PG: postgres://ci:ci@localhost:5432/postgres
+      # A crashed backend shows only as a closed connection in the tests; the server log says which
+      # statement it was running.
+      - if: failure()
+        run: sudo tail -n 200 /var/log/postgresql/postgresql-16-main.log
