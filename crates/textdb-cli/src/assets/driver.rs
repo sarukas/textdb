@@ -74,6 +74,18 @@ pub fn stamp(t: SystemTime) -> String {
     format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
+/// How long a push waits for another one putting the same path.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A held lock file, removed when dropped.
+struct Lock(PathBuf);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// A folder reachable from this computer: a NAS, a USB disk, or a cloud drive synced to a folder.
 pub struct LocalDriver {
     pub root: PathBuf,
@@ -102,6 +114,40 @@ impl LocalDriver {
                 return slot;
             }
             n += 1;
+        }
+    }
+
+    /// Hold the lock of store path `path` (its case ignored), waiting for another push holding it.
+    fn lock(&self, path: &str) -> Result<Lock> {
+        use sha2::Digest;
+        let dir = self.root.join(TRASH).join("locks");
+        std::fs::create_dir_all(&dir).map_err(|e| io(dir.display(), e))?;
+        let name = super::pointer::hex(&sha2::Sha256::digest(path.to_lowercase().as_bytes()));
+        let file = dir.join(format!("{}.lock", &name[..32]));
+        let started = std::time::Instant::now();
+        let mut told = false;
+        loop {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&file) {
+                Ok(mut f) => {
+                    let _ = writeln!(f, "{path}\npid {}", std::process::id());
+                    return Ok(Lock(file));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if started.elapsed() > LOCK_WAIT {
+                        return Err(StoreError::other(format!(
+                            "another push has been putting {path} for {} minutes; if none is running, remove {}",
+                            LOCK_WAIT.as_secs() / 60,
+                            file.display()
+                        )));
+                    }
+                    if !told {
+                        eprintln!("waiting for another push of {path}");
+                        told = true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => return Err(io(file.display(), e)),
+            }
         }
     }
 
@@ -141,15 +187,31 @@ impl LocalDriver {
         }
         if let (Some(expected), true) = (replace, dest.exists()) {
             let trashed = self.trash_for(path);
-            let moved = trashed
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|_| rename_new(&dest, &trashed));
-            if let Err(e) = moved {
+            if let Err(e) = trashed.parent().map_or(Ok(()), std::fs::create_dir_all) {
+                let _ = std::fs::remove_file(&part);
+                return Err(io(format!("making the trash for {}", dest.display()), e));
+            }
+            // What is there gets a second name in the trash first, so the asset is never missing
+            // from its path, and is checked to be what this push replaces (not bytes put there
+            // some other way); then the new copy replaces it in one step.
+            if std::fs::hard_link(&dest, &trashed).is_ok() {
+                if !matches!(hash_file(&trashed), Ok((sha, _)) if sha == expected) {
+                    let _ = std::fs::remove_file(&trashed);
+                    let _ = std::fs::remove_file(&part);
+                    return Ok(false);
+                }
+                if let Err(e) = std::fs::rename(&part, &dest) {
+                    let _ = std::fs::remove_file(&part);
+                    let _ = std::fs::remove_file(&trashed);
+                    return Err(io(format!("putting {} in place", dest.display()), e));
+                }
+                return Ok(true);
+            }
+            // No hard links here: moved to the trash, checked, and put back when it is not.
+            if let Err(e) = rename_new(&dest, &trashed) {
                 let _ = std::fs::remove_file(&part);
                 return Err(io(format!("moving {} to the trash", dest.display()), e));
             }
-            // The copy took a while: what went to the trash must still be what this push replaces.
             if !matches!(hash_file(&trashed), Ok((sha, _)) if sha == expected) {
                 let _ = std::fs::remove_file(&part);
                 return match rename_new(&trashed, &dest) {
@@ -248,6 +310,9 @@ impl Driver for LocalDriver {
         }
         // The item of a local store is the path its bytes were put at, so a pointer moved in the
         // store still finds them.
+        // One push at a time decides what happens at a path, from the look at what is there to
+        // the new copy in place.
+        let _lock = self.lock(path)?;
         match self.hash(path, None)? {
             Some((sha, _)) if sha == sha256 => Ok(Some(path.to_string())),
             None => self.place(path, src, sha256, None).map(|_| Some(path.to_string())),

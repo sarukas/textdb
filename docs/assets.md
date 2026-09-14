@@ -138,9 +138,13 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
   replaces only the asset's own bytes where they are kept (its path, or the item its pointer
   names), and only when no other pointer names them (locations compared without case); anything
   else is kept and the upload goes to the asset's path, next to what is there, as
-  `NAME (<first 8 of its sha256>).ext`, which the pointer's item records. What a push moved to
-  the trash is hashed again, and put back when another push replaced it meanwhile. An asset
-  store folder inside the vault is left out of the vault's assets.
+  `NAME (<first 8 of its sha256>).ext`, which the pointer's item records. Pushes of the same path
+  take turns (a lock file in `<root>/.textdb-trash/locks/`, waited on for up to ten minutes);
+  what a push replaces is hard-linked into the trash and checked before the new copy replaces it
+  in one step, so the asset is never missing from its path, and bytes put there some other way
+  are kept. Within one push, what it has placed counts as in use for the assets after it. An
+  asset store folder inside the vault is left out of the vault's assets; a vault inside an asset
+  store's folder is refused.
 - Hashes of local files are cached per computer and directory in the local cache directory
   (`TEXTDB_CONFIG_DIR/cache`, else `%LOCALAPPDATA%\textdb`, `$XDG_CACHE_HOME/textdb` or
   `~/.cache/textdb`; `assets-*.json`, written atomically), by size and modification time, and only

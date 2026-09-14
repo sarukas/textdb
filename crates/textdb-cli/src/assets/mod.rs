@@ -239,20 +239,32 @@ fn dir_inside(outer: &Path, inner: &Path) -> Option<String> {
     i.strip_prefix(o).and_then(|r| r.strip_prefix(sep)).map(|r| r.replace(sep, "/"))
 }
 
-fn scan(st: &mut dyn Store, v: &Vault) -> Result<Scan> {
-    let (mut disk, nested) = walk(&v.dir)?;
-    // An asset store kept inside the vault holds copies, not assets of it.
+/// Leave out of `files` (below the directory `dir`) what an asset store bound on this computer
+/// keeps inside it: copies, not assets. A directory inside an asset store's folder is refused:
+/// its files would be the store's copies, changed in place.
+fn leave_out_asset_stores(st: &mut dyn Store, dir: &Path, files: &mut Files) -> Result<()> {
     for s in st.asset_stores()? {
         let Ok(d) = driver::open(&s) else { continue };
-        let Some(rel) = d.local_root().and_then(|root| dir_inside(&v.dir, root)) else { continue };
-        eprintln!("warning: asset store {} keeps its files in {}, inside {}: they are left out", s.name, rel, v.dir.display());
-        if rel.is_empty() {
-            disk.clear();
-        } else {
-            let inside = format!("{}/", rel.to_lowercase());
-            disk.retain(|r, _| !r.to_lowercase().starts_with(&inside));
+        let Some(root) = d.local_root() else { continue };
+        if dir_inside(root, dir).is_some() {
+            return Err(StoreError::invalid(format!(
+                "{} is inside the folder of asset store {} ({}): keep a vault and its asset store apart",
+                dir.display(),
+                s.name,
+                root.display()
+            )));
         }
+        let Some(rel) = dir_inside(dir, root) else { continue };
+        eprintln!("warning: asset store {} keeps its files in {rel}, inside {}: they are left out", s.name, dir.display());
+        let inside = format!("{}/", rel.to_lowercase());
+        files.retain(|r, _| !r.to_lowercase().starts_with(&inside));
     }
+    Ok(())
+}
+
+fn scan(st: &mut dyn Store, v: &Vault) -> Result<Scan> {
+    let (mut disk, nested) = walk(&v.dir)?;
+    leave_out_asset_stores(st, &v.dir, &mut disk)?;
     let classifier = Classifier::load(&v.dir, &nested);
     for w in &classifier.warnings {
         eprintln!("warning: {w}");
@@ -294,6 +306,9 @@ struct VaultCache {
     /// Where an older build kept this cache, removed once it is saved here.
     #[serde(skip)]
     legacy: Option<PathBuf>,
+    /// The entries this process learnt: `(0, file)`, `(1, sniffed)`, `(2, seen)`.
+    #[serde(skip)]
+    touched: BTreeSet<(u8, String)>,
     #[serde(skip)]
     dirty: bool,
     /// Hash every file afresh.
@@ -353,6 +368,7 @@ impl VaultCache {
     fn remember(&mut self, rel: &str, size: u64, mtime: i64, sha: &str) {
         if now_ns() - mtime > RACY_NS {
             self.files.insert(rel.to_string(), Cached { size, mtime, sha256: sha.to_string() });
+            self.touched.insert((0, rel.to_string()));
             self.dirty = true;
         }
     }
@@ -361,6 +377,7 @@ impl VaultCache {
     fn saw(&mut self, rel: &str, sha: &str) {
         if self.seen.get(rel).map(String::as_str) != Some(sha) {
             self.seen.insert(rel.to_string(), sha.to_string());
+            self.touched.insert((2, rel.to_string()));
             self.dirty = true;
         }
     }
@@ -374,6 +391,7 @@ impl VaultCache {
         let b = classify::looks_binary(&root.join(rel));
         if now_ns() - mtime > RACY_NS {
             self.sniffed.insert(rel.to_string(), (size, mtime, b));
+            self.touched.insert((1, rel.to_string()));
             self.dirty = true;
         }
         b
@@ -381,11 +399,14 @@ impl VaultCache {
 
     fn save(&self) {
         if let (true, Some(path)) = (self.dirty, &self.path) {
-            // Another process may have saved meanwhile: what it learnt and this one did not is kept.
+            // Another process may have saved meanwhile: only what this one learnt goes over what
+            // is there (all of it when taking over an older build's cache).
             let mut merged = Self::read(path).filter(|c| c.host == self.host && c.dir == self.dir).unwrap_or_default();
-            merged.files.extend(self.files.clone());
-            merged.sniffed.extend(self.sniffed.clone());
-            merged.seen.extend(self.seen.clone());
+            let all = self.legacy.is_some();
+            let mine = |kind: u8, k: &String| all || self.touched.contains(&(kind, k.clone()));
+            merged.files.extend(self.files.iter().filter(|(k, _)| mine(0, k)).map(|(k, v)| (k.clone(), v.clone())));
+            merged.sniffed.extend(self.sniffed.iter().filter(|(k, _)| mine(1, k)).map(|(k, v)| (k.clone(), *v)));
+            merged.seen.extend(self.seen.iter().filter(|(k, _)| mine(2, k)).map(|(k, v)| (k.clone(), v.clone())));
             (merged.host, merged.dir) = (self.host.clone(), self.dir.clone());
             let Ok(text) = serde_json::to_string(&merged) else { return };
             if let Some(parent) = path.parent() {
@@ -750,7 +771,7 @@ fn push_one(
     let shared = |location: &str| {
         in_use
             .get(&(store.clone(), location_key(location)))
-            .is_some_and(|users| users.iter().any(|u| !u.eq_ignore_ascii_case(&item.path)))
+            .is_some_and(|users| users.iter().any(|u| location_key(u) != location_key(&item.path)))
     };
     let own = old
         .filter(|p| p.store == store)
@@ -795,7 +816,7 @@ fn push_one(
     }
     // Recorded as synced only now that both sides have it.
     written.push(Written { path: pointer_path, version: w.version, text });
-    Outcome::Done(json!({ "path": item.path, "file": file, "state": item.state, "size": size, "store": store, "version": w.version }))
+    Outcome::Done(json!({ "path": item.path, "file": file, "state": item.state, "size": size, "store": store, "item": p.item, "version": w.version }))
 }
 
 /// This directory's sync base for the vault's folder, without its files, as it was recorded.
@@ -867,11 +888,15 @@ pub fn push(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, o: PushOpt
             return Err(StoreError::invalid(format!("several asset stores ({}): choose one for new assets with --to", names.join(", "))));
         }
     }
-    let in_use = if todo.is_empty() || o.dry_run { HashMap::new() } else { pointer_locations(st)? };
+    let mut in_use = if todo.is_empty() || o.dry_run { HashMap::new() } else { pointer_locations(st)? };
     let mut written = Vec::new();
     for item in &todo {
         match push_one(st, &v, &mut drivers, &o, &mut cache, &in_use, item, &mut written) {
             Outcome::Done(j) => {
+                // What this push placed is in use for the assets after it.
+                if let (Some(store), Some(location)) = (j["store"].as_str(), j["item"].as_str()) {
+                    in_use.entry((store.to_string(), location_key(location))).or_default().insert(item.path.clone());
+                }
                 bytes += j["size"].as_u64().unwrap_or(0);
                 pushed.push(j);
             }
@@ -1160,7 +1185,8 @@ pub fn gitignore(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, dry
         Some(d) => d.to_path_buf(),
         None => vault(st, path, None)?.dir,
     };
-    let (files, nested) = walk(&root)?;
+    let (mut files, nested) = walk(&root)?;
+    leave_out_asset_stores(st, &root, &mut files)?;
     let classifier = Classifier::load(&root, &nested);
     for w in &classifier.warnings {
         eprintln!("warning: {w}");

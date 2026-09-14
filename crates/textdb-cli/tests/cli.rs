@@ -843,6 +843,28 @@ fn assets_push_keeps_bytes_in_use_and_records_only_what_it_wrote() {
     let other = run(&mut t(&["--json", "sync", "--dry-run", "/w1", dw]), None).json();
     assert_eq!(other["to_textdb"]["new"], serde_json::json!(["z.png.tdbasset"]), "{other}");
 
+    // One push that takes a moved pointer's bytes for a new asset does not then replace them for
+    // the moved pointer's own change.
+    let m = tmp.path().join("m");
+    std::fs::create_dir_all(m.join("img")).unwrap();
+    let dm = m.to_str().unwrap();
+    std::fs::write(m.join("img/a.png"), b"\x89PNG A").unwrap();
+    ok(&mut t(&["sync", "/m", dm]), None);
+    ok(&mut t(&["assets", "push", "--dir", dm]), None);
+    ok(&mut t(&["mv", "/m/img/a.png.tdbasset", "/m/img/b.png.tdbasset"]), None);
+    ok(&mut t(&["sync", "/m", dm]), None);
+    if !m.join("img/a.png").exists() {
+        std::fs::write(m.join("img/a.png"), b"\x89PNG A").unwrap();
+    }
+    std::fs::write(m.join("img/b.png"), b"\x89PNG B2").unwrap();
+    let _ = run(&mut t(&["assets", "push", "--dir", dm, "--force"]), None);
+    assert_eq!(ok(&mut t(&["--json", "assets", "verify", "--dir", dm]), None).json()["problems"], 0);
+
+    // A vault inside its asset store's folder is refused.
+    let inner = bucket.join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    assert_eq!(run(&mut t(&["assets", "status", "/inner", "--dir", inner.to_str().unwrap()]), None).status, 6);
+
     // Items that differ only in case are the same file on Windows and macOS: a push never
     // replaces bytes another pointer names under another case.
     let c = tmp.path().join("c");
@@ -873,7 +895,7 @@ fn assets_push_keeps_bytes_in_use_and_records_only_what_it_wrote() {
     std::fs::write(v.join("raw/readme.md"), "# raw\n").unwrap();
     std::fs::create_dir_all(v.join("docs/photos.png")).unwrap();
     std::fs::write(v.join("docs/photos.png/notes.md"), "# p\n").unwrap();
-    std::fs::write(v.join(".gitattributes"), "assets/* binary\nraw binary\n").unwrap();
+    std::fs::write(v.join(".gitattributes"), "assets/* binary\nraw binary\ntrash binary\n").unwrap();
     ok(&mut t(&["assets", "gitignore", "--dir", d]), None);
     let gi = std::fs::read_to_string(v.join(".gitignore")).unwrap();
     assert!(gi.contains("\n/.textdb/trash/\n") && gi.contains("\n!/assets/readme.md\n") && gi.contains("\n/data.bin\n"), "{gi}");
@@ -882,6 +904,8 @@ fn assets_push_keeps_bytes_in_use_and_records_only_what_it_wrote() {
         let ignored = |rel: &str| Command::new("git").arg("-C").arg(&v).args(["check-ignore", "-q", rel]).status().unwrap().success();
         for (rel, want) in [
             ("assets/readme.md", false),
+            (".textdb/trash/old.md", true),
+            (".gitignore", false),
             ("raw/readme.md", false),
             ("docs/photos.png/notes.md", false),
             ("docs/photos.png/q.png.tdbasset", false),

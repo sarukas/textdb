@@ -281,7 +281,7 @@ impl Classifier {
     /// ignored or back to a non-asset default adds a negation, and pointers are never ignored.
     pub fn gitignore_patterns(&self) -> Vec<String> {
         // What pull moved aside in the vault.
-        let mut out = vec!["/.textdb/trash/".to_string()];
+        let mut out = Vec::new();
         // Each asset pattern is followed by its negation as a directory: rules match files only,
         // and git never looks inside an ignored directory for the documents and pointers there.
         out.extend(ASSET_EXTS.iter().flat_map(|e| [format!("*.{}", any_case(e)), format!("!*.{}/", any_case(e))]));
@@ -318,6 +318,10 @@ impl Classifier {
                 }
             }
         }
+        // After the rules, so none of their directory negations brings them back: what pull moved
+        // aside in the vault is ignored, git's own files and pointers never are.
+        out.push("/.textdb/trash/".to_string());
+        out.push("!.git*".to_string());
         out.push(format!("!*{SUFFIX}"));
         out
     }
