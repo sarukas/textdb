@@ -653,6 +653,64 @@ fn sync_stops_when_its_include_rules_changed_and_honours_textdbignore() {
 }
 
 #[test]
+fn sync_carries_untracked_files_with_a_moved_folder_and_reports_what_stays() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    for d in ["proj/sub", "proj/img", "other", "empty/deeper", "keep/node_modules"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    for (rel, text) in [
+        ("proj/a.md", "a\n"),
+        ("proj/sub/b.md", "b\n"),
+        ("proj/data.json", "{}\n"),
+        ("proj/img/x.png", "png"),
+        ("other/c.md", "c\n"),
+        ("other/deck.pdf", "%PDF"),
+        ("keep/node_modules/m.js", "m"),
+    ] {
+        std::fs::write(dir.join(rel), text).unwrap();
+    }
+    let sync = |extra: &[&str]| {
+        let mut cmd = textdb(&store);
+        cmd.args(["--json", "sync"]).args(extra).arg("/").arg(&dir);
+        let o = run(&mut cmd, None);
+        assert_eq!(o.status, 0, "{}\n{}", o.stdout, o.stderr);
+        o.json()
+    };
+    sync(&[]);
+
+    // The store says what a move or delete leaves on disk.
+    let moved = ok(textdb(&store).args(["mv", "/proj", "/archive/proj"]), None).stdout;
+    assert!(moved.contains("also holds 2 files textdb does not track (1 json, 1 png); the next sync moves them"), "{moved}");
+    let deleted = ok(textdb(&store).args(["rm", "/other"]), None).stdout;
+    assert!(deleted.contains("also holds 1 file textdb does not track (1 pdf); they stay on disk"), "{deleted}");
+
+    let dry = sync(&["--dry-run"]);
+    assert_eq!(dry["carried"].as_array().unwrap().len(), 2, "{dry}");
+    assert!(dir.join("proj/data.json").exists());
+
+    let r = sync(&[]);
+    assert_eq!(
+        r["carried"],
+        serde_json::json!([
+            {"from": "proj/data.json", "to": "archive/proj/data.json"},
+            {"from": "proj/img/x.png", "to": "archive/proj/img/x.png"}
+        ])
+    );
+    assert!(dir.join("archive/proj/img/x.png").exists() && dir.join("archive/proj/sub/b.md").exists() && !dir.join("proj").exists());
+    assert_eq!(r["left_behind"][0]["path"], "other", "{r}");
+    assert!(r["left_behind"][0]["reason"].as_str().unwrap().contains("1 pdf"));
+    assert!(dir.join("other/deck.pdf").exists() && !dir.join("other/c.md").exists());
+    // Directories holding nothing are listed; one holding only a skipped folder is not.
+    assert_eq!(r["empty_dirs"], serde_json::json!(["empty", "empty/deeper"]));
+
+    let pruned = sync(&["--prune-empty-dirs"]);
+    assert_eq!(pruned["removed_empty_dirs"], 2);
+    assert!(!dir.join("empty").exists() && dir.join("keep/node_modules/m.js").exists());
+}
+
+#[test]
 fn sync_reconciles_both_sides_merges_and_marks_conflicts() {
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("kb.db");

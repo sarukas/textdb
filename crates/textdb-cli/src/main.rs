@@ -138,6 +138,9 @@ enum Cmd {
         /// .textdbignore) add since the last sync; without it such a sync stops and lists them.
         #[arg(long)]
         accept_rules: bool,
+        /// Remove directories on disk that hold no files.
+        #[arg(long)]
+        prune_empty_dirs: bool,
     },
     /// When a store folder was last synced, what changed in it since, and how it compares with a
     /// git commit (by git blob id).
@@ -525,6 +528,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             dry_run,
             commit,
             accept_rules,
+            prune_empty_dirs,
         } => sync::sync(
             st,
             sync::Options {
@@ -537,6 +541,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
                 author: cli.author.clone(),
                 store: config::redact(&cli.store),
                 accept_rules,
+                prune_empty_dirs,
             },
             json,
         ),
@@ -854,16 +859,26 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             no_update_links,
         } => {
             let update = if update_links { Some(true) } else if no_update_links { Some(false) } else { None };
+            let untracked = untracked_on_disk(st, &from);
             let moved_links = st.mv_links(&from, &to, author, message.as_deref(), update)?;
             let removed = if keep_empty_folders { Vec::new() } else { prune_empty_folders(st, &from, author)? };
             if json {
-                return emit_json(&json!({ "moved": from, "to": to, "removed_empty_folders": removed, "links": moved_links }));
+                return emit_json(&json!({
+                    "moved": from, "to": to, "removed_empty_folders": removed, "links": moved_links,
+                    "untracked_on_disk": untracked_json(&untracked),
+                }));
             }
             let mut s = format!("moved {from} -> {to}\n");
             for folder in &removed {
                 s.push_str(&format!("removed empty folder {folder}\n"));
             }
             s.push_str(&links::moved_text(&from, &moved_links));
+            for (disk, n, kinds) in &untracked {
+                s.push_str(&format!(
+                    "note: {disk} also holds {n} {} textdb does not track ({kinds}); the next sync moves them along with the folder\n",
+                    if *n == 1 { "file" } else { "files" }
+                ));
+            }
             out(s.as_bytes())
         }
         Cmd::Rm {
@@ -871,6 +886,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             message,
             keep_empty_folders,
         } => {
+            let untracked = untracked_on_disk(st, &path);
             // Links from elsewhere into what is deleted, unless the store turned link reports off.
             let broken: Vec<store::LinkRow> = match st.setting(textdb_sqlite::links::LINK_UPDATES_SETTING) {
                 Ok(mode) if mode.as_deref() != Some("off") => {
@@ -882,13 +898,22 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             st.rm(&path, author, message.as_deref())?;
             let removed = if keep_empty_folders { Vec::new() } else { prune_empty_folders(st, &path, author)? };
             if json {
-                return emit_json(&json!({ "deleted": path, "removed_empty_folders": removed, "broken_links": broken }));
+                return emit_json(&json!({
+                    "deleted": path, "removed_empty_folders": removed, "broken_links": broken,
+                    "untracked_on_disk": untracked_json(&untracked),
+                }));
             }
             let mut s = format!("deleted {path}\n");
             for folder in &removed {
                 s.push_str(&format!("removed empty folder {folder}\n"));
             }
             s.push_str(&links::deleted_text(&broken));
+            for (disk, n, kinds) in &untracked {
+                s.push_str(&format!(
+                    "note: {disk} also holds {n} {} textdb does not track ({kinds}); they stay on disk after the next sync\n",
+                    if *n == 1 { "file" } else { "files" }
+                ));
+            }
             out(s.as_bytes())
         }
         Cmd::Setting { key, value } => {
@@ -1598,6 +1623,65 @@ enum MetaOp {
         #[arg(long, short = 'm')]
         message: Option<String>,
     },
+}
+
+/// Directories synced with the store folder `path` that hold files textdb does not track, which
+/// a move or delete in the store leaves where they are until the next sync: `(dir, files, kinds)`.
+fn untracked_on_disk(st: &mut dyn Store, path: &str) -> Vec<(String, usize, String)> {
+    let Ok(path) = normalize_path(path) else { return Vec::new() };
+    let Ok(heads) = st.file_heads(&path) else { return Vec::new() };
+    if path == "/" {
+        return Vec::new();
+    }
+    let tracked: std::collections::HashSet<String> = heads.into_iter().map(|h| h.path).collect();
+    let mut prefixes = vec!["/".to_string()];
+    let mut acc = String::new();
+    for seg in path.split('/').filter(|s| !s.is_empty()) {
+        acc.push('/');
+        acc.push_str(seg);
+        prefixes.push(acc.clone());
+    }
+    let mut found = Vec::new();
+    for p in prefixes {
+        let Ok(bases) = st.sync_bases(&p) else { continue };
+        let rel = path[if p == "/" { 1 } else { p.len() }..].trim_start_matches('/');
+        for base in bases {
+            let root = Path::new(&base.dir).join(rel);
+            if !root.is_dir() {
+                continue;
+            }
+            let mut files = Vec::new();
+            let mut stack = vec![(root.clone(), String::new())];
+            while let Some((dir, rel_dir)) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let r = if rel_dir.is_empty() { name.clone() } else { format!("{rel_dir}/{name}") };
+                    match entry.file_type() {
+                        Ok(t) if t.is_dir() => {
+                            if !sync::SKIP_DIRS.contains(&name.as_str()) {
+                                stack.push((entry.path(), r));
+                            }
+                        }
+                        Ok(t) if t.is_file() => {
+                            if !tracked.contains(&format!("{path}/{r}")) {
+                                files.push(r);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !files.is_empty() {
+                found.push((root.display().to_string(), files.len(), sync::kinds(files.iter().map(String::as_str))));
+            }
+        }
+    }
+    found
+}
+
+fn untracked_json(untracked: &[(String, usize, String)]) -> Vec<serde_json::Value> {
+    untracked.iter().map(|(dir, files, kinds)| json!({ "dir": dir, "files": files, "kinds": kinds })).collect()
 }
 
 /// Delete the folders a move or delete of `path` left empty, from its parent upwards; never the

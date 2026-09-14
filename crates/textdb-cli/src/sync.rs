@@ -48,6 +48,8 @@ pub struct Options {
     pub store: String,
     /// Take in files that a change of include rules adds since the last sync.
     pub accept_rules: bool,
+    /// Remove directories on disk that hold no files.
+    pub prune_empty_dirs: bool,
 }
 
 /// What a sync takes in from disk, recorded with its base so the next sync can tell when it
@@ -186,6 +188,10 @@ struct Walk {
     files: BTreeMap<String, OnDisk>,
     /// Symbolic links: left alone, and what is below them too.
     links: Vec<String>,
+    /// Directories entered.
+    dirs: Vec<String>,
+    /// Directories not entered (`.git`, `node_modules`, …): content all the same.
+    skipped: Vec<String>,
 }
 
 /// Every regular file below `root`. `.git` is never entered; the rest of [`SKIP_DIRS`] only
@@ -208,7 +214,10 @@ fn walk(root: &Path, tracked_dirs: &HashSet<String>) -> Result<Walk> {
             } else if kind.is_dir() {
                 let skipped = SKIP_DIRS.contains(&name.as_str());
                 if name != ".git" && (!skipped || tracked_dirs.contains(&rel)) {
+                    w.dirs.push(rel.clone());
                     pending.push((entry.path(), rel));
+                } else {
+                    w.skipped.push(rel);
                 }
             } else if kind.is_file() {
                 w.files.insert(rel, on_disk(&entry.metadata()?));
@@ -237,19 +246,56 @@ fn remove_disk(root: &Path, rel: &str) -> std::io::Result<()> {
         }
         std::fs::remove_file(&file)?;
     }
+    prune_parents(root, rel);
+    Ok(())
+}
+
+/// Remove the directories above `rel` that are left empty, deepest first (never `root`).
+fn prune_parents(root: &Path, rel: &str) {
     let mut rel = rel;
     while let Some(i) = rel.rfind('/') {
         rel = &rel[..i];
-        let dir = root.join(rel);
-        if std::fs::remove_dir(&dir).is_ok() {
-            continue;
-        }
-        let empty = std::fs::read_dir(&dir).is_ok_and(|mut entries| entries.next().is_none());
-        if !(empty && clear_read_only(&dir) && std::fs::remove_dir(&dir).is_ok()) {
+        if !remove_empty_dir(&root.join(rel)) {
             break;
         }
     }
+}
+
+/// Remove `dir` when it is empty, read-only or not.
+fn remove_empty_dir(dir: &Path) -> bool {
+    std::fs::remove_dir(dir).is_ok()
+        || (std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none()) && clear_read_only(dir) && std::fs::remove_dir(dir).is_ok())
+}
+
+/// Move a file on disk from `from` to `to`, creating the folders it needs and removing the ones
+/// it leaves empty.
+fn move_disk(root: &Path, from: &str, to: &str) -> std::io::Result<()> {
+    let target = root.join(to);
+    if target.exists() {
+        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{to} exists already")));
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(root.join(from), &target)?;
+    prune_parents(root, from);
     Ok(())
+}
+
+/// `1 json, 2 png`: how many of `rels` have each extension, most first.
+pub fn kinds<'a>(rels: impl Iterator<Item = &'a str>) -> String {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for rel in rels {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        let ext = match name.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() => ext.to_lowercase(),
+            _ => "no extension".to_string(),
+        };
+        *counts.entry(ext).or_default() += 1;
+    }
+    let mut counted: Vec<(String, usize)> = counts.into_iter().collect();
+    counted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    counted.iter().map(|(ext, n)| format!("{n} {ext}")).collect::<Vec<_>>().join(", ")
 }
 
 /// Windows refuses to delete a file or directory carrying the read-only attribute, which the
@@ -356,6 +402,8 @@ struct Plan {
     hold: Vec<String>,
     /// Found only on disk, not yet checked against .gitignore or paired as moves.
     candidates: Vec<String>,
+    /// Files textdb does not track, moved on disk with their folder: (from, to).
+    carry: Vec<(String, String)>,
 }
 
 #[derive(Serialize, Default)]
@@ -430,6 +478,15 @@ pub struct Report {
     pub rules: Option<RulesChange>,
     /// They would take in new files, and `--accept-rules` was not given: nothing was written.
     pub stopped_by_rules: bool,
+    /// Files textdb does not track, moved on disk with a folder the store moved.
+    pub carried: Vec<Move>,
+    /// Folders whose text files were deleted or moved in textdb but that still hold files
+    /// textdb does not track.
+    pub left_behind: Vec<Note>,
+    /// Directories on disk that hold no files.
+    pub empty_dirs: Vec<String>,
+    /// Of those, removed by `--prune-empty-dirs`.
+    pub removed_empty_dirs: usize,
 }
 
 fn failure(e: &StoreError) -> String {
@@ -680,6 +737,123 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         }
     }
 
+    // Files textdb does not track (images, JSON, …) go with their folder when the store moved it:
+    // every tracked file of the folder left for the same new place, which does not have them yet.
+    let taken: HashSet<String> = plan.to_textdb.iter().map(|(rel, _)| rel.clone()).collect();
+    let untracked: Vec<&String> = walked
+        .files
+        .keys()
+        .filter(|rel| !base.contains_key(*rel) && !heads.contains_key(*rel) && !taken.contains(*rel) && !under_link(rel))
+        .collect();
+    let new_on_disk_rels: HashSet<&String> = plan.to_disk.iter().filter(|rel| !walked.files.contains_key(*rel)).collect();
+    let deleted: HashSet<&String> = plan.disk_delete.iter().collect();
+    let mut carry: Vec<(String, String)> = Vec::new();
+    if !plan.disk_delete.is_empty() && !untracked.is_empty() {
+        let mut new_by_blob: HashMap<String, Vec<&String>> = HashMap::new();
+        for rel in &new_on_disk_rels {
+            new_by_blob.entry(blob_id(&sides.textdb(rel)?.0)).or_default().push(*rel);
+        }
+        let mut maps: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut paired: HashSet<&String> = HashSet::new();
+        for old in &plan.disk_delete {
+            let Some(b) = base.get(old) else { continue };
+            let name = old.rsplit('/').next();
+            let Some(new) = new_by_blob.get(&b.blob).and_then(|c| c.iter().find(|n| n.rsplit('/').next() == name).copied()) else {
+                continue;
+            };
+            let (o, n): (Vec<&str>, Vec<&str>) = (old.split('/').collect(), new.split('/').collect());
+            let common = o.iter().rev().zip(n.iter().rev()).take_while(|(a, b)| a == b).count().min(o.len() - 1);
+            if common == 0 || n.len() == common {
+                continue;
+            }
+            let (od, nd) = (o[..o.len() - common].join("/"), n[..n.len() - common].join("/"));
+            paired.insert(old);
+            let entry = maps.entry(od).or_insert_with(|| Some(nd.clone()));
+            if entry.as_deref() != Some(nd.as_str()) {
+                *entry = None;
+            }
+        }
+        for (od, nd) in &maps {
+            let Some(nd) = nd else { continue };
+            let inside = format!("{od}/");
+            let whole = base.keys().filter(|r| r.starts_with(&inside)).all(|r| paired.contains(r) || !walked.files.contains_key(r));
+            if !whole {
+                continue;
+            }
+            for rel in untracked.iter().filter(|r| r.starts_with(&inside)) {
+                let to = format!("{nd}/{}", &rel[inside.len()..]);
+                if !walked.files.contains_key(&to) && !new_on_disk_rels.contains(&&to) {
+                    carry.push((rel.to_string(), to));
+                }
+            }
+        }
+    }
+    // Folders whose tracked files all leave disk but that keep untracked ones.
+    let carried: HashSet<&str> = carry.iter().map(|(from, _)| from.as_str()).collect();
+    let mut emptied: BTreeSet<String> = BTreeSet::new();
+    for rel in &plan.disk_delete {
+        let mut d = rel.as_str();
+        while let Some(i) = d.rfind('/') {
+            d = &d[..i];
+            if emptied.contains(d) {
+                break;
+            }
+            let inside = format!("{d}/");
+            let stays = walked
+                .files
+                .keys()
+                .any(|r| r.starts_with(&inside) && !deleted.contains(r) && (base.contains_key(r) || heads.contains_key(r) || taken.contains(r)))
+                || plan.to_disk.iter().any(|r| r.starts_with(&inside));
+            if stays {
+                break;
+            }
+            emptied.insert(d.to_string());
+        }
+    }
+    for d in &emptied {
+        if emptied.iter().any(|up| d.starts_with(&format!("{up}/"))) {
+            continue;
+        }
+        let inside = format!("{d}/");
+        let left: Vec<&str> = untracked.iter().map(|r| r.as_str()).filter(|r| r.starts_with(&inside) && !carried.contains(r)).collect();
+        if !left.is_empty() {
+            let (noun, verb) = if left.len() == 1 { ("file", "stays") } else { ("files", "stay") };
+            report.left_behind.push(note(
+                d,
+                format!(
+                    "{} {noun} textdb does not track {verb} here ({}), though its text files were deleted or moved in textdb",
+                    left.len(),
+                    kinds(left.iter().copied())
+                ),
+            ));
+        }
+    }
+    // Directories that hold nothing, and will not once sync has written and deleted files.
+    let gone: HashSet<&str> = plan.disk_delete.iter().map(String::as_str).chain(carried.iter().copied()).collect();
+    let mut holds: HashSet<String> = HashSet::new();
+    let mut emptied_by_sync: HashSet<String> = HashSet::new();
+    let ancestors = |set: &mut HashSet<String>, rel: &str| {
+        let mut d = rel;
+        while let Some(i) = d.rfind('/') {
+            d = &d[..i];
+            if !set.insert(d.to_string()) {
+                break;
+            }
+        }
+    };
+    for rel in walked.files.keys().filter(|r| !gone.contains(r.as_str())).chain(walked.links.iter()).chain(walked.skipped.iter()) {
+        ancestors(&mut holds, rel);
+    }
+    for rel in plan.to_disk.iter().chain(plan.conflicts.iter().map(|c| &c.0)).chain(carry.iter().map(|(_, to)| to)) {
+        ancestors(&mut holds, rel);
+    }
+    for rel in &gone {
+        ancestors(&mut emptied_by_sync, rel);
+    }
+    report.empty_dirs = walked.dirs.iter().filter(|d| !holds.contains(*d) && !emptied_by_sync.contains(*d)).cloned().collect();
+    report.empty_dirs.sort();
+    plan.carry = carry;
+
     // Names written to disk must be able to exist next to what is there.
     let new_on_disk: Vec<&str> = plan
         .to_disk
@@ -713,6 +887,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     }
     report.to_textdb.deleted = plan.textdb_delete.clone();
     report.moved = plan.moves.iter().map(|(from, to)| Move { from: from.clone(), to: to.clone() }).collect();
+    report.carried = plan.carry.iter().map(|(from, to)| Move { from: from.clone(), to: to.clone() }).collect();
     report.merged = plan.merges.iter().map(|m| m.0.clone()).collect();
     report.conflicts = plan.conflicts.iter().map(|c| c.0.clone()).collect();
     report.unchanged = plan.keep.len() + plan.adopt.len();
@@ -912,6 +1087,16 @@ fn apply(
             failed(report, &mut rows, rel, e.to_string());
         }
     }
+    for (from, to) in &plan.carry {
+        if let Err(e) = move_disk(dir, from, to) {
+            report.failed.push(note(from, format!("not moved to {to} with its folder: {e}")));
+        }
+    }
+    if o.prune_empty_dirs {
+        let mut dirs = report.empty_dirs.clone();
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count()));
+        report.removed_empty_dirs = dirs.iter().filter(|d| remove_empty_dir(&dir.join(d))).count();
+    }
     for (rel, version) in &plan.adopt {
         let (bytes, _) = sides.textdb(rel)?;
         rows.insert(rel.clone(), base_row(dir, rel, Some(*version), blob_id(&bytes), false));
@@ -1050,6 +1235,27 @@ fn print_report(r: &Report) -> Result<()> {
     list(&mut s, "textdb deleted", &r.to_textdb.deleted);
     for m in &r.moved {
         s.push_str(&format!("{:<15} {} -> {}\n", "textdb moved", m.from, m.to));
+    }
+    for m in r.carried.iter().take(LIST_MAX) {
+        s.push_str(&format!("{:<15} {} -> {}\n", "disk carried", m.from, m.to));
+    }
+    if r.carried.len() > LIST_MAX {
+        s.push_str(&format!("{:<15} … and {} more\n", "disk carried", r.carried.len() - LIST_MAX));
+    }
+    for n in &r.left_behind {
+        s.push_str(&format!("{:<15} {}/: {}\n", "left behind", n.path, n.reason));
+    }
+    if r.removed_empty_dirs > 0 {
+        s.push_str(&format!("{:<15} removed {} directories that held no files\n", "empty dirs", r.removed_empty_dirs));
+    } else if !r.empty_dirs.is_empty() {
+        let shown: Vec<&str> = r.empty_dirs.iter().take(5).map(String::as_str).collect();
+        let more = if r.empty_dirs.len() > 5 { ", …" } else { "" };
+        s.push_str(&format!(
+            "{:<15} {} directories hold no files ({}{more}); --prune-empty-dirs removes them\n",
+            "empty dirs",
+            r.empty_dirs.len(),
+            shown.join(", ")
+        ));
     }
     list(&mut s, "merged", &r.merged);
     list(&mut s, "conflict", &r.conflicts);
