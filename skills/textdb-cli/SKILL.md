@@ -88,16 +88,29 @@ textdb --json sql 'SELECT path, nwords FROM files ORDER BY nwords DESC LIMIT 10'
 
 | View | Columns |
 |---|---|
-| `files` | `path, name, version, nbytes, nlines, nwords, created_at, updated_at, updated_by` |
-| `folders` | `path, files, folders, nbytes, nwords, versions, updated_at` (totals below) |
+| `files` | `path, name, dir, depth, ext, version, nbytes, nlines, nwords, created_at, updated_at, updated_by` |
+| `folders` | `path, name, parent, depth, files, folders, nbytes, nwords, versions, updated_at` (totals below) |
 | `frontmatter` | `path, data` — YAML front matter as JSON: `json_extract(data, '$.key')`, `json_each(data, '$.list')` |
 | `sections` | `path, heading` (`Title / Section`), `level, line_from, line_to` — feed `line_from` to `cat --lines` |
 | `links` | `path, target` (as written), `line` |
-| `commits` | `path, version, author, ts, message, kind` |
+| `commits` | `path, version, author, ts, message, kind, batch` |
 | `authors` | `path, author, commits, first_ts, last_ts` |
 
 Also `textdb_search(query, prefix)`, `textdb_ls(dir, recursive)`, `textdb_content(path)`. Do not
 select `content` from `kb` across many files: it reads every document in full.
+
+- **Output for scripts:** `--format lines` prints one value per line (one column), `--format tsv`
+  whole values tab-separated; the table cuts values at 60 characters (`--full` shows them). Long
+  statements: `textdb sql -f query.sql`.
+- **Paths:** use `dir`, `depth`, `ext` (files) and `parent`, `depth` (folders) instead of
+  `substr`/`instr` arithmetic: `WHERE dir = '/accounts/acme'`, `WHERE depth = 2`.
+- **Patterns:** in `LIKE`, `_` and `%` are wildcards (`'/work_files/%'` matches `/workXfiles/`; add
+  `ESCAPE '\'` and write `\_`); `[0-9]`-style classes work only with `GLOB`, which is case-sensitive.
+  A wrong "0 rows" is often this.
+- **`textdb_search`** gives one row per document holding every term (hyphenated terms such as
+  `teo-group` need no quotes). Its `line`/`snippet` come from one chunk and may hold only some of the
+  terms: check with `textdb_lines(path, line, line)`, or use the `search` command, which lists each
+  matching line.
 
 Statements are read-only unless you pass `--write`. Then change documents only through the textdb
 functions, passing `:author` (bound to your author name) so the edits are attributed:
@@ -109,11 +122,28 @@ FROM frontmatter WHERE path LIKE '/guides/%' AND json_extract(data, '$.status') 
 SQL
 ```
 
-Run the same `SELECT` without the function first to see which files it touches. A `--write`
-statement is all or nothing: if one file fails (the old text is missing or not unique), nothing
-changes; fix the statement and run it again. `textdb_edit(path, old, new, :author)` needs `old` to
-occur exactly once; `textdb_append(path, text, :author)` and
-`textdb_write(path, content, base_version, :author, message)` are the others.
+Run it with `--write --dry-run` first: it prints each file's diff and the moves and deletes, then
+undoes everything. A `--write` statement is all or nothing: if one file fails (old text missing or
+not unique, a count that does not match), nothing changes; fix the statement and run it again.
+
+| Function | Use |
+|---|---|
+| `textdb_edit(path, old, new, :author)` | `old` must occur exactly once |
+| `textdb_replace(path, old, new, expected_count, :author)` | every occurrence, one version; pass the count you expect (or NULL for "at least one") |
+| `textdb_replace_many(path, '[["old","new"],["old2","new2",1]]', :author)` | several replacements in one file, applied in order, one version |
+| `textdb_move(from, to, :author)`, `textdb_delete(path, :author)` | move or delete files or folders atomically with the rest of the statement — no shell loops |
+| `textdb_append(path, text, :author)`, `textdb_write(path, content, base_version, :author, message)` | as the commands |
+
+After a real write, `textdb sql` prints `batch <id>`; `textdb revert-batch <id>` undoes that whole
+run (files back to their earlier content, moves undone, deletes restored as new files) and refuses if
+something changed since — `--dry-run` to preview, `--skip-changed` to revert the rest.
+
+```sh
+textdb sql --write --dry-run <<'SQL'
+SELECT path, textdb_replace_many(path, '[["Acme Corp", "Acme"], ["status: draft", "status: published", 1]]', :author)
+FROM files WHERE dir = '/accounts/acme' AND ext = 'md' AND instr(textdb_content(path), 'Acme Corp') > 0
+SQL
+```
 
 ## Read before you edit
 
@@ -154,6 +184,7 @@ textdb meta unset guides/api/index.md draft_notes
 
 # Replace text that occurs exactly once (no version needed).
 textdb edit guides/api/index.md --old 'deprecated in 2.0' --new 'removed in 3.0'
+textdb edit notes/todo.md --old '- call Ana' --new '- [x] call Ana'   # values starting with - work (or --old='- …')
 
 # Multi-line anchors without shell quoting trouble:
 printf '%s' '{"old": "## Errors\n\nOld intro.", "new": "## Errors\n\nNew intro."}' | textdb edit guides/api/index.md --stdin-json

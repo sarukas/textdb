@@ -11,18 +11,26 @@ use postgres::{Client, NoTls, Row};
 use textdb_sqlite::normalize_path;
 
 use super::{
-    BaseFile, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, PathEvent, Result, SqlResult, Stat, Store,
-    StoreError, SyncBase, Written,
+    BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, PathEvent, Result, RevertOutcome,
+    SqlResult, Stat, Store, StoreError, SyncBase, Written,
 };
 
 /// The views `textdb sql` offers, as in SQLite: the live store by path. Temporary, so they live
 /// in this session only.
 const SQL_VIEWS: &str = "\
 CREATE OR REPLACE TEMP VIEW files AS
-  SELECT id, path, name, version, nbytes, nlines, nwords, nauthors, created_at, updated_at, updated_by
+  SELECT id, path, name,
+         CASE WHEN length(path) = length(name) + 1 THEN '/' ELSE left(path, length(path) - length(name) - 1) END AS dir,
+         length(path) - length(replace(path, '/', '')) AS depth,
+         CASE WHEN name ~ '^.+\\.[^.]*$' THEN lower(substring(name from '\\.([^.]*)$')) ELSE '' END AS ext,
+         version, nbytes, nlines, nwords, nauthors, created_at, updated_at, updated_by
   FROM kb.node WHERE kind = 1 AND deleted_at IS NULL;
 CREATE OR REPLACE TEMP VIEW folders AS
-  SELECT id, path, name, files, folders, nbytes, nlines, nwords, versions, updated_at FROM kb.entry WHERE kind = 'folder';
+  SELECT id, path, name,
+         CASE WHEN path = '/' THEN NULL WHEN length(path) = length(name) + 1 THEN '/'
+              ELSE left(path, length(path) - length(name) - 1) END AS parent,
+         CASE WHEN path = '/' THEN 0 ELSE length(path) - length(replace(path, '/', '')) END AS depth,
+         files, folders, nbytes, nlines, nwords, versions, updated_at FROM kb.entry WHERE kind = 'folder';
 CREATE OR REPLACE TEMP VIEW frontmatter AS
   SELECT n.path, f.data FROM kb.frontmatter f JOIN kb.node n ON n.id = f.file_id AND n.deleted_at IS NULL;
 CREATE OR REPLACE TEMP VIEW sections AS
@@ -607,7 +615,11 @@ impl Store for PgStore {
         Ok(Some(base))
     }
 
-    fn sql(&mut self, query: &str, params: &[String], _author: Option<&str>, write: bool) -> Result<SqlResult> {
+    fn revert_batch(&mut self, _batch: &str, _author: Option<&str>, _skip_changed: bool, _dry_run: bool) -> Result<RevertOutcome> {
+        Err(StoreError::invalid("batches are recorded in SQLite stores only, for now: revert-batch needs one"))
+    }
+
+    fn sql(&mut self, query: &str, params: &[String], _author: Option<&str>, write: bool, dry_run: bool) -> Result<SqlResult> {
         if !self.sql_views_ready {
             self.client.batch_execute(SQL_VIEWS).map_err(pg)?;
             self.sql_views_ready = true;
@@ -641,9 +653,30 @@ impl Store for PgStore {
             let stmt = tx.prepare_typed(query, &types).map_err(pg)?;
             tx.execute(&stmt, &values).map_err(pg)?;
         }
-        tx.commit().map_err(pg)?;
         if write {
-            result.store_changes = Some(self.last_seq()? - before);
+            let after: i64 = tx.query_one("SELECT coalesce(max(seq), 0) FROM kb.change", &[]).map_err(pg)?.get(0);
+            result.store_changes = Some(after - before);
+            if dry_run {
+                result.dry_run = true;
+                for row in tx
+                    .query("SELECT op, path, old_path, version FROM kb.change WHERE seq > $1 ORDER BY seq", &[&before])
+                    .map_err(pg)?
+                {
+                    result.changes.push(BatchChange {
+                        op: row.get(0),
+                        path: row.get(1),
+                        old_path: row.get(2),
+                        from_version: None,
+                        to_version: row.get(3),
+                        diff: None,
+                    });
+                }
+            }
+        }
+        if dry_run {
+            tx.rollback().map_err(pg)?;
+        } else {
+            tx.commit().map_err(pg)?;
         }
         Ok(result)
     }

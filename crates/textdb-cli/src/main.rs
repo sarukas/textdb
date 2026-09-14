@@ -163,6 +163,29 @@ enum Cmd {
         /// Print whole values instead of cutting them at 60 characters.
         #[arg(long)]
         full: bool,
+        /// With --write: run the statement, print each file's diff and the moves and deletes it
+        /// made, then undo all of it.
+        #[arg(long, requires = "write")]
+        dry_run: bool,
+        /// Read the statement from this file.
+        #[arg(long, short = 'f', conflicts_with = "query")]
+        file: Option<PathBuf>,
+        /// How to print rows: table, tsv, lines (one value per line) or json (as --json).
+        #[arg(long, value_enum, default_value_t = sql_query::SqlFormat::Table)]
+        format: sql_query::SqlFormat,
+    },
+    /// Undo what one `sql --write` run changed, by the batch id it printed (also in the `commits`
+    /// view): changed files get their earlier content back as a new version, files it created
+    /// are deleted, moves are undone and what it deleted is created again. Refuses, changing
+    /// nothing, when something in the batch changed since, unless --skip-changed. SQLite stores.
+    RevertBatch {
+        batch: String,
+        /// Revert what can be, and list what changed since and was left alone.
+        #[arg(long)]
+        skip_changed: bool,
+        /// Say what reverting would do, without changing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List one folder.
     Ls {
@@ -411,6 +434,18 @@ enum Cmd {
 }
 
 fn main() {
+    // clap builds the whole command tree in one go; in a debug build its frames outgrow the
+    // 1 MiB main-thread stack Windows gives a program, so the CLI runs on a thread with more.
+    let status = std::thread::Builder::new()
+        .stack_size(8 << 20)
+        .spawn(cli_main)
+        .expect("start the CLI thread")
+        .join()
+        .unwrap_or(101);
+    std::process::exit(status);
+}
+
+fn cli_main() -> i32 {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let json = cli.json;
@@ -422,7 +457,7 @@ fn main() {
         }
     };
     let _ = std::io::stdout().flush();
-    std::process::exit(status);
+    status
 }
 
 fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
@@ -476,16 +511,34 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             params,
             write,
             full,
+            dry_run,
+            file,
+            format,
         } => {
-            let statement = match query.as_deref() {
-                None | Some("-") => {
+            let statement = match (file, query.as_deref()) {
+                (Some(file), _) => String::from_utf8(read_file(&file)?)
+                    .map_err(|_| StoreError::invalid(format!("{} is not UTF-8 text", file.display())))?,
+                (None, None | Some("-")) => {
                     let mut text = String::new();
                     std::io::stdin().read_to_string(&mut text)?;
                     text
                 }
-                Some(text) => text.to_string(),
+                (None, Some(text)) => text.to_string(),
             };
-            sql_query::run(st, &statement, &params, author, write, full, json)
+            let format = if json { sql_query::SqlFormat::Json } else { format };
+            let options = sql_query::SqlOptions { write, dry_run, full, format };
+            sql_query::run(st, &statement, &params, author, options)
+        }
+        Cmd::RevertBatch {
+            batch,
+            skip_changed,
+            dry_run,
+        } => {
+            let r = st.revert_batch(&batch, author, skip_changed, dry_run)?;
+            if json {
+                return emit_json(&r);
+            }
+            out(sql_query::revert_text(&r).as_bytes())
         }
         Cmd::GitStatus { prefix, dir, rev, ext } => sync::git_status(st, &prefix, &dir, &rev, &sync::parse_exts(&ext), json),
         Cmd::Ls {

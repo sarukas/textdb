@@ -274,6 +274,53 @@ pub struct SqlResult {
     pub rows: Vec<Vec<serde_json::Value>>,
     /// With `--write`: changes the store's change log gained (commits, moves, deletes).
     pub store_changes: Option<i64>,
+    /// With `--write`: the batch the changes were recorded under, for `revert-batch`.
+    pub batch: Option<String>,
+    /// With `--dry-run`: the statement ran and was undone; `changes` is what it did.
+    pub dry_run: bool,
+    pub changes: Vec<BatchChange>,
+}
+
+/// One change a statement made: a file's content (`create`, `edit`: versions and a unified
+/// diff), a `move`, `delete` or `mkdir`.
+#[derive(Debug, Serialize)]
+pub struct BatchChange {
+    pub op: String,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+}
+
+/// What `revert-batch` did, or with `dry_run` would do.
+#[derive(Debug, Serialize)]
+pub struct RevertOutcome {
+    pub batch: String,
+    pub dry_run: bool,
+    /// The batch the revert itself was recorded under (so it can be reverted too).
+    pub revert_batch: Option<String>,
+    pub restored: Vec<RestoredFile>,
+    pub removed: Vec<String>,
+    pub moved_back: Vec<MovedBack>,
+    pub recreated: Vec<String>,
+    pub skipped: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RestoredFile {
+    pub path: String,
+    pub version: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MovedBack {
+    pub from: String,
+    pub to: String,
 }
 
 /// A live file's current version, as `sync` compares it with the sync base.
@@ -428,7 +475,11 @@ pub trait Store {
     /// Run one statement with `params` bound as text, read-only unless `write`. The views
     /// `files`, `folders`, `frontmatter`, `sections`, `links`, `commits` and `authors` are there
     /// to query; in SQLite, `:author` is bound to `author`.
-    fn sql(&mut self, query: &str, params: &[String], author: Option<&str>, write: bool) -> Result<SqlResult>;
+    /// With `dry_run` (and `write`), the statement runs and is rolled back, and the result lists
+    /// the changes it made.
+    fn sql(&mut self, query: &str, params: &[String], author: Option<&str>, write: bool, dry_run: bool) -> Result<SqlResult>;
+    /// Undo the changes recorded under `batch`; with `dry_run`, only report what that would do.
+    fn revert_batch(&mut self, batch: &str, author: Option<&str>, skip_changed: bool, dry_run: bool) -> Result<RevertOutcome>;
 }
 
 pub fn open(store: &str) -> Result<Box<dyn Store>> {
