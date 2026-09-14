@@ -1614,3 +1614,32 @@ mod kb {
     #[allow(dead_code)]
     fn _unused(_: DatumWithOid) {}
 }
+
+/// `cargo pgrx test` runs these in a scratch database with the extension installed.
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use pgrx::prelude::*;
+
+    fn one<T: pgrx::datum::FromDatum + pgrx::datum::IntoDatum>(sql: &str) -> Option<T> {
+        Spi::get_one::<T>(sql).expect(sql)
+    }
+
+    #[pg_test]
+    fn write_read_move_and_the_feed() {
+        Spi::run("SELECT kb.write('/notes/a.md', E'# A\\n\\nsee [[B]]\\n')").unwrap();
+        assert_eq!(one::<String>("SELECT kb.content('/notes/a.md')").as_deref(), Some("# A\n\nsee [[B]]\n"));
+        Spi::run("SELECT kb.move('/notes/a.md', '/archive/a.md', 'tester')").unwrap();
+        assert_eq!(one::<String>("SELECT path FROM kb.file WHERE name = 'a.md'").as_deref(), Some("/archive/a.md"));
+        assert_eq!(one::<i64>("SELECT count(*) FROM kb.feed(0) WHERE op = 'move' AND author = 'tester'"), Some(1));
+    }
+}
+
+#[cfg(test)]
+pub mod pg_test {
+    pub fn setup(_options: Vec<&str>) {}
+
+    pub fn postgresql_conf_options() -> Vec<&'static str> {
+        vec![]
+    }
+}

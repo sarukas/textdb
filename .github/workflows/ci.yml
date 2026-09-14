@@ -26,7 +26,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            crates/textdb-pg -> target
       - run: sudo apt-get update && sudo apt-get install -y postgresql-16 postgresql-server-dev-16 libclang-dev
       - run: cargo install cargo-pgrx --version 0.18.1 --locked
       - run: cargo pgrx init --pg16 /usr/lib/postgresql/16/bin/pg_config
+      # `cargo pgrx test` and `install` write the extension into the system PostgreSQL's directories.
+      - run: sudo chmod a+rwx "$(/usr/lib/postgresql/16/bin/pg_config --pkglibdir)" "$(/usr/lib/postgresql/16/bin/pg_config --sharedir)/extension" /var/run/postgresql/
       - run: cd crates/textdb-pg && cargo build --release
+      # The extension's own tests (#[pg_test]), in a scratch cluster pgrx starts.
+      - run: cd crates/textdb-pg && cargo pgrx test pg16
+      # The CLI against the extension installed in the runner's PostgreSQL 16.
+      - run: cd crates/textdb-pg && cargo pgrx install --release --pg-config /usr/lib/postgresql/16/bin/pg_config
+      - run: |
+          sudo systemctl start postgresql
+          sudo -u postgres psql -c "CREATE ROLE ci LOGIN SUPERUSER PASSWORD 'ci'"
+      - run: cargo test --release -p textdb-cli --test cli_pg
+        env:
+          TEXTDB_TEST_PG: postgres://ci:ci@localhost:5432/postgres
