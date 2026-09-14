@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use pgrx::prelude::*;
 use textdb_core::tree::materialize;
-use textdb_core::{Edit, Link, StructureExtractor, TextdbError};
+use textdb_core::{Edit, Link, TextdbError};
 use textdb_md::resolve::{line_of_offset, name_key, resolve, rewritten_target, LinkUpdates, Lookup, LINK_UPDATES_SETTING};
 
 use crate::store::{to_hash, SpiStorage};
@@ -302,32 +302,4 @@ pub fn follow_move(
         }
     }
     Ok(changes)
-}
-
-/// Extract and resolve the links of every live markdown file again.
-pub fn backfill() -> Result<()> {
-    let files: Vec<(i64, i64, Vec<u8>, String)> = Spi::connect(|client| {
-        let t = client
-            .select("SELECT id, version, root, path FROM kb.node WHERE kind = 1 AND root IS NOT NULL AND deleted_at IS NULL", None, &[])
-            .map_err(err)?;
-        let mut out = Vec::new();
-        for r in t {
-            out.push((
-                r.get::<i64>(1).map_err(err)?.unwrap_or(0),
-                r.get::<i64>(2).map_err(err)?.unwrap_or(0),
-                r.get::<Vec<u8>>(3).map_err(err)?.unwrap_or_default(),
-                r.get::<String>(4).map_err(err)?.unwrap_or_default(),
-            ));
-        }
-        Ok::<_, TextdbError>(out)
-    })?;
-    let st = SpiStorage::new();
-    for (id, version, root, path) in files {
-        let lower = path.to_ascii_lowercase();
-        if lower.ends_with(".md") || lower.ends_with(".markdown") {
-            let doc = materialize(&st, &to_hash(&root)?)?;
-            write_rows(id, version, &textdb_md::MarkdownExtractor.extract(&doc).links)?;
-        }
-    }
-    relink_where("true", None)
 }

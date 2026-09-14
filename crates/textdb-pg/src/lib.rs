@@ -1285,12 +1285,14 @@ mod kb {
         if path_history_enabled()? {
             record_path_events(PathOp::Delete, &n, None, author, seq)?;
         }
+        // One timestamp for the whole subtree, distinct from other deletes in the same
+        // transaction: reverting a batch finds what one delete took by it. Read once, since
+        // clock_timestamp() in the UPDATE itself may be evaluated again for every row.
+        let at = Spi::get_one::<String>("SELECT clock_timestamp()::text").map_err(storage_err)?.unwrap_or_default();
         Spi::run_with_args(
-            // One timestamp for the whole subtree, distinct from other deletes in the same
-            // transaction: reverting a batch finds what one delete took by it.
-            "UPDATE kb.node SET deleted_at = t.ts FROM (SELECT clock_timestamp() AS ts) t \
+            "UPDATE kb.node SET deleted_at = $2::timestamptz \
              WHERE (path = $1 OR path LIKE kb._subtree_like($1)) AND deleted_at IS NULL",
-            &[path.as_str().into()],
+            &[path.as_str().into(), at.as_str().into()],
         )
         .map_err(storage_err)?;
         crate::links::relink(&crate::links::names_of(&files), &files.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;

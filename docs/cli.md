@@ -236,9 +236,15 @@ and deletes), and rolls it all back; `--json` gives the same as `changes: [{op, 
 from_version, to_version, diff}]`. A real `--write` records its commits, moves and deletes under a
 batch id, printed after the statement (`batch 20260914-211500-3f9a: …`) and kept in the `commits`
 view's `batch` column. `textdb revert-batch ID` undoes the batch; `--dry-run` shows what it would do.
-Batches are SQLite only for now; in Postgres, `--dry-run` lists the change-log rows without diffs.
 Another client can record its own batch with `SELECT textdb_batch('id')` before writing and
 `textdb_batch(NULL)` after.
+
+In a Postgres store the same statements use the extension's functions: `kb.replace`,
+`kb.replace_many`, `kb.write`, `kb.append`, `kb.edit`, `kb.replace_lines`, `kb.move`, `kb.remove`
+and `kb.content` (see [USAGE.md](USAGE.md)); positional parameters are `$1`, `$2`, … and
+`:author` is bound as in SQLite. Batches, `--dry-run` diffs and `revert-batch` work the same; a
+client records its own batch with `SELECT set_config('textdb.batch', 'id', true)` in its
+transaction.
 
 ## Syncing with a git checkout
 

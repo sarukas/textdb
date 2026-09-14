@@ -42,14 +42,17 @@ psycopg, JDBC, …). Python: `pip install -e python/` from the repo gives `textd
 | `grep -rn '"quarterly review"'` | `SELECT path, line FROM kb.search('"quarterly review"');` |
 | `grep -rn 'renew' --include='*'` (prefix) | `SELECT path, line FROM kb.search('renew*');` |
 | `sed -i 's/pending/signed/' notes.md` (one unique occurrence) | `SELECT kb.edit('/clients/acme/notes.md', 'pending', 'signed', 'me');` |
-| `sed -i 's/foo/bar/g' notes.md` (all occurrences, last writer wins) | `UPDATE kb.file SET content = replace(content, 'foo', 'bar') WHERE path = '/clients/acme/notes.md';` |
+| `sed -i 's/foo/bar/g' notes.md` (all occurrences, one version) | `SELECT kb.replace('/clients/acme/notes.md', 'foo', 'bar', NULL, 'me');` (4th argument: the exact count expected, else at least one; `kb.replace_many(path, '[["a","b"],["c","d",2]]', 'me')` for several) |
+| `sed -i '12,14c…' notes.md` (line ranges, one commit) | `SELECT kb.replace_ranges(p, '[{"from": 12, "to": 14, "text": "…\n"}, {"from": 40, "to": 39, "text": "inserted\n"}]', $version_you_read, 'me', 'message');` |
 | `echo "- done" >> journal.md` | `SELECT kb.append('/clients/acme/journal.md', E'- done\n', 'me');` |
 | `cat > new.md <<EOF …` (create or overwrite) | `INSERT INTO kb.file(path, content, updated_by) VALUES ('/clients/acme/new.md', $body, 'me');` |
 | `mkdir -p /clients/acme/2027` | `INSERT INTO kb.folder(path) VALUES ('/clients/acme/2027');` (also implicit on file create) |
 | `mv notes.md notes-2026.md` | `UPDATE kb.file SET path = '/clients/acme/notes-2026.md' WHERE path = '/clients/acme/notes.md';` |
 | `mv /clients/acme /archive/acme` | `UPDATE kb.folder SET path = '/archive/acme' WHERE path = '/clients/acme';` |
 | `rm notes.md` / `rm -r /archive` | `DELETE FROM kb.file WHERE path = …;` / `DELETE FROM kb.folder WHERE path = '/archive';` (tombstones; history stays) |
-| `mv` with attribution | `SELECT kb.move('/clients/acme', '/archive/acme', 'me');` · `SELECT kb.remove('/archive/old', 'me');` |
+| `mv` with attribution | `SELECT kb.move('/clients/acme', '/archive/acme', 'me', 'why');` · `SELECT kb.remove('/archive/old', 'me', 'why');` |
+| `mv` and fix the links to it | `SELECT kb.move_links('/notes/Plan.md', '/archive/Plan.md', 'me', NULL, 'rewrite');` (`'report'` lists them without changing anything) |
+| which notes link here / broken links | `SELECT n.path, l.line, l.target_path FROM kb.link l JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL WHERE l.resolved_id = kb._node_id('/notes/Plan.md');` · `… WHERE l.status IN ('broken', 'anchor-missing', 'ambiguous')` |
 | `git log notes.md` | `SELECT * FROM kb.history('/clients/acme/notes.md');` and `SELECT * FROM kb.path_history('/clients/acme/notes.md');` (renames, moves, deletes) |
 | `git show HEAD~3:notes.md` | `SELECT kb.content('/clients/acme/notes.md', version - 3) FROM kb.file WHERE path = …;` |
 | `git diff v1 v2 -- notes.md` | `SELECT kb.diff('/clients/acme/notes.md', 1, 2);` |
@@ -133,3 +136,19 @@ SELECT kb.set_setting('path_history', 'off');     -- the store default for every
 
 Postgres has no trash functions yet: a deleted file's versions stay readable with
 `kb.content(path, version)` and `kb.history(path)`.
+
+## Bulk changes: preview, batch, revert
+
+Name a batch for the transaction, preview with the diffs, then commit or roll back; a batch can
+be undone later as a whole:
+
+```sql
+BEGIN;
+SELECT set_config('textdb.batch', 'acme-rename-2026-09-15', true);
+SELECT kb.last_seq();                                            -- remember it as :seq
+SELECT kb.replace(path, 'Acme Corp', 'Acme', NULL, 'agent-7') FROM kb.file
+ WHERE path LIKE '/accounts/%' AND strpos(content, 'Acme Corp') > 0;
+SELECT kb.changes_after(:seq);                                   -- [{op, path, from_version, to_version, diff}]
+COMMIT;                                                          -- or ROLLBACK
+SELECT kb.revert_batch('acme-rename-2026-09-15', 'agent-7');     -- TX004 if anything changed since; true as 3rd argument skips those
+```

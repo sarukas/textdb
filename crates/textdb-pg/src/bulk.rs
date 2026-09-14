@@ -145,19 +145,18 @@ fn change_recs(seq: Option<i64>, batch: Option<&str>) -> Result<Vec<ChangeRec>> 
     })
 }
 
-/// A node by id, deleted or not: kind, path, version, root, and whether it is deleted.
+/// A node by id, deleted or not: kind, path, version, and whether it is deleted.
 struct AnyNode {
     kind: i16,
     path: String,
     version: i64,
-    root: Option<Vec<u8>>,
     deleted: bool,
 }
 
 fn node_by_id(id: i64) -> Result<Option<AnyNode>> {
     Spi::connect(|client| {
         let rows = client
-            .select("SELECT kind, path, version, root, deleted_at IS NOT NULL FROM kb.node WHERE id = $1", Some(1), &[id.into()])
+            .select("SELECT kind, path, version, deleted_at IS NOT NULL FROM kb.node WHERE id = $1", Some(1), &[id.into()])
             .map_err(err)?;
         let mut out = None;
         for r in rows {
@@ -165,8 +164,7 @@ fn node_by_id(id: i64) -> Result<Option<AnyNode>> {
                 kind: r.get::<i16>(1).map_err(err)?.unwrap_or(0),
                 path: r.get::<String>(2).map_err(err)?.unwrap_or_default(),
                 version: r.get::<i64>(3).map_err(err)?.unwrap_or(0),
-                root: r.get::<Vec<u8>>(4).map_err(err)?,
-                deleted: r.get::<bool>(5).map_err(err)?.unwrap_or(false),
+                deleted: r.get::<bool>(4).map_err(err)?.unwrap_or(false),
             });
         }
         Ok(out)
