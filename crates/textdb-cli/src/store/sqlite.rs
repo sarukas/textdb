@@ -315,6 +315,21 @@ impl Store for SqliteStore {
             .collect())
     }
 
+    fn replace_ranges(
+        &mut self,
+        path: &str,
+        ranges: &[super::LineRange],
+        base_version: Option<i64>,
+        author: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<Written> {
+        let ranges: Vec<(u64, u64, Vec<u8>)> = super::sorted_ranges(ranges)?
+            .into_iter()
+            .map(|r| (r.from as u64, r.to as u64, r.text.clone().into_bytes()))
+            .collect();
+        Ok(written(self.db().with_message(message).replace_line_ranges(path, &ranges, base_version.map(version), author)?))
+    }
+
     fn mv(&mut self, from: &str, to: &str, author: Option<&str>, message: Option<&str>) -> Result<()> {
         Ok(self.db().with_message(message).rename_by(from, to, author)?)
     }

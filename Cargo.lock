@@ -1214,6 +1214,7 @@ dependencies = [
  "sha1",
  "tempfile",
  "textdb-core",
+ "textdb-md",
  "textdb-sqlite",
  "unicode-normalization",
 ]

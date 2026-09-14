@@ -163,6 +163,67 @@ pub struct Hit {
     pub rank: f64,
 }
 
+/// Lines `from..=to` (1-based) as numbered in the base version become `text`; `to = from - 1`
+/// inserts before `from`. Several make one commit (`replace-lines --stdin-json`, `meta`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct LineRange {
+    pub from: i64,
+    pub to: i64,
+    pub text: String,
+}
+
+/// `ranges` in line order; refuses an invalid range, and ranges that overlap or start at the
+/// same line.
+pub fn sorted_ranges(ranges: &[LineRange]) -> Result<Vec<&LineRange>> {
+    if ranges.is_empty() {
+        return Err(StoreError::invalid("no line ranges given"));
+    }
+    let mut sorted: Vec<&LineRange> = ranges.iter().collect();
+    sorted.sort_by_key(|r| r.from);
+    if let Some(r) = sorted.iter().find(|r| r.from < 1 || r.to < r.from - 1) {
+        return Err(StoreError::invalid(format!(
+            "invalid line range {}..{}: FROM starts at 1, and TO is at least FROM-1 (which inserts)",
+            r.from, r.to
+        )));
+    }
+    if let Some(w) = sorted.windows(2).find(|w| w[1].from <= w[0].to || w[1].from == w[0].from) {
+        return Err(StoreError::invalid(format!(
+            "line ranges {}..{} and {}..{} overlap: give each line once, all numbered as in the same version",
+            w[0].from, w[0].to, w[1].from, w[1].to
+        )));
+    }
+    Ok(sorted)
+}
+
+/// `content` with `ranges` replaced, as `replace_line_ranges` in the SQLite binding does it.
+pub fn splice_lines(content: &[u8], ranges: &[LineRange]) -> Result<Vec<u8>> {
+    let sorted = sorted_ranges(ranges)?;
+    let starts: Vec<usize> = std::iter::once(0)
+        .chain(content.iter().enumerate().filter(|(_, b)| **b == b'\n').map(|(i, _)| i + 1))
+        .collect();
+    let unterminated = content.last().is_some_and(|b| *b != b'\n');
+    let nlines = (starts.len() - 1 + unterminated as usize) as i64;
+    let (mut out, mut pos) = (Vec::with_capacity(content.len()), 0);
+    for r in sorted {
+        if r.from - 1 > nlines || r.to > nlines {
+            return Err(StoreError::invalid(format!("lines {}..{} are outside the file, which has {nlines} lines", r.from, r.to)));
+        }
+        let start = starts.get(r.from as usize - 1).copied();
+        if start.is_none() {
+            out.extend_from_slice(&content[pos..]);
+            out.push(b'\n');
+            pos = content.len();
+        }
+        let start = start.unwrap_or(content.len());
+        let end = if r.to < r.from { start } else { starts.get(r.to as usize).copied().unwrap_or(content.len()) };
+        out.extend_from_slice(&content[pos..start.max(pos)]);
+        out.extend_from_slice(r.text.as_bytes());
+        pos = end.max(pos);
+    }
+    out.extend_from_slice(&content[pos..]);
+    Ok(out)
+}
+
 /// Lines `old_from..old_from + old_count` (1-based) became `new_from..new_from + new_count`.
 #[derive(Debug, Serialize)]
 pub struct Hunk {
@@ -309,6 +370,15 @@ pub trait Store {
         from: i64,
         to: i64,
         text: &[u8],
+        base_version: Option<i64>,
+        author: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<Written>;
+    /// Several line ranges, all numbered as in `base_version`, replaced in one commit.
+    fn replace_ranges(
+        &mut self,
+        path: &str,
+        ranges: &[LineRange],
         base_version: Option<i64>,
         author: Option<&str>,
         message: Option<&str>,

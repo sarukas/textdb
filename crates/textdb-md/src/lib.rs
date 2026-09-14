@@ -68,6 +68,11 @@ pub fn split_frontmatter(bytes: &[u8]) -> Option<(&[u8], usize)> {
     None
 }
 
+/// Front matter YAML (without its `---` lines) as JSON, as it is kept for the `frontmatter` table.
+pub fn parse_yaml(text: &str) -> Option<serde_json::Value> {
+    yaml::parse(text)
+}
+
 pub fn extract(bytes: &[u8]) -> Structure {
     let text = String::from_utf8_lossy(bytes);
     let starts = line_starts(bytes);

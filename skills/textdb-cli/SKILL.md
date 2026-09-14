@@ -138,6 +138,20 @@ EOF
 # Insert before line 40 (TO = FROM - 1), as numbered in v12.
 textdb replace-lines guides/api/index.md 40 39 -b 12 --text $'A new line.\n'
 
+# One logical change in several places: all ranges numbered as in v12, one version, one message.
+textdb replace-lines guides/api/index.md -b 12 --stdin-json -m 'rename Foo to Bar' <<'EOF'
+[{"from": 3, "to": 3, "text": "title: Bar\n"},
+ {"from": 88, "to": 90, "text": "Bar replaces Foo.\n"},
+ {"from": 200, "to": 199, "text": "- 2026-09-14: renamed to Bar\n"}]
+EOF
+
+# Front matter, one key at a time; nothing else in the file changes.
+textdb meta get guides/api/index.md status            # value; list items one per line; --json for JSON
+textdb meta set guides/api/index.md status published
+textdb meta set guides/api/index.md tags api limits    # several values (or --list) make a list
+textdb meta set guides/api/index.md related '[[Limits]]'   # quoted in YAML as needed
+textdb meta unset guides/api/index.md draft_notes
+
 # Replace text that occurs exactly once (no version needed).
 textdb edit guides/api/index.md --old 'deprecated in 2.0' --new 'removed in 3.0'
 

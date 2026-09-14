@@ -1303,9 +1303,37 @@ impl<'c> TextDb<'c> {
         base_version: Option<u64>,
         author: Option<&str>,
     ) -> Result<WriteResult> {
+        self.replace_line_ranges(path, &[(from, to, text.to_vec())], base_version, author)
+    }
+
+    /// Replace several line ranges `(from, to, text)`, all numbered as in `base_version`, in one
+    /// commit. Each is as in [`TextDb::replace_lines`]; they may come in any order, but must not
+    /// overlap or start at the same line.
+    pub fn replace_line_ranges(
+        &self,
+        path: &str,
+        ranges: &[(u64, u64, Vec<u8>)],
+        base_version: Option<u64>,
+        author: Option<&str>,
+    ) -> Result<WriteResult> {
         let path = normalize_path(path)?;
-        if from == 0 || to + 1 < from {
-            return Err(TextdbError::InvalidEdit(format!("invalid line range {}-{}", from, to)));
+        let mut sorted: Vec<&(u64, u64, Vec<u8>)> = ranges.iter().collect();
+        sorted.sort_by_key(|r| r.0);
+        if sorted.is_empty() {
+            return Err(TextdbError::InvalidEdit("no line ranges".into()));
+        }
+        for &&(from, to, _) in &sorted {
+            if from == 0 || to + 1 < from {
+                return Err(TextdbError::InvalidEdit(format!("invalid line range {}-{}", from, to)));
+            }
+        }
+        for w in sorted.windows(2) {
+            if w[1].0 <= w[0].1 || w[1].0 == w[0].0 {
+                return Err(TextdbError::InvalidEdit(format!(
+                    "line ranges {}-{} and {}-{} overlap",
+                    w[0].0, w[0].1, w[1].0, w[1].1
+                )));
+            }
         }
         let n = self.file_by_path(&path)?;
         let base_v = base_version.unwrap_or(n.version as u64);
@@ -1317,28 +1345,31 @@ impl<'c> TextDb<'c> {
         let (len, newlines) = totals(&st, &root)?;
         let unterminated = len > 0 && textdb_core::materialize_range(&st, &root, len - 1, len)? != b"\n";
         let nlines = newlines + unterminated as u64;
-        if from - 1 > nlines || to > nlines {
-            return Err(TextdbError::InvalidEdit(format!(
-                "lines {}-{} are outside {}, which has {} lines at version {}",
-                from, to, path, nlines, base_v
-            )));
-        }
-        let mut replacement = text.to_vec();
-        let start = match textdb_core::locate_line(&st, &root, from - 1)? {
-            Some(off) => off,
-            // Appending after a last line with no newline: supply one, or the new text
-            // would run on from that line instead of following it.
-            None => {
-                replacement.insert(0, b'\n');
-                len
+        let mut edits = Vec::with_capacity(sorted.len());
+        for &&(from, to, ref text) in &sorted {
+            if from - 1 > nlines || to > nlines {
+                return Err(TextdbError::InvalidEdit(format!(
+                    "lines {}-{} are outside {}, which has {} lines at version {}",
+                    from, to, path, nlines, base_v
+                )));
             }
-        };
-        let end = if to < from {
-            start
-        } else {
-            textdb_core::locate_line(&st, &root, to)?.unwrap_or(len)
-        };
-        let edits = [Edit::new(start, end, replacement)];
+            let mut replacement = text.clone();
+            let start = match textdb_core::locate_line(&st, &root, from - 1)? {
+                Some(off) => off,
+                // Appending after a last line with no newline: supply one, or the new text
+                // would run on from that line instead of following it.
+                None => {
+                    replacement.insert(0, b'\n');
+                    len
+                }
+            };
+            let end = if to < from {
+                start
+            } else {
+                textdb_core::locate_line(&st, &root, to)?.unwrap_or(len)
+            };
+            edits.push(Edit::new(start, end, replacement));
+        }
         self.commit_edits(&path, &edits, Some(base_v), author, self.message.as_deref().or(Some("replace-lines")))
     }
 

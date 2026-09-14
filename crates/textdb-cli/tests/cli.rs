@@ -270,6 +270,71 @@ fn messages_create_paths_search_grep_and_empty_folders() {
 }
 
 #[test]
+fn several_line_ranges_make_one_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    ok(textdb(&store).args(["write", "/r.md"]), Some("one\ntwo\nthree\nfour\nfive\n"));
+
+    // Numbered as in v1, in any order: one new version with one message.
+    let ranges = r#"[{"from": 5, "to": 5, "text": "FIVE\n"}, {"from": 1, "to": 1, "text": "ONE\n"}, {"from": 3, "to": 2, "text": "2.5\n"}]"#;
+    let w = ok(textdb(&store).args(["--json", "replace-lines", "/r.md", "-b", "1", "--stdin-json", "-m", "tidy"]), Some(ranges)).json();
+    assert_eq!((w["version"].as_i64(), w["kind"].as_str()), (Some(2), Some("direct")), "{w}");
+    assert_eq!(ok(textdb(&store).args(["cat", "/r.md"]), None).stdout, "ONE\ntwo\n2.5\nthree\nfour\nFIVE\n");
+    let history = ok(textdb(&store).args(["--json", "history", "--versions-only", "/r.md"]), None).json();
+    assert_eq!(history.as_array().unwrap().len(), 2);
+    assert_eq!(history[1]["message"], "tidy");
+
+    // Overlapping or out-of-file ranges change nothing.
+    let overlap = run(textdb(&store).args(["replace-lines", "/r.md", "--stdin-json"]), Some(r#"[{"from": 2, "to": 3, "text": ""}, {"from": 3, "to": 4, "text": ""}]"#));
+    assert_eq!(overlap.status, 6, "{}", overlap.stderr);
+    let outside = run(textdb(&store).args(["replace-lines", "/r.md", "--stdin-json"]), Some(r#"[{"from": 1, "to": 1, "text": "x\n"}, {"from": 20, "to": 20, "text": ""}]"#));
+    assert_eq!(outside.status, 6, "{}", outside.stderr);
+    assert_eq!(ok(textdb(&store).args(["stat", "--json", "/r.md"]), None).json()["version"], 2);
+
+    // Against a stale version, rebased over a commit elsewhere in the file.
+    ok(textdb(&store).args(["append", "/r.md", "six"]), None);
+    let stale = ok(textdb(&store).args(["--json", "replace-lines", "/r.md", "-b", "2", "--stdin-json"]), Some(r#"[{"from": 2, "to": 2, "text": "TWO\n"}, {"from": 4, "to": 4, "text": "THREE\n"}]"#)).json();
+    assert_eq!(stale["kind"], "rebased", "{stale}");
+    assert_eq!(ok(textdb(&store).args(["cat", "/r.md"]), None).stdout, "ONE\nTWO\n2.5\nTHREE\nfour\nFIVE\nsix\n");
+}
+
+#[test]
+fn meta_changes_one_front_matter_key_and_nothing_else() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let doc = "---\r\ntitle: Acme\r\ntags:\r\n    - telco\r\n    - cvm\r\nstatus: draft # was review\r\nowner: \"[[Jonas]]\"\r\n---\r\n# Acme\r\n";
+    ok(textdb(&store).args(["write", "/m.md"]), Some(doc));
+
+    assert_eq!(ok(textdb(&store).args(["meta", "get", "/m.md", "title"]), None).stdout, "Acme\n");
+    assert_eq!(ok(textdb(&store).args(["meta", "get", "/m.md", "tags"]), None).stdout, "telco\ncvm\n");
+    assert_eq!(ok(textdb(&store).args(["meta", "get", "/m.md", "owner"]), None).stdout, "[[Jonas]]\n");
+    assert_eq!(ok(textdb(&store).args(["--json", "meta", "get", "/m.md"]), None).json()["tags"], serde_json::json!(["telco", "cvm"]));
+    assert_eq!(run(textdb(&store).args(["meta", "get", "/m.md", "missing"]), None).status, 5);
+
+    ok(textdb(&store).args(["meta", "set", "/m.md", "status", "published"]), None);
+    ok(textdb(&store).args(["meta", "set", "/m.md", "tags", "telco", "cvm", "rfi"]), None);
+    ok(textdb(&store).args(["meta", "set", "/m.md", "related", "[[Acme]]", "-m", "link the account"]), None);
+    ok(textdb(&store).args(["meta", "unset", "/m.md", "owner"]), None);
+    assert_eq!(
+        ok(textdb(&store).args(["cat", "/m.md"]), None).stdout,
+        "---\r\ntitle: Acme\r\ntags:\r\n    - telco\r\n    - cvm\r\n    - rfi\r\nstatus: published\r\nrelated: \"[[Acme]]\"\r\n---\r\n# Acme\r\n"
+    );
+    let history = ok(textdb(&store).args(["--json", "history", "--versions-only", "/m.md"]), None).json();
+    let messages: Vec<&str> = history.as_array().unwrap().iter().map(|c| c["message"].as_str().unwrap_or("")).collect();
+    assert_eq!(messages[1..], ["meta set status", "meta set tags", "link the account", "meta unset owner"]);
+
+    // Setting what is there, or removing what is not, makes no version.
+    assert!(ok(textdb(&store).args(["meta", "set", "/m.md", "status", "published"]), None).stdout.contains("unchanged"));
+    assert!(ok(textdb(&store).args(["meta", "unset", "/m.md", "owner"]), None).stdout.contains("unchanged"));
+
+    // A file without front matter gets some.
+    ok(textdb(&store).args(["write", "/plain.md"]), Some("# Plain\n"));
+    ok(textdb(&store).args(["meta", "set", "/plain.md", "modified_date", "2026-09-14"]), None);
+    assert_eq!(ok(textdb(&store).args(["cat", "/plain.md"]), None).stdout, "---\nmodified_date: 2026-09-14\n---\n# Plain\n");
+    assert_eq!(ok(textdb(&store).args(["--json", "meta", "get", "/plain.md", "modified_date"]), None).json(), "2026-09-14");
+}
+
+#[test]
 fn sql_reads_through_views_and_writes_only_when_asked() {
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("kb.db");

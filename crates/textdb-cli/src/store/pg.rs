@@ -470,6 +470,21 @@ impl Store for PgStore {
             .collect())
     }
 
+    /// `kb.replace_lines` takes one range: splice them all into the base version and write that
+    /// against it, so commits made since are rebased as for one range.
+    fn replace_ranges(
+        &mut self,
+        path: &str,
+        ranges: &[super::LineRange],
+        base_version: Option<i64>,
+        author: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<Written> {
+        let (content, v) = self.read(path, base_version)?;
+        let spliced = super::splice_lines(&content, ranges)?;
+        self.write(path, &spliced, Some(v), author, Some(message.unwrap_or("replace-lines")))
+    }
+
     fn mv(&mut self, from: &str, to: &str, author: Option<&str>, message: Option<&str>) -> Result<()> {
         self.client.execute("SELECT kb.move($1, $2, $3)", &[&from, &to, &author]).map_err(pg)?;
         let (from, to) = (normalize_path(from)?, normalize_path(to)?);

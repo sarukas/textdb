@@ -26,6 +26,7 @@ use store::{Change, Commit, Entry, ImportStats, PathEvent, Store, StoreError, Wr
 type Result<T> = std::result::Result<T, StoreError>;
 
 mod git;
+mod meta;
 mod portable;
 mod search;
 mod sql_query;
@@ -296,8 +297,10 @@ enum Cmd {
     ReplaceLines {
         #[arg(value_parser = store_path)]
         path: String,
-        from: i64,
-        to: i64,
+        #[arg(required_unless_present = "stdin_json")]
+        from: Option<i64>,
+        #[arg(required_unless_present = "stdin_json")]
+        to: Option<i64>,
         /// The version the line numbers refer to (see `cat -n`).
         #[arg(long, short = 'b')]
         base_version: Option<i64>,
@@ -305,9 +308,19 @@ enum Cmd {
         text: Option<String>,
         #[arg(long, short = 'f')]
         file: Option<PathBuf>,
+        /// Several ranges in one commit, read from stdin as
+        /// `[{"from": N, "to": N, "text": "…"}, …]`, all numbered as in the same version.
+        #[arg(long, conflicts_with_all = ["from", "to", "text", "file"])]
+        stdin_json: bool,
         /// Commit message (default `replace-lines`).
         #[arg(long, short = 'm')]
         message: Option<String>,
+    },
+    /// Read or change front matter, one top-level key at a time; the other lines of the file are
+    /// left exactly as they are.
+    Meta {
+        #[command(subcommand)]
+        op: MetaOp,
     },
     /// Append text (the argument, or stdin) to the end of a file; never conflicts.
     Append {
@@ -595,6 +608,31 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             let w = st.edit(&path, &old, &new, author, message.as_deref())?;
             emit_written(&path, &w, json)
         }
+        Cmd::Meta { op } => match op {
+            MetaOp::Get { path, key } => meta::get(st, &path, key.as_deref(), json),
+            MetaOp::Set {
+                path,
+                key,
+                values,
+                list,
+                raw,
+                message,
+            } => {
+                let value = match (values.len(), list, raw) {
+                    (_, true, _) => meta::NewValue::List(values),
+                    (0, false, _) => {
+                        return Err(StoreError::invalid(
+                            "meta set: give a value (several values, or --list, make a list; --list alone an empty one)",
+                        ))
+                    }
+                    (_, false, true) => meta::NewValue::Raw(values.join(" ")),
+                    (1, false, false) => meta::NewValue::Text(values.into_iter().next().unwrap_or_default()),
+                    (_, false, false) => meta::NewValue::List(values),
+                };
+                meta::set(st, &path, &key, Some(value), message.as_deref(), author, json)
+            }
+            MetaOp::Unset { path, key, message } => meta::set(st, &path, &key, None, message.as_deref(), author, json),
+        },
         Cmd::ReplaceLines {
             path,
             from,
@@ -602,8 +640,20 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             base_version,
             text,
             file,
+            stdin_json,
             message,
         } => {
+            if stdin_json {
+                let body = input(None, "replace-lines --stdin-json")?;
+                let ranges: Vec<store::LineRange> = serde_json::from_slice(&body).map_err(|e| {
+                    StoreError::invalid(format!("--stdin-json wants [{{\"from\": N, \"to\": N, \"text\": \"…\"}}, …]: {e}"))
+                })?;
+                let w = st.replace_ranges(&path, &ranges, base_version, author, message.as_deref())?;
+                return emit_written(&path, &w, json);
+            }
+            let (Some(from), Some(to)) = (from, to) else {
+                return Err(StoreError::invalid("pass FROM and TO, or --stdin-json"));
+            };
             if from < 1 || to < from - 1 {
                 return Err(StoreError::invalid(format!(
                     "invalid line range {from}..{to}: FROM starts at 1, and TO is at least FROM-1 (which inserts)"
@@ -1401,6 +1451,44 @@ fn collect_files(root: &Path, exts: &[String]) -> Result<Vec<(String, PathBuf)>>
     }
     found.sort();
     Ok(found)
+}
+
+#[derive(Subcommand)]
+enum MetaOp {
+    /// A key's value (list items one per line), or the whole front matter without KEY.
+    Get {
+        #[arg(value_parser = store_path)]
+        path: String,
+        key: Option<String>,
+    },
+    /// Set a top-level key: its lines are replaced, or it is added at the end of the front
+    /// matter (which is created when the file has none).
+    Set {
+        #[arg(value_parser = store_path)]
+        path: String,
+        key: String,
+        /// The value. Several values make a list. Put a value starting with `-` after `--`.
+        #[arg(num_args = 0.., allow_negative_numbers = true)]
+        values: Vec<String>,
+        /// Write a list, even of one value (or none).
+        #[arg(long)]
+        list: bool,
+        /// Write the value as YAML, without quoting (`[a, b]`).
+        #[arg(long, conflicts_with = "list")]
+        raw: bool,
+        /// Commit message (default `meta set KEY`).
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+    },
+    /// Remove a top-level key and its lines.
+    Unset {
+        #[arg(value_parser = store_path)]
+        path: String,
+        key: String,
+        /// Commit message (default `meta unset KEY`).
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+    },
 }
 
 /// Delete the folders a move or delete of `path` left empty, from its parent upwards; never the
