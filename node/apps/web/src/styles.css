@@ -1081,6 +1081,15 @@ kbd {
 .diff-stats .removed {
   color: var(--removed);
 }
+.diff-eol {
+  color: var(--muted);
+}
+.viewer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
 
 /* ---- conflict ------------------------------------------------------------------------------------- */
 .conflict {
