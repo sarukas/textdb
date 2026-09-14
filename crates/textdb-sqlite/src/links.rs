@@ -179,7 +179,7 @@ impl<'c> TextDb<'c> {
         }
         let folder = parent_of(source);
         let mut found: Vec<(i64, String)> = Vec::new();
-        let mut by_path = |found: &mut Vec<(i64, String)>, p: Option<String>| -> Result<()> {
+        let by_path = |found: &mut Vec<(i64, String)>, p: Option<String>| -> Result<()> {
             for v in p.map(|p| variants(&p)).unwrap_or_default() {
                 found.extend(self.live_files("lower(path) = lower(?1)", &v)?);
             }

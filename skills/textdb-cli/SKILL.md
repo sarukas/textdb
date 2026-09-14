@@ -79,7 +79,7 @@ SELECT path, json_extract(data, '$.status') AS status
 FROM frontmatter WHERE json_extract(data, '$.type') = 'account' ORDER BY path
 SQL
 textdb sql -p guides/api/index.md <<'SQL'
-SELECT path, line FROM links WHERE target = ?1 OR target LIKE '%/' || ?1   -- who links here
+SELECT path, line, kind, target FROM links WHERE resolved = ?1   -- who links here (as `backlinks`)
 SQL
 textdb sql -p '%Errors' 'SELECT path, heading, line_from FROM sections WHERE heading LIKE ?'
 textdb sql 'SELECT path, version, author, ts, message FROM commits ORDER BY ts DESC LIMIT 20'
@@ -92,7 +92,7 @@ textdb --json sql 'SELECT path, nwords FROM files ORDER BY nwords DESC LIMIT 10'
 | `folders` | `path, name, parent, depth, files, folders, nbytes, nwords, versions, updated_at` (totals below) |
 | `frontmatter` | `path, data` — YAML front matter as JSON: `json_extract(data, '$.key')`, `json_each(data, '$.list')` |
 | `sections` | `path, heading` (`Title / Section`), `level, line_from, line_to` — feed `line_from` to `cat --lines` |
-| `links` | `path, target` (as written), `line` |
+| `links` | `path, target` (without `#anchor`/`|alias`), `line, kind` (`wiki`, `embed`, `md`, `image`), `anchor, alias, status` (`ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store`, `external`), `resolved` (the file it points to) |
 | `commits` | `path, version, author, ts, message, kind, batch` |
 | `authors` | `path, author, commits, first_ts, last_ts` |
 
@@ -234,6 +234,22 @@ file — also those of a folder it was in (`renamed … (with /old-folder)`). In
 entry has `"type": "version"` or `"type": "path"` (`op`: `rename`, `move`, `delete`);
 `--versions-only` gives versions alone. A deleted file's history is still found at the path it
 was deleted from.
+
+## Links
+
+Links are resolved in the store (Obsidian's rules: markdown links relative to the note, `[[a/b]]`
+from the root, `[[name]]` by file name, `.md` optional, `#heading` checked) and kept current as files
+come and go.
+
+```sh
+textdb links guides/api/index.md          # path:line: [[target]] -> /resolved.md, or (broken) etc.
+textdb backlinks guides/api/index.md      # who links here — check before moving or deleting it
+textdb links --broken guides              # broken, anchor-missing, not-in-store (add --dir DIR to check files on disk)
+textdb mv guides/a.md guides/b.md --update-links   # also rewrite the links that pointed at a.md
+```
+
+Without `--update-links`, `mv` lists the links it leaves pointing at the old place (unless the
+store's `link_updates` setting is `rewrite` or `off`); `rm` lists the links it breaks.
 
 ## Reorganise
 

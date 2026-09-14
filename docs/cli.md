@@ -130,8 +130,10 @@ environment and its own author name, and the instructions in
 | `diff PATH V1 [V2]` | Unified diff; `V2` defaults to the current version |
 | `hunks PATH [V1 [V2]]` | Line hunks; defaults to the latest commit |
 | `chunks PATH [--version V]` | The content-defined chunks the file is stored as |
-| `mv FROM TO [-m MSG]`, `rm PATH [-m MSG]` | Move/rename and delete files or folders. History stays readable, and each file or folder touched gets a `rename`, `move` or `delete` entry in its history while path history is on. Folders left empty are removed (listed as `removed empty folder …`) unless `--keep-empty-folders`; `-m` is recorded in the change log |
-| `setting [KEY [VALUE]]` | Show or change a store setting. `path_history` is `on` (default) or `off`; `default` clears it. `--path-history` overrides it for one command |
+| `mv FROM TO [-m MSG]`, `rm PATH [-m MSG]` | Move/rename and delete files or folders. History stays readable, and each file or folder touched gets a `rename`, `move` or `delete` entry in its history while path history is on. Folders left empty are removed (listed as `removed empty folder …`) unless `--keep-empty-folders`; `-m` is recorded in the change log. Links that pointed at what moved and no longer reach it are listed, or rewritten with `--update-links` (see `link_updates`); `rm` lists the links it leaves broken |
+| `links [PATH] [--broken [--dir DIR]]` | The links written in a file or every file below a folder: `path:line: [[target]] -> /resolved/path` with a status — `ok`, `ambiguous` (several files match; the nearest is taken), `anchor-missing`, `broken`, `not-in-store` (PDFs, images and other files a text store does not hold) or `external` (URLs, emails, `?tab=` queries, numbered references). Resolved by Obsidian's rules: markdown links relative to the note, `[[a/b]]` from the vault root, `[[name]]` by file name anywhere, `.md` optional, `#heading` checked (block `^ids` are not). `--broken` lists only what does not resolve; with `--dir`, links to files the store does not hold are looked for on disk. SQLite stores |
+| `backlinks PATH` | The links in any file that resolve to a file, or to a file below a folder |
+| `setting [KEY [VALUE]]` | Show or change a store setting. `path_history` is `on` (default) or `off`; `default` clears it. `--path-history` overrides it for one command. `link_updates` is what a move does to links that pointed at what moved: `report` (default: list them), `rewrite` (rewrite them, one commit per linking file) or `off`; moves made by `sync` never rewrite links |
 | `log [--since SEQ] [--limit N]` | The change log: every create, commit, mkdir, move and delete, in order |
 | `watch [--since SEQ] [-p PREFIX]` | Follow the change log live — one line per change, JSON lines with `--json` |
 
@@ -158,7 +160,7 @@ by path, deleted files left out:
 | `folders` | `id, path, name, parent, depth, files, folders, nbytes, nlines, nwords, versions, updated_at` — totals of everything below |
 | `frontmatter` | `path, data` — a document's YAML front matter as JSON (text in SQLite: `json_extract`, `json_each`; `jsonb` in Postgres) |
 | `sections` | `path, heading` (`Title / Section / Subsection`), `level, line_from, line_to` |
-| `links` | `path, target` (as written in the document), `line` |
+| `links` | `path, target` (without `#anchor` or `\|alias`; markdown links decoded), `line, kind` (`wiki`, `embed`, `md`, `image`), `anchor, alias, status` (`ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store`, `external`), `resolved` (the path it points to). SQLite stores; Postgres has `path, target, line` |
 | `commits` | `path, version, author, ts, message, kind, base_version, nbytes, nlines, batch` (`batch` in SQLite: the `sql --write` run that made it) |
 | `authors` | `path, author, commits, first_ts, last_ts` |
 
