@@ -124,10 +124,21 @@ fn relink_where(cond: &str, arg: Option<&str>) -> Result<()> {
     })?;
     for (id, file_id, path, kind, target, anchor, external) in rows {
         let (to, status) = resolve(&PgLookup, file_id, &path, &kind, &target, anchor.as_deref(), external)?;
-        Spi::run_with_args("UPDATE kb.link SET resolved_id = $1, status = $2 WHERE id = $3", &[to.into(), status.into(), id.into()])
-            .map_err(err)?;
+        // Only rows whose outcome changed are written: a commit then locks no other file's rows
+        // it leaves as they were, so writers to files that link to each other do not deadlock.
+        Spi::run_with_args(
+            "UPDATE kb.link SET resolved_id = $1, status = $2 \
+             WHERE id = $3 AND (resolved_id IS DISTINCT FROM $1 OR status IS DISTINCT FROM $2)",
+            &[to.into(), status.into(), id.into()],
+        )
+        .map_err(err)?;
     }
     Ok(())
+}
+
+/// `col` is one of the ids in the JSON array `$1`, in a form the planner serves from an index.
+fn in_ids(col: &str) -> String {
+    format!("{col} = ANY(ARRAY(SELECT jsonb_array_elements_text($1::jsonb)::bigint))")
 }
 
 /// After a file's structure rows changed: its own links, and links to its headings.
@@ -143,15 +154,11 @@ pub fn relink_file(file_id: i64) -> Result<()> {
 pub fn relink(names: &[String], ids: &[i64]) -> Result<()> {
     if !names.is_empty() {
         let list = serde_json::to_string(names).expect("names serialize");
-        relink_where("l.target_name IN (SELECT jsonb_array_elements_text($1::jsonb))", Some(&list))?;
+        relink_where("l.target_name = ANY(ARRAY(SELECT jsonb_array_elements_text($1::jsonb)))", Some(&list))?;
     }
     if !ids.is_empty() {
         let list = serde_json::to_string(ids).expect("ids serialize");
-        relink_where(
-            "l.resolved_id IN (SELECT jsonb_array_elements_text($1::jsonb)::bigint) \
-             OR l.file_id IN (SELECT jsonb_array_elements_text($1::jsonb)::bigint)",
-            Some(&list),
-        )?;
+        relink_where(&format!("{} OR {}", in_ids("l.resolved_id"), in_ids("l.file_id")), Some(&list))?;
     }
     Ok(())
 }
@@ -201,12 +208,14 @@ pub fn links_into(moved: &[(i64, String)]) -> Result<Vec<Pointing>> {
     Spi::connect(|client| {
         let t = client
             .select(
-                "SELECT l.id, l.file_id, l.line, coalesce(l.kind, ''), l.target_path, l.resolved_id \
-                 FROM kb.link l JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL \
-                 WHERE l.resolved_id IS NOT NULL AND l.target_path <> '' \
-                   AND (l.resolved_id IN (SELECT jsonb_array_elements_text($1::jsonb)::bigint) \
-                        OR l.file_id IN (SELECT jsonb_array_elements_text($1::jsonb)::bigint)) \
-                 ORDER BY l.id",
+                &format!(
+                    "SELECT l.id, l.file_id, l.line, coalesce(l.kind, ''), l.target_path, l.resolved_id \
+                     FROM kb.link l JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL \
+                     WHERE l.resolved_id IS NOT NULL AND l.target_path <> '' AND ({} OR {}) \
+                     ORDER BY l.id",
+                    in_ids("l.resolved_id"),
+                    in_ids("l.file_id")
+                ),
                 None,
                 &[ids.as_str().into()],
             )

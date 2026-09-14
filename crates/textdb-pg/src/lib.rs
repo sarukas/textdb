@@ -831,39 +831,124 @@ mod kb {
         if lower.ends_with(".md") || lower.ends_with(".markdown") {
             let bytes = ok(materialize(&st, &c.root));
             let s = MarkdownExtractor.extract(&bytes);
-            // HEAD-only structure rows (ADR 0007).
-            for t in ["kb.section", "kb.frontmatter"] {
-                Spi::run_with_args(&format!("DELETE FROM {} WHERE file_id = $1", t), &[file_id.into()]).unwrap_or_else(|e| spi_err(e));
-            }
-            for sec in &s.sections {
-                Spi::run_with_args(
-                    "INSERT INTO kb.section(file_id, version, heading_path, level, line_from, line_to) VALUES ($1, $2, $3, $4, $5, $6)",
-                    &[
-                        file_id.into(),
-                        (c.version as i64).into(),
-                        sec.heading_path.as_str().into(),
-                        (sec.level as i32).into(),
-                        (sec.line_from as i64).into(),
-                        (sec.line_to as i64).into(),
-                    ],
-                )
-                .unwrap_or_else(|e| spi_err(e));
-            }
-            ok(crate::links::write_rows(file_id, c.version as i64, &s.links));
-            if let Some(fm) = &s.frontmatter {
-                Spi::run_with_args(
-                    "INSERT INTO kb.frontmatter(file_id, version, data) VALUES ($1, $2, $3::jsonb) ON CONFLICT (file_id, version) DO UPDATE SET data = EXCLUDED.data",
-                    &[file_id.into(), (c.version as i64).into(), fm.to_string().as_str().into()],
-                )
-                .unwrap_or_else(|e| spi_err(e));
-            }
-            // This file's links, and links to its headings, which may have changed.
-            ok(crate::links::relink_file(file_id));
+            ok(write_structure(file_id, c.version as i64, &s));
         }
         if c.version == 1 {
             // Links elsewhere may have been waiting for a file of this name.
             ok(crate::links::relink(&[textdb_md::resolve::name_key(path)], &[]));
         }
+    }
+
+    /// Replace a file's HEAD-only structure rows (ADR 0007) and resolve its links. When the
+    /// headings, links and front matter are what the rows already hold — most edits — only the
+    /// rows' version moves: no rows are rewritten and no link is resolved again.
+    fn write_structure(file_id: i64, version: i64, s: &textdb_core::structure::Structure) -> Result<(), TextdbError> {
+        if structure_matches(file_id, s)? {
+            for t in ["kb.section", "kb.link", "kb.frontmatter"] {
+                Spi::run_with_args(&format!("UPDATE {t} SET version = $1 WHERE file_id = $2 AND version <> $1"), &[version.into(), file_id.into()])
+                    .map_err(storage_err)?;
+            }
+            return Ok(());
+        }
+        for t in ["kb.section", "kb.frontmatter"] {
+            Spi::run_with_args(&format!("DELETE FROM {} WHERE file_id = $1", t), &[file_id.into()]).map_err(storage_err)?;
+        }
+        for sec in &s.sections {
+            Spi::run_with_args(
+                "INSERT INTO kb.section(file_id, version, heading_path, level, line_from, line_to) VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    file_id.into(),
+                    version.into(),
+                    sec.heading_path.as_str().into(),
+                    (sec.level as i32).into(),
+                    (sec.line_from as i64).into(),
+                    (sec.line_to as i64).into(),
+                ],
+            )
+            .map_err(storage_err)?;
+        }
+        crate::links::write_rows(file_id, version, &s.links)?;
+        if let Some(fm) = &s.frontmatter {
+            Spi::run_with_args(
+                "INSERT INTO kb.frontmatter(file_id, version, data) VALUES ($1, $2, $3::jsonb) ON CONFLICT (file_id, version) DO UPDATE SET data = EXCLUDED.data",
+                &[file_id.into(), version.into(), fm.to_string().as_str().into()],
+            )
+            .map_err(storage_err)?;
+        }
+        // This file's links, and links to its headings, which may have changed.
+        crate::links::relink_file(file_id)
+    }
+
+    /// Do the stored rows for `file_id` already describe `s`, version aside?
+    fn structure_matches(file_id: i64, s: &textdb_core::structure::Structure) -> Result<bool, TextdbError> {
+        let same_sections = Spi::connect(|client| {
+            let rows = client
+                .select(
+                    "SELECT heading_path, level, line_from, line_to FROM kb.section WHERE file_id = $1 ORDER BY line_from, level",
+                    None,
+                    &[file_id.into()],
+                )
+                .map_err(storage_err)?;
+            if rows.len() != s.sections.len() {
+                return Ok::<_, TextdbError>(false);
+            }
+            for (r, sec) in rows.zip(&s.sections) {
+                let stored = (
+                    r.get::<String>(1).map_err(storage_err)?.unwrap_or_default(),
+                    r.get::<i32>(2).map_err(storage_err)?.unwrap_or(0) as i64,
+                    r.get::<i64>(3).map_err(storage_err)?.unwrap_or(0),
+                    r.get::<i64>(4).map_err(storage_err)?.unwrap_or(0),
+                );
+                if stored != (sec.heading_path.clone(), sec.level as i64, sec.line_from as i64, sec.line_to as i64) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })?;
+        if !same_sections {
+            return Ok(false);
+        }
+        let same_links = Spi::connect(|client| {
+            let rows = client
+                .select(
+                    "SELECT target_path, line, coalesce(kind, ''), anchor, alias, external FROM kb.link WHERE file_id = $1 ORDER BY id",
+                    None,
+                    &[file_id.into()],
+                )
+                .map_err(storage_err)?;
+            if rows.len() != s.links.len() {
+                return Ok::<_, TextdbError>(false);
+            }
+            for (r, l) in rows.zip(&s.links) {
+                let stored = textdb_core::Link {
+                    target_path: r.get::<String>(1).map_err(storage_err)?.unwrap_or_default(),
+                    line: r.get::<i64>(2).map_err(storage_err)?.unwrap_or(0) as u64,
+                    kind: r.get::<String>(3).map_err(storage_err)?.unwrap_or_default(),
+                    anchor: r.get::<String>(4).map_err(storage_err)?,
+                    alias: r.get::<String>(5).map_err(storage_err)?,
+                    external: r.get::<bool>(6).map_err(storage_err)?.unwrap_or(false),
+                };
+                if &stored != l {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })?;
+        if !same_links {
+            return Ok(false);
+        }
+        // Front matter compared as jsonb, which ignores key order and spacing.
+        let want = s.frontmatter.as_ref().map(|fm| fm.to_string());
+        let stored = Spi::get_one_with_args::<bool>(
+            "SELECT (SELECT CASE WHEN $2::text IS NULL THEN false ELSE data = $2::jsonb END FROM kb.frontmatter WHERE file_id = $1 LIMIT 1)",
+            &[file_id.into(), want.as_deref().into()],
+        )
+        .map_err(storage_err)?;
+        Ok(match (stored, want) {
+            (None, None) => true,
+            (Some(same), Some(_)) => same,
+            _ => false,
+        })
     }
 
     /// Create a file (parents created), commit version 1.

@@ -38,9 +38,14 @@ impl Drop for Db {
 fn database() -> Option<Db> {
     let admin = std::env::var("TEXTDB_TEST_PG").ok().filter(|u| !u.is_empty())?;
     static N: AtomicUsize = AtomicUsize::new(0);
+    // CREATE DATABASE copies template1 and fails while another session is copying it.
+    static CREATING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let name = format!("textdb_cli_{}_{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst));
+    let guard = CREATING.lock().unwrap_or_else(|e| e.into_inner());
     let mut c = postgres::Client::connect(&admin, postgres::NoTls).expect("connect to TEXTDB_TEST_PG");
     c.batch_execute(&format!("CREATE DATABASE {name}")).expect("create a test database");
+    drop(c);
+    drop(guard);
     let base = admin.rsplit_once('/').map_or(admin.as_str(), |(base, _)| base);
     let url = format!("{base}/{name}");
     let db = Db { admin: admin.clone(), name, url };

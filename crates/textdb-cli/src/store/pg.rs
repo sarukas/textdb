@@ -212,17 +212,40 @@ impl PgStore {
 /// A batch id: when, and four random hex digits (`20260914-211500-3f9a`), as SQLite makes them.
 const NEW_BATCH_ID: &str = "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYYMMDD-HH24MISS') || '-' || substr(md5(random()::text), 1, 4)";
 
-/// `query` with each `:author` placeholder (outside strings, quoted names, comments and `::`
-/// casts) replaced by `$n`; `None` when it has none.
-fn author_placeholder(query: &str, n: usize) -> Option<String> {
+/// The placeholders of a statement, found outside strings, quoted names, comments and `::` casts.
+#[derive(Debug, PartialEq)]
+struct Placeholders {
+    /// The statement with each `:author` replaced by `$n` (`n` as given), when it has one.
+    rewritten: Option<String>,
+    /// The highest `$n` written in the statement itself.
+    positional: usize,
+}
+
+fn placeholders(query: &str, author_index: usize) -> Placeholders {
     let b = query.as_bytes();
-    let (mut out, mut i, mut last, mut found) = (String::with_capacity(query.len()), 0, 0, false);
-    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let (mut out, mut i, mut last) = (String::with_capacity(query.len()), 0, 0);
+    let mut found = (false, 0usize);
+    // Part of a name: ASCII letters, digits, `_`, `$`, and any byte of a non-ASCII character.
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
     while i < b.len() {
         match b[i] {
-            q @ (b'\'' | b'"') => {
+            b'\'' => {
+                // E'…' strings escape with backslashes; others only double the quote.
+                let escapes = i > 0 && matches!(b[i - 1], b'e' | b'E') && (i < 2 || !ident(b[i - 2]));
                 i += 1;
-                while i < b.len() && b[i] != q {
+                while i < b.len() {
+                    match b[i] {
+                        b'\\' if escapes => i += 2,
+                        b'\'' if b.get(i + 1) == Some(&b'\'') => i += 2,
+                        b'\'' => break,
+                        _ => i += 1,
+                    }
+                }
+                i += 1;
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
                     i += 1;
                 }
                 i += 1;
@@ -233,52 +256,96 @@ fn author_placeholder(query: &str, n: usize) -> Option<String> {
                 }
             }
             b'/' if b.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                    i += 1;
+                // Block comments nest.
+                let mut depth = 0;
+                while i < b.len() {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
                 }
-                i += 2;
             }
             b'$' if i == 0 || !ident(b[i - 1]) => {
+                let digits = b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+                if digits > 0 {
+                    found.1 = found.1.max(query[i + 1..i + 1 + digits].parse().unwrap_or(0));
+                    i += 1 + digits;
+                    continue;
+                }
                 // A dollar-quoted string: $tag$ … $tag$.
-                let tag_end = b[i + 1..].iter().position(|c| !ident(*c)).map(|p| i + 1 + p);
-                match tag_end {
-                    Some(e) if b[e] == b'$' && !b[i + 1..e].first().is_some_and(u8::is_ascii_digit) => {
-                        let tag = &query[i..=e];
-                        i = query[e + 1..].find(tag).map_or(b.len(), |p| e + 1 + p + tag.len());
-                    }
-                    _ => i += 1,
+                let tag_len = b[i + 1..].iter().take_while(|c| **c != b'$' && ident(**c)).count();
+                if b.get(i + 1 + tag_len) == Some(&b'$') {
+                    let tag = &query[i..i + 2 + tag_len];
+                    let body = i + tag.len();
+                    i = query[body..].find(tag).map_or(b.len(), |p| body + p + tag.len());
+                } else {
+                    i += 1;
                 }
             }
             b':' if b.get(i + 1) == Some(&b':') => i += 2,
-            b':' if query[i + 1..].starts_with("author") && !b.get(i + 7).is_some_and(|c| ident(*c)) => {
+            b':' if query[i + 1..].starts_with("author")
+                && (i == 0 || !ident(b[i - 1]))
+                && !query[i + 7..].chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$') =>
+            {
                 out.push_str(&query[last..i]);
-                out.push_str(&format!("${n}"));
+                out.push_str(&format!("${author_index}"));
                 i += 7;
                 last = i;
-                found = true;
+                found.0 = true;
             }
             _ => i += 1,
         }
     }
-    found.then(|| {
-        out.push_str(&query[last.min(query.len())..]);
-        out
-    })
+    Placeholders {
+        rewritten: found.0.then(|| {
+            out.push_str(&query[last.min(query.len())..]);
+            out
+        }),
+        positional: found.1,
+    }
 }
 
-/// A statement's own error: the SQL is the caller's, so anything but the store's own `TX00n`
-/// errors is reported as invalid input, as in SQLite.
+/// A statement's own error: the SQL is the caller's, so it is reported as invalid input, as in
+/// SQLite; a lost connection stays an error of its own.
 fn statement_error(e: postgres::Error, write: bool) -> StoreError {
-    let read_only = e.as_db_error().is_some_and(|db| db.code().code() == "25006");
+    let Some(db) = e.as_db_error() else { return pg(e) };
+    let read_only = db.code().code() == "25006" || db.message().contains("read-only transaction");
     let mut err = pg(e);
-    if err.code == "TX000" {
-        err.code = "TX004".to_string();
-    }
+    err.code = "TX004".to_string();
+    err.conflict = None;
     if read_only && !write {
         err.message = format!("{}: this statement changes the store; run it with --write", err.message);
     }
     err
+}
+
+/// A column of a row read without a JSON wrapper, for statements that cannot be a subquery.
+fn cell(row: &Row, i: usize) -> serde_json::Value {
+    use serde_json::Value;
+    if let Ok(v) = row.try_get::<_, Option<String>>(i) {
+        return v.map_or(Value::Null, Value::from);
+    }
+    if let Ok(v) = row.try_get::<_, Option<i64>>(i) {
+        return v.map_or(Value::Null, Value::from);
+    }
+    if let Ok(v) = row.try_get::<_, Option<i32>>(i) {
+        return v.map_or(Value::Null, Value::from);
+    }
+    if let Ok(v) = row.try_get::<_, Option<f64>>(i) {
+        return v.map_or(Value::Null, Value::from);
+    }
+    if let Ok(v) = row.try_get::<_, Option<bool>>(i) {
+        return v.map_or(Value::Null, Value::from);
+    }
+    Value::from(format!("({})", row.columns()[i].type_().name()))
 }
 
 fn batch_change(v: &serde_json::Value) -> BatchChange {
@@ -775,22 +842,24 @@ impl Store for PgStore {
             self.client.batch_execute(SQL_VIEWS).map_err(pg)?;
             self.sql_views_ready = true;
         }
-        let before = self.last_seq()?;
         // `:author` is bound to the author, after the positional parameters.
-        let rewritten = author_placeholder(query, params.len() + 1);
-        let query = rewritten.as_deref().unwrap_or(query);
+        let found = placeholders(query, params.len() + 1);
+        if found.positional > params.len() {
+            return Err(StoreError::invalid(format!(
+                "the statement has more placeholders than the {} --param values given",
+                params.len()
+            )));
+        }
+        if found.positional < params.len() {
+            return Err(StoreError::invalid("more --param values were given than the statement has placeholders"));
+        }
+        let query = found.rewritten.as_deref().unwrap_or(query);
         let mut types = vec![Type::TEXT; params.len()];
         let mut values: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-        if rewritten.is_some() {
+        if found.rewritten.is_some() {
             types.push(Type::TEXT);
             values.push(&author);
         }
-        let first = query
-            .trim_start()
-            .split(|c: char| !c.is_ascii_alphabetic())
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
         let fail = |e| statement_error(e, write);
         let mut tx = self.client.build_transaction().read_only(!write).start().map_err(pg)?;
         let batch: Option<String> = if write {
@@ -801,33 +870,58 @@ impl Store for PgStore {
             None
         };
         let mut result = SqlResult::default();
-        if matches!(first.as_str(), "select" | "with" | "values" | "table") {
-            // Each row as JSON, so any column type comes back without a Rust mapping for it.
-            let inner = tx.prepare_typed(query, &types).map_err(fail)?;
-            result.columns = inner.columns().iter().map(|c| c.name().to_string()).collect();
-            let wrapped = tx
-                .prepare_typed(&format!("SELECT row_to_json(q)::text FROM ({query}) q"), &types)
-                .map_err(fail)?;
-            for row in tx.query(&wrapped, &values).map_err(fail)? {
-                let text: String = row.get(0);
-                let object: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).unwrap_or_default();
-                result
-                    .rows
-                    .push(result.columns.iter().map(|c| object.get(c).cloned().unwrap_or_default()).collect());
-            }
+        let inner = tx.prepare_typed(query, &types).map_err(fail)?;
+        if inner.columns().is_empty() {
+            tx.execute(&inner, &values).map_err(fail)?;
         } else {
-            let stmt = tx.prepare_typed(query, &types).map_err(fail)?;
-            tx.execute(&stmt, &values).map_err(fail)?;
+            result.columns = inner.columns().iter().map(|c| c.name().to_string()).collect();
+            // Each row as a JSON array, so any column type comes back without a Rust mapping for
+            // it; columns are renamed positionally, so repeated names keep their own values.
+            let n = result.columns.len();
+            let wrapped_sql = format!(
+                "SELECT json_build_array({})::text FROM ({query}) AS q({})",
+                (1..=n).map(|i| format!("q.c{i}")).collect::<Vec<_>>().join(", "),
+                (1..=n).map(|i| format!("c{i}")).collect::<Vec<_>>().join(", ")
+            );
+            // A statement that cannot be a subquery (EXPLAIN, SHOW, RETURNING, a writing WITH)
+            // fails to prepare wrapped; the savepoint keeps that from aborting the transaction.
+            let wrapped = if n <= 100 {
+                let mut sp = tx.savepoint("textdb_sql_wrap").map_err(pg)?;
+                match sp.prepare_typed(&wrapped_sql, &types) {
+                    Ok(stmt) => {
+                        sp.commit().map_err(pg)?;
+                        Some(stmt)
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            match wrapped {
+                Some(stmt) => {
+                    for row in tx.query(&stmt, &values).map_err(fail)? {
+                        let text: String = row.get(0);
+                        let cells: Vec<serde_json::Value> =
+                            serde_json::from_str(&text).map_err(|e| StoreError::other(format!("a row could not be read ({e}): {text}")))?;
+                        result.rows.push(cells);
+                    }
+                }
+                None => {
+                    for row in tx.query(&inner, &values).map_err(fail)? {
+                        result.rows.push((0..n).map(|i| cell(&row, i)).collect());
+                    }
+                }
+            }
         }
-        if write {
-            let after: i64 = tx.query_one("SELECT coalesce(max(seq), 0) FROM kb.change", &[]).map_err(pg)?.get(0);
-            result.store_changes = Some(after - before);
-            if dry_run {
-                result.dry_run = true;
-                let json: String = tx.query_one("SELECT kb.changes_after($1)::text", &[&before]).map_err(pg)?.get(0);
-                let items: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap_or_default();
+        if let Some(id) = &batch {
+            let changes: i64 = tx.query_one("SELECT count(*) FROM kb.change WHERE batch = $1", &[id]).map_err(pg)?.get(0);
+            result.store_changes = Some(changes);
+            if dry_run && changes > 0 {
+                let json: String = tx.query_one("SELECT kb.batch_changes($1)::text", &[id]).map_err(pg)?.get(0);
+                let items: Vec<serde_json::Value> = serde_json::from_str(&json).map_err(|e| StoreError::other(format!("unexpected changes {json}: {e}")))?;
                 result.changes = items.iter().map(batch_change).collect();
             }
+            result.dry_run = dry_run;
         }
         if dry_run {
             tx.rollback().map_err(pg)?;
@@ -971,5 +1065,28 @@ impl Store for PgStore {
         tx.commit().map_err(pg)?;
         progress(&stats);
         Ok(stats)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rewrite(q: &str) -> (String, usize) {
+        let p = placeholders(q, 9);
+        (p.rewritten.unwrap_or_else(|| q.to_string()), p.positional)
+    }
+
+    #[test]
+    fn author_placeholders_outside_strings_comments_and_casts() {
+        assert_eq!(rewrite("SELECT kb.edit($1, 'a', 'b', :author)"), ("SELECT kb.edit($1, 'a', 'b', $9)".into(), 1));
+        assert_eq!(rewrite("SELECT ':author', \":author\", x::author, :authority, $2"), ("SELECT ':author', \":author\", x::author, :authority, $2".into(), 2));
+        assert_eq!(rewrite("SELECT 'it''s :author', :author -- :author\n"), ("SELECT 'it''s :author', $9 -- :author\n".into(), 0));
+        assert_eq!(rewrite("SELECT E'it\\'s :author', :author"), ("SELECT E'it\\'s :author', $9".into(), 0));
+        assert_eq!(rewrite("SELECT $$ :author $$, $tag$ $1 :author $tag$, :author"), ("SELECT $$ :author $$, $tag$ $1 :author $tag$, $9".into(), 0));
+        assert_eq!(rewrite("/* a /* nested */ :author */ SELECT :author"), ("/* a /* nested */ :author */ SELECT $9".into(), 0));
+        assert_eq!(rewrite("SELECT arr[1:author], :authoré, 'ünï' || :author"), ("SELECT arr[1:author], :authoré, 'ünï' || $9".into(), 0));
+        assert_eq!(rewrite("SELECT 'unterminated :author"), ("SELECT 'unterminated :author".into(), 0));
+        assert_eq!(rewrite("SELECT $10 FROM t$1"), ("SELECT $10 FROM t$1".into(), 10));
     }
 }
