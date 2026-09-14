@@ -164,7 +164,13 @@ impl Drop for SpiStorage {
         // Anything still pending belongs to a write that did not reach CAS (no-op or
         // error); persisting it is harmless (content-addressed, idempotent) and keeps
         // `chunk_ref`/search consistent for callers that recorded the hashes.
-        let _ = self.flush();
+        //
+        // Not while unwinding: a Postgres ERROR reaches Rust as a panic, and another SPI call
+        // then raises again inside the unwind (a read-only transaction refuses the INSERT), a
+        // panic while panicking, which aborts the backend and puts the server into recovery.
+        if !std::thread::panicking() {
+            let _ = self.flush();
+        }
     }
 }
 
