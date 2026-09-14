@@ -213,6 +213,63 @@ fn export_writes_only_what_differs_and_stops_on_clashing_names() {
 }
 
 #[test]
+fn messages_create_paths_search_grep_and_empty_folders() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let doc = "---\nentity_name: RFI Response Tracker\nmodified_date: 2026-02-10\n---\n# Tracker\n\nNothing here.\n\n## Changelog\n\n- 2026-02-11: renamed the tracker file\n";
+    ok(textdb(&store).args(["write", "/acc/x.md", "-m", "first"]), Some(doc));
+
+    // Search: several words are one query; each line holding a word is listed at its own line.
+    let found = ok(textdb(&store).args(["search", "RFI", "tracker", "-p", "/acc"]), None).stdout;
+    assert_eq!(
+        found,
+        "/acc/x.md:2: entity_name: RFI Response Tracker\n/acc/x.md:5: # Tracker\n/acc/x.md:11: - 2026-02-11: renamed the tracker file\n"
+    );
+    let phrase = ok(textdb(&store).args(["search", "\"RFI Response\""]), None).stdout;
+    assert_eq!(phrase, "/acc/x.md:2: entity_name: RFI Response Tracker\n");
+    let dated = ok(textdb(&store).args(["search", "2026-02"]), None).stdout;
+    assert!(dated.contains("/acc/x.md:3: modified_date") && dated.contains("/acc/x.md:11: - 2026-02-11"), "{dated}");
+    let none = run(textdb(&store).args(["search", "zebra"]), None);
+    assert_eq!((none.status, none.stdout.as_str()), (0, ""));
+    assert!(none.stderr.contains("no matches"), "{}", none.stderr);
+
+    // grep: regular expressions, case-sensitive unless -i, or only the files.
+    assert_eq!(ok(textdb(&store).args(["grep", r"modified_date: 2026-\d\d"]), None).stdout, "/acc/x.md:3: modified_date: 2026-02-10\n");
+    assert_eq!(ok(textdb(&store).args(["grep", "-il", "TRACKER"]), None).stdout, "/acc/x.md\n");
+    assert!(run(textdb(&store).args(["grep", "TRACKER"]), None).stderr.contains("no matches"));
+
+    // A message on every kind of edit.
+    ok(textdb(&store).args(["edit", "/acc/x.md", "--old", "Nothing here.", "--new", "Nothing yet.", "-m", "wording"]), None);
+    ok(textdb(&store).args(["replace-lines", "/acc/x.md", "6", "6", "--text", "Intro.\n", "-m", "intro"]), None);
+    ok(textdb(&store).args(["append", "/acc/x.md", "- 2026-02-12: more", "-m", "log"]), None);
+    let history = ok(textdb(&store).args(["--json", "history", "--versions-only", "/acc/x.md"]), None).json();
+    let messages: Vec<&str> = history.as_array().unwrap().iter().map(|c| c["message"].as_str().unwrap_or("")).collect();
+    assert_eq!(messages, ["first", "wording", "intro", "log"]);
+
+    // --create never replaces a file.
+    let exists = run(textdb(&store).args(["write", "--create", "/acc/x.md"]), Some("again\n"));
+    assert_eq!(exists.status, 6, "{}", exists.stderr);
+    ok(textdb(&store).args(["write", "--create", "/acc/new.md"]), Some("new\n"));
+    assert!(ok(textdb(&store).args(["cat", "/acc/x.md"]), None).stdout.contains("# Tracker"));
+
+    // ls --paths: one path per line.
+    assert_eq!(ok(textdb(&store).args(["ls", "--paths", "/acc"]), None).stdout, "/acc/new.md\n/acc/x.md\n");
+
+    // A move or delete that empties folders removes them, unless told to keep them.
+    ok(textdb(&store).args(["write", "/drafts/rsi/a.md"]), Some("a\n"));
+    let moved = ok(textdb(&store).args(["mv", "/drafts/rsi/a.md", "/acc/a.md", "-m", "move drafts"]), None).stdout;
+    assert!(moved.contains("removed empty folder /drafts/rsi\n") && moved.contains("removed empty folder /drafts\n"), "{moved}");
+    assert_eq!(run(textdb(&store).args(["stat", "/drafts"]), None).status, 5);
+    let logged = ok(textdb(&store).args(["--json", "sql", "SELECT message FROM kb_change WHERE op = 'move'"]), None).json();
+    assert_eq!(logged["rows"][0]["message"], "move drafts", "{logged}");
+    ok(textdb(&store).args(["write", "/tmp/one/b.md"]), Some("b\n"));
+    ok(textdb(&store).args(["rm", "--keep-empty-folders", "/tmp/one/b.md"]), None);
+    assert_eq!(ok(textdb(&store).args(["--json", "stat", "/tmp/one"]), None).json()["kind"], "folder");
+    let deleted = ok(textdb(&store).args(["rm", "/acc/new.md"]), None).stdout;
+    assert_eq!(deleted, "deleted /acc/new.md\n");
+}
+
+#[test]
 fn sql_reads_through_views_and_writes_only_when_asked() {
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("kb.db");
@@ -309,6 +366,11 @@ fn sync_reconciles_both_sides_merges_and_marks_conflicts() {
         std::fs::write(dir.join(name), doc).unwrap();
     }
     std::fs::write(dir.join("logo.png"), [0u8, 1, 2]).unwrap();
+    // Hidden folders are synced, except Obsidian's trash (and .git, .textdb, node_modules).
+    std::fs::create_dir_all(dir.join(".claude")).unwrap();
+    std::fs::create_dir_all(dir.join(".trash")).unwrap();
+    std::fs::write(dir.join(".claude/rules.md"), "rules\n").unwrap();
+    std::fs::write(dir.join(".trash/old.md"), "old\n").unwrap();
     let sync = |extra: &[&str]| {
         let mut cmd = textdb(&store);
         cmd.args(["--json", "sync"]).args(extra).arg("/notes").arg(&dir);
@@ -321,7 +383,7 @@ fn sync_reconciles_both_sides_merges_and_marks_conflicts() {
     let first = sync(&[]);
     assert_eq!(first.status, 0, "{}", first.stderr);
     let first = first.json();
-    assert_eq!(first["to_textdb"]["new"], serde_json::json!(["a.md", "b.md", "c.md", "sub/d.md"]), "{first}");
+    assert_eq!(first["to_textdb"]["new"], serde_json::json!([".claude/rules.md", "a.md", "b.md", "c.md", "sub/d.md"]), "{first}");
     assert_eq!(first["first_sync"], true);
 
     // Edits on both sides: different lines of a.md, the same line of b.md.
@@ -374,7 +436,7 @@ fn sync_reconciles_both_sides_merges_and_marks_conflicts() {
     assert_eq!(resolved.json()["to_textdb"]["changed"], serde_json::json!(["b.md"]));
     assert_eq!(cat("/notes/b.md"), "one\ntwo\nthree (both)\nfour\nfive\n");
     let quiet = sync(&[]).json();
-    assert_eq!(quiet["unchanged"], 5, "{quiet}");
+    assert_eq!(quiet["unchanged"], 6, "{quiet}");
     assert_eq!(std::fs::read(dir.join("logo.png")).unwrap(), [0u8, 1, 2]);
 }
 

@@ -299,8 +299,10 @@ pub trait Store {
         author: Option<&str>,
         message: Option<&str>,
     ) -> Result<Written>;
-    fn edit(&mut self, path: &str, old: &[u8], new: &[u8], author: Option<&str>) -> Result<Written>;
-    fn append(&mut self, path: &str, tail: &[u8], author: Option<&str>) -> Result<Written>;
+    /// `message` replaces the default commit message (`edit`, `append`, `replace-lines`).
+    fn edit(&mut self, path: &str, old: &[u8], new: &[u8], author: Option<&str>, message: Option<&str>) -> Result<Written>;
+    fn append(&mut self, path: &str, tail: &[u8], author: Option<&str>, message: Option<&str>) -> Result<Written>;
+    #[allow(clippy::too_many_arguments)]
     fn replace_lines(
         &mut self,
         path: &str,
@@ -309,13 +311,15 @@ pub trait Store {
         text: &[u8],
         base_version: Option<i64>,
         author: Option<&str>,
+        message: Option<&str>,
     ) -> Result<Written>;
     fn history(&mut self, path: &str) -> Result<Vec<Commit>>;
     fn diff(&mut self, path: &str, v1: i64, v2: i64) -> Result<String>;
     fn hunks(&mut self, path: &str, v1: i64, v2: i64) -> Result<Vec<Hunk>>;
     fn chunks(&mut self, path: &str, version: Option<i64>) -> Result<Vec<Chunk>>;
-    fn mv(&mut self, from: &str, to: &str, author: Option<&str>) -> Result<()>;
-    fn rm(&mut self, path: &str, author: Option<&str>) -> Result<()>;
+    /// `message` is recorded on the change in the store's change log.
+    fn mv(&mut self, from: &str, to: &str, author: Option<&str>, message: Option<&str>) -> Result<()>;
+    fn rm(&mut self, path: &str, author: Option<&str>, message: Option<&str>) -> Result<()>;
     /// Renames, moves and deletes of the file or folder at `path`, oldest first.
     fn path_history(&mut self, path: &str) -> Result<Vec<PathEvent>>;
     /// Record renames, moves and deletes on this connection (`Some(true)`), don't

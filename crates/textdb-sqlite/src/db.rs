@@ -160,6 +160,9 @@ pub struct TextDb<'c> {
     /// Record renames, moves and deletes (`Some`), or leave it to the store's `path_history`
     /// setting (`None`). See [`TextDb::path_history_enabled`].
     pub path_history: Option<bool>,
+    /// The message recorded for edits, appends, line replacements, moves and deletes made
+    /// through this handle, instead of their defaults (`edit`, `append`, `replace-lines`, none).
+    pub message: Option<String>,
 }
 
 pub(crate) fn to_hash(v: &[u8]) -> Result<Hash> {
@@ -239,7 +242,15 @@ impl<'c> TextDb<'c> {
             manage_tx,
             retries: textdb_core::DEFAULT_RETRIES,
             path_history: None,
+            message: None,
         }
+    }
+
+    /// Record `message` on the edits, appends, line replacements, moves and deletes made
+    /// through this handle.
+    pub fn with_message(mut self, message: Option<&str>) -> Self {
+        self.message = message.map(str::to_string);
+        self
     }
 
     /// This handle's own choice about recording renames, moves and deletes; `None` follows the
@@ -896,7 +907,7 @@ impl<'c> TextDb<'c> {
             let edits = [Edit::new(pos as u64, (pos + old.len()) as u64, new.to_vec())];
             let c = commit(&mut st, &db.params, n.id as u64, &path, &cur, &edits, db.retries)?;
             if c.kind != CommitKind::NoOp {
-                db.record_commit(n.id, &path, &c, Some(&cur), Some(n.version), author, Some("edit"))?;
+                db.record_commit(n.id, &path, &c, Some(&cur), Some(n.version), author, db.message.as_deref().or(Some("edit")))?;
             }
             Ok(WriteResult {
                 version: c.version,
@@ -913,7 +924,7 @@ impl<'c> TextDb<'c> {
             let mut st = db.storage();
             let c = commit_append(&mut st, &db.params, n.id as u64, &path, tail, db.retries)?;
             if c.kind != CommitKind::NoOp {
-                db.record_commit(n.id, &path, &c, Some(&cur), Some(n.version), author, Some("append"))?;
+                db.record_commit(n.id, &path, &c, Some(&cur), Some(n.version), author, db.message.as_deref().or(Some("append")))?;
             }
             Ok(WriteResult {
                 version: c.version,
@@ -946,7 +957,7 @@ impl<'c> TextDb<'c> {
             let now = Self::now();
             let moved = db.subtree_totals(src.id)?;
             db.add_to_ancestors(&from, &moved.neg(), &now)?;
-            let seq = db.record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, None)?;
+            let seq = db.record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, db.message.as_deref())?;
             if db.path_history_enabled()? {
                 db.record_path_events(PathOp::classify(&from, &to), &src, Some(&to), author, seq, &now)?;
             }
@@ -990,7 +1001,7 @@ impl<'c> TextDb<'c> {
             let now = Self::now();
             let gone = db.subtree_totals(n.id)?;
             db.add_to_ancestors(&path, &gone.neg(), &now)?;
-            let seq = db.record_change("delete", n.id, n.kind, &path, None, None, None, None, author, None)?;
+            let seq = db.record_change("delete", n.id, n.kind, &path, None, None, None, None, author, db.message.as_deref())?;
             if db.path_history_enabled()? {
                 db.record_path_events(PathOp::Delete, &n, None, author, seq, &now)?;
             }
@@ -1328,7 +1339,7 @@ impl<'c> TextDb<'c> {
             textdb_core::locate_line(&st, &root, to)?.unwrap_or(len)
         };
         let edits = [Edit::new(start, end, replacement)];
-        self.commit_edits(&path, &edits, Some(base_v), author, Some("replace-lines"))
+        self.commit_edits(&path, &edits, Some(base_v), author, self.message.as_deref().or(Some("replace-lines")))
     }
 
     /// Append one row to the change feed. Callers run it inside the operation's own

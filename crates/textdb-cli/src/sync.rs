@@ -111,12 +111,17 @@ fn heads_by_rel(st: &mut dyn Store, prefix: &str) -> Result<BTreeMap<String, Fil
         .collect())
 }
 
-/// Whether a file found only on disk is taken in: one of `exts`, and not inside a hidden
-/// directory or `node_modules` (the same files `import` reads).
+/// Directories `sync` and `import` never read: version control, the textdb app installed in a
+/// folder, Obsidian's trash and dependencies. Other hidden directories (`.claude`, `.github`, …)
+/// are read like any other.
+pub const SKIP_DIRS: &[&str] = &[".git", ".textdb", ".trash", "node_modules"];
+
+/// Whether a file found only on disk is taken in: one of `exts`, and not inside one of
+/// [`SKIP_DIRS`] (the same files `import` reads).
 fn eligible(rel: &str, exts: &[String]) -> bool {
     let mut segs: Vec<&str> = rel.split('/').collect();
     let name = segs.pop().unwrap_or("");
-    if segs.iter().any(|s| s.starts_with('.') || *s == "node_modules") {
+    if segs.iter().any(|s| SKIP_DIRS.contains(s)) {
         return false;
     }
     exts.iter().any(|e| e == "*")
@@ -154,8 +159,8 @@ struct Walk {
     links: Vec<String>,
 }
 
-/// Every regular file below `root`. `.git` is never entered; other hidden directories and
-/// `node_modules` only when the store or the base has files in them.
+/// Every regular file below `root`. `.git` is never entered; the rest of [`SKIP_DIRS`] only
+/// when the store or the base has files in them.
 fn walk(root: &Path, tracked_dirs: &HashSet<String>) -> Result<Walk> {
     let mut w = Walk::default();
     if !root.is_dir() {
@@ -172,8 +177,8 @@ fn walk(root: &Path, tracked_dirs: &HashSet<String>) -> Result<Walk> {
             if kind.is_symlink() {
                 w.links.push(rel);
             } else if kind.is_dir() {
-                let hidden = name.starts_with('.') || name == "node_modules";
-                if name != ".git" && (!hidden || tracked_dirs.contains(&rel)) {
+                let skipped = SKIP_DIRS.contains(&name.as_str());
+                if name != ".git" && (!skipped || tracked_dirs.contains(&rel)) {
                     pending.push((entry.path(), rel));
                 }
             } else if kind.is_file() {
@@ -196,15 +201,48 @@ fn write_disk(root: &Path, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Delete a file, then the directories it leaves empty (never `root`).
 fn remove_disk(root: &Path, rel: &str) -> std::io::Result<()> {
-    std::fs::remove_file(root.join(rel))?;
+    let file = root.join(rel);
+    if let Err(e) = std::fs::remove_file(&file) {
+        if !clear_read_only(&file) {
+            return Err(e);
+        }
+        std::fs::remove_file(&file)?;
+    }
     let mut rel = rel;
     while let Some(i) = rel.rfind('/') {
         rel = &rel[..i];
-        if std::fs::remove_dir(root.join(rel)).is_err() {
+        let dir = root.join(rel);
+        if std::fs::remove_dir(&dir).is_ok() {
+            continue;
+        }
+        let empty = std::fs::read_dir(&dir).is_ok_and(|mut entries| entries.next().is_none());
+        if !(empty && clear_read_only(&dir) && std::fs::remove_dir(&dir).is_ok()) {
             break;
         }
     }
     Ok(())
+}
+
+/// Windows refuses to delete a file or directory carrying the read-only attribute, which the
+/// folders of synced and cloud-backed trees often have. Clear it; `false` when it was not set.
+fn clear_read_only(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                #[allow(clippy::permissions_set_readonly_false)]
+                perms.set_readonly(false);
+                return std::fs::set_permissions(path, perms).is_ok();
+            }
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 /// The base row for `rel` as it now is on disk.
@@ -715,7 +753,7 @@ fn apply(
     let exact = |kind: &str, version: i64| matches!(kind, "direct" | "noop").then_some(version);
 
     for (from, to) in &plan.moves {
-        match sides.st.mv(&store_path(&prefix, from), &store_path(&prefix, to), Some(author)) {
+        match sides.st.mv(&store_path(&prefix, from), &store_path(&prefix, to), Some(author), Some(&format!("sync: moved in {key}"))) {
             Ok(()) => {
                 let version = heads.get(from).map(|h| h.version);
                 rows.insert(to.clone(), base_row(dir, to, version, base[from].blob.clone(), false));
@@ -755,7 +793,7 @@ fn apply(
         }
     }
     for rel in &plan.textdb_delete {
-        if let Err(e) = sides.st.rm(&store_path(&prefix, rel), Some(author)) {
+        if let Err(e) = sides.st.rm(&store_path(&prefix, rel), Some(author), Some(&format!("sync: deleted in {key}"))) {
             failed(report, &mut rows, rel, failure(&e));
         }
     }
@@ -1117,11 +1155,32 @@ mod tests {
         assert_eq!(crlf_to_lf(b"a\nb"), None);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn removes_read_only_directories_it_empties() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("a/b");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("x.md"), "x").unwrap();
+        std::fs::write(tmp.path().join("a/keep.md"), "k").unwrap();
+        for dir in [tmp.path().join("a"), deep.clone()] {
+            let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&dir, perms).unwrap();
+        }
+        remove_disk(tmp.path(), "a/b/x.md").unwrap();
+        assert!(!deep.exists());
+        // A directory that still holds files keeps its attribute and stays.
+        assert!(std::fs::metadata(tmp.path().join("a")).unwrap().permissions().readonly());
+    }
+
     #[test]
     fn only_wanted_files_on_disk_are_taken_in() {
         let exts = parse_exts("md, .TXT");
         assert!(eligible("notes/a.md", &exts) && eligible("B.Txt", &exts));
-        assert!(!eligible("logo.png", &exts) && !eligible(".github/a.md", &exts) && !eligible("x/node_modules/a.md", &exts));
+        assert!(eligible(".claude/instructions/rules.md", &exts) && eligible("docs/.drafts/a.md", &exts));
+        assert!(!eligible("logo.png", &exts) && !eligible("x/node_modules/a.md", &exts));
+        assert!(!eligible(".git/a.md", &exts) && !eligible(".trash/a.md", &exts) && !eligible(".textdb/app/a.md", &exts));
         assert!(eligible("logo.png", &parse_exts("*")));
         assert!(has_markers(b"a\n<<<<<<< textdb\nb\n=======\nc\n>>>>>>> disk\n"));
         assert!(!has_markers(b"<<<<<<< only an opening line\n"));

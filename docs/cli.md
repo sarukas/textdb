@@ -106,25 +106,26 @@ environment and its own author name, and the instructions in
 |---|---|
 | `init` | Create the store, or upgrade one an older build wrote; prints the last change number |
 | `config` | Show settings and their sources |
-| `import DIR [--prefix /p] [--ext md,markdown,mdx,txt] [--batch 500]` | Load matching files; unchanged files make no new version. Hidden directories and `node_modules` are skipped |
+| `import DIR [--prefix /p] [--ext md,markdown,mdx,txt] [--batch 500]` | Load matching files; unchanged files make no new version. `.git`, `.textdb`, `.trash` and `node_modules` directories are skipped; other hidden directories (`.claude`, `.github`) are read, as by `sync` |
 | `export PREFIX DIR [--dry-run]` | Write the files under a folder to disk, byte for byte (line endings, BOM). Only new and changed files are written and nothing on disk is deleted, so exporting over a git checkout shows only real changes; an existing file is overwritten in place and keeps its permissions, a symbolic link is left alone. Names that cannot coexist on this computer (differing only in letter case on Windows and macOS, or in Unicode normalization on macOS; Windows reserved names, forbidden characters, trailing dot or space; clashes with what is on disk) stop the export before anything is written, with exit code 6 and the list; problems only on other systems are warnings. `--dry-run` lists what would be written. `--json` gives `{ new, changed, unchanged, skipped, problems, stopped, written, bytes }` |
 | `sync PREFIX DIR [--dry-run] [--commit] [--base REV] [--ext md,markdown,mdx,txt]` | Reconcile a folder with a directory both ways against what both held at the last sync (recorded in the store): changes, new files, deletes and moves on either side are carried across; edits on both sides are merged line by line, and where they overlap the file on disk gets `<<<<<<< textdb` / `>>>>>>> disk` markers (exit code 3) and the store keeps its version until they are resolved. Files never synced are left alone. In a git checkout, changes that came from git are committed to the store under their git author and subject; `--commit` commits what sync wrote to disk with `Textdb-*` trailers. See [Syncing with a git checkout](#syncing-with-a-git-checkout) |
 | `sql [STATEMENT] [-p VALUE]… [--write] [--full]` | One SQL statement (argument or stdin) against the store, printed as a table or, with `--json`, `{ columns, rows, row_count, store_changes }`. Views `files`, `folders`, `frontmatter`, `sections`, `links`, `commits`, `authors` besides `kb` and the `textdb_*` functions. Read-only unless `--write`; see [Querying with SQL](#querying-with-sql) |
 | `git-status PREFIX DIR [--rev REV]` | When the folder was synced and with which commit, what changed in the store since, and how it compares with a commit (`HEAD` by default) by git blob id: same (CRLF-only differences noted), differ, only in textdb, only in git |
-| `ls [PATH] [-l] [-S KEY] [-r] [-R]` | One folder: folders first, then files with size and line count. `-l` adds words, versions, last update, and a file's authors (commits each) or a folder's contents; a folder's size, lines, words and versions are totals of everything below it. `--sort` by `name`, `type`, `size`, `lines`, `words`, `versions`, `created`, `updated` or `authors`; `-r` reverses; `-R` lists everything below the folder by path |
+| `ls [PATH] [-l \| -1] [-S KEY] [-r] [-R]` | One folder: folders first, then files with size and line count. `-1` (`--paths`) prints only the paths, one per line, for scripts. `-l` adds words, versions, last update, and a file's authors (commits each) or a folder's contents; a folder's size, lines, words and versions are totals of everything below it. `--sort` by `name`, `type`, `size`, `lines`, `words`, `versions`, `created`, `updated` or `authors`; `-r` reverses; `-R` lists everything below the folder by path |
 | `tree [PATH] [-L DEPTH] [-d]` | The folder tree with file counts and sizes; `--json` gives a flat, path-sorted list |
 | `stat PATH` | Kind, version, size, lines, last update and author |
 | `cat PATH [-n] [--lines A:B] [--version V] [--section HEADING]` | Content; `-n` numbers lines under a header `PATH vN · lines A-B of T` |
-| `search QUERY [-p PREFIX] [--limit N]` | Full text: terms ANDed per document, `"phrases"`, `prefix*`; prints `path:line: snippet` |
-| `write PATH [-b V] [-f FILE] [-m MSG] [--allow-empty]` | Create or replace from `--file` or stdin; with `-b`, concurrent commits are rebased |
-| `edit PATH --old TEXT --new TEXT` | Replace the one occurrence of `old`. Also `--old-file`/`--new-file`, or `--stdin-json` reading `{"old": …, "new": …}` |
-| `replace-lines PATH FROM TO [-b V] [--text T \| -f FILE \| stdin]` | Replace lines `FROM..TO` (1-based, inclusive) as numbered in version `V`; `TO = FROM-1` inserts before `FROM` |
-| `append PATH [TEXT]` | Append the argument (as a line) or stdin; never conflicts |
+| `search WORD… [-p PREFIX] [--limit N] [--per-file N]` | Full text: every word must occur in the document, `"phrases"`, `prefix*`, case and accents ignored. Prints `path:line: text` for each line holding a word (up to `--per-file`, default 10), checked against the text; a document is listed only when its lines hold every word. No match: nothing on stdout, `no matches` on stderr, exit 0 |
+| `grep PATTERN [-p PREFIX] [-i] [-F] [-l] [--limit N]` | Regular expression per line over every file under a folder (case-sensitive unless `-i`; `-F` plain text; `-l` paths only). Reads each file, so slower than `search` on large folders; stops after `--limit` lines (500) |
+| `write PATH [-b V] [-f FILE] [-m MSG] [--allow-empty] [--create]` | Create or replace from `--file` or stdin; with `-b`, concurrent commits are rebased. `--create` refuses (exit 6) when the file exists |
+| `edit PATH --old TEXT --new TEXT [-m MSG]` | Replace the one occurrence of `old`. Also `--old-file`/`--new-file`, or `--stdin-json` reading `{"old": …, "new": …}` |
+| `replace-lines PATH FROM TO [-b V] [--text T \| -f FILE \| stdin] [-m MSG]` | Replace lines `FROM..TO` (1-based, inclusive) as numbered in version `V`; `TO = FROM-1` inserts before `FROM` |
+| `append PATH [TEXT] [-m MSG]` | Append the argument (as a line) or stdin; never conflicts |
 | `history PATH [--versions-only]` | Versions — time, author, how each landed (`direct`, `rebased`, `merged`) and its base — and, between them, the renames, moves and deletes that touched the file, including those of a folder it was in. A deleted file is found at the path it was deleted from |
 | `diff PATH V1 [V2]` | Unified diff; `V2` defaults to the current version |
 | `hunks PATH [V1 [V2]]` | Line hunks; defaults to the latest commit |
 | `chunks PATH [--version V]` | The content-defined chunks the file is stored as |
-| `mv FROM TO`, `rm PATH` | Move/rename and delete files or folders. History stays readable, and each file or folder touched gets a `rename`, `move` or `delete` entry in its history while path history is on |
+| `mv FROM TO [-m MSG]`, `rm PATH [-m MSG]` | Move/rename and delete files or folders. History stays readable, and each file or folder touched gets a `rename`, `move` or `delete` entry in its history while path history is on. Folders left empty are removed (listed as `removed empty folder …`) unless `--keep-empty-folders`; `-m` is recorded in the change log |
 | `setting [KEY [VALUE]]` | Show or change a store setting. `path_history` is `on` (default) or `off`; `default` clears it. `--path-history` overrides it for one command |
 | `log [--since SEQ] [--limit N]` | The change log: every create, commit, mkdir, move and delete, in order |
 | `watch [--since SEQ] [-p PREFIX]` | Follow the change log live — one line per change, JSON lines with `--json` |
@@ -275,7 +276,8 @@ EOF
 | `setting` | `{"path_history": {"value": "on" \| "off" \| null, "effective": true \| false}}` |
 | `hunks` | `{"path", "from", "to", "hunks": [{"old_from", "old_count", "new_from", "new_count", "old_text", "new_text"}]}` |
 | `log`, `watch` | `{"seq", "ts", "op", "path", "old_path", "node_kind", "version", "base_version", "commit_kind", "author", "message"}` |
-| `search` | `[{"path", "line", "snippet", "rank"}]` |
+| `search` | `[{"path", "line", "snippet", "rank"}]`, one per matching line |
+| `grep` | `[{"path", "line", "text"}]`; with `-l`, `["path", …]` |
 | `import` | `{"dir", "prefix", "stats": {"files", "created", "updated", "unchanged", "failed", "bytes"}, "seconds"}` |
 
 ## How `watch` learns about changes

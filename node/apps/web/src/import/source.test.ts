@@ -30,20 +30,22 @@ function dir(name: string, tree: Tree): DirectoryHandle {
 const list = (root: DirectoryHandle, signal = new AbortController().signal) => listFolder(root, () => {}, signal);
 
 describe("listFolder", () => {
-  it("lists visible files sorted by path, skipping hidden folders", async () => {
+  it("lists files sorted by path, skipping .git, .trash and node_modules", async () => {
     const folder = await list(
       dir("kb", {
         "b.md": "b",
         a: { "x.md": "x", deep: { "y.md": "y" } },
         ".git": { config: "c" },
+        ".trash": { "old.md": "o" },
+        ".claude": { "rules.md": "r" },
         node_modules: { "z.md": "z" },
         ".hidden.md": "h",
       }),
     );
     expect(folder?.name).toBe("kb");
-    expect(folder?.files.map((f) => f.rel)).toEqual([".hidden.md", "a/deep/y.md", "a/x.md", "b.md"]);
+    expect(folder?.files.map((f) => f.rel)).toEqual([".claude/rules.md", ".hidden.md", "a/deep/y.md", "a/x.md", "b.md"]);
     expect(folder?.unreadable).toEqual([]);
-    expect(await (await folder!.files[1]!.open()).text()).toBe("y");
+    expect(await (await folder!.files[2]!.open()).text()).toBe("y");
   });
 
   it("keeps going when a folder cannot be listed part way", async () => {
@@ -93,11 +95,12 @@ describe("listFolder", () => {
 });
 
 describe("folderFromFileList", () => {
-  it("strips the picked folder and skips hidden folders", () => {
+  it("strips the picked folder and skips .git", () => {
     const file = (rel: string) => Object.assign(new File(["x"], rel.split("/").pop()!), { webkitRelativePath: rel });
-    const folder = folderFromFileList([file("kb/b.md"), file("kb/.git/HEAD"), file("kb/a/c.md")]);
+    const folder = folderFromFileList([file("kb/b.md"), file("kb/.git/HEAD"), file("kb/a/c.md"), file("kb/.obsidian/n.md")]);
     expect(folder?.name).toBe("kb");
     expect(folder?.files.map((f) => [f.rel, f.size])).toEqual([
+      [".obsidian/n.md", 1],
       ["a/c.md", 1],
       ["b.md", 1],
     ]);

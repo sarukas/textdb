@@ -198,7 +198,8 @@ export function ImportDialog({ author, onClose, onOpen }: Props) {
                   , <strong>{formatBytes(selectionBytes)}</strong>
                 </>
               )}
-              . Hidden folders and <span className="mono">node_modules</span> are not read.
+              . <span className="mono">.git</span>, <span className="mono">.trash</span> and <span className="mono">node_modules</span>{" "}
+              folders are not read.
             </p>
             {step.folder.unreadable.length > 0 && (
               <details className="failures">

@@ -17,6 +17,7 @@ use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use textdb_sqlite::db::parent_of;
 use textdb_sqlite::normalize_path;
 
 use config::StoreUrl;
@@ -26,6 +27,7 @@ type Result<T> = std::result::Result<T, StoreError>;
 
 mod git;
 mod portable;
+mod search;
 mod sql_query;
 mod sync;
 
@@ -169,6 +171,9 @@ enum Cmd {
         /// folder's contents. A folder's figures are totals over everything below it.
         #[arg(long, short = 'l')]
         long: bool,
+        /// Only the paths, one per line: for scripts.
+        #[arg(long, short = '1', conflicts_with = "long")]
+        paths: bool,
         /// Order by this; folders stay before files.
         #[arg(long, short = 'S', value_enum, default_value_t = SortKey::Name)]
         sort: SortKey,
@@ -213,13 +218,39 @@ enum Cmd {
         #[arg(long, conflicts_with = "at")]
         section: Option<String>,
     },
-    /// Full-text search: terms are ANDed per document, "quoted phrases", prefix*.
+    /// Full-text search: every word must occur in the document (AND), "quoted phrases" and
+    /// prefix* work, case and accents do not matter. Lists each line holding a word, checked
+    /// against the text. For regular expressions or exact case, use `grep`.
     Search {
-        query: String,
+        /// The words; several arguments are one query.
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
         #[arg(long, short = 'p', default_value = "/", value_parser = store_path)]
         prefix: String,
+        /// Documents to list at most.
         #[arg(long, default_value_t = 50)]
         limit: i64,
+        /// Matching lines to list per document.
+        #[arg(long, default_value_t = 10)]
+        per_file: usize,
+    },
+    /// Lines matching a regular expression in every file under a folder; case-sensitive
+    /// unless -i. Reads the files, so it is slower than `search` on a large folder.
+    Grep {
+        pattern: String,
+        #[arg(long, short = 'p', default_value = "/", value_parser = store_path)]
+        prefix: String,
+        #[arg(long, short = 'i')]
+        ignore_case: bool,
+        /// Match the pattern as plain text.
+        #[arg(long, short = 'F')]
+        fixed_strings: bool,
+        /// List only the paths of files with a match.
+        #[arg(long, short = 'l')]
+        files_with_matches: bool,
+        /// Matching lines to list at most.
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
     },
     /// Create a file or replace its content, from --file or stdin.
     Write {
@@ -236,6 +267,9 @@ enum Cmd {
         /// Allow writing empty content (otherwise refused, as it is usually a missing pipe).
         #[arg(long)]
         allow_empty: bool,
+        /// Only create: fail if the file exists.
+        #[arg(long, conflicts_with = "base_version")]
+        create: bool,
     },
     /// Replace the one occurrence of the old text with the new text.
     Edit {
@@ -254,6 +288,9 @@ enum Cmd {
         /// Read `{"old": "…", "new": "…"}` from stdin: no shell quoting for multi-line text.
         #[arg(long)]
         stdin_json: bool,
+        /// Commit message (default `edit`).
+        #[arg(long, short = 'm')]
+        message: Option<String>,
     },
     /// Replace lines FROM..TO (1-based, inclusive) with --text, --file or stdin. TO = FROM-1 inserts before FROM.
     ReplaceLines {
@@ -268,6 +305,9 @@ enum Cmd {
         text: Option<String>,
         #[arg(long, short = 'f')]
         file: Option<PathBuf>,
+        /// Commit message (default `replace-lines`).
+        #[arg(long, short = 'm')]
+        message: Option<String>,
     },
     /// Append text (the argument, or stdin) to the end of a file; never conflicts.
     Append {
@@ -275,6 +315,9 @@ enum Cmd {
         path: String,
         #[arg(allow_hyphen_values = true)]
         text: Option<String>,
+        /// Commit message (default `append`).
+        #[arg(long, short = 'm')]
+        message: Option<String>,
     },
     /// Versions of a file, oldest first.
     History {
@@ -305,17 +348,30 @@ enum Cmd {
         #[arg(long = "version", short = 'v', value_name = "VERSION")]
         at: Option<i64>,
     },
-    /// Move or rename a file or folder.
+    /// Move or rename a file or folder. Folders the move leaves empty are removed.
     Mv {
         #[arg(value_parser = store_path)]
         from: String,
         #[arg(value_parser = store_path)]
         to: String,
+        /// Message recorded in the change log.
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+        /// Keep folders the move leaves empty.
+        #[arg(long)]
+        keep_empty_folders: bool,
     },
-    /// Delete a file or folder; its history stays readable.
+    /// Delete a file or folder; its history stays readable. Folders the delete leaves empty are
+    /// removed.
     Rm {
         #[arg(value_parser = store_path)]
         path: String,
+        /// Message recorded in the change log.
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+        /// Keep folders the delete leaves empty.
+        #[arg(long)]
+        keep_empty_folders: bool,
     },
     /// Show or change a store setting: `setting`, `setting path_history`,
     /// `setting path_history off` (`on`, or `default` to clear it).
@@ -422,6 +478,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
         Cmd::Ls {
             path,
             long,
+            paths,
             sort,
             reverse,
             recursive,
@@ -430,6 +487,9 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             sort_entries(&mut entries, sort, reverse, recursive);
             if json {
                 return emit_json(&entries);
+            }
+            if paths {
+                return out(entries.iter().map(|e| format!("{}\n", e.path)).collect::<String>().as_bytes());
             }
             out(ls_text(&entries, long, recursive).as_bytes())
         }
@@ -456,26 +516,56 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             line(text)
         }
         Cmd::Cat { path, number, lines, at, section } => cat(st, &path, number, lines.as_deref(), at, section.as_deref(), json),
-        Cmd::Search { query, prefix, limit } => {
-            let hits = st.search(&query, &prefix, limit)?;
-            if json {
-                return emit_json(&hits);
-            }
-            let s: String = hits.iter().map(|h| format!("{}:{}: {}\n", h.path, h.line, h.snippet)).collect();
-            out(s.as_bytes())
-        }
+        Cmd::Search {
+            query,
+            prefix,
+            limit,
+            per_file,
+        } => search::search(st, &query.join(" "), &prefix, limit, per_file, json),
+        Cmd::Grep {
+            pattern,
+            prefix,
+            ignore_case,
+            fixed_strings,
+            files_with_matches,
+            limit,
+        } => search::grep(
+            st,
+            &pattern,
+            &prefix,
+            search::GrepOptions {
+                ignore_case,
+                fixed: fixed_strings,
+                files_only: files_with_matches,
+                limit,
+            },
+            json,
+        ),
         Cmd::Write {
             path,
             base_version,
             file,
             message,
             allow_empty,
+            create,
         } => {
             let content = input(file.as_deref(), "write")?;
             if content.is_empty() && !allow_empty {
                 return Err(StoreError::invalid(
                     "refusing to write empty content (nothing on stdin?); pass --allow-empty to mean it",
                 ));
+            }
+            if create {
+                match st.stat(&path) {
+                    Ok(s) => {
+                        return Err(StoreError::invalid(format!(
+                            "{} exists already (v{}); --create only makes new files",
+                            s.path, s.version
+                        )))
+                    }
+                    Err(e) if e.code == "TX003" => {}
+                    Err(e) => return Err(e),
+                }
             }
             let w = st.write(&path, &content, base_version, author, message.as_deref())?;
             emit_written(&path, &w, json)
@@ -487,6 +577,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             old_file,
             new_file,
             stdin_json,
+            message,
         } => {
             let (old, new) = if stdin_json {
                 #[derive(Deserialize)]
@@ -501,7 +592,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             } else {
                 (text_or_file(old, old_file, "old")?, text_or_file(new, new_file, "new")?)
             };
-            let w = st.edit(&path, &old, &new, author)?;
+            let w = st.edit(&path, &old, &new, author, message.as_deref())?;
             emit_written(&path, &w, json)
         }
         Cmd::ReplaceLines {
@@ -511,6 +602,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             base_version,
             text,
             file,
+            message,
         } => {
             if from < 1 || to < from - 1 {
                 return Err(StoreError::invalid(format!(
@@ -529,17 +621,17 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
                     body
                 }
             };
-            let w = st.replace_lines(&path, from, to, &body, base_version, author)?;
+            let w = st.replace_lines(&path, from, to, &body, base_version, author, message.as_deref())?;
             emit_written(&path, &w, json)
         }
-        Cmd::Append { path, text } => {
+        Cmd::Append { path, text, message } => {
             let tail = match text {
                 // An argument is a line of text; stdin is taken as it comes.
                 Some(t) if t.ends_with('\n') => t.into_bytes(),
                 Some(t) => format!("{t}\n").into_bytes(),
                 None => input(None, "append")?,
             };
-            let w = st.append(&path, &tail, author)?;
+            let w = st.append(&path, &tail, author, message.as_deref())?;
             emit_written(&path, &w, json)
         }
         Cmd::History { path, versions_only } => {
@@ -614,21 +706,38 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
                 .collect();
             out(s.as_bytes())
         }
-        Cmd::Mv { from, to } => {
-            st.mv(&from, &to, author)?;
+        Cmd::Mv {
+            from,
+            to,
+            message,
+            keep_empty_folders,
+        } => {
+            st.mv(&from, &to, author, message.as_deref())?;
+            let removed = if keep_empty_folders { Vec::new() } else { prune_empty_folders(st, &from, author)? };
             if json {
-                emit_json(&json!({ "moved": from, "to": to }))
-            } else {
-                line(format!("moved {from} -> {to}"))
+                return emit_json(&json!({ "moved": from, "to": to, "removed_empty_folders": removed }));
             }
+            let mut s = format!("moved {from} -> {to}\n");
+            for folder in &removed {
+                s.push_str(&format!("removed empty folder {folder}\n"));
+            }
+            out(s.as_bytes())
         }
-        Cmd::Rm { path } => {
-            st.rm(&path, author)?;
+        Cmd::Rm {
+            path,
+            message,
+            keep_empty_folders,
+        } => {
+            st.rm(&path, author, message.as_deref())?;
+            let removed = if keep_empty_folders { Vec::new() } else { prune_empty_folders(st, &path, author)? };
             if json {
-                emit_json(&json!({ "deleted": path }))
-            } else {
-                line(format!("deleted {path}"))
+                return emit_json(&json!({ "deleted": path, "removed_empty_folders": removed }));
             }
+            let mut s = format!("deleted {path}\n");
+            for folder in &removed {
+                s.push_str(&format!("removed empty folder {folder}\n"));
+            }
+            out(s.as_bytes())
         }
         Cmd::Setting { key, value } => {
             let key = key.unwrap_or_else(|| textdb_core::PATH_HISTORY_SETTING.to_string());
@@ -1251,7 +1360,8 @@ fn import(
 }
 
 /// Files under `root` with one of `exts` (or any, for `*`), as `(relative/path, local path)`
-/// sorted by the relative path. Hidden directories and `node_modules` are skipped.
+/// sorted by the relative path. `.git`, `.textdb`, `.trash` and `node_modules` are skipped;
+/// other hidden directories are read.
 fn collect_files(root: &Path, exts: &[String]) -> Result<Vec<(String, PathBuf)>> {
     let any = exts.iter().any(|e| e == "*");
     let mut found = Vec::new();
@@ -1263,7 +1373,7 @@ fn collect_files(root: &Path, exts: &[String]) -> Result<Vec<(String, PathBuf)>>
             let name = entry.file_name().to_string_lossy().into_owned();
             let kind = entry.file_type()?;
             if kind.is_dir() {
-                if !name.starts_with('.') && name != "node_modules" {
+                if !sync::SKIP_DIRS.contains(&name.as_str()) {
                     dirs.push(entry.path());
                 }
                 continue;
@@ -1291,6 +1401,24 @@ fn collect_files(root: &Path, exts: &[String]) -> Result<Vec<(String, PathBuf)>>
     }
     found.sort();
     Ok(found)
+}
+
+/// Delete the folders a move or delete of `path` left empty, from its parent upwards; never the
+/// root. Returns them, deepest first.
+fn prune_empty_folders(st: &mut dyn Store, path: &str, author: Option<&str>) -> Result<Vec<String>> {
+    let mut removed = Vec::new();
+    let mut folder = parent_of(&normalize_path(path)?).to_string();
+    while folder != "/" {
+        match st.ls(&folder, false) {
+            Ok(entries) if entries.is_empty() => {
+                st.rm(&folder, author, Some("remove a folder left empty"))?;
+                removed.push(folder.clone());
+            }
+            _ => break,
+        }
+        folder = parent_of(&folder).to_string();
+    }
+    Ok(removed)
 }
 
 #[derive(Default)]

@@ -2,9 +2,15 @@
 
 export const DEFAULT_EXTENSIONS = ["md", "markdown", "mdx", "txt"];
 
-/** Folders an import never reads: version control, dependencies, anything hidden. */
+/**
+ * Folders an import never reads: version control, the textdb app installed in a folder,
+ * Obsidian's trash and dependencies. Other hidden folders (`.claude`, `.github`) are read, as
+ * `textdb import` and `sync` read them.
+ */
+const SKIPPED_FOLDERS = new Set([".git", ".textdb", ".trash", "node_modules"]);
+
 export function skipDirectory(name: string): boolean {
-  return name.startsWith(".") || name === "node_modules";
+  return SKIPPED_FOLDERS.has(name);
 }
 
 /** "md, .markdown *.txt" → ["md", "markdown", "txt"]; "*" means every file. */
@@ -32,14 +38,13 @@ export function isLikelyBinary(ext: string): boolean {
 
 /**
  * The extension of the file at `rel` (a /-separated path inside the picked folder), lower case,
- * `NO_EXTENSION` when it has none, or `null` when the file is never read: hidden, or inside a
- * hidden folder or `node_modules`.
+ * `NO_EXTENSION` when it has none (`.gitignore` included), or `null` when the file is never read:
+ * inside a skipped folder.
  */
 export function extensionOf(rel: string): string | null {
   const parts = rel.split("/");
   if (parts.slice(0, -1).some(skipDirectory)) return null;
   const name = parts[parts.length - 1] ?? "";
-  if (name.startsWith(".")) return null;
   const dot = name.lastIndexOf(".");
   return dot > 0 && dot < name.length - 1 ? name.slice(dot + 1).toLowerCase() : NO_EXTENSION;
 }

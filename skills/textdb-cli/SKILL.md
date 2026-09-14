@@ -38,10 +38,18 @@ textdb ls guides/api
 textdb ls -l guides                      # + words, versions, last update, authors; folders show totals below them
 textdb ls -R -l --sort updated -r guides # everything below /guides, most recently changed first
 textdb ls -l --sort words guides --json  # machine-readable, with authors and folder file counts
-textdb search 'rate limit' -p guides     # path:line: snippet — terms ANDed, "phrase", prefix*
+textdb ls -1 guides                      # only paths, one per line: for loops and xargs
+textdb search rate limit -p guides       # path:line: text for each line holding a word; all words must occur
+textdb search '"rate limit"' 'retry*'    # a phrase and a prefix
+textdb grep -i 'status: (draft|review)' -p guides   # regular expression per line; -F plain text, -l paths only
 textdb stat guides/api/index.md          # version, size, lines, last author
 textdb export guides ./checkout --dry-run # what writing /guides to disk would change; drop --dry-run to write
 ```
+
+`search` uses the full-text index (case and accents ignored) and prints nothing on stdout when
+nothing matches (`no matches` on stderr, exit 0). Treat its lines as candidates: read the lines
+with `cat -n --lines` before editing. Use `grep` for exact case, punctuation or regular
+expressions; it reads every file under the folder, so narrow it with `-p`.
 
 `export` writes only new and changed files and deletes nothing. It stops with exit code 6 and
 lists the names that cannot exist side by side on this OS (e.g. `README.md` and `readme.md` on
@@ -142,11 +150,14 @@ textdb append notes/journal.md '- 2026-09-13: reviewed the API guide'
 # Whole-document rewrite derived from v12.
 textdb write guides/api/index.md -b 12 -m 'restructure' < new-index.md
 
-# Create a new file.
-textdb write guides/api/limits.md -m 'new page' <<'EOF'
+# Create a new file; --create fails (exit 6) instead of replacing one that exists.
+textdb write --create guides/api/limits.md -m 'new page' <<'EOF'
 # Limits
 EOF
 ```
+
+Every editing command takes `-m 'why'`: `write`, `edit`, `replace-lines`, `append`, `mv` and `rm`.
+Give one that says what the change is for; history and the web app show it.
 
 Each write prints `path: vN (kind)`: `direct` (nobody else wrote), `rebased` (others changed
 other lines; your change was applied on top), `merged` (others touched nearby lines and the
@@ -182,8 +193,8 @@ was deleted from.
 ## Reorganise
 
 ```sh
-textdb mv guides/draft.md guides/published/intro.md   # a file or a whole folder; history moves with it
-textdb rm guides/old                                  # a file or a whole folder, recursively
+textdb mv guides/draft.md guides/published/intro.md -m 'publish'  # a file or a whole folder; history moves with it
+textdb rm guides/old -m 'superseded by guides/new'                 # a file or a whole folder, recursively
 textdb setting                                        # path_history: on (default) or off for this store
 textdb --path-history off mv archive/2024 archive/y2024   # keep one bulk reshuffle out of history
 ```
@@ -191,6 +202,8 @@ textdb --path-history off mv archive/2024 archive/y2024   # keep one bulk reshuf
 `rm` is not final: deleted files keep their content and versions in the store's trash, where
 people can read and restore-by-copy them in the web app until someone permanently removes
 them. Moving or deleting a folder touches everything inside it — check with `tree` first.
+Folders a move or delete leaves empty are removed too (printed as `removed empty folder …`);
+pass `--keep-empty-folders` to keep them.
 
 ## Rules
 

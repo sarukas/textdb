@@ -158,6 +158,38 @@ impl PgStore {
         })
     }
 
+    /// `kb.edit`, `kb.append` and `kb.replace_lines` take no message: put one on the commit they
+    /// made and on its change-log row.
+    fn label_commit(&mut self, path: &str, version: i64, message: Option<&str>) -> Result<()> {
+        let Some(message) = message else {
+            return Ok(());
+        };
+        self.client
+            .execute(
+                "WITH n AS (SELECT id FROM kb.node WHERE path = $2 AND deleted_at IS NULL), \
+                 c AS (UPDATE kb.commit SET message = $1 WHERE file_id = (SELECT id FROM n) AND version = $3 RETURNING 1) \
+                 UPDATE kb.change SET message = $1 WHERE node_id = (SELECT id FROM n) AND version = $3 AND op IN ('create', 'commit')",
+                &[&message, &path, &version],
+            )
+            .map_err(pg)?;
+        Ok(())
+    }
+
+    /// `kb.move` and `kb.remove` take no message: put one on the change-log row they wrote.
+    fn label_change(&mut self, op: &str, path: &str, old_path: Option<&str>, message: Option<&str>) -> Result<()> {
+        let Some(message) = message else {
+            return Ok(());
+        };
+        self.client
+            .execute(
+                "UPDATE kb.change SET message = $1 WHERE seq = \
+                 (SELECT max(seq) FROM kb.change WHERE op = $2 AND path = $3 AND old_path IS NOT DISTINCT FROM $4)",
+                &[&message, &op, &path, &old_path],
+            )
+            .map_err(pg)?;
+        Ok(())
+    }
+
     fn ensure_sync_tables(&mut self) -> Result<()> {
         if !self.sync_ready {
             self.client.batch_execute(SYNC_TABLES).map_err(pg)?;
@@ -326,24 +358,28 @@ impl Store for PgStore {
         written(row.get(0))
     }
 
-    fn edit(&mut self, path: &str, old: &[u8], new: &[u8], author: Option<&str>) -> Result<Written> {
+    fn edit(&mut self, path: &str, old: &[u8], new: &[u8], author: Option<&str>, message: Option<&str>) -> Result<Written> {
         let (old, new) = (utf8(path, old)?, utf8(path, new)?);
         let version: i64 = self
             .client
             .query_one("SELECT kb.edit($1, $2, $3, $4)", &[&path, &old, &new, &author])
             .map_err(pg)?
             .get(0);
-        self.written_at(&normalize_path(path)?, version)
+        let path = normalize_path(path)?;
+        self.label_commit(&path, version, message)?;
+        self.written_at(&path, version)
     }
 
-    fn append(&mut self, path: &str, tail: &[u8], author: Option<&str>) -> Result<Written> {
+    fn append(&mut self, path: &str, tail: &[u8], author: Option<&str>, message: Option<&str>) -> Result<Written> {
         let tail = utf8(path, tail)?;
         let version: i64 = self
             .client
             .query_one("SELECT kb.append($1, $2, $3)", &[&path, &tail, &author])
             .map_err(pg)?
             .get(0);
-        self.written_at(&normalize_path(path)?, version)
+        let path = normalize_path(path)?;
+        self.label_commit(&path, version, message)?;
+        self.written_at(&path, version)
     }
 
     fn replace_lines(
@@ -354,6 +390,7 @@ impl Store for PgStore {
         text: &[u8],
         base_version: Option<i64>,
         author: Option<&str>,
+        message: Option<&str>,
     ) -> Result<Written> {
         let text = utf8(path, text)?;
         let row = self
@@ -363,7 +400,9 @@ impl Store for PgStore {
                 &[&path, &from, &to, &text, &base_version, &author],
             )
             .map_err(pg)?;
-        written(row.get(0))
+        let w = written(row.get(0))?;
+        self.label_commit(&normalize_path(path)?, w.version, message)?;
+        Ok(w)
     }
 
     fn history(&mut self, path: &str) -> Result<Vec<Commit>> {
@@ -431,14 +470,15 @@ impl Store for PgStore {
             .collect())
     }
 
-    fn mv(&mut self, from: &str, to: &str, author: Option<&str>) -> Result<()> {
+    fn mv(&mut self, from: &str, to: &str, author: Option<&str>, message: Option<&str>) -> Result<()> {
         self.client.execute("SELECT kb.move($1, $2, $3)", &[&from, &to, &author]).map_err(pg)?;
-        Ok(())
+        let (from, to) = (normalize_path(from)?, normalize_path(to)?);
+        self.label_change("move", &to, Some(&from), message)
     }
 
-    fn rm(&mut self, path: &str, author: Option<&str>) -> Result<()> {
+    fn rm(&mut self, path: &str, author: Option<&str>, message: Option<&str>) -> Result<()> {
         self.client.execute("SELECT kb.remove($1, $2)", &[&path, &author]).map_err(pg)?;
-        Ok(())
+        self.label_change("delete", &normalize_path(path)?, None, message)
     }
 
     fn path_history(&mut self, path: &str) -> Result<Vec<PathEvent>> {

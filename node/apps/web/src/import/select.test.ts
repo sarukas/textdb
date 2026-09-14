@@ -21,12 +21,15 @@ describe("includeFile", () => {
     expect(includeFile("md", MD)).toBe(false);
   });
 
-  it("never reads hidden files, hidden folders or node_modules", () => {
+  it("reads hidden folders and files, but never .git, .textdb, .trash or node_modules", () => {
     expect(includeFile(".git/HEAD.md", MD)).toBe(false);
-    expect(includeFile("docs/.drafts/a.md", MD)).toBe(false);
+    expect(includeFile(".textdb/app/README.md", MD)).toBe(false);
+    expect(includeFile(".trash/old.md", MD)).toBe(false);
     expect(includeFile("site/node_modules/pkg/README.md", MD)).toBe(false);
-    expect(includeFile("docs/.hidden.md", MD)).toBe(false);
-    expect(includeFile("docs/.hidden.md", ["*"])).toBe(false);
+    expect(includeFile(".claude/instructions/rules.md", MD)).toBe(true);
+    expect(includeFile("docs/.drafts/a.md", MD)).toBe(true);
+    expect(includeFile("docs/.hidden.md", MD)).toBe(true);
+    expect(includeFile(".gitignore", MD)).toBe(false);
   });
 
   it("takes every visible file for *", () => {
@@ -52,6 +55,7 @@ describe("extensions found in a folder", () => {
       { ext: "md", files: 2, bytes: 30 },
       { ext: NO_EXTENSION, files: 2, bytes: 6 },
       { ext: "pdf", files: 1, bytes: 1000 },
+      { ext: "txt", files: 1, bytes: 2 },
     ]);
     expect(countExtensions([{ rel: "a.md", size: null }, { rel: "b.md", size: 3 }])).toEqual([{ ext: "md", files: 2, bytes: null }]);
   });

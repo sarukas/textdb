@@ -233,12 +233,12 @@ impl Store for SqliteStore {
         Ok(written(self.db().write(path, content, base_version.map(version), author, message)?))
     }
 
-    fn edit(&mut self, path: &str, old: &[u8], new: &[u8], author: Option<&str>) -> Result<Written> {
-        Ok(written(self.db().edit(path, old, new, author)?))
+    fn edit(&mut self, path: &str, old: &[u8], new: &[u8], author: Option<&str>, message: Option<&str>) -> Result<Written> {
+        Ok(written(self.db().with_message(message).edit(path, old, new, author)?))
     }
 
-    fn append(&mut self, path: &str, tail: &[u8], author: Option<&str>) -> Result<Written> {
-        Ok(written(self.db().append(path, tail, author)?))
+    fn append(&mut self, path: &str, tail: &[u8], author: Option<&str>, message: Option<&str>) -> Result<Written> {
+        Ok(written(self.db().with_message(message).append(path, tail, author)?))
     }
 
     fn replace_lines(
@@ -249,8 +249,9 @@ impl Store for SqliteStore {
         text: &[u8],
         base_version: Option<i64>,
         author: Option<&str>,
+        message: Option<&str>,
     ) -> Result<Written> {
-        Ok(written(self.db().replace_lines(
+        Ok(written(self.db().with_message(message).replace_lines(
             path,
             version(from),
             version(to),
@@ -314,12 +315,12 @@ impl Store for SqliteStore {
             .collect())
     }
 
-    fn mv(&mut self, from: &str, to: &str, author: Option<&str>) -> Result<()> {
-        Ok(self.db().rename_by(from, to, author)?)
+    fn mv(&mut self, from: &str, to: &str, author: Option<&str>, message: Option<&str>) -> Result<()> {
+        Ok(self.db().with_message(message).rename_by(from, to, author)?)
     }
 
-    fn rm(&mut self, path: &str, author: Option<&str>) -> Result<()> {
-        Ok(self.db().delete_by(path, author)?)
+    fn rm(&mut self, path: &str, author: Option<&str>, message: Option<&str>) -> Result<()> {
+        Ok(self.db().with_message(message).delete_by(path, author)?)
     }
 
     fn path_history(&mut self, path: &str) -> Result<Vec<PathEvent>> {
