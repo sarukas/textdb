@@ -13,6 +13,8 @@ use pgrx::prelude::*;
 
 ::pgrx::pg_module_magic!();
 
+mod bulk;
+mod links;
 mod store;
 
 extension_sql!(
@@ -47,6 +49,9 @@ CREATE TABLE kb.node (
 CREATE UNIQUE INDEX node_path ON kb.node(path text_pattern_ops) WHERE deleted_at IS NULL;
 CREATE UNIQUE INDEX node_parent_name ON kb.node(parent_id, name) WHERE deleted_at IS NULL;
 CREATE INDEX node_parent ON kb.node(parent_id);
+-- Link resolution looks files up by path and name, ignoring case.
+CREATE INDEX node_lower_path ON kb.node(lower(path)) WHERE deleted_at IS NULL;
+CREATE INDEX node_lower_name ON kb.node(lower(name)) WHERE deleted_at IS NULL;
 INSERT INTO kb.node(parent_id, name, kind, path) VALUES (NULL, '', 0, '/');
 
 CREATE TABLE kb.commit (
@@ -54,6 +59,7 @@ CREATE TABLE kb.commit (
   author text, ts timestamptz NOT NULL DEFAULT now(), message text, nbytes bigint, nlines bigint,
   kind text,                -- direct, rebased, merged
   base_version bigint,      -- the version the writer started from (NULL for version 1)
+  batch text,               -- the batch (session setting textdb.batch) the commit belongs to
   PRIMARY KEY (file_id, version)
 );
 -- Change feed: one row per create, commit, mkdir, move and delete, written in the same
@@ -70,8 +76,11 @@ CREATE TABLE kb.change (
   base_version bigint,               -- commit: the version the writer started from
   commit_kind  text,                 -- create, commit: direct, rebased, merged
   author       text,
-  message      text
+  message      text,
+  batch        text                  -- the batch (session setting textdb.batch) the change belongs to
 );
+CREATE INDEX change_node ON kb.change(node_id);
+CREATE INDEX change_batch ON kb.change(batch) WHERE batch IS NOT NULL;
 CREATE TABLE kb.chunk (
   id bigserial PRIMARY KEY, hash bytea NOT NULL UNIQUE, bytes bytea NOT NULL, nlines int NOT NULL
 );
@@ -79,8 +88,26 @@ CREATE TABLE kb.tree_node (hash bytea PRIMARY KEY, children bytea NOT NULL);
 CREATE TABLE kb.chunk_ref (chunk_id bigint NOT NULL, file_id bigint NOT NULL, version bigint NOT NULL, PRIMARY KEY (chunk_id, file_id));
 CREATE TABLE kb.section (file_id bigint NOT NULL, version bigint NOT NULL, heading_path text NOT NULL, level int NOT NULL, line_from bigint NOT NULL, line_to bigint NOT NULL);
 CREATE INDEX section_file ON kb.section(file_id, version);
-CREATE TABLE kb.link (file_id bigint NOT NULL, version bigint NOT NULL, target_path text NOT NULL, line bigint NOT NULL);
+-- Links as written (target without anchor or alias), and what each resolves to by the rules the
+-- stores share (textdb_md::resolve). target_name (last segment, lower case, without .md) finds
+-- the rows a created, moved or deleted file can change.
+CREATE TABLE kb.link (
+  id          bigserial PRIMARY KEY,
+  file_id     bigint NOT NULL,
+  version     bigint NOT NULL,
+  target_path text NOT NULL,
+  line        bigint NOT NULL,
+  kind        text,                          -- wiki, embed, md, image
+  anchor      text,                          -- heading or ^block after #
+  alias       text,
+  external    boolean NOT NULL DEFAULT false,-- URL, email, query, numbered reference
+  target_name text,
+  resolved_id bigint,                        -- the file it points to
+  status      text                           -- ok, ambiguous, anchor-missing, folder, broken, not-in-store, external
+);
 CREATE INDEX link_file ON kb.link(file_id, version);
+CREATE INDEX link_target_name ON kb.link(target_name);
+CREATE INDEX link_resolved ON kb.link(resolved_id);
 CREATE TABLE kb.frontmatter (file_id bigint NOT NULL, version bigint NOT NULL, data jsonb, PRIMARY KEY (file_id, version));
 CREATE TABLE kb.checkpoint (name text NOT NULL, file_id bigint NOT NULL, path text NOT NULL, root bytea NOT NULL, version bigint NOT NULL, PRIMARY KEY (name, file_id));
 -- Path history (textdb_core::path): one row per node a rename, move or delete touched — the
@@ -133,6 +160,7 @@ CREATE TABLE kb.sync (
   id bigserial PRIMARY KEY, prefix text NOT NULL, dir text NOT NULL, seq bigint NOT NULL,
   synced_at timestamptz NOT NULL DEFAULT now(), author text,
   git_commit text, git_branch text, git_remote text, git_clean boolean,
+  rules text,               -- the include rules of that sync, as JSON
   UNIQUE (prefix, dir)
 );
 CREATE TABLE kb.sync_file (
@@ -167,23 +195,33 @@ CREATE FUNCTION kb._switch(v text) RETURNS boolean LANGUAGE sql IMMUTABLE PARALL
 $$;
 
 -- Store settings. kb.setting(key) is NULL at the default; kb.set_setting(key, NULL) returns a
--- setting to its default. The only setting so far is path_history.
+-- setting to its default. path_history is on or off; link_updates (what a move does to links
+-- that pointed at what moved) is off, report or rewrite.
 CREATE FUNCTION kb.setting(k text) RETURNS text LANGUAGE sql STABLE AS $$
   SELECT s.value FROM kb.setting s WHERE s.key = k
 $$;
 CREATE FUNCTION kb.set_setting(k text, v text) RETURNS text LANGUAGE plpgsql VOLATILE AS $$
+DECLARE norm text;
 BEGIN
-  IF k IS DISTINCT FROM 'path_history' THEN
-    PERFORM kb._raise('TX004', format('unknown setting ''%s'' (known: path_history)', k), NULL);
+  IF k IS NULL OR k NOT IN ('path_history', 'link_updates') THEN
+    PERFORM kb._raise('TX004', format('unknown setting ''%s'' (known: path_history, link_updates)', k), NULL);
   END IF;
   IF v IS NULL THEN
     DELETE FROM kb.setting s WHERE s.key = k;
     RETURN NULL;
   END IF;
-  IF kb._switch(v) IS NULL THEN
-    PERFORM kb._raise('TX004', format('%s is on or off, not ''%s''', k, v), NULL);
+  IF k = 'link_updates' THEN
+    norm := lower(trim(v));
+    IF norm NOT IN ('off', 'report', 'rewrite') THEN
+      PERFORM kb._raise('TX004', format('%s is off, report or rewrite, not ''%s''', k, v), NULL);
+    END IF;
+  ELSE
+    IF kb._switch(v) IS NULL THEN
+      PERFORM kb._raise('TX004', format('%s is on or off, not ''%s''', k, v), NULL);
+    END IF;
+    norm := CASE WHEN kb._switch(v) THEN 'on' ELSE 'off' END;
   END IF;
-  INSERT INTO kb.setting AS s (key, value) VALUES (k, CASE WHEN kb._switch(v) THEN 'on' ELSE 'off' END)
+  INSERT INTO kb.setting AS s (key, value) VALUES (k, norm)
     ON CONFLICT ON CONSTRAINT setting_pkey DO UPDATE SET value = EXCLUDED.value;
   RETURN kb.setting(k);
 END $$;
@@ -302,9 +340,13 @@ BEGIN
   WHERE f.id = f2.id AND f2.kind = 0 AND f2.deleted_at IS NULL;
 END $$;
 
--- Attributed namespace changes (recorded in the change feed with `author`).
-CREATE FUNCTION kb.move(from_path text, to_path text, author text DEFAULT NULL) RETURNS void LANGUAGE sql VOLATILE AS $$ SELECT kb._move(from_path, to_path, author) $$;
-CREATE FUNCTION kb.remove(path text, author text DEFAULT NULL) RETURNS void LANGUAGE sql VOLATILE AS $$ SELECT kb._remove(path, author) $$;
+-- Attributed namespace changes (recorded in the change feed with `author` and `message`).
+CREATE FUNCTION kb.move(from_path text, to_path text, author text DEFAULT NULL, message text DEFAULT NULL) RETURNS void LANGUAGE sql VOLATILE AS $$ SELECT kb._move(from_path, to_path, author, message) $$;
+CREATE FUNCTION kb.remove(path text, author text DEFAULT NULL, message text DEFAULT NULL) RETURNS void LANGUAGE sql VOLATILE AS $$ SELECT kb._remove(path, author, message) $$;
+-- A move that returns the links that pointed at what moved and no longer reach it:
+-- {"links": [{path, line, kind, target, now_at, version}]}. `links` is off, report or rewrite
+-- (rewrite commits each linking file, version set), or NULL for the store's link_updates setting.
+CREATE FUNCTION kb.move_links(from_path text, to_path text, author text DEFAULT NULL, message text DEFAULT NULL, links text DEFAULT NULL) RETURNS jsonb LANGUAGE sql VOLATILE AS $$ SELECT kb._check_j(kb._move_links_j(from_path, to_path, author, message, links)) $$;
 
 CREATE FUNCTION kb.file_iud() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -361,10 +403,29 @@ BEGIN
   RETURN r;
 END $$;
 CREATE FUNCTION kb.write(path text, content text, base_version bigint DEFAULT NULL, author text DEFAULT NULL, message text DEFAULT NULL) RETURNS jsonb LANGUAGE sql VOLATILE AS $$ SELECT kb._check_j(kb._write_j(path, content, base_version, author, message)) $$;
-CREATE FUNCTION kb.replace_lines(path text, l_from bigint, l_to bigint, body text, base_version bigint DEFAULT NULL, author text DEFAULT NULL) RETURNS jsonb LANGUAGE sql VOLATILE AS $$ SELECT kb._check_j(kb._replace_lines_j(path, l_from, l_to, body, base_version, author)) $$;
+CREATE FUNCTION kb.replace_lines(path text, l_from bigint, l_to bigint, body text, base_version bigint DEFAULT NULL, author text DEFAULT NULL, message text DEFAULT NULL) RETURNS jsonb LANGUAGE sql VOLATILE AS $$ SELECT kb._check_j(kb._replace_lines_j(path, l_from, l_to, body, base_version, author, message)) $$;
+-- Several line ranges [{"from": 3, "to": 4, "text": "…"}, …], all numbered as in base_version, in one commit.
+CREATE FUNCTION kb.replace_ranges(path text, ranges jsonb, base_version bigint DEFAULT NULL, author text DEFAULT NULL, message text DEFAULT NULL) RETURNS jsonb LANGUAGE sql VOLATILE AS $$ SELECT kb._check_j(kb._replace_ranges_j(path, ranges, base_version, author, message)) $$;
 CREATE FUNCTION kb._update_content(path text, content text, base_version bigint, author text, message text) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb._check(kb._update_content_j(path, content, base_version, author, message)) $$;
-CREATE FUNCTION kb.edit(path text, old text, new text, author text) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb._check(kb._edit_j(path, old, new, author)) $$;
-CREATE FUNCTION kb.append(path text, tail text, author text) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb._check(kb._append_j(path, tail, author)) $$;
+CREATE FUNCTION kb.edit(path text, old text, new text, author text, message text DEFAULT NULL) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb._check(kb._edit_j(path, old, new, author, message)) $$;
+CREATE FUNCTION kb.append(path text, tail text, author text, message text DEFAULT NULL) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb._check(kb._append_j(path, tail, author, message)) $$;
+-- Every occurrence of `old` becomes `new`, as one version. With expected_count the file must hold
+-- exactly that many occurrences, else at least one; otherwise TX004 and nothing changes.
+CREATE FUNCTION kb.replace(path text, old text, new text, expected_count bigint DEFAULT NULL, author text DEFAULT NULL, message text DEFAULT NULL) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb._check(kb._replace_many_j(path, jsonb_build_array(jsonb_build_array(old, new, expected_count)), author, message)) $$;
+-- Replacements applied in order, one version: [[old, new], [old, new, expected_count], {"old", "new", "count"}, …].
+CREATE FUNCTION kb.replace_many(path text, replacements jsonb, author text DEFAULT NULL, message text DEFAULT NULL) RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT kb._check(kb._replace_many_j(path, replacements, author, message)) $$;
+
+-- Batches: commits, moves and deletes made while the session setting textdb.batch names a batch
+-- (SELECT set_config('textdb.batch', 'id', true) for the rest of a transaction) are recorded
+-- under it, so they can be listed and reverted together.
+CREATE FUNCTION kb.batch() RETURNS text LANGUAGE sql STABLE AS $$ SELECT nullif(current_setting('textdb.batch', true), '') $$;
+-- What changed after change number `seq`, or under `batch`: [{op, path, old_path, from_version, to_version, diff}],
+-- a file's commits folded into one item with a unified diff.
+CREATE FUNCTION kb.changes_after(seq bigint) RETURNS jsonb LANGUAGE sql STABLE AS $$ SELECT kb._check_j(kb._changes_j(seq, NULL)) $$;
+CREATE FUNCTION kb.batch_changes(batch text) RETURNS jsonb LANGUAGE sql STABLE AS $$ SELECT kb._check_j(kb._changes_j(NULL, batch)) $$;
+-- Undo a batch: {restored: [{path, version}], removed, moved_back: [{from, to}], recreated, skipped}. Anything
+-- changed since is skipped; unless skip_changed, that fails the whole revert (TX004).
+CREATE FUNCTION kb.revert_batch(batch text, author text DEFAULT NULL, skip_changed boolean DEFAULT false) RETURNS jsonb LANGUAGE sql VOLATILE AS $$ SELECT kb._check_j(kb._revert_batch_j(batch, author, skip_changed)) $$;
 
 -- Attribute notation (spec §7.2): f.content is the view column; the rest are wrappers.
 CREATE FUNCTION kb.lines(f kb.file, l_from bigint, l_to bigint) RETURNS text LANGUAGE sql STABLE AS $$ SELECT kb.lines(f.path, l_from, l_to) $$;
@@ -437,7 +498,7 @@ mod kb {
         })
     }
 
-    fn file_by_path_r(path: &str) -> Result<NodeRow, TextdbError> {
+    pub(crate) fn file_by_path_r(path: &str) -> Result<NodeRow, TextdbError> {
         match node_by_path(path) {
             Some(n) if n.kind == 1 => Ok(n),
             Some(_) => Err(TextdbError::InvalidEdit(format!("{} is a folder", path))),
@@ -445,7 +506,7 @@ mod kb {
         }
     }
 
-    fn root_of_version_r(file_id: i64, version: u64) -> Result<Hash, TextdbError> {
+    pub(crate) fn root_of_version_r(file_id: i64, version: u64) -> Result<Hash, TextdbError> {
         let root = Spi::get_one_with_args::<Vec<u8>>(
             "SELECT root FROM kb.commit WHERE file_id = $1 AND version = $2",
             &[file_id.into(), (version as i64).into()],
@@ -473,7 +534,7 @@ mod kb {
         Some(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    fn node_by_path(path: &str) -> Option<NodeRow> {
+    pub(crate) fn node_by_path(path: &str) -> Option<NodeRow> {
         NodeRow::by_path(path, false)
     }
 
@@ -493,7 +554,7 @@ mod kb {
     }
 
     /// `mkdir -p` of a normalized path; each folder it creates gets a `mkdir` feed row.
-    fn ensure_folder(path: &str) -> Result<i64, TextdbError> {
+    pub(crate) fn ensure_folder(path: &str) -> Result<i64, TextdbError> {
         if let Some(n) = node_by_path(path) {
             if n.kind != 0 {
                 return Err(TextdbError::InvalidEdit(format!("{} is a file", path)));
@@ -621,7 +682,8 @@ mod kb {
         message: Option<&str>,
     ) -> i64 {
         Spi::run_with_args(
-            "WITH c AS (INSERT INTO kb.change(op, node_id, node_kind, path, old_path, version, base_version, commit_kind, author, message) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING seq) SELECT pg_notify('textdb_change', seq::text) FROM c",
+            "WITH c AS (INSERT INTO kb.change(op, node_id, node_kind, path, old_path, version, base_version, commit_kind, author, message, batch) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, kb.batch()) RETURNING seq) SELECT pg_notify('textdb_change', seq::text) FROM c",
             &[
                 op.into(),
                 node_id.into(),
@@ -716,7 +778,7 @@ mod kb {
             _ => ok(words_at(&st, &c.root)) as i64,
         };
         Spi::run_with_args(
-            "INSERT INTO kb.commit(file_id, version, root, parent_root, author, message, nbytes, nlines, kind, base_version) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            "INSERT INTO kb.commit(file_id, version, root, parent_root, author, message, nbytes, nlines, kind, base_version, batch) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, kb.batch())",
             &[
                 file_id.into(),
                 (c.version as i64).into(),
@@ -770,7 +832,7 @@ mod kb {
             let bytes = ok(materialize(&st, &c.root));
             let s = MarkdownExtractor.extract(&bytes);
             // HEAD-only structure rows (ADR 0007).
-            for t in ["kb.section", "kb.link", "kb.frontmatter"] {
+            for t in ["kb.section", "kb.frontmatter"] {
                 Spi::run_with_args(&format!("DELETE FROM {} WHERE file_id = $1", t), &[file_id.into()]).unwrap_or_else(|e| spi_err(e));
             }
             for sec in &s.sections {
@@ -787,13 +849,7 @@ mod kb {
                 )
                 .unwrap_or_else(|e| spi_err(e));
             }
-            for l in &s.links {
-                Spi::run_with_args(
-                    "INSERT INTO kb.link(file_id, version, target_path, line) VALUES ($1, $2, $3, $4)",
-                    &[file_id.into(), (c.version as i64).into(), l.target_path.as_str().into(), (l.line as i64).into()],
-                )
-                .unwrap_or_else(|e| spi_err(e));
-            }
+            ok(crate::links::write_rows(file_id, c.version as i64, &s.links));
             if let Some(fm) = &s.frontmatter {
                 Spi::run_with_args(
                     "INSERT INTO kb.frontmatter(file_id, version, data) VALUES ($1, $2, $3::jsonb) ON CONFLICT (file_id, version) DO UPDATE SET data = EXCLUDED.data",
@@ -801,6 +857,12 @@ mod kb {
                 )
                 .unwrap_or_else(|e| spi_err(e));
             }
+            // This file's links, and links to its headings, which may have changed.
+            ok(crate::links::relink_file(file_id));
+        }
+        if c.version == 1 {
+            // Links elsewhere may have been waiting for a file of this name.
+            ok(crate::links::relink(&[textdb_md::resolve::name_key(path)], &[]));
         }
     }
 
@@ -810,7 +872,7 @@ mod kb {
         ok(create_impl(path, content, author, message))
     }
 
-    fn create_impl(path: &str, content: &str, author: Option<&str>, message: Option<&str>) -> Result<i64, TextdbError> {
+    pub(crate) fn create_impl(path: &str, content: &str, author: Option<&str>, message: Option<&str>) -> Result<i64, TextdbError> {
         let path = normalize_path(path)?;
         if node_by_path(&path).is_some() {
             return Err(TextdbError::InvalidEdit(format!("{} already exists", path)));
@@ -865,16 +927,65 @@ mod kb {
     /// that landed elsewhere in the meantime are rebased over (or TX001 on the same lines).
     /// JSON outcome; `kb.replace_lines(...)` (SQL) raises from it.
     #[pg_extern(volatile)]
-    fn _replace_lines_j(path: &str, l_from: i64, l_to: i64, body: &str, base_version: Option<i64>, author: Option<&str>) -> pgrx::JsonB {
-        json_result(replace_lines_impl(path, l_from, l_to, body, base_version, author))
+    fn _replace_lines_j(
+        path: &str,
+        l_from: i64,
+        l_to: i64,
+        body: &str,
+        base_version: Option<i64>,
+        author: Option<&str>,
+        message: default!(Option<&str>, "NULL"),
+    ) -> pgrx::JsonB {
+        let ranges = [(l_from.max(0) as u64, l_to.max(0) as u64, body.as_bytes().to_vec())];
+        json_result(replace_ranges_impl(path, &ranges, base_version, author, message))
     }
 
-    fn replace_lines_impl(path: &str, l_from: i64, l_to: i64, body: &str, base_version: Option<i64>, author: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
+    /// Several line ranges `[{"from", "to", "text"}]` in one commit (`kb.replace_ranges` in SQL).
+    #[pg_extern(volatile)]
+    fn _replace_ranges_j(path: &str, ranges: pgrx::JsonB, base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> pgrx::JsonB {
+        let usage = || TextdbError::InvalidEdit("ranges must be a JSON array of {\"from\": n, \"to\": n, \"text\": \"…\"}".into());
+        let parsed: Result<Vec<(u64, u64, Vec<u8>)>, TextdbError> = match ranges.0.as_array() {
+            None => Err(usage()),
+            Some(items) => items
+                .iter()
+                .map(|r| {
+                    let from = r.get("from").and_then(serde_json::Value::as_i64).ok_or_else(usage)?;
+                    let to = r.get("to").and_then(serde_json::Value::as_i64).ok_or_else(usage)?;
+                    let text = r.get("text").and_then(serde_json::Value::as_str).ok_or_else(usage)?;
+                    Ok((from.max(0) as u64, to.max(0) as u64, text.as_bytes().to_vec()))
+                })
+                .collect(),
+        };
+        json_result(parsed.and_then(|ranges| replace_ranges_impl(path, &ranges, base_version, author, message)))
+    }
+
+    /// Replace line ranges `(from, to, text)` (1-based, inclusive), all numbered as in
+    /// `base_version` (HEAD when NULL), in one commit. `to = from - 1` inserts in front of `from`;
+    /// `from` one past the last line appends. They may come in any order but must not overlap or
+    /// start at the same line. Committed with that base version, so commits that landed elsewhere
+    /// in the meantime are rebased over (or TX001 on the same lines).
+    pub(crate) fn replace_ranges_impl(
+        path: &str,
+        ranges: &[(u64, u64, Vec<u8>)],
+        base_version: Option<i64>,
+        author: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<(i64, CommitKind), TextdbError> {
         let path = normalize_path(path)?;
-        let from = l_from.max(0) as u64;
-        let to = l_to.max(0) as u64;
-        if from == 0 || to + 1 < from {
-            return Err(TextdbError::InvalidEdit(format!("invalid line range {}-{}", from, to)));
+        let mut sorted: Vec<&(u64, u64, Vec<u8>)> = ranges.iter().collect();
+        sorted.sort_by_key(|r| r.0);
+        if sorted.is_empty() {
+            return Err(TextdbError::InvalidEdit("no line ranges".into()));
+        }
+        for &&(from, to, _) in &sorted {
+            if from == 0 || to + 1 < from {
+                return Err(TextdbError::InvalidEdit(format!("invalid line range {}-{}", from, to)));
+            }
+        }
+        for w in sorted.windows(2) {
+            if w[1].0 <= w[0].1 || w[1].0 == w[0].0 {
+                return Err(TextdbError::InvalidEdit(format!("line ranges {}-{} and {}-{} overlap", w[0].0, w[0].1, w[1].0, w[1].1)));
+            }
         }
         let n = file_by_path_r(&path)?;
         let base_v = base_version.map_or(n.version, |v| v.max(0));
@@ -882,35 +993,63 @@ mod kb {
             Some(r) if base_v == n.version => r,
             _ => root_of_version_r(n.id, base_v as u64)?,
         };
-        let edit = {
+        let mut edits = Vec::with_capacity(sorted.len());
+        {
             let st = SpiStorage::new();
             let (len, newlines) = totals(&st, &root)?;
             let unterminated = len > 0 && materialize_range(&st, &root, len - 1, len)? != b"\n";
             let nlines = newlines + unterminated as u64;
-            if from - 1 > nlines || to > nlines {
-                return Err(TextdbError::InvalidEdit(format!(
-                    "lines {}-{} are outside {}, which has {} lines at version {}",
-                    from, to, path, nlines, base_v
-                )));
-            }
-            let mut replacement = body.as_bytes().to_vec();
-            let start = match locate_line(&st, &root, from - 1)? {
-                Some(off) => off,
-                // Appending after a last line with no newline: supply one, or the new text
-                // would run on from that line instead of following it.
-                None => {
-                    replacement.insert(0, b'\n');
-                    len
+            for &&(from, to, ref body) in &sorted {
+                if from - 1 > nlines || to > nlines {
+                    return Err(TextdbError::InvalidEdit(format!(
+                        "lines {}-{} are outside {}, which has {} lines at version {}",
+                        from, to, path, nlines, base_v
+                    )));
                 }
-            };
-            let end = if to < from { start } else { locate_line(&st, &root, to)?.unwrap_or(len) };
-            Edit::new(start, end, replacement)
-        };
-        commit_edits_impl(&path, &[edit], Some(base_v), author, Some("replace-lines"))
+                let mut replacement = body.clone();
+                let start = match locate_line(&st, &root, from - 1)? {
+                    Some(off) => off,
+                    // Appending after a last line with no newline: supply one, or the new text
+                    // would run on from that line instead of following it.
+                    None => {
+                        replacement.insert(0, b'\n');
+                        len
+                    }
+                };
+                let end = if to < from { start } else { locate_line(&st, &root, to)?.unwrap_or(len) };
+                edits.push(Edit::new(start, end, replacement));
+            }
+        }
+        commit_edits_impl(&path, &edits, Some(base_v), author, message.or(Some("replace-lines")))
+    }
+
+    /// Text replacements as one version (`kb.replace`, `kb.replace_many` in SQL). JSON outcome.
+    #[pg_extern(volatile)]
+    fn _replace_many_j(path: &str, replacements: pgrx::JsonB, author: Option<&str>, message: Option<&str>) -> pgrx::JsonB {
+        json_result(crate::bulk::parse_replacements(&replacements.0).and_then(|r| replace_text_impl(path, &r, author, message)))
+    }
+
+    /// Apply `replacements` in order to the current content and commit the result as one version.
+    /// A count that does not match (or none found, without an expected count) fails the whole call.
+    pub(crate) fn replace_text_impl(
+        path: &str,
+        replacements: &[crate::bulk::Replacement],
+        author: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<(i64, CommitKind), TextdbError> {
+        let path = normalize_path(path)?;
+        if replacements.is_empty() {
+            return Err(TextdbError::InvalidEdit("no replacements given".into()));
+        }
+        let n = file_by_path_r(&path)?;
+        let root = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
+        let text = crate::bulk::apply_replacements(&path, materialize(&SpiStorage::new(), &root)?, replacements)?;
+        let text = String::from_utf8(text).map_err(|_| TextdbError::InvalidEdit(format!("{path}: the replaced content is not valid UTF-8")))?;
+        update_content_impl(&path, &text, Some(n.version), author, message.or(Some("replace")))
     }
 
     /// Commit a byte-range edit set expressed against `base_version` (or HEAD).
-    fn commit_edits_impl(path: &str, edits: &[Edit], base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
+    pub(crate) fn commit_edits_impl(path: &str, edits: &[Edit], base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
         let n = file_by_path_r(path)?;
         let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.to_string()))?;
         let base = match base_version {
@@ -932,7 +1071,7 @@ mod kb {
         json_result(update_content_impl(path, content, base_version, author, message))
     }
 
-    fn update_content_impl(path: &str, content: &str, base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
+    pub(crate) fn update_content_impl(path: &str, content: &str, base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
         let path = normalize_path(path)?;
         let n = file_by_path_r(&path)?;
         let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
@@ -968,11 +1107,11 @@ mod kb {
     /// Strict replace: `old` must occur exactly once in the current content (spec §7.2 `edit`).
     /// JSON outcome; `kb.edit(...)` (SQL) raises from it.
     #[pg_extern(volatile)]
-    fn _edit_j(path: &str, old: &str, new: &str, author: Option<&str>) -> pgrx::JsonB {
-        json_result(edit_impl(path, old, new, author))
+    fn _edit_j(path: &str, old: &str, new: &str, author: Option<&str>, message: default!(Option<&str>, "NULL")) -> pgrx::JsonB {
+        json_result(edit_impl(path, old, new, author, message))
     }
 
-    fn edit_impl(path: &str, old: &str, new: &str, author: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
+    fn edit_impl(path: &str, old: &str, new: &str, author: Option<&str>, message: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
         let path = normalize_path(path)?;
         let n = file_by_path_r(&path)?;
         let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
@@ -982,7 +1121,7 @@ mod kb {
         let edits = [Edit::new(pos as u64, (pos + old.len()) as u64, new.as_bytes().to_vec())];
         let c = commit(&mut st, &P, n.id as u64, &path, &cur, &edits, RETRIES)?;
         if c.kind != CommitKind::NoOp {
-            record_commit(n.id, &path, &c, Some(&cur), Some(n.version), author, Some("edit"));
+            record_commit(n.id, &path, &c, Some(&cur), Some(n.version), author, message.or(Some("edit")));
         }
         Ok((c.version as i64, c.kind))
     }
@@ -1009,18 +1148,18 @@ mod kb {
 
     /// Append at the current end; never conflicts. JSON outcome; `kb.append(...)` (SQL) raises.
     #[pg_extern(volatile)]
-    fn _append_j(path: &str, tail: &str, author: Option<&str>) -> pgrx::JsonB {
-        json_result(append_impl(path, tail, author))
+    fn _append_j(path: &str, tail: &str, author: Option<&str>, message: default!(Option<&str>, "NULL")) -> pgrx::JsonB {
+        json_result(append_impl(path, tail, author, message))
     }
 
-    fn append_impl(path: &str, tail: &str, author: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
+    fn append_impl(path: &str, tail: &str, author: Option<&str>, message: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
         let path = normalize_path(path)?;
         let n = file_by_path_r(&path)?;
         let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let mut st = SpiStorage::new();
         let c = commit_append(&mut st, &P, n.id as u64, &path, tail.as_bytes(), RETRIES)?;
         if c.kind != CommitKind::NoOp {
-            record_commit(n.id, &path, &c, Some(&cur), Some(n.version), author, Some("append"));
+            record_commit(n.id, &path, &c, Some(&cur), Some(n.version), author, message.or(Some("append")));
         }
         Ok((c.version as i64, c.kind))
     }
@@ -1028,16 +1167,37 @@ mod kb {
     /// Rename/move a file or folder: subtree path rewrite in one statement, ids stable.
     #[pg_extern(volatile)]
     fn _rename(from: &str, to: &str) {
-        ok(rename_impl(from, to, None))
+        ok(rename_impl(from, to, None, None, None, false));
     }
 
-    /// As `_rename`, attributing the move in the change feed (`kb.move` in SQL).
+    /// As `_rename`, attributing the move in the change feed (`kb.move` in SQL). Links follow
+    /// the store's link_updates setting, rewritten only when it says rewrite.
     #[pg_extern(volatile)]
-    fn _move(from_path: &str, to_path: &str, author: Option<&str>) {
-        ok(rename_impl(from_path, to_path, author))
+    fn _move(from_path: &str, to_path: &str, author: Option<&str>, message: default!(Option<&str>, "NULL")) {
+        ok(rename_impl(from_path, to_path, author, message, None, false));
     }
 
-    fn rename_impl(from: &str, to: &str, author: Option<&str>) -> Result<(), TextdbError> {
+    /// As `_move`, returning the links that pointed at what moved (`kb.move_links` in SQL).
+    #[pg_extern(volatile)]
+    fn _move_links_j(from_path: &str, to_path: &str, author: Option<&str>, message: Option<&str>, links: Option<&str>) -> pgrx::JsonB {
+        pgrx::JsonB(match rename_impl(from_path, to_path, author, message, links, true) {
+            Ok(changes) => serde_json::json!({ "links": changes }),
+            Err(e) => error_json(&e),
+        })
+    }
+
+    /// Move `from` to `to`; then the links that pointed at what moved and no longer reach it are
+    /// rewritten (mode `rewrite`) and, with `report`, returned. `links` chooses the mode, else the
+    /// store's link_updates setting; a caller that does not read the result (`report = false`)
+    /// skips reporting.
+    pub(crate) fn rename_impl(
+        from: &str,
+        to: &str,
+        author: Option<&str>,
+        message: Option<&str>,
+        links: Option<&str>,
+        report: bool,
+    ) -> Result<Vec<serde_json::Value>, TextdbError> {
         let from = normalize_path(from)?;
         let to = normalize_path(to)?;
         if from == "/" || to == "/" {
@@ -1051,9 +1211,16 @@ mod kb {
             return Err(TextdbError::InvalidEdit(format!("{} already exists", to)));
         }
         let parent = ensure_folder(parent_of(&to))?;
+        let before = crate::links::files_at(&from)?;
+        let mode = crate::links::mode(links)?;
+        let pointing = match mode {
+            textdb_md::resolve::LinkUpdates::Off => Vec::new(),
+            textdb_md::resolve::LinkUpdates::Report if !report => Vec::new(),
+            _ => crate::links::links_into(&before)?,
+        };
         let moved = subtree_totals(src.id)?;
         add_to_ancestors(&from, &moved.neg())?;
-        let seq = record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, None);
+        let seq = record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, message);
         if path_history_enabled()? {
             record_path_events(PathOp::classify(&from, &to), &src, Some(&to), author, seq)?;
         }
@@ -1068,38 +1235,65 @@ mod kb {
         )
         .map_err(storage_err)?;
         add_to_ancestors(&to, &moved)?;
-        Ok(())
+        let after = crate::links::files_at(&to)?;
+        let names = crate::links::names_of(&before.iter().chain(&after).cloned().collect::<Vec<_>>());
+        crate::links::relink(&names, &after.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
+        crate::links::follow_move(pointing, &from, &to, mode, |path, edits, msg| {
+            commit_edits_impl(path, edits, None, author, Some(msg)).map(|(version, _)| version)
+        })
+    }
+
+    /// The changes after change number `seq`, or under `batch` (`kb.changes_after`, `kb.batch_changes`).
+    #[pg_extern(stable)]
+    fn _changes_j(seq: Option<i64>, batch: Option<&str>) -> pgrx::JsonB {
+        pgrx::JsonB(crate::bulk::changes(seq, batch).unwrap_or_else(|e| error_json(&e)))
+    }
+
+    /// Undo a batch (`kb.revert_batch` in SQL).
+    #[pg_extern(volatile)]
+    fn _revert_batch_j(batch: &str, author: Option<&str>, skip_changed: bool) -> pgrx::JsonB {
+        pgrx::JsonB(crate::bulk::revert(batch, author, skip_changed).unwrap_or_else(|e| error_json(&e)))
+    }
+
+    /// An error as the JSON the PL/pgSQL wrappers raise from.
+    fn error_json(e: &TextdbError) -> serde_json::Value {
+        serde_json::json!({ "code": e.code(), "message": e.to_string(), "detail": "" })
     }
 
     /// Tombstone a file or folder subtree; content and history retained.
     #[pg_extern(volatile)]
     fn _delete(path: &str) {
-        ok(delete_impl(path, None))
+        ok(delete_impl(path, None, None))
     }
 
     /// As `_delete`, attributing the change in the feed (`kb.remove` in SQL).
     #[pg_extern(volatile)]
-    fn _remove(path: &str, author: Option<&str>) {
-        ok(delete_impl(path, author))
+    fn _remove(path: &str, author: Option<&str>, message: default!(Option<&str>, "NULL")) {
+        ok(delete_impl(path, author, message))
     }
 
-    fn delete_impl(path: &str, author: Option<&str>) -> Result<(), TextdbError> {
+    pub(crate) fn delete_impl(path: &str, author: Option<&str>, message: Option<&str>) -> Result<(), TextdbError> {
         let path = normalize_path(path)?;
         if path == "/" {
             return Err(TextdbError::InvalidEdit("cannot delete the root".into()));
         }
         let n = node_by_path(&path).ok_or_else(|| TextdbError::NotFound(path.clone()))?;
+        let files = crate::links::files_at(&path)?;
         let gone = subtree_totals(n.id)?;
         add_to_ancestors(&path, &gone.neg())?;
-        let seq = record_change("delete", n.id, n.kind, &path, None, None, None, None, author, None);
+        let seq = record_change("delete", n.id, n.kind, &path, None, None, None, None, author, message);
         if path_history_enabled()? {
             record_path_events(PathOp::Delete, &n, None, author, seq)?;
         }
         Spi::run_with_args(
-            "UPDATE kb.node SET deleted_at = now() WHERE (path = $1 OR path LIKE kb._subtree_like($1)) AND deleted_at IS NULL",
+            // One timestamp for the whole subtree, distinct from other deletes in the same
+            // transaction: reverting a batch finds what one delete took by it.
+            "UPDATE kb.node SET deleted_at = t.ts FROM (SELECT clock_timestamp() AS ts) t \
+             WHERE (path = $1 OR path LIKE kb._subtree_like($1)) AND deleted_at IS NULL",
             &[path.as_str().into()],
         )
         .map_err(storage_err)?;
+        crate::links::relink(&crate::links::names_of(&files), &files.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
         Ok(())
     }
 
@@ -1177,6 +1371,7 @@ mod kb {
             name!(message, Option<String>),
             name!(kind, Option<String>),
             name!(base_version, Option<i64>),
+            name!(nbytes, Option<i64>),
         ),
     > {
         let path = ok(normalize_path(path));
@@ -1184,7 +1379,7 @@ mod kb {
         let rows: Vec<_> = Spi::connect(|client| {
             let t = client
                 .select(
-                    "SELECT version, author, ts, message, kind, base_version FROM kb.commit WHERE file_id = $1 ORDER BY version",
+                    "SELECT version, author, ts, message, kind, base_version, nbytes FROM kb.commit WHERE file_id = $1 ORDER BY version",
                     None,
                     &[n.id.into()],
                 )
@@ -1198,6 +1393,7 @@ mod kb {
                     r.get::<String>(4).unwrap_or_else(|e| spi_err(e)),
                     r.get::<String>(5).unwrap_or_else(|e| spi_err(e)),
                     r.get::<i64>(6).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<i64>(7).unwrap_or_else(|e| spi_err(e)),
                 ));
             }
             v
@@ -1532,12 +1728,12 @@ mod kb {
             let leaf = ok(leaves(&st, &root)).into_iter().find(|l| l.hash == hash);
             let (line, snippet) = match leaf {
                 Some(l) => {
-                    let (li, sn) = locate_terms(&bytes, &terms[..1]);
+                    let (li, sn) = locate_terms(&bytes, &terms);
                     (l.line_off as i64 + li as i64 + 1, sn)
                 }
                 None => {
                     let body = ok(materialize(&st, &root));
-                    let (li, sn) = locate_terms(&body, &terms[..1]);
+                    let (li, sn) = locate_terms(&body, &terms);
                     if sn.is_empty() {
                         continue;
                     }
@@ -1592,23 +1788,25 @@ mod kb {
         }
     }
 
+    /// The line (0-based, within `bytes`) holding the most of the query's terms — the first such
+    /// line — and that line as the snippet; line 0 when none holds any. As `locate_terms` in the
+    /// SQLite binding: terms compared as lower case text, a prefix without its `*`.
     fn locate_terms(bytes: &[u8], terms: &[String]) -> (usize, String) {
-        let text = String::from_utf8_lossy(bytes).to_lowercase();
-        let mut best: Option<usize> = None;
-        for t in terms {
-            let t = t.trim_end_matches('*').to_lowercase();
-            if t.is_empty() {
-                continue;
-            }
-            if let Some(p) = text.find(&t) {
-                best = Some(best.map_or(p, |b| b.min(p)));
+        let raw = String::from_utf8_lossy(bytes);
+        let wanted: Vec<String> = terms.iter().map(|t| t.trim_end_matches('*').to_lowercase()).filter(|t| !t.is_empty()).collect();
+        let (mut best_count, mut best_line) = (0, 0);
+        for (i, line) in raw.lines().enumerate() {
+            let lower = line.to_lowercase();
+            let n = wanted.iter().filter(|t| lower.contains(t.as_str())).count();
+            if n > best_count {
+                (best_count, best_line) = (n, i);
+                if n == wanted.len() {
+                    break;
+                }
             }
         }
-        let pos = best.unwrap_or(0);
-        let line = text[..pos].matches('\n').count();
-        let raw = String::from_utf8_lossy(bytes);
-        let snippet = raw.lines().nth(line).unwrap_or("").chars().take(200).collect();
-        (line, snippet)
+        let snippet = raw.lines().nth(best_line).unwrap_or("").chars().take(200).collect();
+        (best_line, snippet)
     }
 
     #[allow(dead_code)]
@@ -1632,6 +1830,105 @@ mod tests {
         Spi::run("SELECT kb.move('/notes/a.md', '/archive/a.md', 'tester')").unwrap();
         assert_eq!(one::<String>("SELECT path FROM kb.file WHERE name = 'a.md'").as_deref(), Some("/archive/a.md"));
         assert_eq!(one::<i64>("SELECT count(*) FROM kb.feed(0) WHERE op = 'move' AND author = 'tester'"), Some(1));
+    }
+
+    #[pg_test]
+    fn links_resolve_stay_current_and_follow_moves() {
+        Spi::run("SELECT kb.write('/notes/Plan.md', E'# Plan\\n\\n## Next steps\\n')").unwrap();
+        Spi::run(
+            "SELECT kb.write('/acc/acme.md', E'[[Plan]] [[Plan#Next steps]] [[plan#Nope]]\\n[x](../notes/Plan.md) [[Missing]] ![[deck.pdf]] [[notes/]] [w](https://x.y)\\n')",
+        )
+        .unwrap();
+        let statuses = "SELECT string_agg(coalesce(status, '?'), ',' ORDER BY id) FROM kb.link";
+        assert_eq!(one::<String>(statuses).as_deref(), Some("ok,ok,anchor-missing,ok,broken,not-in-store,folder,external"));
+
+        // A new file resolves links that waited for it; a second of the same name makes them ambiguous.
+        Spi::run("SELECT kb.write('/Missing.md', 'here')").unwrap();
+        assert_eq!(one::<String>("SELECT status FROM kb.link WHERE target_path = 'Missing'").as_deref(), Some("ok"));
+        Spi::run("SELECT kb.write('/other/Plan.md', 'other')").unwrap();
+        assert_eq!(one::<String>("SELECT status FROM kb.link WHERE target_path = 'Plan' AND anchor IS NULL").as_deref(), Some("ambiguous"));
+        Spi::run("SELECT kb.remove('/other/Plan.md', 'tester', 'not needed')").unwrap();
+        assert_eq!(one::<String>("SELECT status FROM kb.link WHERE target_path = 'Plan' AND anchor IS NULL").as_deref(), Some("ok"));
+        assert_eq!(one::<String>("SELECT message FROM kb.change WHERE op = 'delete'").as_deref(), Some("not needed"));
+
+        // Reported, not changed; then back, then rewritten in the style each link was written.
+        let report = one::<pgrx::JsonB>("SELECT kb.move_links('/notes/Plan.md', '/archive/Plan-v1.md', 'tester', NULL, 'report')").unwrap();
+        assert_eq!(report.0["links"].as_array().map(Vec::len), Some(4), "{}", report.0);
+        Spi::run("SELECT kb.move_links('/archive/Plan-v1.md', '/notes/Plan.md', NULL, NULL, 'off')").unwrap();
+        assert_eq!(one::<String>(statuses).as_deref(), Some("ok,ok,anchor-missing,ok,ok,not-in-store,folder,external"));
+        let rewrite = one::<pgrx::JsonB>("SELECT kb.move_links('/notes/Plan.md', '/archive/2026/Plan-v1.md', 'tester', NULL, 'rewrite')").unwrap();
+        assert!(rewrite.0["links"].as_array().unwrap().iter().all(|l| !l["version"].is_null()), "{}", rewrite.0);
+        assert_eq!(
+            one::<String>("SELECT kb.content('/acc/acme.md')").as_deref(),
+            Some("[[Plan-v1]] [[Plan-v1#Next steps]] [[Plan-v1#Nope]]\n[x](../archive/2026/Plan-v1.md) [[Missing]] ![[deck.pdf]] [[notes/]] [w](https://x.y)\n")
+        );
+        assert_eq!(one::<String>("SELECT kb.set_setting('link_updates', 'Rewrite')").as_deref(), Some("rewrite"));
+    }
+
+    #[pg_test]
+    fn messages_line_ranges_and_replacements() {
+        let content = "SELECT kb.content('/p/a.md')";
+        Spi::run("SELECT kb.write('/p/a.md', E'Acme one\\nAcme two\\n- item\\n')").unwrap();
+        Spi::run("SELECT kb.edit('/p/a.md', 'one', 'uno', 'ana', 'spanish')").unwrap();
+        Spi::run("SELECT kb.append('/p/a.md', E'tail\\n', 'ana', 'more')").unwrap();
+        Spi::run("SELECT kb.replace_lines('/p/a.md', 3, 3, E'- point\\n', NULL, 'ana', 'point')").unwrap();
+        let w = one::<pgrx::JsonB>(r#"SELECT kb.replace_ranges('/p/a.md', '[{"from": 4, "to": 3, "text": "x\n"}, {"from": 1, "to": 1, "text": "ONE\n"}]', 4, 'ana', 'ranges')"#).unwrap();
+        assert_eq!(w.0["version"], 5, "{}", w.0);
+        assert_eq!(one::<String>(content).as_deref(), Some("ONE\nAcme two\n- point\nx\ntail\n"));
+        assert_eq!(
+            one::<String>("SELECT string_agg(message, ',' ORDER BY version) FROM kb.commit WHERE file_id = kb._node_id('/p/a.md')").as_deref(),
+            Some("spanish,more,point,ranges")
+        );
+        assert_eq!(one::<String>("SELECT string_agg(message, ',' ORDER BY seq) FROM kb.change WHERE op = 'commit'").as_deref(), Some("spanish,more,point,ranges"));
+        let overlap = one::<pgrx::JsonB>(r#"SELECT kb._replace_ranges_j('/p/a.md', '[{"from": 1, "to": 2, "text": ""}, {"from": 2, "to": 2, "text": ""}]', NULL, NULL, NULL)"#).unwrap();
+        assert_eq!(overlap.0["code"], "TX004", "{}", overlap.0);
+
+        // Replacements: counts checked, several in one version.
+        let wrong = one::<pgrx::JsonB>(r#"SELECT kb._replace_many_j('/p/a.md', '[["Acme", "Globex", 2]]', NULL, NULL)"#).unwrap();
+        assert!(wrong.0["message"].as_str().unwrap().contains("expected 2 occurrences of \"Acme\", found 1"), "{}", wrong.0);
+        assert_eq!(one::<i64>(r#"SELECT kb.replace_many('/p/a.md', '[["Acme", "Globex", 1], {"old": "- point", "new": "- item"}]', 'ana')"#), Some(6));
+        assert_eq!(one::<i64>("SELECT kb.replace('/p/a.md', 'tail', 'end')"), Some(7));
+        assert_eq!(one::<String>(content).as_deref(), Some("ONE\nGlobex two\n- item\nx\nend\n"));
+        assert_eq!(one::<String>("SELECT message FROM kb.commit WHERE file_id = kb._node_id('/p/a.md') AND version = 7").as_deref(), Some("replace"));
+
+        // The snippet is the line holding the most terms; history has sizes.
+        Spi::run("SELECT kb.write('/s.md', E'alpha\\nbeta\\nalpha beta\\n')").unwrap();
+        assert_eq!(one::<i64>("SELECT line FROM kb.search('alpha beta')"), Some(3));
+        assert_eq!(one::<i64>("SELECT nbytes FROM kb.history('/s.md')"), Some(22));
+    }
+
+    #[pg_test]
+    fn batches_are_listed_and_reverted() {
+        Spi::run("SELECT kb.write('/p/a.md', E'Acme\\n')").unwrap();
+        Spi::run("SELECT kb.write('/p/b.md', E'bee\\n')").unwrap();
+        Spi::run("SELECT kb.write('/p/old/c.md', E'gone soon\\n')").unwrap();
+        assert_eq!(one::<String>("SELECT kb.batch()"), None);
+        Spi::run("SELECT set_config('textdb.batch', 'b1', true)").unwrap();
+        assert_eq!(one::<String>("SELECT kb.batch()").as_deref(), Some("b1"));
+        Spi::run("SELECT kb.replace('/p/a.md', 'Acme', 'Globex')").unwrap();
+        Spi::run("SELECT kb.write('/p/new.md', 'new')").unwrap();
+        Spi::run("SELECT kb.move('/p/b.md', '/p/b2.md')").unwrap();
+        Spi::run("SELECT kb.remove('/p/old')").unwrap();
+        Spi::run("SELECT set_config('textdb.batch', '', true)").unwrap();
+        assert_eq!(one::<i64>("SELECT count(*) FROM kb.change WHERE batch = 'b1'"), Some(4));
+        assert_eq!(one::<i64>("SELECT count(*) FROM kb.commit WHERE batch = 'b1'"), Some(2));
+        let changes = one::<pgrx::JsonB>("SELECT kb.batch_changes('b1')").unwrap().0;
+        let ops: Vec<&str> = changes.as_array().unwrap().iter().map(|c| c["op"].as_str().unwrap()).collect();
+        assert_eq!(ops, ["edit", "create", "move", "delete"], "{changes}");
+        assert!(changes[0]["diff"].as_str().unwrap().contains("-Acme\n+Globex\n"), "{changes}");
+
+        let r = one::<pgrx::JsonB>("SELECT kb.revert_batch('b1', 'ana')").unwrap().0;
+        assert_eq!(r["removed"], serde_json::json!(["/p/new.md"]), "{r}");
+        assert_eq!(r["moved_back"], serde_json::json!([{ "from": "/p/b2.md", "to": "/p/b.md" }]), "{r}");
+        assert_eq!(r["recreated"], serde_json::json!(["/p/old/c.md"]), "{r}");
+        assert_eq!(r["restored"][0]["path"], "/p/a.md", "{r}");
+        assert_eq!(one::<String>("SELECT kb.content('/p/a.md')").as_deref(), Some("Acme\n"));
+        assert_eq!(one::<String>("SELECT kb.content('/p/old/c.md')").as_deref(), Some("gone soon\n"));
+        assert_eq!(one::<String>("SELECT kb.content('/p/b.md')").as_deref(), Some("bee\n"));
+        let again = one::<pgrx::JsonB>("SELECT kb._revert_batch_j('b1', NULL, false)").unwrap().0;
+        assert_eq!(again["code"], "TX004", "{again}");
+        let unknown = one::<pgrx::JsonB>("SELECT kb._revert_batch_j('nope', NULL, false)").unwrap().0;
+        assert_eq!(unknown["code"], "TX003", "{unknown}");
     }
 }
 

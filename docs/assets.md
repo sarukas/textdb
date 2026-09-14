@@ -185,10 +185,10 @@ built on top, and make CI run Postgres for real (until now CI only built the ext
   choice and the rewrite of a link's target on a move move out of the SQLite binding into
   `textdb-md`, behind a small lookup trait each backend implements, so SQLite and Postgres
   cannot drift apart.
-- **Schema and upgrade.** `kb.link` gains `kind, anchor, alias, external, target_name,
-  resolved_id, status`; `kb.commit` / `kb.change` gain `batch`; `kb.sync` gains `rules`; the
-  missing indexes. `kb.migrate()` adds what an older install lacks (`ADD COLUMN IF NOT EXISTS`)
-  and backfills links; the CLI calls it on open.
+- **Schema.** `kb.link` gains `id, kind, anchor, alias, external, target_name, resolved_id,
+  status`; `kb.commit` / `kb.change` gain `batch`; `kb.sync` gains `rules`; the missing indexes.
+  The extension has no upgrade scripts (INSTALL.md: re-create), and no Postgres store has been
+  deployed, so the schema changes in place; upgrade scripts come with the first deployment.
 - **Links.** Link rows written with their parts; resolved at commit; re-resolved on create, move
   and delete; `link_updates` (off/report/rewrite) accepted by `kb.set_setting`; `kb.move` reports
   or rewrites links in the same transaction; `links`, `backlinks` and `mv --update-links` work.

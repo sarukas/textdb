@@ -228,6 +228,7 @@ pub fn sorted_ranges(ranges: &[LineRange]) -> Result<Vec<&LineRange>> {
 }
 
 /// `content` with `ranges` replaced, as `replace_line_ranges` in the SQLite binding does it.
+#[cfg(test)]
 pub fn splice_lines(content: &[u8], ranges: &[LineRange]) -> Result<Vec<u8>> {
     let sorted = sorted_ranges(ranges)?;
     let starts: Vec<usize> = std::iter::once(0)

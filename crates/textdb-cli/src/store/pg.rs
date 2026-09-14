@@ -11,8 +11,8 @@ use postgres::{Client, NoTls, Row};
 use textdb_sqlite::normalize_path;
 
 use super::{
-    BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, PathEvent, Result, RevertOutcome,
-    SqlResult, Stat, Store, StoreError, SyncBase, Written,
+    BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, LineRange, LinkRow, MovedBack, MovedLink,
+    PathEvent, RestoredFile, Result, RevertOutcome, SqlResult, Stat, Store, StoreError, SyncBase, Written,
 };
 
 /// The views `textdb sql` offers, as in SQLite: the live store by path. Temporary, so they live
@@ -37,9 +37,11 @@ CREATE OR REPLACE TEMP VIEW sections AS
   SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to
   FROM kb.section s JOIN kb.node n ON n.id = s.file_id AND n.deleted_at IS NULL;
 CREATE OR REPLACE TEMP VIEW links AS
-  SELECT n.path, l.target_path AS target, l.line FROM kb.link l JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL;
+  SELECT n.path, l.target_path AS target, l.line, l.kind, l.anchor, l.alias, l.status, r.path AS resolved
+  FROM kb.link l JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL
+  LEFT JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL;
 CREATE OR REPLACE TEMP VIEW commits AS
-  SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines
+  SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines, c.batch
   FROM kb.commit c JOIN kb.node n ON n.id = c.file_id AND n.deleted_at IS NULL;
 CREATE OR REPLACE TEMP VIEW authors AS
   SELECT n.path, nullif(a.author, '') AS author, a.commits, a.first_ts, a.last_ts
@@ -168,38 +170,6 @@ impl PgStore {
         })
     }
 
-    /// `kb.edit`, `kb.append` and `kb.replace_lines` take no message: put one on the commit they
-    /// made and on its change-log row.
-    fn label_commit(&mut self, path: &str, version: i64, message: Option<&str>) -> Result<()> {
-        let Some(message) = message else {
-            return Ok(());
-        };
-        self.client
-            .execute(
-                "WITH n AS (SELECT id FROM kb.node WHERE path = $2 AND deleted_at IS NULL), \
-                 c AS (UPDATE kb.commit SET message = $1 WHERE file_id = (SELECT id FROM n) AND version = $3 RETURNING 1) \
-                 UPDATE kb.change SET message = $1 WHERE node_id = (SELECT id FROM n) AND version = $3 AND op IN ('create', 'commit')",
-                &[&message, &path, &version],
-            )
-            .map_err(pg)?;
-        Ok(())
-    }
-
-    /// `kb.move` and `kb.remove` take no message: put one on the change-log row they wrote.
-    fn label_change(&mut self, op: &str, path: &str, old_path: Option<&str>, message: Option<&str>) -> Result<()> {
-        let Some(message) = message else {
-            return Ok(());
-        };
-        self.client
-            .execute(
-                "UPDATE kb.change SET message = $1 WHERE seq = \
-                 (SELECT max(seq) FROM kb.change WHERE op = $2 AND path = $3 AND old_path IS NOT DISTINCT FROM $4)",
-                &[&message, &op, &path, &old_path],
-            )
-            .map_err(pg)?;
-        Ok(())
-    }
-
     fn ensure_sync_tables(&mut self) -> Result<()> {
         if !self.sync_ready {
             self.client.batch_execute(SYNC_TABLES).map_err(pg)?;
@@ -208,21 +178,118 @@ impl PgStore {
         Ok(())
     }
 
-    /// `kb.edit` and `kb.append` return only the version; the commit row says how it landed.
-    fn written_at(&mut self, path: &str, version: i64) -> Result<Written> {
-        let kind: Option<String> = self
+    /// Links of live files matching `cond` (over `n`, the file written in, `l` and `r`, the file
+    /// resolved to), in path and line order.
+    fn link_rows(&mut self, cond: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<LinkRow>> {
+        let rows = self
             .client
-            .query_opt(
-                "SELECT c.kind FROM kb.commit c JOIN kb.node n ON n.id = c.file_id \
-                 WHERE n.path = $1 AND n.deleted_at IS NULL AND c.version = $2",
-                &[&path, &version],
+            .query(
+                &format!(
+                    "SELECT n.path, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status, r.path \
+                     FROM kb.link l JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL \
+                     LEFT JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL \
+                     WHERE {cond} ORDER BY n.path COLLATE \"C\", l.line, l.id"
+                ),
+                params,
             )
-            .map_err(pg)?
-            .and_then(|r| r.get(0));
-        Ok(Written {
-            version,
-            kind: kind.unwrap_or_else(|| "direct".to_string()),
-        })
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| LinkRow {
+                path: r.get(0),
+                line: r.get(1),
+                kind: r.get(2),
+                target: r.get(3),
+                anchor: r.get(4),
+                alias: r.get(5),
+                status: r.get(6),
+                resolved: r.get(7),
+            })
+            .collect())
+    }
+}
+
+/// A batch id: when, and four random hex digits (`20260914-211500-3f9a`), as SQLite makes them.
+const NEW_BATCH_ID: &str = "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYYMMDD-HH24MISS') || '-' || substr(md5(random()::text), 1, 4)";
+
+/// `query` with each `:author` placeholder (outside strings, quoted names, comments and `::`
+/// casts) replaced by `$n`; `None` when it has none.
+fn author_placeholder(query: &str, n: usize) -> Option<String> {
+    let b = query.as_bytes();
+    let (mut out, mut i, mut last, mut found) = (String::with_capacity(query.len()), 0, 0, false);
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"') => {
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b'$' if i == 0 || !ident(b[i - 1]) => {
+                // A dollar-quoted string: $tag$ … $tag$.
+                let tag_end = b[i + 1..].iter().position(|c| !ident(*c)).map(|p| i + 1 + p);
+                match tag_end {
+                    Some(e) if b[e] == b'$' && !b[i + 1..e].first().is_some_and(u8::is_ascii_digit) => {
+                        let tag = &query[i..=e];
+                        i = query[e + 1..].find(tag).map_or(b.len(), |p| e + 1 + p + tag.len());
+                    }
+                    _ => i += 1,
+                }
+            }
+            b':' if b.get(i + 1) == Some(&b':') => i += 2,
+            b':' if query[i + 1..].starts_with("author") && !b.get(i + 7).is_some_and(|c| ident(*c)) => {
+                out.push_str(&query[last..i]);
+                out.push_str(&format!("${n}"));
+                i += 7;
+                last = i;
+                found = true;
+            }
+            _ => i += 1,
+        }
+    }
+    found.then(|| {
+        out.push_str(&query[last.min(query.len())..]);
+        out
+    })
+}
+
+/// A statement's own error: the SQL is the caller's, so anything but the store's own `TX00n`
+/// errors is reported as invalid input, as in SQLite.
+fn statement_error(e: postgres::Error, write: bool) -> StoreError {
+    let read_only = e.as_db_error().is_some_and(|db| db.code().code() == "25006");
+    let mut err = pg(e);
+    if err.code == "TX000" {
+        err.code = "TX004".to_string();
+    }
+    if read_only && !write {
+        err.message = format!("{}: this statement changes the store; run it with --write", err.message);
+    }
+    err
+}
+
+fn batch_change(v: &serde_json::Value) -> BatchChange {
+    let text = |k: &str| v[k].as_str().map(str::to_string);
+    BatchChange {
+        op: text("op").unwrap_or_default(),
+        path: text("path").unwrap_or_default(),
+        old_path: text("old_path"),
+        from_version: v["from_version"].as_i64(),
+        to_version: v["to_version"].as_i64(),
+        diff: text("diff"),
     }
 }
 
@@ -235,13 +302,14 @@ impl Store for PgStore {
         self.client.batch_execute("CREATE EXTENSION IF NOT EXISTS textdb_pg").map_err(pg)?;
         let current: bool = self
             .client
-            .query_one("SELECT to_regprocedure('kb.last_seq()') IS NOT NULL", &[])
+            .query_one("SELECT to_regprocedure('kb.revert_batch(text,text,boolean)') IS NOT NULL", &[])
             .map_err(pg)?
             .get(0);
         if !current {
             return Err(StoreError::other(
-                "the textdb_pg extension in this database predates the change feed; install the build from this \
-                 repository and recreate the extension",
+                "the textdb_pg extension in this database predates link resolution and batches; export the store, \
+                 install the build from this repository, recreate the extension (DROP EXTENSION textdb_pg CASCADE; \
+                 CREATE EXTENSION textdb_pg) and import again",
             ));
         }
         Ok(())
@@ -370,26 +438,20 @@ impl Store for PgStore {
 
     fn edit(&mut self, path: &str, old: &[u8], new: &[u8], author: Option<&str>, message: Option<&str>) -> Result<Written> {
         let (old, new) = (utf8(path, old)?, utf8(path, new)?);
-        let version: i64 = self
+        let row = self
             .client
-            .query_one("SELECT kb.edit($1, $2, $3, $4)", &[&path, &old, &new, &author])
-            .map_err(pg)?
-            .get(0);
-        let path = normalize_path(path)?;
-        self.label_commit(&path, version, message)?;
-        self.written_at(&path, version)
+            .query_one("SELECT kb._check_j(kb._edit_j($1, $2, $3, $4, $5))::text", &[&path, &old, &new, &author, &message])
+            .map_err(pg)?;
+        written(row.get(0))
     }
 
     fn append(&mut self, path: &str, tail: &[u8], author: Option<&str>, message: Option<&str>) -> Result<Written> {
         let tail = utf8(path, tail)?;
-        let version: i64 = self
+        let row = self
             .client
-            .query_one("SELECT kb.append($1, $2, $3)", &[&path, &tail, &author])
-            .map_err(pg)?
-            .get(0);
-        let path = normalize_path(path)?;
-        self.label_commit(&path, version, message)?;
-        self.written_at(&path, version)
+            .query_one("SELECT kb._check_j(kb._append_j($1, $2, $3, $4))::text", &[&path, &tail, &author, &message])
+            .map_err(pg)?;
+        written(row.get(0))
     }
 
     fn replace_lines(
@@ -406,19 +468,17 @@ impl Store for PgStore {
         let row = self
             .client
             .query_one(
-                "SELECT kb.replace_lines($1, $2, $3, $4, $5, $6)::text",
-                &[&path, &from, &to, &text, &base_version, &author],
+                "SELECT kb.replace_lines($1, $2, $3, $4, $5, $6, $7)::text",
+                &[&path, &from, &to, &text, &base_version, &author, &message],
             )
             .map_err(pg)?;
-        let w = written(row.get(0))?;
-        self.label_commit(&normalize_path(path)?, w.version, message)?;
-        Ok(w)
+        written(row.get(0))
     }
 
     fn history(&mut self, path: &str) -> Result<Vec<Commit>> {
         let rows = self
             .client
-            .query("SELECT version, author, ts::text, message, kind, base_version FROM kb.history($1)", &[&path])
+            .query("SELECT version, author, ts::text, message, kind, base_version, nbytes FROM kb.history($1)", &[&path])
             .map_err(pg)?;
         Ok(rows
             .iter()
@@ -427,7 +487,7 @@ impl Store for PgStore {
                 author: r.get(1),
                 ts: r.get(2),
                 message: r.get(3),
-                nbytes: None,
+                nbytes: r.get(6),
                 kind: r.get(4),
                 base_version: r.get(5),
             })
@@ -480,44 +540,83 @@ impl Store for PgStore {
             .collect())
     }
 
-    /// `kb.replace_lines` takes one range: splice them all into the base version and write that
-    /// against it, so commits made since are rebased as for one range.
     fn replace_ranges(
         &mut self,
         path: &str,
-        ranges: &[super::LineRange],
+        ranges: &[LineRange],
         base_version: Option<i64>,
         author: Option<&str>,
         message: Option<&str>,
     ) -> Result<Written> {
-        let (content, v) = self.read(path, base_version)?;
-        let spliced = super::splice_lines(&content, ranges)?;
-        self.write(path, &spliced, Some(v), author, Some(message.unwrap_or("replace-lines")))
+        let sorted = super::sorted_ranges(ranges)?;
+        let json = serde_json::Value::Array(
+            sorted.iter().map(|r| serde_json::json!({ "from": r.from, "to": r.to, "text": r.text })).collect(),
+        )
+        .to_string();
+        let row = self
+            .client
+            .query_one(
+                "SELECT kb.replace_ranges($1, $2::text::jsonb, $3, $4, $5)::text",
+                &[&path, &json, &base_version, &author, &message],
+            )
+            .map_err(pg)?;
+        written(row.get(0))
     }
 
-    /// Links are not resolved in Postgres stores yet, so a move leaves them as they are.
-    fn mv_links(&mut self, from: &str, to: &str, author: Option<&str>, message: Option<&str>, _update: Option<bool>) -> Result<Vec<super::MovedLink>> {
-        self.mv(from, to, author, message)?;
-        Ok(Vec::new())
+    fn mv_links(&mut self, from: &str, to: &str, author: Option<&str>, message: Option<&str>, update: Option<bool>) -> Result<Vec<MovedLink>> {
+        let mode = update.map(|rewrite| if rewrite { "rewrite" } else { "off" });
+        let json: String = self
+            .client
+            .query_one("SELECT kb.move_links($1, $2, $3, $4, $5)::text", &[&from, &to, &author, &message, &mode])
+            .map_err(pg)?
+            .get(0);
+        let v: serde_json::Value = serde_json::from_str(&json).map_err(|e| StoreError::other(format!("unexpected move result {json}: {e}")))?;
+        Ok(v["links"]
+            .as_array()
+            .map(|links| {
+                links
+                    .iter()
+                    .map(|l| MovedLink {
+                        path: l["path"].as_str().unwrap_or_default().to_string(),
+                        line: l["line"].as_i64().unwrap_or(0),
+                        kind: l["kind"].as_str().unwrap_or_default().to_string(),
+                        target: l["target"].as_str().unwrap_or_default().to_string(),
+                        now_at: l["now_at"].as_str().unwrap_or_default().to_string(),
+                        version: l["version"].as_i64(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
-    fn links(&mut self, _path: &str, _statuses: &[&str]) -> Result<Vec<super::LinkRow>> {
-        Err(StoreError::other("links are resolved in SQLite stores only for now"))
+    fn links(&mut self, path: &str, statuses: &[&str]) -> Result<Vec<LinkRow>> {
+        let path = normalize_path(path)?;
+        let statuses: Vec<&str> = statuses.to_vec();
+        self.link_rows(
+            "($1 = '/' OR n.path = $1 OR n.path LIKE kb._subtree_like($1)) AND (cardinality($2::text[]) = 0 OR l.status = ANY($2::text[]))",
+            &[&path, &statuses],
+        )
     }
 
-    fn backlinks(&mut self, _path: &str) -> Result<Vec<super::LinkRow>> {
-        Err(StoreError::other("backlinks are resolved in SQLite stores only for now"))
+    fn backlinks(&mut self, path: &str) -> Result<Vec<LinkRow>> {
+        let path = normalize_path(path)?;
+        self.link_rows(
+            "l.target_path <> '' AND r.kind = 1 AND ($1 = '/' OR r.path = $1 OR r.path LIKE kb._subtree_like($1))",
+            &[&path],
+        )
     }
 
+    /// A move that leaves links as they are (a sync's move follows one made on disk).
     fn mv(&mut self, from: &str, to: &str, author: Option<&str>, message: Option<&str>) -> Result<()> {
-        self.client.execute("SELECT kb.move($1, $2, $3)", &[&from, &to, &author]).map_err(pg)?;
-        let (from, to) = (normalize_path(from)?, normalize_path(to)?);
-        self.label_change("move", &to, Some(&from), message)
+        self.client
+            .execute("SELECT kb.move_links($1, $2, $3, $4, 'off')", &[&from, &to, &author, &message])
+            .map_err(pg)?;
+        Ok(())
     }
 
     fn rm(&mut self, path: &str, author: Option<&str>, message: Option<&str>) -> Result<()> {
-        self.client.execute("SELECT kb.remove($1, $2)", &[&path, &author]).map_err(pg)?;
-        self.label_change("delete", &normalize_path(path)?, None, message)
+        self.client.execute("SELECT kb.remove($1, $2, $3)", &[&path, &author, &message]).map_err(pg)?;
+        Ok(())
     }
 
     fn path_history(&mut self, path: &str) -> Result<Vec<PathEvent>> {
@@ -631,34 +730,85 @@ impl Store for PgStore {
         Ok(Some(base))
     }
 
-    fn revert_batch(&mut self, _batch: &str, _author: Option<&str>, _skip_changed: bool, _dry_run: bool) -> Result<RevertOutcome> {
-        Err(StoreError::invalid("batches are recorded in SQLite stores only, for now: revert-batch needs one"))
+    fn revert_batch(&mut self, batch: &str, author: Option<&str>, skip_changed: bool, dry_run: bool) -> Result<RevertOutcome> {
+        let mut tx = self.client.transaction().map_err(pg)?;
+        let id: String = tx.query_one(NEW_BATCH_ID, &[]).map_err(pg)?.get(0);
+        tx.execute("SELECT set_config('textdb.batch', $1, true)", &[&id]).map_err(pg)?;
+        let json: String = tx
+            .query_one("SELECT kb.revert_batch($1, $2, $3)::text", &[&batch, &author, &skip_changed])
+            .map_err(pg)?
+            .get(0);
+        if dry_run {
+            tx.rollback().map_err(pg)?;
+        } else {
+            tx.commit().map_err(pg)?;
+        }
+        let v: serde_json::Value = serde_json::from_str(&json).map_err(|e| StoreError::other(format!("unexpected revert result {json}: {e}")))?;
+        let texts = |k: &str| -> Vec<String> {
+            v[k].as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect()).unwrap_or_default()
+        };
+        let empty = Vec::new();
+        Ok(RevertOutcome {
+            batch: batch.to_string(),
+            dry_run,
+            revert_batch: (!dry_run).then_some(id),
+            restored: v["restored"]
+                .as_array()
+                .unwrap_or(&empty)
+                .iter()
+                .map(|r| RestoredFile { path: r["path"].as_str().unwrap_or_default().to_string(), version: r["version"].as_i64().unwrap_or(0) })
+                .collect(),
+            removed: texts("removed"),
+            moved_back: v["moved_back"]
+                .as_array()
+                .unwrap_or(&empty)
+                .iter()
+                .map(|m| MovedBack { from: m["from"].as_str().unwrap_or_default().to_string(), to: m["to"].as_str().unwrap_or_default().to_string() })
+                .collect(),
+            recreated: texts("recreated"),
+            skipped: texts("skipped"),
+        })
     }
 
-    fn sql(&mut self, query: &str, params: &[String], _author: Option<&str>, write: bool, dry_run: bool) -> Result<SqlResult> {
+    fn sql(&mut self, query: &str, params: &[String], author: Option<&str>, write: bool, dry_run: bool) -> Result<SqlResult> {
         if !self.sql_views_ready {
             self.client.batch_execute(SQL_VIEWS).map_err(pg)?;
             self.sql_views_ready = true;
         }
         let before = self.last_seq()?;
-        let types = vec![Type::TEXT; params.len()];
-        let values: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        // `:author` is bound to the author, after the positional parameters.
+        let rewritten = author_placeholder(query, params.len() + 1);
+        let query = rewritten.as_deref().unwrap_or(query);
+        let mut types = vec![Type::TEXT; params.len()];
+        let mut values: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        if rewritten.is_some() {
+            types.push(Type::TEXT);
+            values.push(&author);
+        }
         let first = query
             .trim_start()
             .split(|c: char| !c.is_ascii_alphabetic())
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
+        let fail = |e| statement_error(e, write);
         let mut tx = self.client.build_transaction().read_only(!write).start().map_err(pg)?;
+        let batch: Option<String> = if write {
+            let id: String = tx.query_one(NEW_BATCH_ID, &[]).map_err(pg)?.get(0);
+            tx.execute("SELECT set_config('textdb.batch', $1, true)", &[&id]).map_err(pg)?;
+            Some(id)
+        } else {
+            None
+        };
         let mut result = SqlResult::default();
         if matches!(first.as_str(), "select" | "with" | "values" | "table") {
             // Each row as JSON, so any column type comes back without a Rust mapping for it.
-            let inner = tx.prepare_typed(query, &types).map_err(pg)?;
+            let inner = tx.prepare_typed(query, &types).map_err(fail)?;
             result.columns = inner.columns().iter().map(|c| c.name().to_string()).collect();
             let wrapped = tx
                 .prepare_typed(&format!("SELECT row_to_json(q)::text FROM ({query}) q"), &types)
-                .map_err(pg)?;
-            for row in tx.query(&wrapped, &values).map_err(pg)? {
+                .map_err(fail)?;
+            for row in tx.query(&wrapped, &values).map_err(fail)? {
                 let text: String = row.get(0);
                 let object: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).unwrap_or_default();
                 result
@@ -666,33 +816,26 @@ impl Store for PgStore {
                     .push(result.columns.iter().map(|c| object.get(c).cloned().unwrap_or_default()).collect());
             }
         } else {
-            let stmt = tx.prepare_typed(query, &types).map_err(pg)?;
-            tx.execute(&stmt, &values).map_err(pg)?;
+            let stmt = tx.prepare_typed(query, &types).map_err(fail)?;
+            tx.execute(&stmt, &values).map_err(fail)?;
         }
         if write {
             let after: i64 = tx.query_one("SELECT coalesce(max(seq), 0) FROM kb.change", &[]).map_err(pg)?.get(0);
             result.store_changes = Some(after - before);
             if dry_run {
                 result.dry_run = true;
-                for row in tx
-                    .query("SELECT op, path, old_path, version FROM kb.change WHERE seq > $1 ORDER BY seq", &[&before])
-                    .map_err(pg)?
-                {
-                    result.changes.push(BatchChange {
-                        op: row.get(0),
-                        path: row.get(1),
-                        old_path: row.get(2),
-                        from_version: None,
-                        to_version: row.get(3),
-                        diff: None,
-                    });
-                }
+                let json: String = tx.query_one("SELECT kb.changes_after($1)::text", &[&before]).map_err(pg)?.get(0);
+                let items: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap_or_default();
+                result.changes = items.iter().map(batch_change).collect();
             }
         }
         if dry_run {
             tx.rollback().map_err(pg)?;
         } else {
             tx.commit().map_err(pg)?;
+        }
+        if !dry_run && result.store_changes.unwrap_or(0) > 0 {
+            result.batch = batch;
         }
         Ok(result)
     }
