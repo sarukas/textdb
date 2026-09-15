@@ -43,7 +43,7 @@ export function findCli(explicit: string | undefined): string | null {
   return null;
 }
 
-function runCli(cli: string, args: string[]): Promise<{ stdout: string; stderr: string; status: number }> {
+export function runCli(cli: string, args: string[]): Promise<{ stdout: string; stderr: string; status: number }> {
   const env = { ...process.env };
   // The store, author and settings come from the arguments, never from the server's environment.
   for (const name of ['TEXTDB_STORE', 'TEXTDB_AUTHOR', 'TEXTDB_PATH_HISTORY']) delete env[name];
@@ -73,6 +73,22 @@ export class SyncService {
     this.cli = cli;
   }
 
+  /** The textdb CLI this server runs, when it was found. */
+  get cliPath(): string | null {
+    return this.cli;
+  }
+
+  /** Run `fn` as the only sync, pull or push of the folder `prefix` at the moment. */
+  async exclusive<T>(prefix: string, fn: () => Promise<T>): Promise<T> {
+    if (this.running.has(prefix)) throw new CodedError('TX002', `${prefix} is being synced already; try again when it finishes`);
+    this.running.add(prefix);
+    try {
+      return await fn();
+    } finally {
+      this.running.delete(prefix);
+    }
+  }
+
   list(): SyncLinks {
     return {
       available: this.cli !== null,
@@ -88,13 +104,12 @@ export class SyncService {
 
   async run(prefix: string, options: RunOptions): Promise<unknown> {
     const link = this.link(prefix);
-    if (!this.cli) throw badRequest(this.list().reason ?? 'syncing is unavailable');
+    const cli = this.cli;
+    if (!cli) throw badRequest(this.list().reason ?? 'syncing is unavailable');
     if (options.base !== undefined && (!REV.test(options.base) || options.base.startsWith('-'))) {
       throw badRequest(`base must name a commit: ${options.base}`);
     }
-    if (this.running.has(prefix)) throw new CodedError('TX002', `${prefix} is being synced already; try again when it finishes`);
-    this.running.add(prefix);
-    try {
+    return this.exclusive(prefix, async () => {
       const args = ['--store', this.corpus.db, '--json'];
       if (options.author) args.push('--author', options.author);
       args.push('sync');
@@ -102,7 +117,7 @@ export class SyncService {
       if (options.commit) args.push('--commit');
       if (options.base) args.push('--base', options.base);
       args.push('--', link.prefix, link.dir);
-      const { stdout, stderr, status } = await runCli(this.cli, args);
+      const { stdout, stderr, status } = await runCli(cli, args);
       let parsed: Record<string, unknown> | null = null;
       try {
         parsed = JSON.parse(stdout) as Record<string, unknown>;
@@ -114,9 +129,7 @@ export class SyncService {
       const code = typeof parsed?.code === 'string' && /^TX00[0-4]$/.test(parsed.code) ? (parsed.code as ErrorCode) : 'TX000';
       const message = typeof parsed?.message === 'string' ? parsed.message : (stderr || stdout).trim().slice(0, 2000);
       throw new CodedError(code, message || `textdb sync exited with status ${status}`);
-    } finally {
-      this.running.delete(prefix);
-    }
+    });
   }
 
   /** A file the last sync left conflict markers in, as it is on disk. */
@@ -132,7 +145,8 @@ export class SyncService {
     return this.run(prefix, { author });
   }
 
-  private link(prefix: string): SyncLinkConfig {
+  /** The folder `prefix` as this server syncs it; NotFound for any other. */
+  link(prefix: string): SyncLinkConfig {
     const link = this.links.find((l) => l.prefix === prefix);
     if (!link) throw new NotFound(`${prefix} is not a folder this server syncs (TEXTDB_SYNC)`);
     return link;

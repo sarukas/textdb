@@ -232,7 +232,10 @@ keeps an asset's id when its bytes change, and records the pointers it wrote in 
 sync base, as sync would. One asset failing does not stop the others. `pull` fetches `not-pulled`
 and `outdated` assets, leaves `modified` and `conflict` files alone, and never puts bytes whose
 hash differs from the pointer in place. `verify` counts an asset store it cannot reach as a
-problem.
+problem. `status --json` gives `{ prefix, dir, assets, counts }`, each asset with `path`, `state`,
+`type` (the pointer's media type, or one from the name), and where known `size`, `store`,
+`sha256` (the pointer's), `version` (the pointer's in the store), `file` (its name on disk,
+relative to the directory) and `note`.
 
 Which files are candidates at all: besides the rules above, textdb's own and system files are
 never assets — `.git`, `.textdb`, `.trash`, `.textdb-trash`, `.obsidian`, `node_modules`, OS

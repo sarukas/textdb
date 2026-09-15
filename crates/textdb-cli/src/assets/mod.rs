@@ -471,16 +471,23 @@ pub struct Item {
     pub store: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// The media type: the pointer's, or from the name for a file without one.
+    #[serde(rename = "type")]
+    media_type: String,
+    /// The SHA-256 the pointer names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
     /// Relative to the vault: the pointer's asset path, or the file's for a new asset.
     #[serde(skip)]
     rel: String,
-    /// The file on disk, when there is one (its name may differ in case from the pointer's).
-    #[serde(skip)]
+    /// The file on disk relative to the vault, when there is one (its name may differ in case from
+    /// the pointer's).
+    #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<String>,
     #[serde(skip)]
     pointer: Option<Pointer>,
     /// The pointer document's version in the store.
-    #[serde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<i64>,
     /// The pointer on disk says something else than the store's.
     #[serde(skip)]
@@ -498,6 +505,8 @@ impl Item {
             size: None,
             store: None,
             note: None,
+            media_type: pointer::media_type(rel).to_string(),
+            sha256: None,
             rel: rel.to_string(),
             file: None,
             pointer: None,
@@ -640,6 +649,7 @@ fn items(v: &Vault, scan: &Scan, cache: &mut VaultCache, scope: &[String]) -> Re
                 item.state = "not-pulled";
             }
         }
+        (item.media_type, item.sha256) = (pointer.media_type.clone(), Some(pointer.sha256.clone()));
         item.pointer = Some(pointer);
         out.push(item);
     }

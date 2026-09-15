@@ -26,6 +26,36 @@ jobs:
       - run: python3 -m pip install --quiet pytest
       - run: python3 -m pytest tests -q
         working-directory: python
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            crates/textdb-sqlite-ext -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # The server reads the store through the SQLite extension and runs the CLI for sync and assets.
+      - run: cargo build --release -p textdb-cli
+      - run: cd crates/textdb-sqlite-ext && cargo build --release
+      - run: npm ci
+        working-directory: node/packages/textdb
+      - run: npm ci
+        working-directory: node/apps/server
+      - run: npm run typecheck
+        working-directory: node/apps/server
+      - run: npm test
+        working-directory: node/apps/server
+      - run: npm ci
+        working-directory: node/apps/web
+      - run: npm run typecheck
+        working-directory: node/apps/web
+      - run: npx vitest run
+        working-directory: node/apps/web
   pg-extension:
     runs-on: ubuntu-latest
     steps:

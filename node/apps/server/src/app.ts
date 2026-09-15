@@ -4,6 +4,7 @@ import { type Corpus, NotFound, SORT_KEYS, type SortKey } from '@textdb/node';
 import { Hono } from 'hono';
 import { ZipFile } from 'yazl';
 import { cors } from 'hono/cors';
+import { type AssetService, fileStream } from './assets.ts';
 import { badRequest, errorResponse } from './errors.ts';
 import { eventStream } from './events.ts';
 import type { ChangeHub } from './hub.ts';
@@ -12,6 +13,7 @@ import {
   bodyInt,
   bodyOptionalInt,
   bodyOptionalString,
+  bodyPaths,
   bodyString,
   jsonBody,
   parseInteger,
@@ -26,11 +28,18 @@ export interface AppOptions {
   pingMs: number;
   /** Folders synced with directories on this machine; null when none are set up. */
   sync?: SyncService | null;
+  /** The assets of those folders; null when none are set up. */
+  assets?: AssetService | null;
 }
 
 function syncService(sync: SyncService | null | undefined): SyncService {
   if (!sync) throw new NotFound('no folders are set up for sync: set TEXTDB_SYNC on the server');
   return sync;
+}
+
+function assetService(assets: AssetService | null | undefined): AssetService {
+  if (!assets) throw new NotFound('no folders are set up for sync: set TEXTDB_SYNC on the server');
+  return assets;
 }
 
 const MAX_BULK_PATHS = 10_000;
@@ -139,6 +148,33 @@ export function createApp(corpus: Corpus, hub: ChangeHub, options: AppOptions): 
     if (keep !== 'textdb' && keep !== 'disk') throw badRequest('keep must be textdb or disk');
     const report = await syncService(sync).resolve(bodyString(body, 'prefix'), bodyString(body, 'rel'), keep, bodyOptionalString(body, 'author'));
     return c.json(report);
+  });
+
+  // Assets of the synced folders: their state, pull and push, and their files to show or download.
+  const assets = options.assets;
+  app.get('/api/assets', async (c) => c.json(await assetService(assets).status(queryString(c, 'prefix'), c.req.query('path') || undefined)));
+  app.post('/api/assets/pull', async (c) => {
+    const body = await jsonBody(c);
+    return c.json(await assetService(assets).pull(bodyString(body, 'prefix'), bodyPaths(body), bodyOptionalString(body, 'author')));
+  });
+  app.post('/api/assets/push', async (c) => {
+    const body = await jsonBody(c);
+    const service = assetService(assets);
+    return c.json(await service.push(bodyString(body, 'prefix'), bodyPaths(body), bodyOptionalString(body, 'message'), bodyOptionalString(body, 'author')));
+  });
+  app.get('/api/assets/file', async (c) => {
+    const f = await assetService(assets).file(queryString(c, 'prefix'), queryString(c, 'path'));
+    const download = c.req.query('download') === '1' || !f.inline;
+    const headers: Record<string, string> = {
+      'Content-Type': download ? 'application/octet-stream' : f.type,
+      'Content-Length': String(f.size),
+      'Content-Disposition': `${download ? 'attachment' : 'inline'}; filename="${f.name.replace(/[^\x20-\x7e]|["\\]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(f.name)}`,
+      'X-Content-Type-Options': 'nosniff',
+      'Cache-Control': 'no-store',
+    };
+    // Images, audio and video shown on their own run nothing; the browser's PDF viewer needs its scripts.
+    if (f.type !== 'application/pdf') headers['Content-Security-Policy'] = "sandbox; default-src 'none'";
+    return c.body(fileStream(f.file), 200, headers);
   });
 
   // Export. A client compares what is on its disk with these, then fetches only what differs.

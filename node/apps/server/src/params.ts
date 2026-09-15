@@ -65,6 +65,18 @@ export function bodyImportFiles(body: Record<string, unknown>): { path: string; 
   });
 }
 
+/** Store paths named in one request. */
+const MAX_PATHS = 1000;
+
+/** An optional array of store paths; empty when absent. */
+export function bodyPaths(body: Record<string, unknown>, name = 'paths'): string[] {
+  const value = body[name];
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || value.some((p) => typeof p !== 'string')) throw badRequest(`${name} must be an array of strings`);
+  if (value.length > MAX_PATHS) throw badRequest(`at most ${MAX_PATHS} ${name} per request`);
+  return value as string[];
+}
+
 export function bodyOptionalInt(body: Record<string, unknown>, name: string): number | undefined {
   const value = body[name];
   return value === undefined || value === null ? undefined : bodyInt(body, name);

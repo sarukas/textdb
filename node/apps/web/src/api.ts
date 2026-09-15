@@ -127,6 +127,74 @@ export interface SyncReport {
     committed: string | null;
     commit_error: string | null;
   } | null;
+  /** What the sync did with assets; absent when the folder has none and no asset store is declared. */
+  assets?: SyncAssetsReport;
+}
+
+export interface SyncAssetsReport {
+  /** The `asset_sync` setting or option this sync followed: off, push, pull or both. */
+  mode: string;
+  counts: Record<string, number>;
+  trashed: string[];
+  trash?: string;
+  renamed: { from: string; to: string }[];
+  conflict_copies: { from: string; to: string }[];
+  pushed: string[];
+  pulled: string[];
+  conflicts: string[];
+  failed: string[];
+  notes: string[];
+}
+
+/** An asset of a synced folder: a binary kept in an asset store, with a `NAME.tdbasset` pointer. */
+export interface AssetItem {
+  /** The asset's own path, without `.tdbasset`. */
+  path: string;
+  state: AssetState;
+  type: string;
+  size?: number;
+  store?: string;
+  sha256?: string;
+  /** The pointer's version in the store. */
+  version?: number;
+  /** Its file on the server's disk, relative to the folder's directory. */
+  file?: string;
+  note?: string;
+}
+
+export type AssetState =
+  | "ok"
+  | "new"
+  | "modified"
+  | "outdated"
+  | "conflict"
+  | "not-pulled"
+  | "conflict-copy"
+  | "orphan"
+  | "invalid-pointer"
+  | "invalid-path";
+
+export interface AssetStatus {
+  prefix: string;
+  dir: string;
+  assets: AssetItem[];
+  counts: Record<string, number>;
+}
+
+export interface AssetPushReport {
+  dry_run: boolean;
+  pushed: { path: string; file?: string; state: string; size: number; store: string; version?: number }[];
+  bytes: number;
+  conflicts: string[];
+  failed: string[];
+}
+
+export interface AssetPullReport {
+  dry_run: boolean;
+  pulled: { path: string; state: string; size: number; store: string }[];
+  bytes: number;
+  kept: string[];
+  failed: string[];
 }
 
 /** A file an export writes, relative to the exported folder. */
@@ -240,6 +308,11 @@ function qs(params: Record<string, string | number | undefined | null>): string 
   return u.toString();
 }
 
+/** Where the server sends an asset's file from a synced folder's directory: to show, or to download. */
+export function assetFileUrl(prefix: string, path: string, download = false): string {
+  return `/api/assets/file?${qs({ prefix, path, download: download ? 1 : undefined })}`;
+}
+
 async function request<T>(method: string, url: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const init: RequestInit = { method, headers: { accept: "application/json" } };
   if (signal) init.signal = signal;
@@ -302,6 +375,12 @@ export const api = {
     request<{ rel: string; text: string }>("GET", `/api/sync/conflict?${qs({ prefix, rel })}`),
   syncResolve: (body: { prefix: string; rel: string; keep: "textdb" | "disk"; author?: string }) =>
     request<SyncReport>("POST", "/api/sync/resolve", body),
+  assets: (prefix: string, path?: string, signal?: AbortSignal) =>
+    request<AssetStatus>("GET", `/api/assets?${qs({ prefix, path })}`, undefined, signal),
+  pullAssets: (body: { prefix: string; paths?: string[]; author?: string }) =>
+    request<AssetPullReport>("POST", "/api/assets/pull", body),
+  pushAssets: (body: { prefix: string; paths?: string[]; message?: string; author?: string }) =>
+    request<AssetPushReport>("POST", "/api/assets/push", body),
   file: (path: string, version?: number) => request<FileDoc>("GET", `/api/file?${qs({ path, version })}`),
   chunks: (path: string, version?: number) => request<Chunk[]>("GET", `/api/chunks?${qs({ path, version })}`),
   history: (path: string) => request<HistoryEntry[]>("GET", `/api/history?${qs({ path })}`),
