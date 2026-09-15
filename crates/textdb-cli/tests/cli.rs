@@ -731,6 +731,13 @@ fn assets_through_an_rclone_store() {
     let (dir, other_dir) = (vault.to_str().unwrap(), other.to_str().unwrap());
     ok(&mut t(&["sync", "/", dir]), None);
 
+    // The root is shared with everyone using the store: only a remote of their own rclone
+    // configuration, never options (some run programs) or a flag.
+    for bad in [":sftp,host=x,ssh='echo pwned':x", "remote,ssh=x:textdb", "-x:textdb"] {
+        let refused = run(&mut t(&["assets", "stores", "--add", "evil", "--driver", "rclone", &format!("--root={bad}")]), None);
+        assert_eq!(refused.status, 6, "{bad}: {}", refused.stderr);
+    }
+
     // A remote folder that is not there is reported; bound on this computer to where rclone
     // reaches the store, it is used.
     ok(&mut t(&["assets", "stores", "--add", "team", "--driver", "rclone", "--root", "nowhere-remote:textdb"]), None);
@@ -746,9 +753,10 @@ fn assets_through_an_rclone_store() {
     assert_eq!(pushed["pushed"].as_array().unwrap().len(), 1, "{pushed}");
     assert_eq!(std::fs::read(bucket.join("img/arch.png")).unwrap(), [137u8, 80, 78, 71, 0, 1]);
 
-    // Changed here: replaced there, the old bytes in the remote's trash.
+    // Changed here: replaced there, the old bytes in the remote's trash; rclone flags set in the
+    // environment do not change that.
     std::fs::write(vault.join("img/arch.png"), [137u8, 80, 78, 71, 0, 2]).unwrap();
-    ok(&mut t(&["assets", "push"]), None);
+    ok(&mut t(&["assets", "push"]).env("RCLONE_IGNORE_EXISTING", "true").env("RCLONE_DRY_RUN", "true"), None);
     assert_eq!(std::fs::read(bucket.join("img/arch.png")).unwrap(), [137u8, 80, 78, 71, 0, 2]);
     let trashed: Vec<_> = std::fs::read_dir(bucket.join(".textdb-trash")).unwrap().flatten().map(|e| e.path().join("img/arch.png")).filter(|p| p.is_file()).collect();
     assert_eq!(trashed.len(), 1, "{trashed:?}");

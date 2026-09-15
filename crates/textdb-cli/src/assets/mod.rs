@@ -246,7 +246,8 @@ fn dir_inside(outer: &Path, inner: &Path) -> Option<String> {
 /// keeps inside it: copies, not assets. A directory inside an asset store's folder is refused:
 /// its files would be the store's copies, changed in place.
 fn leave_out_asset_stores(st: &mut dyn Store, dir: &Path, files: &mut Files) -> Result<()> {
-    for s in st.asset_stores()? {
+    // Only a local store has a folder on this computer; other drivers are not even started.
+    for s in st.asset_stores()?.into_iter().filter(|s| s.driver == "local") {
         let Ok(d) = driver::open(&s) else { continue };
         let Some(root) = d.local_root() else { continue };
         if dir_inside(root, dir).is_some() {
@@ -1026,6 +1027,7 @@ pub(crate) fn store_folders_inside(st: &mut dyn Store, dir: &Path) -> Vec<String
     let Ok(stores) = st.asset_stores() else { return Vec::new() };
     stores
         .iter()
+        .filter(|s| s.driver == "local")
         .filter_map(|s| driver::open(s).ok())
         .filter_map(|d| d.local_root().and_then(|root| dir_inside(dir, root)))
         .map(|rel| rel.to_lowercase())
@@ -1511,6 +1513,9 @@ pub fn stores(st: &mut dyn Store, o: StoresOptions, json: bool) -> Result<()> {
             .clone()
             .filter(|r| !r.is_empty())
             .ok_or_else(|| StoreError::invalid("--add needs --root: the folder (or rclone remote path) the asset store keeps its files in"))?;
+        if let Some(problem) = (o.driver == "rclone").then(|| rclone::shared_root_problem(&root)).flatten() {
+            return Err(StoreError::invalid(problem));
+        }
         st.put_asset_store(&AssetStore { name: name.clone(), driver: o.driver.clone(), root, options: None, created_at: None })?;
     }
     if let Some(name) = &o.remove {

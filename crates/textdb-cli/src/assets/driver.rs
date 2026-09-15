@@ -306,6 +306,17 @@ pub(crate) fn partial_name(name: &str) -> String {
     format!(".{name}.{}-{}-{nanos:09}.tdbpart", host_word(), std::process::id())
 }
 
+/// The process id in `found`, when it is a [`partial_name`] of the file `name` made on this
+/// computer (not on one whose name only starts like this one's).
+pub(crate) fn partial_pid(found: &str, name: &str) -> Option<u32> {
+    let rest = found.strip_prefix(&format!(".{name}.{}-", host_word()))?.strip_suffix(".tdbpart")?;
+    let (pid, nanos) = rest.split_once('-')?;
+    if nanos.is_empty() || !nanos.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
 /// The [`partial_name`] of `file`, next to it.
 pub fn partial(file: &Path) -> PathBuf {
     let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -333,13 +344,11 @@ pub fn process_running(pid: u32) -> bool {
 /// left next to it.
 fn remove_abandoned_partials(file: &Path) {
     let (Some(dir), Some(name)) = (file.parent(), file.file_name()) else { return };
-    let start = format!(".{}.{}-", name.to_string_lossy(), host_word());
+    let name = name.to_string_lossy();
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let found = entry.file_name().to_string_lossy().into_owned();
-        let Some(rest) = found.strip_prefix(&start).and_then(|r| r.strip_suffix(".tdbpart")) else { continue };
-        let pid = rest.split('-').next().and_then(|p| p.parse::<u32>().ok());
-        if pid.is_some_and(|pid| !process_running(pid)) {
+        if partial_pid(&found, &name).is_some_and(|pid| !process_running(pid)) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -542,7 +551,13 @@ pub fn open(store: &AssetStore) -> Result<Box<dyn Driver>> {
         "rclone" => {
             // The remote this computer reaches the store by (another remote name for the same
             // drive, say), else the store's root.
-            let root = binding::get(&store.name).map_or_else(|| store.root.clone(), |(l, _)| l);
+            let root = match binding::get(&store.name) {
+                Some((location, _)) => location,
+                None => match super::rclone::shared_root_problem(&store.root) {
+                    Some(problem) => return Err(StoreError::invalid(format!("asset store {}: {problem}", store.name))),
+                    None => store.root.clone(),
+                },
+            };
             let d = super::rclone::RcloneDriver::new(super::rclone::executable(), root);
             d.check().map_err(|e| StoreError::invalid(format!("asset store {}: {}", store.name, e.message)))?;
             Ok(Box::new(d))

@@ -1,12 +1,13 @@
 //! An asset store reached through rclone: a Google shared drive, SharePoint, S3, or anything else
-//! rclone has a backend for. Layout, trash and locks are the local driver's, kept on the remote:
-//! the asset at `/img/a.png` is `ROOT/img/a.png`, what a push replaces is copied to
-//! `ROOT/.textdb-trash/<time>/…` first, and pushes of the same path take turns through lock files
-//! in `ROOT/.textdb-trash/locks/<hash of the path>/`.
+//! rclone has a backend for. Layout, trash and partial copies are the local driver's, kept on the
+//! remote: the asset at `/img/a.png` is `ROOT/img/a.png`, and what a push replaces is copied to
+//! `ROOT/.textdb-trash/<time>/…` first. Pushes of the same path take turns through lock files in
+//! `ROOT/.textdb-trash/locks/`.
 //!
 //! rclone skips a copy whose destination has the same size and modification time, and a move then
 //! deletes its source and keeps the old bytes: every copy and move here passes `--ignore-times`,
-//! and what is uploaded is hashed where it landed before it is used.
+//! and what lands anywhere is hashed before it is trusted. rclone also takes any flag from an
+//! `RCLONE_*` environment variable, so only its configuration is passed on from the environment.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
-use super::driver::{beside, host_word, lock_name, partial_name, process_running, rename_new, stamp, Driver, Held, LOCK_WAIT, TRASH};
+use super::driver::{beside, host_word, lock_name, partial_name, partial_pid, process_running, stamp, Driver, Held, LOCK_WAIT, TRASH};
 use crate::store::{Result, StoreError};
 
 /// The rclone to run: `TEXTDB_RCLONE`, else the one next to this program (a vault's
@@ -32,6 +33,20 @@ pub fn executable() -> PathBuf {
         .and_then(|me| me.parent().map(|dir| dir.join(name)))
         .filter(|beside| beside.is_file())
         .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// Why `root`, as an asset store declares it, is not one rclone may be pointed at on the
+/// computers of everyone using the store, if it is not. The declaration is shared, so it may only
+/// name a remote of each person's own rclone configuration, `REMOTE:path`: a connection string
+/// (`:sftp,ssh=…:`, `remote,option=…:`) sets backend options, some of which run programs, and a
+/// leading `-` would read as a flag. Anything else is bound on each computer.
+pub fn shared_root_problem(root: &str) -> Option<String> {
+    let valid = root.split_once(':').is_some_and(|(name, _)| {
+        !name.is_empty() && !name.starts_with(['-', ' ']) && !name.ends_with(' ') && name.chars().all(|c| c.is_alphanumeric() || "_-.+@ ".contains(c))
+    });
+    (!valid).then(|| {
+        format!("{root} is not REMOTE:path: an rclone asset store's root names a remote of each person's own rclone configuration (connection strings and options go in that configuration, or in a binding on one computer)")
+    })
 }
 
 pub struct RcloneDriver {
@@ -66,29 +81,38 @@ fn failure(what: &str, out: &Output) -> StoreError {
     })
 }
 
-/// The process id in a lock file name `HOST-PID-NANOS.lock`, when that process is of this computer
-/// and not running any more.
-fn abandoned(name: &str) -> Option<u32> {
-    let mut parts = name.strip_suffix(".lock")?.rsplitn(3, '-');
-    let (_nanos, pid, host) = (parts.next()?, parts.next()?, parts.next()?);
+/// `root` and the path `rel` inside it.
+fn join(root: &str, rel: &str) -> String {
+    // `E:` alone is the current folder of drive E on Windows, not its top.
+    let drive = cfg!(windows) && root.len() == 2 && root.as_bytes()[0].is_ascii_alphabetic() && root.ends_with(':');
+    let sep = if !drive && root.ends_with([':', '/', '\\']) { "" } else { "/" };
+    format!("{root}{sep}{rel}")
+}
+
+/// The process id in the lock file name `KEY-HOST-PID-NANOS.lock`, when that process is of this
+/// computer and not running any more.
+fn abandoned(name: &str, key: &str) -> Option<u32> {
+    let rest = name.strip_prefix(&format!("{key}-"))?.strip_suffix(".lock")?;
+    let rest = rest.strip_prefix(&format!("{}-", host_word()))?;
+    let (pid, nanos) = rest.split_once('-')?;
+    if nanos.is_empty() || !nanos.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let pid: u32 = pid.parse().ok()?;
-    (host.eq_ignore_ascii_case(&host_word()) && !process_running(pid)).then_some(pid)
+    (!process_running(pid)).then_some(pid)
 }
 
 /// A lock file held on the remote, removed when dropped.
 struct RemoteLock {
-    exe: PathBuf,
-    remote: String,
+    driver: RcloneDriver,
+    path: String,
 }
 
 impl Drop for RemoteLock {
     fn drop(&mut self) {
-        let _ = Command::new(&self.exe)
-            .args(["-q", "--retries", "1", "deletefile", &self.remote])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        if let Err(e) = self.driver.delete(&self.path) {
+            eprintln!("warning: the lock {} was not removed ({}); pushes of that path wait for it until it is removed", self.driver.location(&self.path), e.message);
+        }
     }
 }
 
@@ -97,9 +121,9 @@ impl RcloneDriver {
         RcloneDriver { exe, root }
     }
 
-    /// Whether the root is a folder rclone reaches.
+    /// Whether the root is a folder rclone reaches, giving up on a remote that does not answer.
     pub fn check(&self) -> Result<()> {
-        let out = self.run(&["lsjson", "--stat", "--no-mimetype", &self.root])?;
+        let out = self.run(&["--contimeout", "15s", "--timeout", "30s", "--retries", "1", "--low-level-retries", "2", "lsjson", "--stat", "--no-mimetype", "--", &self.root])?;
         match out.status.code() {
             Some(0) if serde_json::from_slice::<Listed>(&out.stdout).is_ok_and(|l| l.is_dir) => Ok(()),
             Some(0) => Err(StoreError::invalid(format!("{} is a file, not a folder", self.root))),
@@ -114,8 +138,7 @@ impl RcloneDriver {
         if rel.is_empty() || rel.contains('\\') || rel.split('/').any(|s| s.is_empty() || s == "." || s == "..") {
             return Err(StoreError::invalid(format!("{path} is not a path inside an asset store")));
         }
-        let sep = if self.root.ends_with([':', '/']) { "" } else { "/" };
-        Ok(format!("{}{sep}{rel}", self.root))
+        Ok(join(&self.root, rel))
     }
 
     /// The remote path of the folder `dir`; the root for `/` or ``.
@@ -129,6 +152,13 @@ impl RcloneDriver {
 
     fn command(&self) -> Command {
         let mut c = Command::new(&self.exe);
+        // A flag set through the environment (RCLONE_IGNORE_EXISTING, RCLONE_DRY_RUN…) would
+        // change what these commands do; rclone's configuration still comes through.
+        for (key, _) in std::env::vars_os() {
+            if let Some(key) = key.to_str().filter(|k| k.starts_with("RCLONE_") && !k.starts_with("RCLONE_CONFIG") && *k != "RCLONE_PASSWORD_COMMAND") {
+                c.env_remove(key);
+            }
+        }
         c.arg("-q");
         c
     }
@@ -158,7 +188,7 @@ impl RcloneDriver {
         if hash {
             args.extend(["--hash", "--hash-type", "SHA256"]);
         }
-        args.push(remote.as_str());
+        args.extend(["--", remote.as_str()]);
         let out = self.run(&args)?;
         match out.status.code() {
             Some(0) => {
@@ -179,7 +209,7 @@ impl RcloneDriver {
     /// The names of the files in the folder `dir`; none when it is not there.
     fn names_in(&self, dir: &str) -> Result<Vec<String>> {
         let remote = self.folder(dir)?;
-        let out = self.run(&["lsjson", "--files-only", "--no-modtime", "--no-mimetype", &remote])?;
+        let out = self.run(&["lsjson", "--files-only", "--no-modtime", "--no-mimetype", "--", &remote])?;
         match out.status.code() {
             Some(0) => Ok(serde_json::from_slice::<Vec<Listed>>(&out.stdout)
                 .map_err(|e| StoreError::other(format!("{remote}: unexpected rclone output ({e})")))?
@@ -191,14 +221,19 @@ impl RcloneDriver {
         }
     }
 
-    /// Remove the file at `path`; one not there is fine.
+    /// Remove textdb's own file at `path` (a lock, a partial copy, a trash copy it made), not to
+    /// the provider's trash; one not there is fine. Tried three times.
     fn delete(&self, path: &str) -> Result<()> {
         let remote = self.remote(path)?;
-        let out = self.run(&["--retries", "1", "deletefile", &remote])?;
-        match out.status.code() {
-            Some(0 | 3 | 4) => Ok(()),
-            _ => Err(failure(&format!("removing {remote}"), &out)),
+        let mut last = None;
+        for _ in 0..3 {
+            let out = self.run(&["--retries", "1", "--drive-use-trash=false", "deletefile", "--", &remote])?;
+            match out.status.code() {
+                Some(0 | 3 | 4) => return Ok(()),
+                _ => last = Some(failure(&format!("removing {remote}"), &out)),
+            }
         }
+        Err(last.unwrap_or_else(|| StoreError::other(format!("removing {remote}"))))
     }
 
     /// Write `body` to a small file at `path`.
@@ -206,7 +241,7 @@ impl RcloneDriver {
         let remote = self.remote(path)?;
         let mut child = self
             .command()
-            .args(["rcat", &remote])
+            .args(["rcat", "--", &remote])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -236,42 +271,55 @@ impl RcloneDriver {
     /// more left next to it.
     fn remove_abandoned_partials(&self, path: &str) {
         let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
-        let start = format!(".{name}.{}-", host_word());
         let Ok(names) = self.names_in(dir) else { return };
         for found in names {
-            let Some(rest) = found.strip_prefix(&start).and_then(|r| r.strip_suffix(".tdbpart")) else { continue };
-            if rest.split('-').next().and_then(|p| p.parse::<u32>().ok()).is_some_and(|pid| !process_running(pid)) {
+            if partial_pid(&found, name).is_some_and(|pid| !process_running(pid)) {
                 let _ = self.delete(&format!("{dir}/{found}"));
             }
         }
     }
 
+    /// The lock files of the path whose [`lock_name`] is `key`.
+    fn lock_files(&self, folder: &str, key: &str) -> Result<Vec<String>> {
+        let start = format!("{key}-");
+        Ok(self.names_in(folder)?.into_iter().filter(|n| n.starts_with(&start) && n.ends_with(".lock")).collect())
+    }
+
     /// Hold the lock of `path` (its case ignored). rclone cannot create a file only when none is
-    /// there, so each push writes a lock file of its own into the path's lock folder and then lists
-    /// the folder: it holds the lock when its file is the only one, and otherwise removes its file
-    /// and tries again a moment later. Of two pushes that write at once, the one that lists later
-    /// sees the other's file, so both never hold it.
+    /// there, so a push writes a lock file of its own (`KEY-HOST-PID-NANOS.lock`) and lists the
+    /// lock folder: it holds the lock when the listing shows its file and no other of that path,
+    /// twice a moment apart, and otherwise removes its file and tries again a little later. Of two
+    /// pushes that write at once, the one that lists later sees the other's file, as long as the
+    /// provider lists what was written.
     fn lock_remote(&self, path: &str) -> Result<RemoteLock> {
-        let folder = format!("/{TRASH}/locks/{}", lock_name(path));
+        let folder = format!("/{TRASH}/locks");
+        let key = lock_name(path);
+        let now = SystemTime::now();
+        let nanos = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+        let mine = format!("{key}-{}-{}-{nanos:09}.lock", host_word(), std::process::id());
+        let mine_path = format!("{folder}/{mine}");
+        let body = format!("{path}\nheld by process {} on {} since {}\n", std::process::id(), host_word(), stamp(now));
         let started = Instant::now();
         let (mut told, mut checked) = (false, None::<Instant>);
         loop {
-            let now = SystemTime::now();
-            let nanos = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
-            let mine = format!("{}-{}-{nanos:09}.lock", host_word(), std::process::id());
-            let lock = RemoteLock { exe: self.exe.clone(), remote: self.remote(&format!("{folder}/{mine}"))? };
-            self.write_small(&format!("{folder}/{mine}"), &format!("{path}\nheld by process {} on {} since {}\n", std::process::id(), host_word(), stamp(now)))?;
-            let others: Vec<String> = self.names_in(&folder)?.into_iter().filter(|n| *n != mine).collect();
-            if others.is_empty() {
-                return Ok(lock);
+            self.write_small(&mine_path, &body).inspect_err(|_| drop(self.delete(&mine_path)))?;
+            let lock = RemoteLock { driver: RcloneDriver::new(self.exe.clone(), self.root.clone()), path: mine_path.clone() };
+            let alone = |files: &[String]| files.len() == 1 && files[0] == mine;
+            let files = self.lock_files(&folder, &key)?;
+            if alone(&files) {
+                std::thread::sleep(Duration::from_millis(300));
+                if alone(&self.lock_files(&folder, &key)?) {
+                    return Ok(lock);
+                }
             }
             drop(lock);
+            let others: Vec<String> = files.into_iter().filter(|f| *f != mine).collect();
             // A lock left by a process of this computer that is not running any more (a push that
             // was killed) is removed, now and then looked at again.
             if checked.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
                 checked = Some(Instant::now());
                 for other in &others {
-                    if let Some(pid) = abandoned(other) {
+                    if let Some(pid) = abandoned(other, &key) {
                         eprintln!("removing the lock of {path} left by process {pid}, which is not running any more");
                         let _ = self.delete(&format!("{folder}/{other}"));
                     }
@@ -279,19 +327,19 @@ impl RcloneDriver {
             }
             if started.elapsed() > LOCK_WAIT {
                 return Err(StoreError::other(format!(
-                    "{path} is locked (by {}) and was not released in {} minutes; if that push is not running any more, remove {}",
-                    others.join(", "),
+                    "{path} is locked ({}) and was not released in {} minutes; if that push is not running any more, remove its file from {}",
+                    if others.is_empty() { "its lock file was not listed".to_string() } else { others.join(", ") },
                     LOCK_WAIT.as_secs() / 60,
                     self.folder(&folder).unwrap_or_default()
                 )));
             }
-            if !told {
+            if !told && !others.is_empty() {
                 eprintln!("waiting for another push of {path}");
                 told = true;
             }
             // Apart from one another, so two pushes that keep meeting stop doing so.
-            let jitter = (u64::from(nanos) ^ u64::from(std::process::id()).wrapping_mul(2_654_435_761)) % 800;
-            std::thread::sleep(Duration::from_millis(200 + jitter));
+            let spread = u64::from(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()) ^ std::process::id().wrapping_mul(2_654_435_761));
+            std::thread::sleep(Duration::from_millis(200 + spread % 800));
         }
     }
 
@@ -328,35 +376,61 @@ impl RcloneDriver {
             e
         };
         let source = src.to_string_lossy();
-        self.ok(&format!("uploading {} to {part}", src.display()), &["copyto", "--ignore-times", &source, &part]).map_err(discard)?;
+        self.ok(&format!("uploading {} to {part}", src.display()), &["copyto", "--ignore-times", "--", &source, &part]).map_err(discard)?;
         match self.hash(&part_path, None).map_err(discard)? {
             Some((sha, _)) if sha == sha256 => {}
             _ => return Err(discard(StoreError::other(format!("{} changed while it was copied to the asset store; push it again", src.display())))),
         }
-        match replace {
-            Some(expected) if self.stat(path, false).map_err(discard)?.is_some() => {
+        let mut trashed = None;
+        match (replace, self.stat(path, false).map_err(discard)?.is_some()) {
+            (Some(expected), true) => {
                 // A copy in the trash first, checked to be what this push replaces (not bytes put
-                // there some other way); then the new copy replaces it in one move, so the asset
-                // is never missing from its path.
-                let trashed_path = self.trash_for(path);
-                let trashed = self.remote(&trashed_path)?;
-                self.ok(&format!("copying {dest} to the trash"), &["copyto", "--ignore-times", &dest, &trashed]).map_err(|e| {
-                    let _ = self.delete(&trashed_path);
-                    discard(e)
-                })?;
-                if !matches!(self.hash(&trashed_path, None), Ok(Some((sha, _))) if sha == expected) {
-                    let _ = self.delete(&trashed_path);
-                    let _ = self.delete(&part_path);
-                    return Ok(false);
+                // there some other way).
+                let copy = self.trash_for(path);
+                let copied = self.ok(&format!("copying {dest} to the trash"), &["copyto", "--ignore-times", "--", &dest, &self.remote(&copy)?]).and_then(|_| self.hash(&copy, None));
+                match copied {
+                    Ok(Some((sha, _))) if sha == expected => trashed = Some(copy),
+                    Ok(_) => {
+                        let _ = self.delete(&copy);
+                        let _ = self.delete(&part_path);
+                        return Ok(false);
+                    }
+                    Err(e) => {
+                        let _ = self.delete(&copy);
+                        return Err(discard(e));
+                    }
                 }
             }
-            _ if self.stat(path, false).map_err(discard)?.is_some() => {
-                return Err(discard(StoreError::other(format!("putting {dest} in place: something is there already"))));
-            }
+            (None, true) => return Err(discard(StoreError::other(format!("putting {dest} in place: something is there already")))),
             _ => {}
         }
-        self.ok(&format!("putting {dest} in place"), &["moveto", "--ignore-times", &part, &dest]).map_err(discard)?;
-        Ok(true)
+        // rclone removes what is at the destination before a server-side move, so the path is
+        // empty for a moment: what is there afterwards is checked, and when it is not the new
+        // bytes, what was there is put back from the trash.
+        let moved = self.ok(&format!("putting {dest} in place"), &["moveto", "--ignore-times", "--", &part, &dest]);
+        let found = self.hash(path, None);
+        if matches!(&found, Ok(Some((sha, _))) if sha == sha256) {
+            if moved.is_err() {
+                let _ = self.delete(&part_path);
+            }
+            return Ok(true);
+        }
+        let why = match (moved, &found) {
+            (Err(e), _) => e.message,
+            (Ok(_), Ok(Some(_))) => "rclone left other bytes there".to_string(),
+            (Ok(_), Ok(None)) => "nothing is there after the move".to_string(),
+            (Ok(_), Err(e)) => e.message.clone(),
+        };
+        let kept = match (&trashed, &found) {
+            (Some(copy), Ok(None)) => match self.ok("", &["copyto", "--ignore-times", "--", &self.remote(copy)?, &dest]) {
+                Ok(_) => "; what was there is back".to_string(),
+                Err(_) => format!("; what was there is kept at {}", self.location(copy)),
+            },
+            (Some(copy), _) => format!("; a copy of what was there is at {}", self.location(copy)),
+            (None, _) => String::new(),
+        };
+        let _ = self.delete(&part_path);
+        Err(StoreError::other(format!("putting {dest} in place: {why}{kept}")))
     }
 }
 
@@ -378,7 +452,7 @@ impl Driver for RcloneDriver {
         }
         // The provider keeps no SHA-256 of this file: rclone reads it through.
         let remote = self.remote(path)?;
-        let out = self.ok(&format!("hashing {remote}"), &["hashsum", "sha256", "--download", &remote])?;
+        let out = self.ok(&format!("hashing {remote}"), &["hashsum", "sha256", "--download", "--", &remote])?;
         let text = String::from_utf8_lossy(&out.stdout);
         match text.split_whitespace().next().filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())) {
             Some(sha) => Ok(Some((sha.to_ascii_lowercase(), size))),
@@ -407,6 +481,7 @@ impl Driver for RcloneDriver {
         }
     }
 
+    /// `dest` is the caller's own partial name, so rclone downloads straight to it.
     fn get(&self, path: &str, item: Option<&str>, dest: &Path) -> Result<()> {
         let from = self.remote(item.unwrap_or(path))?;
         if dest.exists() {
@@ -415,12 +490,9 @@ impl Driver for RcloneDriver {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| StoreError::other(format!("{}: {e}", parent.display())))?;
         }
-        let part = super::driver::partial(dest);
-        let fetched = self
-            .ok(&format!("downloading {from}"), &["copyto", "--ignore-times", &from, &part.to_string_lossy()])
-            .and_then(|_| rename_new(&part, dest).map_err(|e| StoreError::other(format!("putting {} in place: {e}", dest.display()))));
+        let fetched = self.ok(&format!("downloading {from}"), &["copyto", "--ignore-times", "--", &from, &dest.to_string_lossy()]).map(|_| ());
         if fetched.is_err() {
-            let _ = std::fs::remove_file(&part);
+            let _ = std::fs::remove_file(dest);
         }
         fetched
     }
@@ -455,11 +527,29 @@ mod tests {
     }
 
     #[test]
+    fn shared_roots_name_a_configured_remote_and_nothing_more() {
+        for ok in ["teamdrive:textdb", "team drive:Shared/textdb", "s3.eu:bucket/prefix", "remote:", "my_remote-2@x+y:a,b"] {
+            assert_eq!(shared_root_problem(ok), None, "{ok}");
+        }
+        for bad in [":sftp,host=x,ssh='cmd /c calc':x", "remote,ssh=x:path", "-x:path", "--config=x:y", " a:b", "no-colon", ":local:/tmp", "a/b:c"] {
+            assert!(shared_root_problem(bad).is_some(), "{bad}");
+        }
+        assert_eq!(join("teamdrive:", "img/a.png"), "teamdrive:img/a.png");
+        assert_eq!(join("teamdrive:textdb/", "img/a.png"), "teamdrive:textdb/img/a.png");
+        assert_eq!(join("teamdrive:textdb", "img/a.png"), "teamdrive:textdb/img/a.png");
+        if cfg!(windows) {
+            assert_eq!(join("E:", "img/a.png"), "E:/img/a.png");
+        }
+    }
+
+    #[test]
     fn lock_file_names_tell_abandoned_locks_of_this_computer() {
-        assert_eq!(abandoned(&format!("{}-4000000000-000000001.lock", host_word())), Some(4_000_000_000));
-        assert_eq!(abandoned(&format!("{}-{}-000000001.lock", host_word(), std::process::id())), None);
-        assert_eq!(abandoned("another-host-4000000000-000000001.lock"), None);
-        assert_eq!(abandoned("junk.lock"), None);
+        let key = lock_name("/a.png");
+        assert_eq!(abandoned(&format!("{key}-{}-4000000000-000000001.lock", host_word()), &key), Some(4_000_000_000));
+        assert_eq!(abandoned(&format!("{key}-{}-{}-000000001.lock", host_word(), std::process::id()), &key), None);
+        assert_eq!(abandoned(&format!("{key}-another-host-4000000000-000000001.lock"), &key), None);
+        assert_eq!(abandoned(&format!("{}-{}-4000000000-000000001.lock", lock_name("/b.png"), host_word()), &key), None);
+        assert_eq!(abandoned(&format!("{key}-{}-2-4000000000-1.lock", host_word()), &key), None, "host {}-2 is another computer", host_word());
     }
 
     #[test]
@@ -508,8 +598,10 @@ mod tests {
         assert_eq!(lock_files().len(), 0);
         assert_eq!(d.hash("/acc/a.png", None).unwrap().unwrap().0, sha2);
 
-        // Pushes of the same path take turns, whatever its letter case.
+        // Pushes of the same path take turns, whatever its letter case; another path's lock is
+        // no obstacle.
         let held = d.lock("/ACC/A.png").unwrap();
+        drop(d.lock("/acc/other.png").unwrap());
         let (tx, rx) = std::sync::mpsc::channel();
         let other = RcloneDriver::new(exe.clone(), root_text.clone());
         let waiter = std::thread::spawn(move || {
@@ -517,7 +609,7 @@ mod tests {
             tx.send(Instant::now()).unwrap();
             drop(h);
         });
-        std::thread::sleep(Duration::from_millis(1500));
+        std::thread::sleep(Duration::from_millis(2000));
         let released = Instant::now();
         drop(held);
         let got = rx.recv().unwrap();
@@ -526,9 +618,9 @@ mod tests {
         assert_eq!(lock_files().len(), 0);
 
         // What a killed push of this computer left is cleared: its lock, and its partial copy.
-        let locks = root.join(TRASH).join("locks").join(lock_name("/acc/c.png"));
+        let locks = root.join(TRASH).join("locks");
         std::fs::create_dir_all(&locks).unwrap();
-        std::fs::write(locks.join(format!("{}-4000000000-000000001.lock", host_word())), "/acc/c.png\n").unwrap();
+        std::fs::write(locks.join(format!("{}-{}-4000000000-000000001.lock", lock_name("/acc/c.png"), host_word())), "/acc/c.png\n").unwrap();
         let left = root.join(format!("acc/.c.png.{}-4000000000-1.tdbpart", host_word()));
         std::fs::write(&left, b"half").unwrap();
         let held = d.lock("/acc/c.png").unwrap();
