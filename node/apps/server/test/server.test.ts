@@ -371,6 +371,8 @@ describe('event stream', () => {
     const client = await SseClient.connect(`${server.url}/api/events?since=${since}`);
     try {
       await new Promise((resolve) => setTimeout(resolve, 300));
+      // A slow machine may fit only a few writes in that time: the check below needs some.
+      await waitFor(() => (n >= 6 ? true : undefined));
       clearInterval(writer);
       const expected = server.corpus.feed(since).map((c) => c.seq);
       await waitFor(() => (client.changes().length >= expected.length ? true : undefined));
