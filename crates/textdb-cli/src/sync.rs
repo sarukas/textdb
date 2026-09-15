@@ -215,18 +215,51 @@ fn heads_by_rel(st: &mut dyn Store, prefix: &str) -> Result<BTreeMap<String, Fil
 /// are read like any other.
 pub const SKIP_DIRS: &[&str] = &[".git", ".textdb", ".trash", "node_modules"];
 
+/// The directory's own rules for what sync leaves out, in `.gitignore` syntax.
+const IGNORE_FILE: &str = ".textdbignore";
+
+/// What an Obsidian vault that never had a `.textdbignore` gets: its settings sync, but not the code
+/// and styles Obsidian loads, which anyone who can write to the store could otherwise put there.
+const DEFAULT_IGNORE: &str = "# What sync leaves out, in .gitignore syntax: not taken in, and never written, moved or deleted.\n\
+# Obsidian's plugins, snippets and themes are code and styles it loads: delete these lines to sync them.\n\
+**/.obsidian/plugins/\n\
+**/.obsidian/snippets/\n\
+**/.obsidian/themes/\n";
+
 /// Whether `rel` is, or is inside, a folder sync never writes a store file into: version control,
 /// textdb's own folder, trash, dependencies and system folders (the folders assets are never in,
-/// `.obsidian` excepted: its settings sync on purpose). Names are taken as Windows resolves them,
-/// so `.GIT`, `.git.`, `.git::$INDEX_ALLOCATION` and `GIT~1` are `.git`. A file anyone put in the
-/// store must not become a git hook, a script textdb's wrappers run, or a dependency.
+/// `.obsidian` excepted: which of its folders sync is up to `.textdbignore`); or `.textdbignore`
+/// itself. Names are taken as Windows resolves them, so `.GIT`, `.git.`,
+/// `.git::$INDEX_ALLOCATION` and `GIT~1` are `.git`. A file anyone put in the store must not
+/// become a git hook, a script textdb's wrappers run, or a dependency.
 fn protected_rel(rel: &str) -> bool {
     use crate::assets::classify::{names_dir, IGNORED_DIRS};
     let dirs: Vec<&str> = IGNORED_DIRS.iter().copied().filter(|d| *d != ".obsidian").collect();
     let segs: Vec<&str> = rel.split('/').collect();
     segs.iter().any(|s| names_dir(s, &dirs))
-        // Obsidian's settings sync, but not the code and styles it loads.
-        || segs.windows(2).any(|w| names_dir(w[0], &[".obsidian"]) && names_dir(w[1], &["plugins", "snippets", "themes"]))
+        // The rules that keep files out are the directory's own: anyone who can write to the store
+        // could otherwise take away the lines that keep Obsidian's plugins out.
+        || (segs.len() == 1 && names_dir(segs[0], &[IGNORE_FILE]))
+}
+
+/// The rules of a `.textdbignore` (in any letter case where the file system ignores it), and a
+/// note for each line that is not a pattern.
+fn ignore_rules(dir: &Path, text: &str) -> (Option<ignore::gitignore::Gitignore>, Vec<String>) {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(dir);
+    let _ = builder.case_insensitive(CASE_INSENSITIVE);
+    let mut notes = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if let Err(e) = builder.add_line(None, line) {
+            notes.push(format!("line {}: {e}", n + 1));
+        }
+    }
+    match builder.build() {
+        Ok(gi) => (Some(gi), notes),
+        Err(e) => {
+            notes.push(e.to_string());
+            (None, notes)
+        }
+    }
 }
 
 fn refuse_protected(rel: &str) -> std::io::Result<()> {
@@ -240,30 +273,42 @@ fn refuse_protected(rel: &str) -> std::io::Result<()> {
 }
 
 /// A write or move through another name Windows gives a file or folder already on disk, an 8.3
-/// short name (`GITATT~1`, `PROJEC~1/note.md`, `MY~SEC~1.JSO`), is refused: it would reach that
-/// file (`.gitattributes`, say) under a name sync does not know. Short names always hold a `~`, so
-/// each such part of the path that exists must be listed in its folder under that name.
+/// short name (`GITATT~1`, `PROJEC~1/note.md`, `MY~SEC~1.JSO`, or one set by hand with no `~`), is
+/// refused: it would reach that file (`.gitattributes`, say) under a name sync does not know. The
+/// part of the path already on disk must be what the file system calls it, in any letter case.
 fn refuse_short_alias(root: &Path, rel: &str) -> std::io::Result<()> {
-    let mut at = root.to_path_buf();
-    for seg in rel.split('/') {
-        let parent = at.clone();
-        at.push(seg);
-        if std::fs::symlink_metadata(&at).is_err() {
-            return Ok(());
-        }
-        if !seg.contains('~') {
-            continue;
-        }
-        let seg = seg.to_lowercase();
-        let listed = std::fs::read_dir(&parent).is_ok_and(|entries| entries.flatten().any(|e| e.file_name().to_string_lossy().to_lowercase() == seg));
-        if !listed {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("{rel} is another name (an 8.3 short name) of a file or folder already on disk, which sync never writes through"),
-            ));
-        }
+    let segs: Vec<&str> = rel.split('/').collect();
+    let mut on_disk = segs.len();
+    while on_disk > 0 && std::fs::symlink_metadata(root.join(segs[..on_disk].join("/"))).is_err() {
+        on_disk -= 1;
     }
-    Ok(())
+    if on_disk == 0 {
+        return Ok(());
+    }
+    let wanted: Vec<String> = segs[..on_disk].iter().map(|s| s.to_lowercase()).collect();
+    let named = match (std::fs::canonicalize(root), std::fs::canonicalize(root.join(segs[..on_disk].join("/")))) {
+        (Ok(base), Ok(real)) => real
+            .strip_prefix(&base)
+            .ok()
+            .map(|tail| tail.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect::<Vec<_>>())
+            == Some(wanted),
+        // Without the file system's own name, each part must be listed in its folder by that name.
+        _ => {
+            let mut at = root.to_path_buf();
+            wanted.iter().all(|seg| {
+                let listed = std::fs::read_dir(&at).is_ok_and(|entries| entries.flatten().any(|e| e.file_name().to_string_lossy().to_lowercase() == *seg));
+                at.push(seg);
+                listed
+            })
+        }
+    };
+    if named {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("{rel} is another name (an 8.3 short name) of a file or folder already on disk, which sync never writes through"),
+    ))
 }
 
 /// A write, move or delete that would go through a symbolic link or junction already on disk,
@@ -1101,6 +1146,36 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             }
         }
     };
+    // `.textdbignore` in the directory, in .gitignore syntax: what it matches is not synced either
+    // way. An Obsidian vault that never had one gets the defaults, which leave its plugins out.
+    let ignore_path = o.dir.join(IGNORE_FILE);
+    let mut ignore_bytes = std::fs::read(&ignore_path).ok();
+    let had_ignore_file = stored
+        .as_ref()
+        .and_then(|b| b.rules.as_deref())
+        .and_then(|r| serde_json::from_str::<Rules>(r).ok())
+        .is_some_and(|r| r.ignore_file.is_some());
+    if std::fs::symlink_metadata(&ignore_path).is_err() && !had_ignore_file && o.dir.join(".obsidian").is_dir() {
+        if !o.dry_run {
+            let written = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&ignore_path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, DEFAULT_IGNORE.as_bytes()));
+            match written {
+                Ok(()) => report.to_disk.new.push(IGNORE_FILE.to_string()),
+                Err(e) => report.skipped.push(note(IGNORE_FILE, format!("the defaults could not be written ({e}): used for this sync"))),
+            }
+        }
+        ignore_bytes = Some(DEFAULT_IGNORE.as_bytes().to_vec());
+    }
+    let (ignore, ignore_notes) = match &ignore_bytes {
+        Some(bytes) => ignore_rules(&o.dir, &String::from_utf8_lossy(bytes)),
+        None => (None, Vec::new()),
+    };
+    report.skipped.extend(ignore_notes.into_iter().map(|e| note(IGNORE_FILE, format!("not read: {e}"))));
+    let ignored = |rel: &str| ignore.as_ref().is_some_and(|gi| gi.matched_path_or_any_parents(rel, false).is_ignore());
+
     let mut plan = Plan::default();
     let all: BTreeSet<String> = base.keys().chain(heads.keys()).chain(walked.files.keys()).cloned().collect();
     for rel in all {
@@ -1108,12 +1183,15 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             plan.hold.push(rel);
             continue;
         }
-        // In a folder sync never writes into, moves out of or deletes in: nothing there is synced
-        // either way, whether textdb, the last sync or only the disk has it (a submodule's `.git`
-        // file under its short name, a plugin deleted in textdb, a plugin taken in from disk).
-        if protected_rel(&rel) {
+        // In a folder sync never writes into, moves out of or deletes in, or left out by
+        // `.textdbignore`: nothing there is synced either way, whether textdb, the last sync or only
+        // the disk has it (a submodule's `.git` file under its short name, a plugin deleted in
+        // textdb, a plugin taken in from disk).
+        let protected = protected_rel(&rel);
+        if protected || ignored(&rel) {
             if heads.contains_key(&rel) || base.contains_key(&rel) {
-                report.skipped.push(note(&rel, "inside a folder sync never writes into (.git, .textdb, node_modules, …): not synced"));
+                let why = if protected { "inside a folder sync never writes into (.git, .textdb, node_modules, …): not synced" } else { "left out by .textdbignore: not synced" };
+                report.skipped.push(note(&rel, why));
             }
             plan.hold.push(rel);
             continue;
@@ -1246,20 +1324,6 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     if repo.is_some() && !plan.candidates.is_empty() {
         let ignored = git::ignored(&o.dir, &plan.candidates);
         plan.candidates.retain(|rel| !ignored.contains(rel));
-    }
-    // `.textdbignore` in the directory, in .gitignore syntax: files it matches are not taken in.
-    let ignore_path = o.dir.join(".textdbignore");
-    let ignore_bytes = std::fs::read(&ignore_path).ok();
-    if ignore_bytes.is_some() && !plan.candidates.is_empty() {
-        let mut builder = ignore::gitignore::GitignoreBuilder::new(&o.dir);
-        let read = match builder.add(&ignore_path) {
-            Some(e) => Err(e),
-            None => builder.build(),
-        };
-        match read {
-            Ok(gi) => plan.candidates.retain(|rel| !gi.matched_path_or_any_parents(rel, false).is_ignore()),
-            Err(e) => report.skipped.push(note(".textdbignore", format!("not read: {e}"))),
-        }
     }
     // Files the asset rules (or their bytes) make assets belong to the asset store, never taken in
     // as documents, whatever `--ext` would take.
@@ -1426,7 +1490,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     }
     report.empty_dirs = walked.dirs.iter().filter(|d| !holds.contains(*d) && !emptied_by_sync.contains(*d)).cloned().collect();
     report.empty_dirs.sort();
-    plan.carry = carry;
+    plan.carry = carry.into_iter().filter(|(from, to)| !ignored(from) && !ignored(to)).collect();
     plan.keep.retain(|rel| !pairs.renames.iter().any(|(from, _)| from == rel));
     plan.present_now = walked.files.keys().filter(|rel| !pairs.unsure.contains(*rel)).cloned().chain(pairs.still_present.iter().cloned()).collect();
     (plan.asset_trash, plan.pointer_renames, plan.conflict_copies, plan.forget_had, plan.asset_hold) =
@@ -2198,13 +2262,14 @@ mod tests {
     #[test]
     fn never_deletes_moves_or_writes_in_protected_folders_or_through_short_names() {
         let tmp = tempfile::tempdir().unwrap();
-        let plugin = tmp.path().join(".obsidian/plugins/p");
-        std::fs::create_dir_all(&plugin).unwrap();
-        std::fs::write(plugin.join("main.js"), "run()").unwrap();
-        assert!(remove_disk(tmp.path(), ".obsidian/plugins/p/main.js").is_err());
-        assert!(move_disk(tmp.path(), ".obsidian/plugins/p/main.js", "elsewhere.js").is_err());
+        let dep = tmp.path().join("node_modules/p");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::write(dep.join("main.js"), "run()").unwrap();
+        assert!(remove_disk(tmp.path(), "node_modules/p/main.js").is_err());
+        assert!(move_disk(tmp.path(), "node_modules/p/main.js", "elsewhere.js").is_err());
         assert!(write_disk(tmp.path(), ".textdb/bin/textdb.cmd", b"x").is_err());
-        assert!(plugin.join("main.js").exists() && !tmp.path().join("elsewhere.js").exists());
+        assert!(write_disk(tmp.path(), ".textdbignore", b"").is_err());
+        assert!(dep.join("main.js").exists() && !tmp.path().join("elsewhere.js").exists());
         // A name shaped like a short name is written when it is its own name, not another's.
         std::fs::write(tmp.path().join("report~1.pdf"), "a").unwrap();
         write_disk(tmp.path(), "report~1.pdf", b"b").unwrap();
@@ -2224,9 +2289,23 @@ mod tests {
         assert!(!protected_rel(".gitignore") && !protected_rel("a/.github/workflows/ci.yml") && !protected_rel("notes/git/a.md"));
         assert!(!protected_rel(".obsidian/app.json") && !protected_rel("scans/report~1.pdf") && !protected_rel("photos~1/a.md"), "settings sync; other names may look like short names");
         assert!(protected_rel("sub/GIT~1") && protected_rel("NODE_M~1/x.js") && protected_rel("GI3F2A~1/hooks/x"));
-        assert!(protected_rel(".obsidian/plugins/p/main.js") && protected_rel(".Obsidian/Themes/t.css") && protected_rel(".obsidian/snippets/s.css"));
+        assert!(!protected_rel(".obsidian/plugins/p/main.js") && protected_rel(".textdbignore") && protected_rel(".TextDbIgnore") && !protected_rel("sub/.textdbignore"), "plugins are up to .textdbignore, which is the directory's own");
         assert!(eligible("logo.png", &parse_exts("*")));
         assert!(has_markers(b"a\n<<<<<<< textdb\nb\n=======\nc\n>>>>>>> disk\n"));
         assert!(!has_markers(b"<<<<<<< only an opening line\n"));
+    }
+
+    #[test]
+    fn the_default_textdbignore_leaves_out_obsidian_code_at_any_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (gi, notes) = ignore_rules(tmp.path(), DEFAULT_IGNORE);
+        assert!(notes.is_empty(), "{notes:?}");
+        let gi = gi.unwrap();
+        let ignored = |rel: &str| gi.matched_path_or_any_parents(rel, false).is_ignore();
+        assert!(ignored(".obsidian/plugins/p/main.js") && ignored("sub/vault/.obsidian/themes/t/theme.css") && ignored(".obsidian/snippets/s.css"));
+        assert!(!ignored(".obsidian/app.json") && !ignored("plugins/p/main.js") && !ignored("notes/a.md"));
+        if CASE_INSENSITIVE {
+            assert!(ignored(".Obsidian/Plugins/p/main.js"));
+        }
     }
 }

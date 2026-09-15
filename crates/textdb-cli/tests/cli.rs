@@ -868,6 +868,49 @@ fn store_pointers_never_move_or_trash_rules_files_nor_sync_write_through_short_f
     }
 }
 
+#[test]
+fn textdbignore_leaves_obsidian_code_out_both_ways_and_stays_the_directorys_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let vault = tmp.path().join("vault");
+    std::fs::create_dir_all(vault.join(".obsidian/plugins/local")).unwrap();
+    std::fs::write(vault.join(".obsidian/plugins/local/main.md"), "local plugin").unwrap();
+    std::fs::write(vault.join("a.md"), "a").unwrap();
+    let dir = vault.to_str().unwrap();
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.args(args);
+        c
+    };
+
+    // An Obsidian vault's first sync writes the defaults, and leaves out what they match.
+    ok(&mut t(&["sync", "/", dir]), None);
+    let rules = std::fs::read_to_string(vault.join(".textdbignore")).unwrap();
+    assert!(rules.contains("**/.obsidian/plugins/"), "{rules}");
+    assert_eq!(run(&mut t(&["stat", "/.obsidian/plugins/local/main.md"]), None).status, 5, "a plugin was taken in");
+    assert_eq!(run(&mut t(&["stat", "/.textdbignore"]), None).status, 5, "the rules were taken in");
+
+    // Nor is a plugin written from the store, at any depth, nor are the rules changed from there.
+    for rel in ["/.obsidian/plugins/evil/main.js", "/sub/.obsidian/themes/t/theme.css", "/.textdbignore"] {
+        ok(&mut t(&["write", rel]), Some("from the store\n"));
+    }
+    let synced = run(&mut t(&["sync", "/", dir]), None);
+    assert!(!vault.join(".obsidian/plugins/evil").exists() && !vault.join("sub/.obsidian/themes").exists(), "{}", synced.stdout);
+    assert_eq!(std::fs::read_to_string(vault.join(".textdbignore")).unwrap(), rules, "the store changed the rules");
+    assert!(synced.stdout.contains("left out by .textdbignore"), "{}", synced.stdout);
+
+    // The directory's own rules decide: without those lines plugins sync, and the defaults are not
+    // written again.
+    std::fs::write(vault.join(".textdbignore"), "").unwrap();
+    let synced = run(&mut t(&["sync", "/", dir, "--accept-rules"]), None);
+    assert!(vault.join(".obsidian/plugins/evil/main.js").exists() && vault.join("sub/.obsidian/themes/t/theme.css").exists(), "{}", synced.stdout);
+    assert_eq!(run(&mut t(&["stat", "/.obsidian/plugins/local/main.md"]), None).status, 0, "{}", synced.stdout);
+    assert_eq!(std::fs::read_to_string(vault.join(".textdbignore")).unwrap(), "");
+    std::fs::remove_file(vault.join(".textdbignore")).unwrap();
+    run(&mut t(&["sync", "/", dir]), None);
+    assert!(!vault.join(".textdbignore").exists(), "the defaults came back after the file was deleted");
+}
+
 /// Make `link` a link to the folder `target`: a junction on Windows (which needs no privilege), a
 /// symbolic link elsewhere.
 fn link_dir(target: &Path, link: &Path) -> bool {

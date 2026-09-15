@@ -237,11 +237,14 @@ names a file that is no asset (a document, a file the rules leave out) is a `con
 never hashed or described: anyone who can write to the store must not be able to plant a git hook
 or learn about other files through a pointer, and `push --force` never uploads a file a pointer
 only names. For the same reason sync never writes, moves or deletes a store file inside `.git`,
-`.textdb`, `node_modules`, `.trash`, `.textdb-trash`, `__pycache__`, the system folders textdb
-leaves out, or `.obsidian/plugins`, `snippets` and `themes` (Obsidian's other settings sync on
-purpose): nothing there is synced either way — a file textdb or the last sync has there is
-reported as skipped, a file only on disk there is not taken in, and none is written, moved or
-deleted. These checks take a name as Windows would resolve it, so `.GIT`, `.git.`,
+`.textdb`, `node_modules`, `.trash`, `.textdb-trash`, `__pycache__` or the system folders textdb
+leaves out, nor anything `.textdbignore` leaves out: nothing there is synced either way — a file
+textdb or the last sync has there is reported as skipped, a file only on disk there is not taken
+in, and none is written, moved or deleted. An Obsidian vault that never had a `.textdbignore` gets
+one at its next sync leaving out `.obsidian/plugins/`, `snippets/` and `themes/`, the code and
+styles Obsidian loads (its other settings sync); delete those lines to sync them. `.textdbignore`
+is the directory's own: sync never writes it from textdb, so the store cannot take those lines
+away. These checks take a name as Windows would resolve it, so `.GIT`, `.git.`,
 `.git::$INDEX_ALLOCATION` and the 8.3 short names Windows may give those folders (`GIT~1`,
 `NODE_M~1`, or the hashed `GI3F2A~1`) are those folders, while other names that only look like
 short names (`photos~1`, `report~1.pdf`) are not. Neither sync nor pull writes, moves or deletes
