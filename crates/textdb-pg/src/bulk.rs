@@ -6,11 +6,10 @@ use std::collections::{HashMap, HashSet};
 
 use pgrx::prelude::*;
 use serde_json::{json, Value};
-use textdb_core::tree::materialize;
 use textdb_core::{unified_diff, TextdbError};
 
 use crate::kb;
-use crate::store::{to_hash, SpiStorage};
+use crate::store::{materialize_all, to_hash, SpiStorage};
 
 type Result<T> = std::result::Result<T, TextdbError>;
 
@@ -172,7 +171,7 @@ fn node_by_id(id: i64) -> Result<Option<AnyNode>> {
 }
 
 fn content_at(file_id: i64, version: i64) -> Result<Vec<u8>> {
-    materialize(&SpiStorage::new(), &kb::root_of_version_r(file_id, version as u64)?)
+    materialize_all(&SpiStorage::new(), &kb::root_of_version_r(file_id, version as u64)?)
 }
 
 /// A new file as a unified diff against nothing.
@@ -328,7 +327,7 @@ pub fn revert(batch: &str, author: Option<&str>, skip_changed: bool) -> Result<V
                         // Created by the batch and deleted again: nothing to bring back.
                         (Some(&(first, _)), _) if first <= 1 => continue,
                         (Some(&(first, _)), _) => content_at(id, first - 1)?,
-                        (None, Some(root)) => materialize(&SpiStorage::new(), &to_hash(&root)?)?,
+                        (None, Some(root)) => materialize_all(&SpiStorage::new(), &to_hash(&root)?)?,
                         (None, None) => continue,
                     };
                     kb::create_impl(&path, &String::from_utf8_lossy(&content), author, Some(&message))?;

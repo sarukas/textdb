@@ -127,14 +127,164 @@ impl NodeRow {
 pub struct SpiStorage {
     pending_chunks: std::collections::BTreeMap<Hash, Vec<u8>>,
     pending_nodes: std::collections::BTreeMap<Hash, Vec<u8>>,
+    /// Tree nodes already read in this call.
+    ///
+    /// Only nodes, never chunks: nodes get asked for twice on every read — once to decide
+    /// whether the document is worth batching, once by the walk that assembles it — and
+    /// without this a one-leaf document paid three queries where it used to pay two. Chunks
+    /// are asked for once each, so caching them would buy nothing and hold the whole
+    /// document in memory a second time.
+    ///
+    /// Content-addressed, so an entry never goes stale and no write has to invalidate it,
+    /// and a `SpiStorage` lives for one function call, which bounds it without a policy.
+    node_cache: std::cell::RefCell<std::collections::HashMap<Hash, Node>>,
 }
+
+/// Hashes per batched `= ANY($1)` lookup.
+///
+/// The point is to stop paying per row, and one round of planning amortised over a few
+/// hundred rows already does that; a single unbounded array would instead build one huge
+/// parameter for a document with a hundred thousand leaves.
+const FETCH_BATCH: usize = 512;
+
+/// Below this many leaves, read the chunks one query at a time.
+///
+/// Batching is not free: `unnest(...) WITH ORDINALITY` joined against `kb.chunk` costs more
+/// to plan than `WHERE hash = $1`, and on a one-leaf document that planning is the whole
+/// read. Measured, the first cut of this made 512 B reads 1.76x *slower* while making 10 MiB
+/// reads 2.6x faster. Small documents are also the ones the RT, CR and SR families issue
+/// most, so that trade was the wrong way round.
+const BATCH_FLOOR: usize = 8;
 
 impl SpiStorage {
     pub fn new() -> Self {
         SpiStorage {
             pending_chunks: Default::default(),
             pending_nodes: Default::default(),
+            node_cache: Default::default(),
         }
+    }
+
+    /// Materialise by fetching the leaves **in document order** and appending them straight
+    /// to the output.
+    ///
+    /// Batching alone still handled every chunk twice — once into a cache, once out of it
+    /// into the result — which at ~10 us a leaf was most of what was left after the queries
+    /// were amortised. `unnest(...) WITH ORDINALITY` makes Postgres return the rows in the
+    /// order they were asked for, so the bytes can be appended as they arrive and each chunk
+    /// is copied once. A hash repeated in one document (chunk sharing does that) is repeated
+    /// by `unnest` too, so shared chunks still land in every position they belong to.
+    ///
+    /// `None` means "not applicable here, use the ordinary walk": there are unflushed
+    /// pending writes whose chunks are not in the table yet, or the tree could not be
+    /// walked. Never a silent wrong answer.
+    fn materialize_ordered(&self, root: &Hash) -> Option<Vec<u8>> {
+        if !self.pending_chunks.is_empty() || !self.pending_nodes.is_empty() {
+            return None;
+        }
+        let leaves = self.leaf_order(root)?;
+        if leaves.len() < BATCH_FLOOR {
+            return None;
+        }
+        let mut out = Vec::new();
+        for want in leaves.chunks(FETCH_BATCH) {
+            let arg: Vec<Vec<u8>> = want.iter().map(|h| h.to_vec()).collect();
+            let got: Vec<Vec<u8>> = Spi::connect(|client| {
+                let rows = client
+                    .select(
+                        "SELECT c.bytes FROM unnest($1::bytea[]) WITH ORDINALITY AS u(h, ord) \
+                         JOIN kb.chunk c ON c.hash = u.h ORDER BY u.ord",
+                        None,
+                        &[arg.into()],
+                    )
+                    .ok()?;
+                let mut v = Vec::with_capacity(want.len());
+                for r in rows {
+                    v.push(r.get::<Vec<u8>>(1).ok()??);
+                }
+                Some(v)
+            })?;
+            // A short result means a chunk is missing; the ordinary walk will say so
+            // properly rather than this silently returning a truncated document.
+            if got.len() != want.len() {
+                return None;
+            }
+            for b in got {
+                out.extend_from_slice(&b);
+            }
+        }
+        Some(out)
+    }
+
+    /// Leaf hashes under `root`, in document order, reading each tree level in one query.
+    fn leaf_order(&self, root: &Hash) -> Option<Vec<Hash>> {
+        // The root goes through the ordinary single-row lookup, which is one query either
+        // way. A shallow document is then recognised without ever building an array
+        // parameter, so the batched path costs it nothing.
+        let top = self.get_node(root).ok()??;
+        let mut order: Vec<Hash> = Vec::new();
+        let mut level = Vec::new();
+        for c in &top.children {
+            if c.is_leaf {
+                order.push(c.hash);
+            } else {
+                level.push(c.hash);
+            }
+        }
+        if level.is_empty() {
+            return Some(order);
+        }
+        if !order.is_empty() {
+            return None;
+        }
+        for _ in 0..64 {
+            if level.is_empty() {
+                return Some(order);
+            }
+            let mut by_hash = std::collections::HashMap::new();
+            for want in level.chunks(FETCH_BATCH) {
+                for (h, enc) in self.fetch_many("SELECT hash, children FROM kb.tree_node WHERE hash = ANY($1)", want).ok()? {
+                    let n = Node::decode(&enc)?;
+                    self.node_cache.borrow_mut().insert(h, n.clone());
+                    by_hash.insert(h, n);
+                }
+            }
+            // Rebuilt in `level` order, not in whatever order the rows came back, or the
+            // document would be assembled out of order.
+            let mut next = Vec::new();
+            for h in &level {
+                for c in &by_hash.get(h)?.children {
+                    if c.is_leaf {
+                        order.push(c.hash);
+                    } else {
+                        next.push(c.hash);
+                    }
+                }
+            }
+            // A tree with leaves and branches at the same level would interleave wrongly;
+            // textdb never builds one, and this declines rather than assumes.
+            if !next.is_empty() && !order.is_empty() {
+                return None;
+            }
+            level = next;
+        }
+        None
+    }
+
+    /// `(hash, bytes)` for every row whose hash is in `want`, in one query.
+    fn fetch_many(&self, sql: &str, want: &[Hash]) -> Result<Vec<(Hash, Vec<u8>)>> {
+        let arg: Vec<Vec<u8>> = want.iter().map(|h| h.to_vec()).collect();
+        Spi::connect(|client| {
+            let rows = client.select(sql, None, &[arg.into()]).map_err(map)?;
+            let mut out = Vec::with_capacity(want.len());
+            for r in rows {
+                let (Some(h), Some(b)) = (r.get::<Vec<u8>>(1).map_err(map)?, r.get::<Vec<u8>>(2).map_err(map)?) else {
+                    continue;
+                };
+                out.push((to_hash(&h)?, b));
+            }
+            Ok(out)
+        })
     }
 
     /// Persist buffered chunks and nodes (sorted by hash) — called before every CAS and
@@ -186,6 +336,7 @@ impl Storage for SpiStorage {
         Spi::get_one_with_args::<Vec<u8>>("SELECT bytes FROM kb.chunk WHERE hash = $1", &[h.to_vec().into()]).map_err(map)
     }
 
+
     fn put_chunk(&mut self, h: &Hash, b: &[u8]) -> Result<()> {
         self.pending_chunks.entry(*h).or_insert_with(|| b.to_vec());
         Ok(())
@@ -195,10 +346,17 @@ impl Storage for SpiStorage {
         if let Some(e) = self.pending_nodes.get(h) {
             return Node::decode(e).map(Some).ok_or_else(|| TextdbError::Storage("corrupt tree node".into()));
         }
+        if let Some(n) = self.node_cache.borrow().get(h) {
+            return Ok(Some(n.clone()));
+        }
         let enc = Spi::get_one_with_args::<Vec<u8>>("SELECT children FROM kb.tree_node WHERE hash = $1", &[h.to_vec().into()]).map_err(map)?;
         match enc {
             None => Ok(None),
-            Some(e) => Node::decode(&e).map(Some).ok_or_else(|| TextdbError::Storage("corrupt tree node".into())),
+            Some(e) => {
+                let n = Node::decode(&e).ok_or_else(|| TextdbError::Storage("corrupt tree node".into()))?;
+                self.node_cache.borrow_mut().insert(*h, n.clone());
+                Ok(Some(n))
+            }
         }
     }
 
@@ -233,5 +391,20 @@ impl Storage for SpiStorage {
         }
         .map_err(map)?;
         Ok(n == Some(1))
+    }
+}
+
+/// Materialise a whole document, reading its tree in bulk first.
+///
+/// Every full-document read goes through here rather than calling
+/// [`textdb_core::tree::materialize`] directly, so no read path can be left paying one
+/// query per chunk by omission. Range reads deliberately do not: they touch a slice of the
+/// leaves, and fetching the whole tree for them would read what they will not use.
+pub fn materialize_all(st: &SpiStorage, root: &Hash) -> Result<Vec<u8>> {
+    match st.materialize_ordered(root) {
+        Some(out) => Ok(out),
+        // Anything the fast path declines — a pending write not yet flushed, a tree it could
+        // not walk — falls back to the ordinary walk, which is always correct.
+        None => textdb_core::tree::materialize(st, root),
     }
 }

@@ -472,14 +472,14 @@ mod kb {
     use pgrx::datum::DatumWithOid;
     use textdb_core::commit::{commit, commit_append, CommitKind, Committed};
     use textdb_core::myers::byte_edits;
-    use textdb_core::tree::{leaves, locate_line, materialize, materialize_range, totals};
+    use textdb_core::tree::{leaves, locate_line, materialize_range, totals};
     use textdb_core::path::ancestors;
     use textdb_core::{
         unified_diff, word_delta, words_at, ChunkParams, Edit, Hash, LineHunk, PathOp, Storage, StructureExtractor, TextdbError,
     };
     use textdb_md::MarkdownExtractor;
 
-    use crate::store::{normalize_path, parent_of, name_of, raise, spi_err, to_hash, NodeRow, SpiStorage};
+    use crate::store::{materialize_all, normalize_path, parent_of, name_of, raise, spi_err, to_hash, NodeRow, SpiStorage};
 
     const P: ChunkParams = ChunkParams::DEFAULT;
     const RETRIES: usize = textdb_core::DEFAULT_RETRIES;
@@ -554,7 +554,7 @@ mod kb {
         let root = root?;
         let h = to_hash(root).ok()?;
         let st = SpiStorage::new();
-        let bytes = ok(materialize(&st, &h));
+        let bytes = ok(materialize_all(&st, &h));
         Some(String::from_utf8_lossy(&bytes).into_owned())
     }
 
@@ -853,7 +853,7 @@ mod kb {
         }
         let lower = path.to_ascii_lowercase();
         if lower.ends_with(".md") || lower.ends_with(".markdown") {
-            let bytes = ok(materialize(&st, &c.root));
+            let bytes = ok(materialize_all(&st, &c.root));
             let s = MarkdownExtractor.extract(&bytes);
             ok(write_structure(file_id, c.version as i64, &s));
         }
@@ -1152,7 +1152,7 @@ mod kb {
         }
         let n = file_by_path_r(&path)?;
         let root = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
-        let text = crate::bulk::apply_replacements(&path, materialize(&SpiStorage::new(), &root)?, replacements)?;
+        let text = crate::bulk::apply_replacements(&path, materialize_all(&SpiStorage::new(), &root)?, replacements)?;
         let text = String::from_utf8(text).map_err(|_| TextdbError::InvalidEdit(format!("{path}: the replaced content is not valid UTF-8")))?;
         update_content_impl(&path, &text, Some(n.version), author, message.or(Some("replace")))
     }
@@ -1189,7 +1189,7 @@ mod kb {
             _ => cur,
         };
         let mut st = SpiStorage::new();
-        let old = materialize(&st, &base)?;
+        let old = materialize_all(&st, &base)?;
         let edits = byte_edits(&old, content.as_bytes());
         if edits.is_empty() && base == cur {
             return Ok((n.version, CommitKind::NoOp));
@@ -1225,7 +1225,7 @@ mod kb {
         let n = file_by_path_r(&path)?;
         let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let mut st = SpiStorage::new();
-        let content = materialize(&st, &cur)?;
+        let content = materialize_all(&st, &cur)?;
         let pos = find_unique(&content, old.as_bytes())?;
         let edits = [Edit::new(pos as u64, (pos + old.len()) as u64, new.as_bytes().to_vec())];
         let c = commit(&mut st, &P, n.id as u64, &path, &cur, &edits, RETRIES)?;
@@ -1416,11 +1416,11 @@ mod kb {
         let bytes = match version {
             None => {
                 let n = file_by_path(&path);
-                ok(materialize(&st, &n.root.unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())))))
+                ok(materialize_all(&st, &n.root.unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())))))
             }
             Some(v) => {
                 let n = NodeRow::by_path(&path, true).unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
-                ok(materialize(&st, &root_of_version(n.id, v as u64)))
+                ok(materialize_all(&st, &root_of_version(n.id, v as u64)))
             }
         };
         String::from_utf8_lossy(&bytes).into_owned()
@@ -1610,7 +1610,7 @@ mod kb {
         let st = SpiStorage::new();
         if v1 == 0 || v2 == 0 {
             let root = root_of_version_r(n.id, v1.max(v2))?;
-            let text = materialize(&st, &root)?;
+            let text = materialize_all(&st, &root)?;
             if text.is_empty() {
                 return Ok(Vec::new());
             }
@@ -1744,7 +1744,7 @@ mod kb {
         let mut out = Vec::new();
         for n in files {
             if let Some(root) = n.root {
-                out.push((n.path, String::from_utf8_lossy(&ok(materialize(&st, &root))).into_owned()));
+                out.push((n.path, String::from_utf8_lossy(&ok(materialize_all(&st, &root))).into_owned()));
             }
         }
         TableIterator::new(out)
@@ -1863,7 +1863,7 @@ mod kb {
                     (l.line_off as i64 + li as i64 + 1, sn)
                 }
                 None => {
-                    let body = ok(materialize(&st, &root));
+                    let body = ok(materialize_all(&st, &root));
                     let (li, sn) = locate_terms(&body, &terms);
                     if sn.is_empty() {
                         continue;
