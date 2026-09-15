@@ -909,7 +909,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             let update = if update_links { Some(true) } else if no_update_links { Some(false) } else { None };
             // An asset is named by its own path: its pointer moves, and the next sync moves the file.
             let from = store_or_pointer(st, &from);
-            let to = if assets::pointer::is_asset_pointer(&from) { pointer_destination(st, &from, &to)? } else { to };
+            let to = if assets::pointer::is_asset_pointer(&from) { pointer_destination(st, &from, &to)? } else { document_destination(st, &to)? };
             let untracked = untracked_on_disk(st, &from);
             let moved_links = st.mv_links(&from, &to, author, message.as_deref(), update)?;
             let removed = if keep_empty_folders { Vec::new() } else { prune_empty_folders(st, &from, author)? };
@@ -1813,10 +1813,39 @@ fn pointer_destination(st: &mut dyn Store, from: &str, to: &str) -> Result<Strin
         let own = asset_path(from).rsplit('/').next().unwrap_or("");
         return Err(StoreError::invalid(format!("{to}: name the asset's new path, as in {}/{own}", asset.trim_end_matches('/'))));
     }
-    if st.stat(asset).is_ok() {
-        return Err(StoreError::invalid(format!("{asset} exists already: an asset cannot take the name of a document")));
+    let pointer = format!("{asset}{SUFFIX}");
+    if exists_any_case(st, asset) || (!pointer.eq_ignore_ascii_case(from) && exists_any_case(st, &pointer)) {
+        return Err(StoreError::invalid(format!("{asset} exists already (in some letter case): an asset cannot take another file's name")));
     }
-    Ok(format!("{asset}{SUFFIX}"))
+    Ok(pointer)
+}
+
+/// `to` for a document or folder, unless that is an asset's path (its pointer exists, in any
+/// letter case): the document would stand where the asset's file goes.
+fn document_destination(st: &mut dyn Store, to: &str) -> Result<String> {
+    use assets::pointer::{is_asset_pointer, SUFFIX};
+    let bare = to.trim_end_matches('/');
+    if !bare.is_empty() && !is_asset_pointer(bare) && exists_any_case(st, &format!("{bare}{SUFFIX}")) {
+        return Err(StoreError::invalid(format!("{bare} is an asset's path ({bare}{SUFFIX} exists): choose another name")));
+    }
+    Ok(to.to_string())
+}
+
+/// Whether the store has `path`, in any letter case along it.
+fn exists_any_case(st: &mut dyn Store, path: &str) -> bool {
+    if st.stat(path).is_ok() {
+        return true;
+    }
+    let mut at = "/".to_string();
+    for seg in path.split('/').filter(|s| !s.is_empty()) {
+        let seg = seg.to_lowercase();
+        let Ok(entries) = st.ls(&at, false) else { return false };
+        match entries.into_iter().find(|e| e.name.to_lowercase() == seg) {
+            Some(e) => at = e.path,
+            None => return false,
+        }
+    }
+    true
 }
 
 /// Directories synced with the store folder `path` that hold files textdb does not track, which

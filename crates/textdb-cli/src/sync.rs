@@ -478,8 +478,8 @@ struct Plan {
     forget_had: Vec<String>,
     /// Asset pointers deleted in the store that stay on disk for now: (pointer, why).
     asset_hold: Vec<(String, String)>,
-    /// The files without a pointer this sync found, recorded for the next.
-    untracked_now: BTreeSet<String>,
+    /// The files this sync found, recorded for the next (less the ones it could not look at).
+    present_now: BTreeSet<String>,
     /// Asset pointers that follow their real file, renamed on disk: (from, to).
     pointer_renames: Vec<(String, String)>,
     /// Real files set aside for a keep-both conflict: (from, to).
@@ -495,6 +495,11 @@ struct AssetPairs {
     copies: Vec<(String, String)>,
     forget: Vec<String>,
     hold: Vec<(String, String)>,
+    /// Files that may be an asset's new name but could not be hashed: not recorded as present, so
+    /// the next sync looks at them again.
+    unsure: HashSet<String>,
+    /// Asset files gone since the last sync that wait on those: still recorded as present.
+    still_present: Vec<String>,
 }
 
 /// Pair asset pointers with their real files (docs/assets.md, "Sync"): a pointer moved in the
@@ -591,7 +596,11 @@ fn pair_assets(
             lost.push((p.sha256, p.size, rel.clone()));
         }
     }
-    let renames_possible = lost.iter().any(|(sha, _, rel)| had.had(&real(rel)) == Some(sha.as_str()));
+    // A pointer's file gone before the last sync (left unpulled on purpose, say) was not renamed.
+    fn renamed_here(had: &crate::assets::DirCache, rel: &str, sha: &str) -> bool {
+        had.had(rel) == Some(sha) && had.was_present(rel) != Some(false)
+    }
+    let renames_possible = lost.iter().any(|(sha, _, rel)| renamed_here(&had, &real(rel), sha));
     let orphans = !lost.is_empty()
         && walked.files.keys().any(|r| free(r) && !is_asset_pointer(r) && had.had(r).is_some() && !on_disk(&format!("{r}{}", pointer::SUFFIX)));
     if renames_possible || orphans {
@@ -611,21 +620,26 @@ fn pair_assets(
                 || on_disk(&pointer_rel)
                 || heads.contains_key(&pointer_rel)
                 || base.contains_key(&pointer_rel)
-                || (!had_file && (!renames_possible || had.was_untracked(rel) == Some(true)))
+                || (!had_file && (!renames_possible || had.was_present(rel) == Some(true)))
                 || store_folders.iter().any(|f| lower.starts_with(&format!("{f}/")))
                 || classifier.classify(dir, rel) != Class::Asset
             {
                 continue;
             }
-            if let Ok(sha) = had.sha(rel, d.size as u64, d.mtime) {
-                found.push((sha.clone(), (rel.clone(), sha)));
+            match had.sha(rel, d.size as u64, d.mtime) {
+                Ok(sha) => found.push((sha.clone(), (rel.clone(), sha))),
+                Err(_) => drop(pairs.unsure.insert(rel.clone())),
             }
+        }
+        if !pairs.unsure.is_empty() {
+            // Until those can be read, the files they may be the new names of count as there.
+            pairs.still_present.extend(lost.iter().map(|(_, _, rel)| real(rel)).filter(|file| had.was_present(file) != Some(false)));
         }
         let lost = lost.into_iter().map(|(sha, _, rel)| (sha.clone(), (rel, sha)));
         for ((pointer_rel, sha), (file, _)) in pairing::one_to_one(lost, found) {
             let lost_file = real(&pointer_rel);
             let had_it = |rel: &str| had.had(rel) == Some(sha.as_str());
-            match (had_it(&lost_file), had_it(&file)) {
+            match (renamed_here(&had, &lost_file, &sha), had_it(&file)) {
                 (true, false) => pairs.renames.push((pointer_rel, format!("{file}{}", pointer::SUFFIX))),
                 (false, true) => pairs.carry.push((file, lost_file)),
                 _ => {}
@@ -933,7 +947,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     };
     // Paths deleted or moved away in the store since the last sync: a file there now may be another
     // with the same version number, so its content tells.
-    let mut gone_since: Vec<String> = Vec::new();
+    let mut gone_since: HashSet<String> = HashSet::new();
     if let Some(b) = &stored {
         const PAGE: i64 = 10_000;
         let mut since = b.seq;
@@ -941,7 +955,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             let page = sides.st.feed(since, PAGE)?;
             for c in &page {
                 match c.op.as_str() {
-                    "delete" => gone_since.push(c.path.clone()),
+                    "delete" => drop(gone_since.insert(c.path.clone())),
                     "move" => gone_since.extend(c.old_path.clone()),
                     _ => {}
                 }
@@ -952,9 +966,22 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             }
         }
     }
+    // The path, or a folder it is in, went away.
     let recreated = |rel: &str| {
+        if gone_since.is_empty() {
+            return false;
+        }
         let path = store_path(&prefix, rel);
-        gone_since.iter().any(|g| path == *g || path.starts_with(&format!("{g}/")))
+        let mut at = path.as_str();
+        loop {
+            if gone_since.contains(at) {
+                return true;
+            }
+            match at.rfind('/') {
+                Some(i) if i > 0 => at = &at[..i],
+                _ => return false,
+            }
+        }
     };
     let mut plan = Plan::default();
     let all: BTreeSet<String> = base.keys().chain(heads.keys()).chain(walked.files.keys()).cloned().collect();
@@ -1197,7 +1224,8 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             }
             for rel in untracked.iter().filter(|r| r.starts_with(&inside)) {
                 let to = format!("{nd}/{}", &rel[inside.len()..]);
-                if !walked.files.contains_key(&to) && !new_on_disk_rels.contains(&&to) {
+                let taken_in_other_case = CASE_INSENSITIVE && walked.files.keys().any(|k| k.to_lowercase() == to.to_lowercase());
+                if !walked.files.contains_key(&to) && !new_on_disk_rels.contains(&&to) && !taken_in_other_case {
                     carry.push((rel.to_string(), to));
                 }
             }
@@ -1272,9 +1300,9 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     report.empty_dirs.sort();
     plan.carry = carry;
     plan.keep.retain(|rel| !pairs.renames.iter().any(|(from, _)| from == rel));
+    plan.present_now = walked.files.keys().filter(|rel| !pairs.unsure.contains(*rel)).cloned().chain(pairs.still_present.iter().cloned()).collect();
     (plan.asset_trash, plan.pointer_renames, plan.conflict_copies, plan.forget_had, plan.asset_hold) =
         (pairs.trash, pairs.renames, pairs.copies, pairs.forget, pairs.hold);
-    plan.untracked_now = untracked.iter().map(|rel| (*rel).clone()).collect();
 
     // Names written to disk must be able to exist next to what is there.
     let new_on_disk: Vec<&str> = plan
@@ -1470,6 +1498,13 @@ fn apply(
     let author = o.author.as_str();
     let mut rows: BTreeMap<String, BaseFile> = BTreeMap::new();
     let mut had = crate::assets::DirCache::open(dir);
+    // The files there after this sync: those found, as they move.
+    let mut present = plan.present_now.clone();
+    let mut moved = |from: &str, to: &str| {
+        if present.remove(from) {
+            present.insert(to.to_string());
+        }
+    };
     for rel in &plan.forget_had {
         had.forget(rel);
     }
@@ -1503,6 +1538,7 @@ fn apply(
                 Ok(()) => {
                     rows.insert(to.clone(), base_row(dir, to, heads.get(from).map(|h| h.version), base[from].blob.clone(), false));
                     had.moved(crate::assets::pointer::asset_path(from), crate::assets::pointer::asset_path(to));
+                    moved(from, to);
                 }
                 Err(e) => failed(report, &mut rows, from, e.to_string()),
             },
@@ -1582,7 +1618,10 @@ fn apply(
     }
     for (from, to) in &plan.carry {
         match move_disk(dir, from, to) {
-            Ok(()) => had.moved(from, to),
+            Ok(()) => {
+                had.moved(from, to);
+                moved(from, to);
+            }
             Err(e) => report.failed.push(note(from, format!("not moved to {to} with its folder: {e}"))),
         }
     }
@@ -1600,6 +1639,7 @@ fn apply(
         match move_disk(dir, file, &format!("{folder}/{file}")) {
             Ok(()) => {
                 had.forget(file);
+                moved(file, &format!("{folder}/{file}"));
                 if let Err(e) = remove_disk(dir, pointer_rel) {
                     failed(report, &mut rows, pointer_rel, e.to_string());
                 }
@@ -1620,7 +1660,7 @@ fn apply(
             report.failed.push(note(from, format!("changed here and in textdb, but not set aside as {to}: {e}")));
         }
     }
-    had.record_untracked(plan.untracked_now.clone());
+    had.record_present(present);
     had.save();
     if o.prune_empty_dirs {
         let mut dirs = report.empty_dirs.clone();

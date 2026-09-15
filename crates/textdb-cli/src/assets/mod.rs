@@ -303,12 +303,12 @@ struct VaultCache {
     /// By the asset's relative path: the SHA-256 of the bytes this directory last had for it.
     #[serde(default)]
     seen: BTreeMap<String, String>,
-    /// The files without a pointer the last sync found (textdb does not track them).
+    /// The files the last sync found in the directory.
     #[serde(default)]
-    untracked: BTreeSet<String>,
-    /// A sync recorded `untracked`.
+    present: BTreeSet<String>,
+    /// A sync recorded `present`.
     #[serde(default)]
-    untracked_known: bool,
+    present_known: bool,
     #[serde(skip)]
     path: Option<PathBuf>,
     /// Where an older build kept this cache, removed once it is saved here.
@@ -390,6 +390,14 @@ impl VaultCache {
         }
     }
 
+    /// A file was put at `rel` after the last sync looked: sync counts it as there then.
+    fn add_present(&mut self, rel: &str) {
+        if self.present_known && self.present.insert(rel.to_string()) {
+            self.touched.insert((3, String::new()));
+            self.dirty = true;
+        }
+    }
+
     fn binary(&mut self, root: &Path, rel: &str, size: u64, mtime: i64) -> bool {
         if let Some(&(s, m, b)) = self.sniffed.get(rel) {
             if Self::trusted(size, mtime, (s, m)) {
@@ -416,7 +424,7 @@ impl VaultCache {
             merged.sniffed.extend(self.sniffed.iter().filter(|(k, _)| mine(1, k)).map(|(k, v)| (k.clone(), *v)));
             merged.seen.extend(self.seen.iter().filter(|(k, _)| mine(2, k)).map(|(k, v)| (k.clone(), v.clone())));
             if all || self.touched.contains(&(3, String::new())) {
-                (merged.untracked, merged.untracked_known) = (self.untracked.clone(), self.untracked_known);
+                (merged.present, merged.present_known) = (self.present.clone(), self.present_known);
             }
             // What this process forgot is forgotten there too.
             for (kind, k) in &self.touched {
@@ -945,15 +953,19 @@ fn seen_key(seen: &BTreeMap<String, String>, rel: &str) -> Option<String> {
 }
 
 /// What a directory knows of its assets, for sync: the bytes it last had of each, its files'
-/// hashes, and the files without a pointer the last sync found.
+/// hashes, and the files the last sync found.
 pub(crate) struct DirCache {
     cache: VaultCache,
     dir: PathBuf,
+    /// `present` in lower case, where letter case does not tell files apart.
+    present_folded: HashSet<String>,
 }
 
 impl DirCache {
     pub(crate) fn open(dir: &Path) -> DirCache {
-        DirCache { cache: VaultCache::open(&Vault { prefix: "/".to_string(), dir: dir.to_path_buf() }), dir: dir.to_path_buf() }
+        let cache = VaultCache::open(&Vault { prefix: "/".to_string(), dir: dir.to_path_buf() });
+        let present_folded = if cfg!(any(windows, target_os = "macos")) { cache.present.iter().map(|r| r.to_lowercase()).collect() } else { HashSet::new() };
+        DirCache { cache, dir: dir.to_path_buf(), present_folded }
     }
 
     /// The SHA-256 of the bytes this directory last had for the asset at `rel`.
@@ -966,9 +978,11 @@ impl DirCache {
         self.cache.sha(&self.dir.clone(), rel, size, mtime)
     }
 
-    /// Whether the last sync found `rel` without a pointer; `None` when no sync recorded that.
-    pub(crate) fn was_untracked(&self, rel: &str) -> Option<bool> {
-        self.cache.untracked_known.then(|| self.cache.untracked.contains(rel))
+    /// Whether the last sync found a file at `rel`; `None` when no sync recorded that.
+    pub(crate) fn was_present(&self, rel: &str) -> Option<bool> {
+        self.cache
+            .present_known
+            .then(|| self.cache.present.contains(rel) || self.present_folded.contains(&rel.to_lowercase()))
     }
 
     /// The asset at `rel` is no longer here.
@@ -990,8 +1004,8 @@ impl DirCache {
         }
     }
 
-    pub(crate) fn record_untracked(&mut self, rels: BTreeSet<String>) {
-        (self.cache.untracked, self.cache.untracked_known) = (rels, true);
+    pub(crate) fn record_present(&mut self, rels: BTreeSet<String>) {
+        (self.cache.present, self.cache.present_known) = (rels, true);
         self.cache.touched.insert((3, String::new()));
         self.cache.dirty = true;
     }
@@ -1266,6 +1280,7 @@ pub(crate) fn pull_run(st: &mut dyn Store, v: &Vault, scope: &[String], linked: 
             cache.remember(&file, meta.len(), mtime_ns(&meta), &p.sha256);
         }
         cache.saw(&item.rel, &p.sha256);
+        cache.add_present(&file);
         bytes += p.size;
         pulled.push(json!({ "path": item.path, "state": item.state, "size": p.size, "store": p.store }));
     }

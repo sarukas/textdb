@@ -321,9 +321,9 @@ textdb setting asset_sync both                     # make that what every sync o
   `backlinks` takes the asset's path, `links --broken --dir DIR` lists assets not pulled into DIR,
   and `mv --update-links` of a pointer rewrites the links to the asset.
 - **Moves and deletes:** `mv` and `rm` take an asset's own path and act on its pointer (a pointer
-  never moves onto a folder or an existing file, and keeps its `.tdbasset` suffix); the next
-  `sync` moves the file on disk, or moves it to `.textdb/trash/`. A file renamed on disk takes its
-  pointer along at the next sync.
+  never moves onto a folder or an existing file, in any letter case, and keeps its `.tdbasset`
+  suffix; nor does a document move onto an asset's path); the next `sync` moves the file on disk,
+  or moves it to `.textdb/trash/`. A file renamed on disk takes its pointer along at the next sync.
 - **Safety:** a push replaces the asset store's copy only when it holds the asset's own bytes and
   no other pointer names them, keeping the copy in the store's `.textdb-trash`; anything else
   there is kept and the upload goes next to it. Pushes of the same file take turns. A pointer is

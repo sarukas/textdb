@@ -238,7 +238,9 @@ content, not its version number. Around that, sync pairs pointers with their rea
    file is missing. What the directory last had decides: it had the pointer's file (not the
    other), so the pointer is moved in the store and on disk; it had the other file (not the
    pointer's), so the pointer moved in the store earlier and the file is moved after it now; a
-   copy it had neither of, or one already there at the last sync, is left alone. Real files are
+   copy it had neither of, or one already there at the last sync, is left alone, and a pointer
+   whose file was already missing at the last sync is never renamed. A possible new name that
+   cannot be read is looked at again by the next sync. Real files are
    found in any letter case on Windows and macOS, and what a directory last had follows its
    pointers' moves and deletes, made on disk or in the store. Asset store folders inside the directory are never
    candidates. Links are left to what renamed the file, as with the other moves sync makes.

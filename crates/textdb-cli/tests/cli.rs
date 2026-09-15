@@ -23,9 +23,12 @@ impl Output {
 
 fn textdb(store: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_textdb"));
+    // Asset bindings and caches in the test's own folder, never the user's.
+    let config = store.parent().map(|p| p.join("config")).unwrap_or_else(|| std::env::temp_dir().join("textdb-cli-test-config"));
     cmd.env_remove("TEXTDB_STORE")
         .env_remove("TEXTDB_AUTHOR")
         .env_remove("TEXTDB_PATH_HISTORY")
+        .env("TEXTDB_CONFIG_DIR", config)
         .arg("--store")
         .arg(store);
     cmd
@@ -1103,6 +1106,12 @@ fn sync_takes_recreated_files_and_leaves_old_copies_and_moved_names_alone() {
     std::fs::remove_file(v2.join("img/a.png")).unwrap();
     ok(&mut t(&["sync", "/", d2]), None);
     assert!(exists("/img/a.png.tdbasset") && !exists("/backup/old.png.tdbasset"));
+    // Nor is a copy that turns up after the asset's file had been gone for a sync.
+    ok(&mut t(&["sync", "/", d2]), None);
+    std::fs::create_dir_all(v2.join("downloads")).unwrap();
+    std::fs::write(v2.join("downloads/logo.png"), b"\x89PNG A").unwrap();
+    ok(&mut t(&["sync", "/", d2]), None);
+    assert!(exists("/img/a.png.tdbasset") && !exists("/downloads/logo.png.tdbasset"));
 
     // An asset moved on disk with its pointer: a new file at the old name is new, not an orphan.
     std::fs::create_dir_all(v1.join("pics")).unwrap();
@@ -1114,8 +1123,10 @@ fn sync_takes_recreated_files_and_leaves_old_copies_and_moved_names_alone() {
     let s = ok(&mut t(&["--json", "assets", "status", "--dir", d1]), None).json();
     assert_eq!(s["counts"], serde_json::json!({ "new": 1, "ok": 1 }), "{s}");
 
-    // An asset cannot take a document's name.
+    // An asset cannot take a document's name, in any letter case, nor a document an asset's.
     assert_eq!(run(&mut t(&["mv", "/pics/a.png", "/notes/n.md"]), None).status, 6);
+    assert_eq!(run(&mut t(&["mv", "/pics/a.png", "/NOTES/N.md"]), None).status, 6);
+    assert_eq!(run(&mut t(&["mv", "/notes/n.md", "/PICS/A.png"]), None).status, 6);
 }
 
 #[test]

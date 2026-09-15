@@ -55,9 +55,11 @@ fn database() -> Option<Db> {
 
 fn textdb(db: &Db) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_textdb"));
+    // Asset bindings and caches in a folder of the test run's own, never the user's.
     cmd.env_remove("TEXTDB_STORE")
         .env_remove("TEXTDB_AUTHOR")
         .env_remove("TEXTDB_PATH_HISTORY")
+        .env("TEXTDB_CONFIG_DIR", std::env::temp_dir().join(format!("textdb-cli-pg-config-{}", db.name)))
         .arg("--store")
         .arg(&db.url);
     cmd
