@@ -1123,10 +1123,16 @@ fn sync_takes_recreated_files_and_leaves_old_copies_and_moved_names_alone() {
     let s = ok(&mut t(&["--json", "assets", "status", "--dir", d1]), None).json();
     assert_eq!(s["counts"], serde_json::json!({ "new": 1, "ok": 1 }), "{s}");
 
-    // An asset cannot take a document's name, in any letter case, nor a document an asset's.
+    // An asset cannot take a document's name, in any letter case, nor a document an asset's, even
+    // with another folder of the same name in another case (`/Pics` lists before `/pics`).
+    ok(&mut t(&["write", "/Pics/z.md"]), Some("Z\n"));
     assert_eq!(run(&mut t(&["mv", "/pics/a.png", "/notes/n.md"]), None).status, 6);
     assert_eq!(run(&mut t(&["mv", "/pics/a.png", "/NOTES/N.md"]), None).status, 6);
     assert_eq!(run(&mut t(&["mv", "/notes/n.md", "/PICS/A.png"]), None).status, 6);
+    // A rename in letter case only, beyond ASCII too, is not in its own way.
+    ok(&mut t(&["mv", "/pics/a.png", "/pics/Ä.png"]), None);
+    ok(&mut t(&["mv", "/pics/Ä.png", "/pics/ä.png"]), None);
+    assert!(exists("/pics/ä.png.tdbasset") && !exists("/pics/Ä.png.tdbasset"));
 }
 
 #[test]

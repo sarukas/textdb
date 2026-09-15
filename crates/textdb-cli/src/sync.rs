@@ -608,7 +608,7 @@ fn pair_assets(
         let classifier = Classifier::load(dir, &nested);
         let store_folders = crate::assets::store_folders_inside(&mut *sides.st, dir);
         let sizes: HashSet<u64> = lost.iter().map(|(_, size, _)| *size).collect();
-        let mut found = Vec::new();
+        let (mut found, mut unsure_sizes) = (Vec::new(), HashSet::new());
         for (rel, d) in &walked.files {
             let pointer_rel = format!("{rel}{}", pointer::SUFFIX);
             let lower = rel.to_lowercase();
@@ -628,23 +628,30 @@ fn pair_assets(
             }
             match had.sha(rel, d.size as u64, d.mtime) {
                 Ok(sha) => found.push((sha.clone(), (rel.clone(), sha))),
-                Err(_) => drop(pairs.unsure.insert(rel.clone())),
+                Err(_) => {
+                    pairs.unsure.insert(rel.clone());
+                    unsure_sizes.insert(d.size as u64);
+                }
             }
         }
-        if !pairs.unsure.is_empty() {
-            // Until those can be read, the files they may be the new names of count as there.
-            pairs.still_present.extend(lost.iter().map(|(_, _, rel)| real(rel)).filter(|file| had.was_present(file) != Some(false)));
-        }
+        // Until those can be read, the files of their size they may be the new names of count as
+        // there, unless this sync pairs them now.
+        let waiting: Vec<(u64, String)> = lost.iter().filter(|(_, size, _)| unsure_sizes.contains(size)).map(|(_, size, rel)| (*size, real(rel))).collect();
         let lost = lost.into_iter().map(|(sha, _, rel)| (sha.clone(), (rel, sha)));
+        let mut paired = HashSet::new();
         for ((pointer_rel, sha), (file, _)) in pairing::one_to_one(lost, found) {
             let lost_file = real(&pointer_rel);
             let had_it = |rel: &str| had.had(rel) == Some(sha.as_str());
             match (renamed_here(&had, &lost_file, &sha), had_it(&file)) {
-                (true, false) => pairs.renames.push((pointer_rel, format!("{file}{}", pointer::SUFFIX))),
+                (true, false) => {
+                    paired.insert(lost_file);
+                    pairs.renames.push((pointer_rel, format!("{file}{}", pointer::SUFFIX)));
+                }
                 (false, true) => pairs.carry.push((file, lost_file)),
                 _ => {}
             }
         }
+        pairs.still_present.extend(waiting.into_iter().map(|(_, file)| file).filter(|file| !paired.contains(file) && had.was_present(file) != Some(false)));
     }
 
     // Changed on both sides: the store's pointer names new bytes, and the file here is neither

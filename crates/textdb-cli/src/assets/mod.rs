@@ -393,7 +393,8 @@ impl VaultCache {
     /// A file was put at `rel` after the last sync looked: sync counts it as there then.
     fn add_present(&mut self, rel: &str) {
         if self.present_known && self.present.insert(rel.to_string()) {
-            self.touched.insert((3, String::new()));
+            // Added to whatever record is there when saved, not over it.
+            self.touched.insert((3, rel.to_string()));
             self.dirty = true;
         }
     }
@@ -425,6 +426,9 @@ impl VaultCache {
             merged.seen.extend(self.seen.iter().filter(|(k, _)| mine(2, k)).map(|(k, v)| (k.clone(), v.clone())));
             if all || self.touched.contains(&(3, String::new())) {
                 (merged.present, merged.present_known) = (self.present.clone(), self.present_known);
+            }
+            if merged.present_known {
+                merged.present.extend(self.touched.iter().filter(|(kind, k)| *kind == 3 && !k.is_empty()).map(|(_, k)| k.clone()));
             }
             // What this process forgot is forgotten there too.
             for (kind, k) in &self.touched {

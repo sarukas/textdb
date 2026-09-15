@@ -1814,7 +1814,8 @@ fn pointer_destination(st: &mut dyn Store, from: &str, to: &str) -> Result<Strin
         return Err(StoreError::invalid(format!("{to}: name the asset's new path, as in {}/{own}", asset.trim_end_matches('/'))));
     }
     let pointer = format!("{asset}{SUFFIX}");
-    if exists_any_case(st, asset) || (!pointer.eq_ignore_ascii_case(from) && exists_any_case(st, &pointer)) {
+    // A pointer renamed in letter case only does not stand in its own way.
+    if exists_any_case(st, asset) || (pointer.to_lowercase() != from.to_lowercase() && exists_any_case(st, &pointer)) {
         return Err(StoreError::invalid(format!("{asset} exists already (in some letter case): an asset cannot take another file's name")));
     }
     Ok(pointer)
@@ -1831,21 +1832,26 @@ fn document_destination(st: &mut dyn Store, to: &str) -> Result<String> {
     Ok(to.to_string())
 }
 
-/// Whether the store has `path`, in any letter case along it.
+/// Whether the store has `path`, in any letter case along it (folders that differ only in case,
+/// such as `/Img` and `/img`, are all looked in).
 fn exists_any_case(st: &mut dyn Store, path: &str) -> bool {
     if st.stat(path).is_ok() {
         return true;
     }
-    let mut at = "/".to_string();
-    for seg in path.split('/').filter(|s| !s.is_empty()) {
-        let seg = seg.to_lowercase();
-        let Ok(entries) = st.ls(&at, false) else { return false };
-        match entries.into_iter().find(|e| e.name.to_lowercase() == seg) {
-            Some(e) => at = e.path,
-            None => return false,
+    let segs: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(str::to_lowercase).collect();
+    let mut at = vec!["/".to_string()];
+    for seg in &segs {
+        let mut next = Vec::new();
+        for folder in &at {
+            let Ok(entries) = st.ls(folder, false) else { continue };
+            next.extend(entries.into_iter().filter(|e| e.name.to_lowercase() == *seg).map(|e| e.path));
         }
+        if next.is_empty() {
+            return false;
+        }
+        at = next;
     }
-    true
+    !segs.is_empty()
 }
 
 /// Directories synced with the store folder `path` that hold files textdb does not track, which
