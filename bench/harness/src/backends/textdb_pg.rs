@@ -363,6 +363,9 @@ impl Backend for TextdbPg {
             Ok(())
         })
     }
+    fn sync_dir(&self, prefix: &str, dir: &std::path::Path) -> R<crate::backend::SyncStats> {
+        super::run_sync(&self.url, prefix, dir)
+    }
     fn changes_since(&self, seq: u64) -> R<(u64, u64)> {
         self.with(|c| {
             let rows = c.query("SELECT seq FROM kb.feed($1)", &[&(seq as i64)])?;

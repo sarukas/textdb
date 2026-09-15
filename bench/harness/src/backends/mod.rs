@@ -124,3 +124,35 @@ pub fn run_each(c: &mut postgres::Client, stmts: &[&str]) -> Result<(), postgres
     }
     Ok(())
 }
+
+/// Run `textdb sync PREFIX DIR --json` against `store` and read its report.
+///
+/// Sync lives in the CLI, not in the SQL surface the backends otherwise drive, so this
+/// shells out — the same way `fs-git` shells out to `git`. The binary is
+/// `$TEXTDB_BIN`, else `target/release/textdb`; when it is not there the cell records N/A
+/// with that reason rather than reporting a zero.
+pub fn run_sync(store: &str, prefix: &str, dir: &std::path::Path) -> crate::backend::R<crate::backend::SyncStats> {
+    use crate::backend::{BackendError, SyncStats};
+    let bin = std::env::var("TEXTDB_BIN").unwrap_or_else(|_| "target/release/textdb".to_string());
+    if !std::path::Path::new(&bin).exists() {
+        return Err(BackendError::NotSupported("textdb binary not built; set TEXTDB_BIN"));
+    }
+    let out = std::process::Command::new(&bin)
+        .args(["-s", store, "sync", prefix])
+        .arg(dir)
+        .args(["--json", "--author", "bench"])
+        .output()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(text.trim())
+        .map_err(|e| BackendError::Other(format!("sync report not JSON ({e}): {} {}", text, String::from_utf8_lossy(&out.stderr))))?;
+    // `--json` reports failures in the document too, so a non-zero exit with a parsable
+    // report is still read; only an unparsable one is an error.
+    let n = |side: &str, key: &str| v.get(side).and_then(|s| s.get(key)).and_then(|a| a.as_array()).map(|a| a.len() as u64).unwrap_or(0);
+    let len = |key: &str| v.get(key).and_then(|a| a.as_array()).map(|a| a.len() as u64).unwrap_or(0);
+    Ok(SyncStats {
+        to_store: n("to_textdb", "new") + n("to_textdb", "changed") + n("to_textdb", "deleted"),
+        to_disk: n("to_disk", "new") + n("to_disk", "changed") + n("to_disk", "deleted"),
+        merged: len("merged"),
+        conflicted: len("conflicts"),
+    })
+}

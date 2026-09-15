@@ -12,6 +12,7 @@ pub mod me;
 pub mod ns;
 pub mod rt;
 pub mod sr;
+pub mod sy;
 pub mod xl;
 
 use crate::gen::{line_starts, Charset, GenOpts, Generator, LineEnding};
@@ -30,6 +31,7 @@ pub fn dispatch(kind: &str, ctx: &Ctx) -> anyhow::Result<()> {
         "search" => sr::search(ctx),
         "namespace" => ns::namespace(ctx),
         "markdown" => md::markdown(ctx),
+        "sync" => sy::sync(ctx),
         "footprint" => fp::footprint(ctx),
         "durability" => du::durability(ctx),
         other => anyhow::bail!("unknown test kind {}", other),

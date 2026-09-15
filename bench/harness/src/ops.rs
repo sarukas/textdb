@@ -29,6 +29,7 @@ pub const SET_META: &str = "set_meta";
 pub const SECTIONS: &str = "sections";
 pub const SECTION: &str = "section";
 pub const CHANGES_SINCE: &str = "changes_since";
+pub const SYNC: &str = "sync";
 
 /// Every operation name, in the order the report should present them.
 pub const ALL: &[&str] = &[
@@ -53,6 +54,7 @@ pub const ALL: &[&str] = &[
     SECTIONS,
     SECTION,
     CHANGES_SINCE,
+    SYNC,
 ];
 
 /// True when `name` is part of the vocabulary. Used by the report to separate genuine

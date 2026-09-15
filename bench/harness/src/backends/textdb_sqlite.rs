@@ -413,6 +413,9 @@ impl Backend for TextdbSqlite {
             Ok(())
         })
     }
+    fn sync_dir(&self, prefix: &str, dir: &std::path::Path) -> R<crate::backend::SyncStats> {
+        super::run_sync(&self.file.display().to_string(), prefix, dir)
+    }
     fn changes_since(&self, seq: u64) -> R<(u64, u64)> {
         self.with(|c| {
             let mut st = c.prepare_cached("SELECT seq FROM textdb_feed(?1)")?;

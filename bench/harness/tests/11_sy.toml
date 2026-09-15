@@ -1,0 +1,25 @@
+# SY — sync: reconciling a store folder with a directory, both ways.
+#
+# The operation a vault or a git checkout actually performs, and the one nothing else in the
+# matrix measured. No baseline has an equivalent — `fs` is a directory, and the sql-text
+# stores have no working copy — so those cells are N/A, as in the MD family.
+#
+# The first import happens once. The no-op sync happens constantly, so `vs_first_pct` and
+# `us_per_file` on the `noop` case are the numbers that decide whether syncing a large vault
+# costs anything when nothing has changed.
+
+[[test]]
+id = "SY-01"
+family = "SY"
+kind = "sync"
+reps = 3
+note = "first import, no-op re-sync, a few files changed on disk, changed in the store, both sides merged, and a delete propagated"
+[test.spec]
+n_files = 5000
+file_size = 8192
+changed_files = 50
+noop_reps = 3
+[test.poc]
+n_files = 400
+file_size = 4096
+changed_files = 10

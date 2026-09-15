@@ -105,7 +105,7 @@ than shrinking them.
 
 ## The test matrix
 
-Eleven families, defined as data in `harness/tests/*.toml`. `reps` repetitions per cell; the
+Twelve families, defined as data in `harness/tests/*.toml`. `reps` repetitions per cell; the
 report takes the median.
 
 ### RT — round-trip accuracy
@@ -230,6 +230,31 @@ Two things MD-01 controls for, because both would swamp the effect it measures:
 - `links0` is not "no structure": those documents still have front matter and eight
   headings, so its overhead is the cost of parsing and recording those. The *link* cost is
   the difference between `links0` and the denser cases.
+
+### SY — sync
+
+Reconciling a store folder with a directory on disk, both ways: what an Obsidian vault or a
+git checkout actually does, and what nothing else in the matrix measured. `fs` *is* a
+directory and the `sql-text-*` stores have no working copy, so those cells are `N/A`.
+
+| Test | What it measures |
+|---|---|
+| SY-01 | First import; a no-op re-sync; a few files changed on disk; changed in the store; both sides changed disjointly (must merge, not conflict); a delete propagated |
+
+The first import happens once. The **no-op sync** happens constantly — every save hook, every
+watcher tick — so `us_per_file` and `vs_first_pct` on the `noop` case are the numbers that
+decide whether a large vault costs anything when nothing has changed.
+
+Sync is a CLI operation, not part of the SQL surface the backends otherwise drive, so the
+suite shells out to `$TEXTDB_BIN` (default `target/release/textdb`) the way `fs-git` shells
+out to `git`. Without that binary the cells record N/A with that reason.
+
+The directory deliberately lives in a temporary directory, **not** under `--work`. `--work`
+defaults to `bench/data`, inside this repository, and `sync` notices a git checkout: it
+attributes changes to git authors and skips what `.gitignore` excludes. `bench/data` is
+ignored, so the first version of this suite reported moving nothing — it measured the ignore
+rules rather than sync. Measuring the git-aware path is a separate test that would have to
+set up a real repository.
 
 ### DU — durability
 

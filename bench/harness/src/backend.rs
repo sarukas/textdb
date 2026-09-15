@@ -98,6 +98,19 @@ pub struct LinkRow {
     pub resolved: Option<String>,
 }
 
+/// What one `sync` run did, from its own JSON report.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncStats {
+    /// Documents written into the store from disk.
+    pub to_store: u64,
+    /// Files written to disk from the store.
+    pub to_disk: u64,
+    /// Files whose two sides both changed and were merged.
+    pub merged: u64,
+    /// Merges whose changes overlapped, so the file on disk carries conflict markers.
+    pub conflicted: u64,
+}
+
 /// One heading and the line range it covers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SectionRow {
@@ -204,6 +217,14 @@ pub trait Backend: Send + Sync {
     fn set_link_mode(&self, _mode: &str) -> R<()> {
         Err(BackendError::NotSupported("no link rewriting"))
     }
+    /// Reconcile the store folder `prefix` with the directory `dir`, both ways.
+    ///
+    /// No baseline has this: `fs` *is* a directory, and the `sql-text-*` stores have no
+    /// notion of a working copy to reconcile with. Only textdb records N/A elsewhere.
+    fn sync_dir(&self, _prefix: &str, _dir: &std::path::Path) -> R<SyncStats> {
+        Err(BackendError::NotSupported("no directory sync"))
+    }
+
     /// Change-feed rows after `seq`, as `(highest seq seen, rows read)`.
     fn changes_since(&self, _seq: u64) -> R<(u64, u64)> {
         Err(BackendError::NotSupported("no change feed"))
