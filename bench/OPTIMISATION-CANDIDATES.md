@@ -23,6 +23,60 @@ structure sidecar and the index writes into a single number.
 Absolute numbers are host-specific. Ratios inside one run are the part to trust, and a
 before/after pair should come from one quiet machine, back to back.
 
+## Postgres: one SPI query per chunk is the whole story (2026-09-15)
+
+`textdb-pg` is 4-50x its SQLite sibling across the board, and loses to its own baseline
+`sql-text-pg` on the operations that matter most: `read` 6.45x, `create` 6.86x, `replace`
+2.96x, `search` 2.69x. It wins where chunk sharing pays — `append` 0.48x, `read_lines`
+0.36x, `read_version` 0.67x, `history` 0.68x — so the design is sound and the
+implementation is not.
+
+Nearly all of the read gap is one line. `SpiStorage::get_chunk` issues
+`Spi::get_one_with_args("SELECT bytes FROM kb.chunk WHERE hash = $1")` **once per chunk**,
+with no read cache (`pending_chunks` only serves writes) and no prepared plan, so every
+leaf costs a fresh parse, plan and execute.
+
+Measured on this host against a 982 KB document with 596 leaves at depth 2, with transport
+excluded (`SELECT length(content)` returns four bytes, so only server work is timed):
+
+| document | leaves | server-side read | per leaf |
+|---|---|---|---|
+| 62 KB | 41 | 1.73 ms | 42.2 us |
+| 244 KB | 154 | 3.66 ms | 23.8 us |
+| 983 KB | 596 | 13.8 ms | 23.1 us |
+| 1.98 MB | 1225 | 26.7 ms | 21.8 us |
+
+Linear in *leaves*, flat per leaf at ~22 us — per-chunk work, not per-byte. The SQLite
+binding materialises the same shape at roughly 0.6 us per leaf, in process and through a
+cached statement.
+
+The ceiling is easy to establish. Fetching all 596 chunks in **one** query, the tree walk
+to find them included, costs 2.3 ms warm against 17.5 ms for the per-chunk path:
+
+```sql
+SELECT sum(length(c.bytes)) FROM kb.chunk c
+ WHERE c.hash IN (SELECT hash FROM kb.leaf_hashes('/s14000.md'));   -- 2.3 ms
+SELECT length(content) FROM kb.file WHERE path = '/s14000.md';      -- 17.5 ms
+```
+
+So about 15 ms of a 17.5 ms read is per-query overhead rather than reaching the data. Two
+changes, in order of expected return:
+
+1. **Batch the chunk fetch.** Walk the tree to collect the leaf hashes, then fetch them with
+   one `WHERE hash = ANY($1)` and assemble in order. One SPI call instead of N.
+2. **Prepare once.** Where a per-row query has to stay, `Spi::prepare` a plan and reuse it,
+   rather than re-planning per call. This is the same fix that took `textdb-sqlite`'s
+   scalar functions from 29.5 us to 9.9 us, one layer down.
+
+The client round trip is *not* the problem and should not be optimised first: this Postgres
+answers a trivial statement in 82-117 us, which bounds how much of a 648 us small-document
+read transport can explain.
+
+Not settled here: whether `textdb-pg` also carries the write regression the SQLite binding
+was shown to have. The old-versus-new A/B needs the previous commit's extension installed
+into a cluster, which this pass did not do; the cross-host figures suggest it does, and the
+rename path is shared logic, but that is inference and not a measurement.
+
 ## The feature work since 2026-09-13 cost the write path (2026-09-15)
 
 Re-running the matrix on current `main` turned up a broad write regression. It is not the
