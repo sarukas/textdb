@@ -1813,6 +1813,9 @@ fn pointer_destination(st: &mut dyn Store, from: &str, to: &str) -> Result<Strin
         let own = asset_path(from).rsplit('/').next().unwrap_or("");
         return Err(StoreError::invalid(format!("{to}: name the asset's new path, as in {}/{own}", asset.trim_end_matches('/'))));
     }
+    if st.stat(asset).is_ok() {
+        return Err(StoreError::invalid(format!("{asset} exists already: an asset cannot take the name of a document")));
+    }
     Ok(format!("{asset}{SUFFIX}"))
 }
 

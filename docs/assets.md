@@ -221,8 +221,9 @@ Moving and trashing items in the asset store itself comes with the rclone driver
 ## Sync
 
 Pointers sync like any document: they are taken in whatever `--ext` says, and files the rules or
-their bytes make assets never are, whatever `--ext` says. A pointer deleted and made again at the
-same path is told apart by its content. Around that, sync pairs pointers with their real files:
+their bytes make assets never are, whatever `--ext` says. A file (document or pointer) deleted or
+moved away in the store since the last sync and made again at the same path is told apart by its
+content, not its version number. Around that, sync pairs pointers with their real files:
 
 1. A pointer moved in the store (matched by its id) → the real file moves with it on disk. When a
    file is already at the new place, the real file stays and is reported (`orphan` until
@@ -230,13 +231,16 @@ same path is told apart by its content. Around that, sync pairs pointers with th
 2. A pointer deleted in the store → the real file goes to
    `.textdb/trash/<yyyymmdd-HHMMSS>-<nanos>/…` when it holds the bytes the pointer named, and
    the pointer leaves disk only once the file is there, so a move that fails is tried again by
-   the next sync; a file with other bytes is kept and reported, as a new asset.
+   the next sync; a file with other bytes is kept and reported, as a new asset; a file that
+   cannot be read keeps its pointer until a later sync can read it.
 3. A real file renamed on disk without its pointer (in Obsidian, say) → an asset file with no
    pointer, matched by size and sha256, one to one, with a pointer unchanged on both sides whose
    file is missing. What the directory last had decides: it had the pointer's file (not the
    other), so the pointer is moved in the store and on disk; it had the other file (not the
    pointer's), so the pointer moved in the store earlier and the file is moved after it now; a
-   copy it had neither of is left alone. Asset store folders inside the directory are never
+   copy it had neither of, or one already there at the last sync, is left alone. Real files are
+   found in any letter case on Windows and macOS, and what a directory last had follows its
+   pointers' moves and deletes, made on disk or in the store. Asset store folders inside the directory are never
    candidates. Links are left to what renamed the file, as with the other moves sync makes.
    A name changed only in letter case is the same asset on Windows and macOS: nothing is paired,
    and a case-only rename in the store renames the files in place.

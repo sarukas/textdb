@@ -303,6 +303,12 @@ struct VaultCache {
     /// By the asset's relative path: the SHA-256 of the bytes this directory last had for it.
     #[serde(default)]
     seen: BTreeMap<String, String>,
+    /// The files without a pointer the last sync found (textdb does not track them).
+    #[serde(default)]
+    untracked: BTreeSet<String>,
+    /// A sync recorded `untracked`.
+    #[serde(default)]
+    untracked_known: bool,
     #[serde(skip)]
     path: Option<PathBuf>,
     /// Where an older build kept this cache, removed once it is saved here.
@@ -409,6 +415,9 @@ impl VaultCache {
             merged.files.extend(self.files.iter().filter(|(k, _)| mine(0, k)).map(|(k, v)| (k.clone(), v.clone())));
             merged.sniffed.extend(self.sniffed.iter().filter(|(k, _)| mine(1, k)).map(|(k, v)| (k.clone(), *v)));
             merged.seen.extend(self.seen.iter().filter(|(k, _)| mine(2, k)).map(|(k, v)| (k.clone(), v.clone())));
+            if all || self.touched.contains(&(3, String::new())) {
+                (merged.untracked, merged.untracked_known) = (self.untracked.clone(), self.untracked_known);
+            }
             // What this process forgot is forgotten there too.
             for (kind, k) in &self.touched {
                 match kind {
@@ -528,7 +537,7 @@ fn items(v: &Vault, scan: &Scan, cache: &mut VaultCache, scope: &[String]) -> Re
                     } else if pairing::is_conflict_copy(rel) {
                         item.note = Some("kept from a conflict: compare it with the asset, then delete it, or rename it to push it".into());
                         "conflict-copy"
-                    } else if cache.seen.contains_key(rel) {
+                    } else if seen_key(&cache.seen, rel).is_some() {
                         item.note = Some(
                             "this directory had an asset here whose pointer was moved or deleted in textdb: sync moves the file after it or trashes it (push --force publishes it as a new asset)".into(),
                         );
@@ -922,26 +931,74 @@ fn record_in_sync_base(st: &mut dyn Store, v: &Vault, written: &[Written]) -> Re
     Ok(())
 }
 
-/// What the directory `dir` last had of each asset: its SHA-256, by the asset's path relative to
-/// the directory.
-pub(crate) fn last_had(dir: &Path) -> HashMap<String, String> {
-    VaultCache::open(&Vault { prefix: "/".to_string(), dir: dir.to_path_buf() }).seen.into_iter().collect()
+/// The key of `seen` for the asset at `rel`: that path, or on Windows and macOS the one differing
+/// only in letter case.
+fn seen_key(seen: &BTreeMap<String, String>, rel: &str) -> Option<String> {
+    if seen.contains_key(rel) {
+        return Some(rel.to_string());
+    }
+    if cfg!(any(windows, target_os = "macos")) {
+        let folded = rel.to_lowercase();
+        return seen.keys().find(|k| k.to_lowercase() == folded).cloned();
+    }
+    None
 }
 
-/// Forget what the directory `dir` had at `rels`: files that moved after their pointer, or went to
-/// the trash, so a new file there is new.
-pub(crate) fn forget_had(dir: &Path, rels: &[String]) {
-    if rels.is_empty() {
-        return;
+/// What a directory knows of its assets, for sync: the bytes it last had of each, its files'
+/// hashes, and the files without a pointer the last sync found.
+pub(crate) struct DirCache {
+    cache: VaultCache,
+    dir: PathBuf,
+}
+
+impl DirCache {
+    pub(crate) fn open(dir: &Path) -> DirCache {
+        DirCache { cache: VaultCache::open(&Vault { prefix: "/".to_string(), dir: dir.to_path_buf() }), dir: dir.to_path_buf() }
     }
-    let mut cache = VaultCache::open(&Vault { prefix: "/".to_string(), dir: dir.to_path_buf() });
-    for rel in rels {
-        if cache.seen.remove(rel).is_some() {
-            cache.touched.insert((2, rel.clone()));
-            cache.dirty = true;
+
+    /// The SHA-256 of the bytes this directory last had for the asset at `rel`.
+    pub(crate) fn had(&self, rel: &str) -> Option<&str> {
+        seen_key(&self.cache.seen, rel).and_then(|k| self.cache.seen.get(&k)).map(String::as_str)
+    }
+
+    /// The SHA-256 of the file at `rel`, from the cache while its size and time are unchanged.
+    pub(crate) fn sha(&mut self, rel: &str, size: u64, mtime: i64) -> Result<String> {
+        self.cache.sha(&self.dir.clone(), rel, size, mtime)
+    }
+
+    /// Whether the last sync found `rel` without a pointer; `None` when no sync recorded that.
+    pub(crate) fn was_untracked(&self, rel: &str) -> Option<bool> {
+        self.cache.untracked_known.then(|| self.cache.untracked.contains(rel))
+    }
+
+    /// The asset at `rel` is no longer here.
+    pub(crate) fn forget(&mut self, rel: &str) {
+        if let Some(k) = seen_key(&self.cache.seen, rel) {
+            self.cache.seen.remove(&k);
+            self.cache.touched.insert((2, k));
+            self.cache.dirty = true;
         }
     }
-    cache.save();
+
+    /// The asset at `from` is at `to` now.
+    pub(crate) fn moved(&mut self, from: &str, to: &str) {
+        if let Some(k) = seen_key(&self.cache.seen, from) {
+            if let Some(sha) = self.cache.seen.remove(&k) {
+                self.cache.touched.insert((2, k));
+                self.cache.saw(to, &sha);
+            }
+        }
+    }
+
+    pub(crate) fn record_untracked(&mut self, rels: BTreeSet<String>) {
+        (self.cache.untracked, self.cache.untracked_known) = (rels, true);
+        self.cache.touched.insert((3, String::new()));
+        self.cache.dirty = true;
+    }
+
+    pub(crate) fn save(&self) {
+        self.cache.save();
+    }
 }
 
 /// The folders below `dir` (relative to it, in lower case) that asset stores bound on this
@@ -968,11 +1025,14 @@ pub(crate) fn not_pulled_after_conflict(st: &mut dyn Store, v: &Vault) -> Result
 }
 
 /// How many of the vault's assets are in each state.
-pub(crate) fn state_counts(st: &mut dyn Store, v: &Vault) -> Result<BTreeMap<String, usize>> {
+/// What it learns is saved only with `save` (not in a dry run).
+pub(crate) fn state_counts(st: &mut dyn Store, v: &Vault, save: bool) -> Result<BTreeMap<String, usize>> {
     let scan = scan(st, v)?;
     let mut cache = VaultCache::open(v);
     let found = items(v, &scan, &mut cache, &[])?;
-    cache.save();
+    if save {
+        cache.save();
+    }
     Ok(counts(&found).into_iter().map(|(state, n)| (state.to_string(), n)).collect())
 }
 

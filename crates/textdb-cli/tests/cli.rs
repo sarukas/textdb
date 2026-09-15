@@ -1069,6 +1069,56 @@ fn sync_pairing_leaves_stray_copies_and_letter_case_alone() {
 }
 
 #[test]
+fn sync_takes_recreated_files_and_leaves_old_copies_and_moved_names_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let (v1, v2, bucket, config) = (tmp.path().join("v1"), tmp.path().join("v2"), tmp.path().join("bucket"), tmp.path().join("config"));
+    for d in [v1.join("img"), v1.join("notes"), v2.clone(), bucket.clone()] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.env("TEXTDB_CONFIG_DIR", &config).args(args);
+        c
+    };
+    let (d1, d2) = (v1.to_str().unwrap(), v2.to_str().unwrap());
+    let exists = |path: &str| run(&mut t(&["stat", path]), None).status == 0;
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", bucket.to_str().unwrap()]), None);
+    std::fs::write(v1.join("notes/n.md"), "old\n").unwrap();
+    std::fs::write(v1.join("img/a.png"), b"\x89PNG A").unwrap();
+    ok(&mut t(&["sync", "--push", "/", d1]), None);
+    ok(&mut t(&["sync", "/", d2]), None);
+    ok(&mut t(&["assets", "pull", "--dir", d2]), None);
+
+    // A document deleted and made again at the same path (version 1 again) reaches the other directory.
+    ok(&mut t(&["rm", "/notes/n.md"]), None);
+    ok(&mut t(&["write", "/notes/n.md"]), Some("NEW\n"));
+    ok(&mut t(&["sync", "/", d2]), None);
+    assert_eq!(std::fs::read_to_string(v2.join("notes/n.md")).unwrap(), "NEW\n");
+
+    // A copy that was there at the last sync is not the new name of an asset whose file went away.
+    std::fs::create_dir_all(v2.join("backup")).unwrap();
+    std::fs::write(v2.join("backup/old.png"), b"\x89PNG A").unwrap();
+    ok(&mut t(&["sync", "/", d2]), None);
+    std::fs::remove_file(v2.join("img/a.png")).unwrap();
+    ok(&mut t(&["sync", "/", d2]), None);
+    assert!(exists("/img/a.png.tdbasset") && !exists("/backup/old.png.tdbasset"));
+
+    // An asset moved on disk with its pointer: a new file at the old name is new, not an orphan.
+    std::fs::create_dir_all(v1.join("pics")).unwrap();
+    std::fs::rename(v1.join("img/a.png"), v1.join("pics/a.png")).unwrap();
+    std::fs::rename(v1.join("img/a.png.tdbasset"), v1.join("pics/a.png.tdbasset")).unwrap();
+    ok(&mut t(&["sync", "/", d1]), None);
+    assert!(exists("/pics/a.png.tdbasset") && !exists("/img/a.png.tdbasset"));
+    std::fs::write(v1.join("img/a.png"), b"\x89PNG another").unwrap();
+    let s = ok(&mut t(&["--json", "assets", "status", "--dir", d1]), None).json();
+    assert_eq!(s["counts"], serde_json::json!({ "new": 1, "ok": 1 }), "{s}");
+
+    // An asset cannot take a document's name.
+    assert_eq!(run(&mut t(&["mv", "/pics/a.png", "/notes/n.md"]), None).status, 6);
+}
+
+#[test]
 fn assets_migrate_from_git_moves_tracked_binaries_out_of_git() {
     if !has_git() {
         return;
