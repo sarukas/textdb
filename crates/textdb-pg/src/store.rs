@@ -290,18 +290,54 @@ impl SpiStorage {
     /// Persist buffered chunks and nodes (sorted by hash) — called before every CAS and
     /// at the end of a write that created no new version.
     pub fn flush(&mut self) -> Result<()> {
-        for (h, b) in std::mem::take(&mut self.pending_chunks) {
-            let nlines = textdb_core::chunker::count_newlines(&b) as i32;
+        // One INSERT per chunk and per node meant 652 statements to store a 1 MiB document —
+        // the write-side twin of the per-chunk SELECT that `materialize_ordered` replaced.
+        // Unnested arrays instead: one statement per batch, whatever the document's size.
+        let chunks = std::mem::take(&mut self.pending_chunks);
+        let entries: Vec<(Hash, Vec<u8>)> = chunks.into_iter().collect();
+        // Below the floor, one statement each: building three arrays to insert a single
+        // chunk costs more than the statement it saves, and measured that way round a
+        // 513 B create came out 1.17x slower while the 10 MiB one gained. Same trade, and
+        // same answer, as the read path.
+        if entries.len() < BATCH_FLOOR {
+            for (h, b) in &entries {
+                let nlines = textdb_core::chunker::count_newlines(b) as i32;
+                Spi::run_with_args(
+                    "INSERT INTO kb.chunk(hash, bytes, nlines) VALUES ($1, $2, $3) ON CONFLICT (hash) DO NOTHING",
+                    &[h.to_vec().into(), b.clone().into(), nlines.into()],
+                )
+                .map_err(map)?;
+            }
+        }
+        for batch in entries.chunks(FETCH_BATCH).filter(|_| entries.len() >= BATCH_FLOOR) {
+            let hashes: Vec<Vec<u8>> = batch.iter().map(|(h, _)| h.to_vec()).collect();
+            let bytes: Vec<Vec<u8>> = batch.iter().map(|(_, b)| b.clone()).collect();
+            let nlines: Vec<i32> = batch.iter().map(|(_, b)| textdb_core::chunker::count_newlines(b) as i32).collect();
             Spi::run_with_args(
-                "INSERT INTO kb.chunk(hash, bytes, nlines) VALUES ($1, $2, $3) ON CONFLICT (hash) DO NOTHING",
-                &[h.to_vec().into(), b.into(), nlines.into()],
+                "INSERT INTO kb.chunk(hash, bytes, nlines) \
+                 SELECT * FROM unnest($1::bytea[], $2::bytea[], $3::int[]) ON CONFLICT (hash) DO NOTHING",
+                &[hashes.into(), bytes.into(), nlines.into()],
             )
             .map_err(map)?;
         }
-        for (h, enc) in std::mem::take(&mut self.pending_nodes) {
+        let nodes = std::mem::take(&mut self.pending_nodes);
+        let entries: Vec<(Hash, Vec<u8>)> = nodes.into_iter().collect();
+        if entries.len() < BATCH_FLOOR {
+            for (h, enc) in &entries {
+                Spi::run_with_args(
+                    "INSERT INTO kb.tree_node(hash, children) VALUES ($1, $2) ON CONFLICT (hash) DO NOTHING",
+                    &[h.to_vec().into(), enc.clone().into()],
+                )
+                .map_err(map)?;
+            }
+        }
+        for batch in entries.chunks(FETCH_BATCH).filter(|_| entries.len() >= BATCH_FLOOR) {
+            let hashes: Vec<Vec<u8>> = batch.iter().map(|(h, _)| h.to_vec()).collect();
+            let encoded: Vec<Vec<u8>> = batch.iter().map(|(_, e)| e.clone()).collect();
             Spi::run_with_args(
-                "INSERT INTO kb.tree_node(hash, children) VALUES ($1, $2) ON CONFLICT (hash) DO NOTHING",
-                &[h.to_vec().into(), enc.into()],
+                "INSERT INTO kb.tree_node(hash, children) \
+                 SELECT * FROM unnest($1::bytea[], $2::bytea[]) ON CONFLICT (hash) DO NOTHING",
+                &[hashes.into(), encoded.into()],
             )
             .map_err(map)?;
         }

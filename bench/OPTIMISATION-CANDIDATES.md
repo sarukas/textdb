@@ -184,6 +184,44 @@ the sidecar is part of the small-document create regression and not all of it. T
 feed, path events and folder totals are the untested remainder — the next step is a probe
 that switches each off in turn, which `textdb-probe writepath` is the right place for.
 
+## A round of per-row batching on both engines, stopped at diminishing returns (2026-09-15)
+
+Three changes, chosen from the `writepath` and `ops` probes rather than from guesses. All
+three are the same shape: a loop issuing one statement per chunk, node or row.
+
+**SQLite — `chunk_ref` in one statement per batch, not one per chunk.** A 1 MiB document
+made 652 of them. Batched into fixed-size multi-`VALUES` lists so `prepare_cached` can hold
+the statement. RT-01 1 MiB create 73.7 ms -> 68.5 ms (about 7 %); smaller documents have too
+few chunks to care, and do not move.
+
+**SQLite — stop recounting authors on every commit.** The node update carried
+`nauthors = (SELECT count(*) FROM file_author WHERE file_id = ?)`, a scan per write to
+re-derive a number that only moves the first time a given author writes to a file.
+`RETURNING commits` from the upsert says whether the row was new, and the recount now runs
+only then. **No measurable change** in the matrix — recorded as done and not as a win.
+
+**Postgres — `flush()` in one statement per batch.** The write-side twin of the per-chunk
+`SELECT` that `materialize_ordered` replaced: one `INSERT` per chunk and one per node.
+Unnested arrays instead. XL 10 MiB create 2.77 s -> 2.49 s (about 10 %), 10 MiB replace
+0.91x; median across the write cells 0.99x.
+
+Both batched paths needed the same floor the read path did, and for the same reason. Without
+it the first cut made a 513 B create **1.17x slower** while the 10 MiB one gained: building
+three arrays to insert a single chunk costs more than the statement it saves. Under
+`BATCH_FLOOR` entries, one statement each.
+
+One bug worth recording because the type system did not catch it: SQLite names a `VALUES`
+clause's columns `column1..N` and rejects the `AS v(h, f, v)` aliasing Postgres accepts. It
+compiled and failed at runtime, and the CLI suite plus the harness canary both caught it —
+the canary failed the cell and published no timings, which is what that check is for.
+
+**Stopping here.** Both engines now give roughly 10 % on large writes and nothing measurable
+on small ones, which is the diminishing-returns line. What is left is not per-row overhead:
+FTS tokenisation is 9-17 ms of a 1 MiB SQLite write and a standalone fts5 test puts batched
+inserts within 15 % of one-at-a-time, so that cost is the feature, not the loop. On Postgres
+the remainder is the round-trip floor (82-117 us a statement) and pgrx datum conversion.
+Neither yields to more batching.
+
 ## Link rewriting on a move is within 1.45x of its floor (2026-09-15)
 
 `link_updates = rewrite` keeps the corpus correct when a file moves: every document that

@@ -14,6 +14,12 @@ use textdb_md::MarkdownExtractor;
 use crate::stats::Totals;
 use crate::storage::{sql_err, SqliteStorage};
 
+/// New chunks per batched `chunk_ref` insert.
+///
+/// Fixed so the statement text repeats and `prepare_cached` can hold it; a batch sized to
+/// whatever was left over would compile a new statement for every document.
+const CHUNK_REF_BATCH: usize = 64;
+
 pub const DEFAULT_PREFIX: &str = "kb_";
 
 #[derive(Clone, Debug)]
@@ -558,24 +564,41 @@ impl<'c> TextDb<'c> {
             author,
             message,
         )?;
-        self.conn
+        // `RETURNING commits` tells this apart from an author who has committed before:
+        // only a fresh row comes back as 1, and only then can `nauthors` have changed.
+        let first_by_author: i64 = self
+            .conn
             .prepare_cached(&format!(
                 "INSERT INTO {}file_author(file_id, author, commits, first_ts, last_ts) VALUES (?1, coalesce(?2, ''), 1, ?3, ?3) \
-                 ON CONFLICT(file_id, author) DO UPDATE SET commits = commits + 1, last_ts = excluded.last_ts",
+                 ON CONFLICT(file_id, author) DO UPDATE SET commits = commits + 1, last_ts = excluded.last_ts \
+                 RETURNING commits",
                 self.p
             ))
             .map_err(sql_err)?
-            .execute(params![file_id, author, now])
+            .query_row(params![file_id, author, now], |r| r.get(0))
             .map_err(sql_err)?;
-        self.conn
-            .prepare_cached(&format!(
-                "UPDATE {p}node SET nbytes = ?1, nlines = ?2, updated_by = ?3, nwords = ?5, \
-                 nauthors = (SELECT count(*) FROM {p}file_author WHERE file_id = ?4) WHERE id = ?4",
-                p = self.p
-            ))
-            .map_err(sql_err)?
-            .execute(params![nbytes as i64, nlines as i64, author, file_id, nwords])
-            .map_err(sql_err)?;
+        // Recounting the authors on every commit meant a scan of `file_author` per write to
+        // re-derive a number that only moves the first time someone writes to a file.
+        if first_by_author == 1 {
+            self.conn
+                .prepare_cached(&format!(
+                    "UPDATE {p}node SET nbytes = ?1, nlines = ?2, updated_by = ?3, nwords = ?5, \
+                     nauthors = (SELECT count(*) FROM {p}file_author WHERE file_id = ?4) WHERE id = ?4",
+                    p = self.p
+                ))
+                .map_err(sql_err)?
+                .execute(params![nbytes as i64, nlines as i64, author, file_id, nwords])
+                .map_err(sql_err)?;
+        } else {
+            self.conn
+                .prepare_cached(&format!(
+                    "UPDATE {p}node SET nbytes = ?1, nlines = ?2, updated_by = ?3, nwords = ?5 WHERE id = ?4",
+                    p = self.p
+                ))
+                .map_err(sql_err)?
+                .execute(params![nbytes as i64, nlines as i64, author, file_id, nwords])
+                .map_err(sql_err)?;
+        }
         let change = Totals {
             files: (c.version == 1) as i64,
             folders: 0,
@@ -586,18 +609,30 @@ impl<'c> TextDb<'c> {
         };
         self.add_to_ancestors(path, &change, &now)?;
         // Reverse index for search: chunk → file, recorded once per (chunk, file).
+        //
+        // One statement per new chunk meant 652 of them for a 1 MiB document. Batched into
+        // multi-row `VALUES` lists of a fixed size, so the statement text repeats and the
+        // cache holds it; the tail is one statement of whatever is left.
         let mut seen = std::collections::HashSet::new();
-        for h in &c.new_chunks {
-            if !seen.insert(*h) {
-                continue;
+        let fresh: Vec<&textdb_core::Hash> = c.new_chunks.iter().filter(|h| seen.insert(**h)).collect();
+        for batch in fresh.chunks(CHUNK_REF_BATCH) {
+            let marks = vec!["(?, ?, ?)"; batch.len()].join(",");
+            let mut args: Vec<rusqlite::types::Value> = Vec::with_capacity(batch.len() * 3);
+            for h in batch {
+                args.push(h.to_vec().into());
+                args.push(file_id.into());
+                args.push((c.version as i64).into());
             }
             self.conn
                 .prepare_cached(&format!(
-                    "INSERT OR IGNORE INTO {p}chunk_ref(chunk_id, file_id, version) SELECT id, ?2, ?3 FROM {p}chunk WHERE hash = ?1",
+                    // SQLite names a VALUES clause's columns `column1..N` and does not accept
+                    // the `AS v(h, f, v)` aliasing Postgres does.
+                    "INSERT OR IGNORE INTO {p}chunk_ref(chunk_id, file_id, version) \
+                     SELECT c.id, v.column2, v.column3 FROM (VALUES {marks}) AS v JOIN {p}chunk c ON c.hash = v.column1",
                     p = self.p
                 ))
                 .map_err(sql_err)?
-                .execute(params![&h[..], file_id, c.version as i64])
+                .execute(rusqlite::params_from_iter(args.iter()))
                 .map_err(sql_err)?;
         }
         // Structure rows (markdown only), kept for HEAD only: per-version rows cost more
