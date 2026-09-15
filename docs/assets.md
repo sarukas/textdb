@@ -236,11 +236,17 @@ hash differs from the pointer in place. A pointer is never pulled into `.git`, `
 names a file that is no asset (a document, a file the rules leave out) is a `conflict` whose file is
 never hashed or described: anyone who can write to the store must not be able to plant a git hook
 or learn about other files through a pointer, and `push --force` never uploads a file a pointer
-only names. For the same reason sync never writes a store file inside `.git`, `.textdb`,
-`node_modules`, `.trash`, `.textdb-trash`, `__pycache__` or the system folders textdb leaves out
-(`.obsidian` excepted: its settings sync on purpose), whatever the name's letter case, trailing
-dots or spaces, stream, or 8.3 short name (`GIT~1`) — such a file is reported as skipped. These
-checks take a name as Windows would resolve it, so `.git.` and `GIT~1` are `.git`. `verify` counts an asset store it cannot reach as a
+only names. For the same reason sync never writes, moves or deletes a store file inside `.git`,
+`.textdb`, `node_modules`, `.trash`, `.textdb-trash`, `__pycache__`, the system folders textdb
+leaves out, or `.obsidian/plugins`, `snippets` and `themes` (Obsidian's other settings sync on
+purpose): such a file stays in textdb only and is reported as skipped, whether a file is on disk
+there or not. These checks take a name as Windows would resolve it, so `.GIT`, `.git.`,
+`.git::$INDEX_ALLOCATION` and the 8.3 short names Windows may give those folders (`GIT~1`,
+`NODE_M~1`, or the hashed `GI3F2A~1`) are those folders, while other names that only look like
+short names (`photos~1`, `report~1.pdf`) are not. Neither sync nor pull writes, moves or deletes
+through a symbolic link or junction already in the directory. And a sync that brings a
+`.gitattributes` from textdb pushes no assets: the next sync reports the rules changed, and only
+`--accept-rules` (or an explicit push) takes files the new rules make assets. `verify` counts an asset store it cannot reach as a
 problem. `status --json` gives `{ prefix, dir, assets, counts }`, each asset with `path`, `state`,
 `type` (the pointer's media type, or one from the name), and where known `size`, `store`,
 `sha256` (the pointer's), `version` (the pointer's in the store), `file` (its name on disk,

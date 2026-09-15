@@ -62,20 +62,40 @@ fn resolved(seg: &str) -> String {
     seg.split(':').next().unwrap_or(seg).trim_end_matches(['.', ' ']).to_lowercase()
 }
 
-/// An 8.3 short name such as `GIT~1` or `NODE_M~1`: on Windows, another name of whatever folder
-/// has it (`.git` included).
-fn short_name(seg: &str) -> bool {
+/// The stem of the 8.3 short name Windows gives `name`: its base (before a last dot) without
+/// leading dots, spaces and other dots, in upper case, six characters at most.
+fn short_stem(name: &str) -> String {
+    let trimmed = name.trim_start_matches('.');
+    let base = match trimmed.rfind('.') {
+        Some(i) if i > 0 => &trimmed[..i],
+        _ => trimmed,
+    };
+    base.chars().filter(|c| *c != ' ' && *c != '.').flat_map(char::to_uppercase).take(6).collect()
+}
+
+/// Whether `seg` is an 8.3 short name Windows may have given one of `dirs`: `GIT~1` for `.git`,
+/// `NODE_M~1` for `node_modules`, or the hashed form it uses when many names share a start
+/// (`GI3F2A~1`: two letters of the stem and four hex digits). Other names that look like short
+/// names (`photos~1`, `report~1.pdf`) are not.
+fn short_name_of(seg: &str, dirs: &[&str]) -> bool {
     let Some((stem, rest)) = seg.split_once('~') else { return false };
     let (num, ext) = rest.split_once('.').unwrap_or((rest, ""));
-    (1..=6).contains(&stem.chars().count()) && !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) && ext.chars().count() <= 3 && !ext.contains('.')
+    if !(1..=6).contains(&stem.chars().count()) || num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) || ext.chars().count() > 3 || ext.contains('.') {
+        return false;
+    }
+    let stem = stem.to_uppercase();
+    dirs.iter().map(|d| short_stem(d)).any(|s| {
+        let start: String = s.chars().take(2).collect();
+        stem == s || (stem.chars().count() == 6 && start.chars().count() == 2 && stem.starts_with(&start) && stem.chars().skip(2).all(|c| c.is_ascii_hexdigit()))
+    })
 }
 
 /// Whether the path segment `seg` names, or on Windows may name, one of `dirs`: in any letter
-/// case, with trailing dots or spaces or a stream, or, for a `folder` on the way to a file, as an
-/// 8.3 short name.
-pub fn names_dir(seg: &str, dirs: &[&str], folder: bool) -> bool {
+/// case, with trailing dots or spaces or a stream (`.git.`, `.git::$INDEX_ALLOCATION`), or as an
+/// 8.3 short name it may have (`GIT~1`).
+pub fn names_dir(seg: &str, dirs: &[&str]) -> bool {
     let name = resolved(seg);
-    dirs.iter().any(|d| d.eq_ignore_ascii_case(&name)) || (folder && short_name(seg))
+    dirs.iter().any(|d| d.eq_ignore_ascii_case(&name)) || short_name_of(&name, dirs)
 }
 
 /// Files that are never assets: a store's database and its copies, system clutter, lock files,
@@ -256,7 +276,7 @@ impl Classifier {
     pub fn rule_class(&self, rel: &str) -> Class {
         let mut segs: Vec<&str> = rel.split('/').collect();
         let name = segs.pop().unwrap_or("");
-        if segs.iter().any(|s| names_dir(s, IGNORED_DIRS, true)) || names_dir(name, IGNORED_DIRS, false) || ignored_name(name) {
+        if segs.iter().chain(std::iter::once(&name)).any(|s| names_dir(s, IGNORED_DIRS)) || ignored_name(name) {
             return Class::Ignore;
         }
         if is_asset_pointer(name) {
@@ -374,8 +394,14 @@ mod tests {
         for alias in ["GIT~1/hooks/post-checkout", ".git./hooks/x", ".GIT /config", ".git::$INDEX_ALLOCATION/hooks/x", "NODE_M~1/x.png", "sub/.git"] {
             assert_eq!(c.rule_class(alias), Class::Ignore, "{alias}");
         }
-        assert!(names_dir("GIT~1", IGNORED_DIRS, true) && !names_dir("report~1.pdf", IGNORED_DIRS, false) && !names_dir("a~b", IGNORED_DIRS, true));
+        for alias in ["GIT~1", "git~1.", "NODE_M~1", "$RECYC~1.BIN", "TEXTDB~2", "GI3F2A~1", "SYSTEM~1"] {
+            assert!(names_dir(alias, IGNORED_DIRS), "{alias}");
+        }
+        for name in ["report~1.pdf", "photos~1", "a~b", "GIT~", "GITHUB~1", "GIZZZZ~1"] {
+            assert!(!names_dir(name, IGNORED_DIRS), "{name}");
+        }
         assert_eq!(c.rule_class("scans/report~1.pdf"), Class::Asset, "a file may be named like a short name");
+        assert_eq!(c.rule_class("photos~1/p.png"), Class::Asset, "and a folder too");
         assert_eq!(c.rule_class(".png"), Class::Other);
         assert_eq!(c.rule_class("certs/server.key"), Class::Other);
 

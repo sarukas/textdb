@@ -761,6 +761,49 @@ fn asset_pointers_never_reach_into_git_or_tell_of_other_files() {
     // push --force never sends a file a pointer only names to the asset store.
     run(&mut t(&["assets", "push", "--force", "--dir", dir]), None);
     assert!(!bucket.join(".env").exists(), "the .env went to the asset store");
+
+    // A submodule's .git file is not overwritten through its 8.3 short name.
+    std::fs::create_dir_all(vault.join("sub")).unwrap();
+    std::fs::write(vault.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+    run(&mut t(&["write", "/sub/GIT~1"]), Some("gitdir: ../evil\n"));
+    run(&mut t(&["sync", "/", dir]), None);
+    assert_eq!(std::fs::read_to_string(vault.join("sub/.git")).unwrap(), "gitdir: ../.git/modules/sub\n");
+
+    // Nothing is written through a link or junction already in the directory, in any letter case,
+    // by sync or by pull.
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    if link_dir(&outside, &vault.join("link")) {
+        ok(&mut t(&["write", "/link/hooks/exact.md"]), Some("x\n"));
+        run(&mut t(&["write", "/LINK/hooks/case.md"]), Some("x\n"));
+        ok(&mut t(&["write", "/link/pic.dat.tdbasset"]), Some(&pointer));
+        run(&mut t(&["sync", "/", dir]), None);
+        run(&mut t(&["assets", "pull", "--dir", dir]), None);
+        let written: Vec<_> = std::fs::read_dir(&outside).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert!(written.is_empty(), "written through the link: {written:?}");
+    }
+
+    // A .gitattributes arriving from textdb does not make other files assets in the same sync, nor
+    // in the next one before the rules are accepted.
+    std::fs::write(vault.join("secret.txt"), "TOKEN=1\n").unwrap();
+    ok(&mut t(&["write", "/.gitattributes"]), Some("secret.txt textdb=asset\n"));
+    run(&mut t(&["sync", "/", dir, "--push"]), None);
+    assert!(!bucket.join("secret.txt").exists(), "pushed in the sync that brought the rule");
+    run(&mut t(&["sync", "/", dir, "--push"]), None);
+    assert!(!bucket.join("secret.txt").exists(), "pushed before the rules were accepted");
+}
+
+/// Make `link` a link to the folder `target`: a junction on Windows (which needs no privilege), a
+/// symbolic link elsewhere.
+fn link_dir(target: &Path, link: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(target).output().is_ok_and(|o| o.status.success())
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
 }
 
 /// rclone for tests: `TEXTDB_RCLONE`, else `rclone` on the PATH. Without one the test is skipped,

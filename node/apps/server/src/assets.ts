@@ -85,8 +85,26 @@ const MAX_RUNS = 4;
 
 const CONTROL = /[\x00-\x1f\x7f]/;
 
-/** An 8.3 short name such as GIT~1: on Windows another name of whatever folder has it, .git included. */
-const SHORT_NAME = /^[^~]{1,6}~\d+(\.[^.]{0,3})?$/;
+/** The stem of the 8.3 short name Windows gives `name`: its base without leading dots, spaces and dots, upper case, six characters. */
+function shortStem(name: string): string {
+  const trimmed = name.replace(/^\.+/, '');
+  const dot = trimmed.lastIndexOf('.');
+  const base = dot > 0 ? trimmed.slice(0, dot) : trimmed;
+  return [...base.replace(/[ .]/g, '').toUpperCase()].slice(0, 6).join('');
+}
+
+const SHORT_STEMS = [...IGNORED_DIRS].map(shortStem);
+
+/**
+ * An 8.3 short name Windows may have given one of the ignored folders: GIT~1 for .git, or the
+ * hashed form (GI3F2A~1). Keep in step with `short_name_of` in crates/textdb-cli/src/assets/classify.rs.
+ */
+function shortNameOfIgnored(seg: string): boolean {
+  const m = /^([^~]{1,6})~\d+(\.[^.]{0,3})?$/.exec(seg);
+  if (!m) return false;
+  const stem = m[1]!.toUpperCase();
+  return SHORT_STEMS.some((s) => stem === s || (stem.length === 6 && s.length >= 2 && stem.startsWith(s.slice(0, 2)) && /^[0-9A-F]{4}$/.test(stem.slice(2))));
+}
 
 /**
  * A store path at or below `prefix` that an asset can be at: no `.` or `..` part, backslash, colon
@@ -96,10 +114,10 @@ const SHORT_NAME = /^[^~]{1,6}~\d+(\.[^.]{0,3})?$/;
 function under(prefix: string, p: string): boolean {
   if (!p.startsWith('/') || p.includes('\\') || p.includes(':') || CONTROL.test(p)) return false;
   const segs = p.split('/');
-  for (const [i, s] of segs.entries()) {
+  for (const s of segs) {
     if (s === '.' || s === '..') return false;
-    if (IGNORED_DIRS.has(s.replace(/[. ]+$/, '').toLowerCase())) return false;
-    if (i > 0 && i < segs.length - 1 && SHORT_NAME.test(s)) return false;
+    const resolved = s.replace(/[. ]+$/, '');
+    if (IGNORED_DIRS.has(resolved.toLowerCase()) || shortNameOfIgnored(resolved)) return false;
   }
   return prefix === '/' || p === prefix || p.startsWith(`${prefix}/`);
 }

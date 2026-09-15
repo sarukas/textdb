@@ -213,7 +213,9 @@ fn protected_rel(rel: &str) -> bool {
     use crate::assets::classify::{names_dir, IGNORED_DIRS};
     let dirs: Vec<&str> = IGNORED_DIRS.iter().copied().filter(|d| *d != ".obsidian").collect();
     let segs: Vec<&str> = rel.split('/').collect();
-    segs.iter().enumerate().any(|(i, s)| names_dir(s, &dirs, i + 1 < segs.len()))
+    segs.iter().any(|s| names_dir(s, &dirs))
+        // Obsidian's settings sync, but not the code and styles it loads.
+        || segs.windows(2).any(|w| names_dir(w[0], &[".obsidian"]) && names_dir(w[1], &["plugins", "snippets", "themes"]))
 }
 
 fn refuse_protected(rel: &str) -> std::io::Result<()> {
@@ -221,6 +223,18 @@ fn refuse_protected(rel: &str) -> std::io::Result<()> {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("{rel} is inside a folder sync never writes into (.git, .textdb, node_modules, …)"),
+        ));
+    }
+    Ok(())
+}
+
+/// A write, move or delete that would go through a symbolic link or junction already on disk,
+/// whose folder may be anywhere (a `.git` included), is refused.
+fn refuse_link(root: &Path, rel: &str) -> std::io::Result<()> {
+    if crate::assets::through_link(root, rel) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{rel} is reached through a link or junction on disk, which sync never writes through"),
         ));
     }
     Ok(())
@@ -310,6 +324,7 @@ fn walk(root: &Path, tracked_dirs: &HashSet<String>) -> Result<Walk> {
 
 fn write_disk(root: &Path, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
     refuse_protected(rel)?;
+    refuse_link(root, rel)?;
     let target = root.join(rel);
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
@@ -321,6 +336,7 @@ fn write_disk(root: &Path, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Delete a file, then the directories it leaves empty (never `root`).
 fn remove_disk(root: &Path, rel: &str) -> std::io::Result<()> {
+    refuse_link(root, rel)?;
     let file = root.join(rel);
     if let Err(e) = std::fs::remove_file(&file) {
         if !clear_read_only(&file) {
@@ -355,6 +371,8 @@ fn move_disk(root: &Path, from: &str, to: &str) -> std::io::Result<()> {
     // textdb's own trash (`.textdb/trash/<time>/<file>`) is the one such folder files move into;
     // the file's own path is checked all the same.
     refuse_protected(to.strip_prefix(".textdb/trash/").and_then(|rest| rest.split_once('/')).map_or(to, |(_, file)| file))?;
+    refuse_link(root, from)?;
+    refuse_link(root, to)?;
     let target = root.join(to);
     let case_only = from != to && from.to_lowercase() == to.to_lowercase();
     if target.exists() && !(case_only && CASE_INSENSITIVE) {
@@ -739,8 +757,17 @@ fn sync_assets(st: &mut dyn Store, o: &Options, prefix: &str, plan: &Plan, attrs
     let mode = o.assets.clone().or_else(|| st.setting("asset_sync").ok().flatten()).unwrap_or_else(|| "off".to_string());
     let v = assets::Vault { prefix: prefix.to_string(), dir: o.dir.clone() };
     if !o.dry_run {
+        // A .gitattributes this very sync brought from textdb is not trusted to make files assets:
+        // a file anyone put in the store could name `.env`. The next sync sees the rules changed.
+        let attrs_arriving = plan
+            .to_disk
+            .iter()
+            .chain(plan.merges.iter().map(|(rel, ..)| rel))
+            .chain(plan.conflicts.iter().map(|(rel, ..)| rel))
+            .chain(plan.moves.iter().map(|(_, to)| to))
+            .any(|rel| rel.rsplit('/').next().is_some_and(|name| name.eq_ignore_ascii_case(".gitattributes")));
         if matches!(mode.as_str(), "push" | "both") {
-            if attrs_changed {
+            if attrs_changed || attrs_arriving {
                 a.notes.push(
                     "the .gitattributes files changed since the last sync, so no assets were pushed: check `textdb assets status`, then sync with --accept-rules (or push)".to_string(),
                 );
@@ -961,11 +988,12 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         }
     }
     let walked = walk(&o.dir, &tracked_dirs)?;
+    // In letter case too where the file system ignores it: `LINK/x` goes through the link `link`.
+    let fold = |s: &str| if CASE_INSENSITIVE { s.to_lowercase() } else { s.to_string() };
+    let links_folded: Vec<String> = walked.links.iter().map(|l| fold(l)).collect();
     let under_link = |rel: &str| {
-        walked
-            .links
-            .iter()
-            .any(|l| rel == l || rel.strip_prefix(l.as_str()).is_some_and(|r| r.starts_with('/')))
+        let rel = fold(rel);
+        links_folded.iter().any(|l| rel == *l || rel.strip_prefix(l.as_str()).is_some_and(|r| r.starts_with('/')))
     };
     for link in &walked.links {
         report.skipped.push(note(link, "a symbolic link, left as it is"));
@@ -1023,13 +1051,17 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             plan.hold.push(rel);
             continue;
         }
+        // In a folder sync never writes into: what textdb has there stays in textdb only, whether
+        // a file is on disk there or not (a submodule's `.git` file under its short name, say).
+        if protected_rel(&rel) && heads.contains_key(&rel) {
+            report.skipped.push(note(&rel, "inside a folder sync never writes into (.git, .textdb, node_modules, …): kept in textdb only"));
+            plan.hold.push(rel);
+            continue;
+        }
         let t = heads.get(&rel);
         let d = walked.files.get(&rel).copied();
         let Some(b) = base.get(&rel) else {
             match (t, d) {
-                (Some(_), None) if protected_rel(&rel) => {
-                    report.skipped.push(note(&rel, "inside a folder sync never writes into (.git, .textdb, node_modules, …): kept in textdb only"))
-                }
                 (Some(_), None) => plan.to_disk.push(rel),
                 (None, Some(_)) => {
                     if eligible(&rel, &o.exts) {
@@ -2114,7 +2146,9 @@ mod tests {
         assert!(protected_rel(".textdb/bin/textdb.cmd") && protected_rel("web/node_modules/x.js") && protected_rel(".trash/a.md"));
         assert!(protected_rel("GIT~1/hooks/x") && protected_rel(".git./hooks/x") && protected_rel(".git::$INDEX_ALLOCATION/hooks/x"));
         assert!(!protected_rel(".gitignore") && !protected_rel("a/.github/workflows/ci.yml") && !protected_rel("notes/git/a.md"));
-        assert!(!protected_rel(".obsidian/app.json") && !protected_rel("scans/report~1.pdf"), "settings sync; a file may look like a short name");
+        assert!(!protected_rel(".obsidian/app.json") && !protected_rel("scans/report~1.pdf") && !protected_rel("photos~1/a.md"), "settings sync; other names may look like short names");
+        assert!(protected_rel("sub/GIT~1") && protected_rel("NODE_M~1/x.js") && protected_rel("GI3F2A~1/hooks/x"));
+        assert!(protected_rel(".obsidian/plugins/p/main.js") && protected_rel(".Obsidian/Themes/t.css") && protected_rel(".obsidian/snippets/s.css"));
         assert!(eligible("logo.png", &parse_exts("*")));
         assert!(has_markers(b"a\n<<<<<<< textdb\nb\n=======\nc\n>>>>>>> disk\n"));
         assert!(!has_markers(b"<<<<<<< only an opening line\n"));

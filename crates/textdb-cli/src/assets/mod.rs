@@ -1054,6 +1054,25 @@ impl DirCache {
     }
 }
 
+/// Whether writing `rel` below `root` would go through a symbolic link or junction already on
+/// disk: a folder that is some other folder, anywhere (a `.git` included), or a file that is a link.
+pub(crate) fn through_link(root: &Path, rel: &str) -> bool {
+    let parts: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    let mut at = root.to_path_buf();
+    for (i, part) in parts.iter().enumerate() {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => return true,
+            // A file on the way, or the end: nothing further to follow.
+            Ok(meta) if !meta.is_dir() || i + 1 == parts.len() => return false,
+            Ok(_) => {}
+            // Not there: made fresh, not followed.
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 /// The folders below `dir` (relative to it, in lower case) that asset stores bound on this
 /// computer keep their files in.
 pub(crate) fn store_folders_inside(st: &mut dyn Store, dir: &Path) -> Vec<String> {
@@ -1285,6 +1304,11 @@ pub(crate) fn pull_run(st: &mut dyn Store, v: &Vault, scope: &[String], linked: 
             }
         };
         let file = item.file.clone().unwrap_or_else(|| item.rel.clone());
+        // Never through a link or junction already in the directory: its folder may be anywhere.
+        if through_link(&v.dir, &file) || through_link(&v.dir, ".textdb/trash/x") {
+            failed.push(format!("{}: {file} is reached through a link or junction on disk, which pull never writes through", item.path));
+            continue;
+        }
         let dest = v.dir.join(&file);
         let part = driver::partial(&dest);
         let fetched = dest
