@@ -163,6 +163,8 @@ export function createApp(corpus: Corpus, hub: ChangeHub, options: AppOptions): 
     return c.json(await service.push(bodyString(body, 'prefix'), bodyPaths(body), bodyOptionalString(body, 'message'), bodyOptionalString(body, 'author')));
   });
   app.get('/api/assets/file', async (c) => {
+    // Hono answers HEAD through this handler and drops the body: no file is opened for one.
+    const head = c.req.method === 'HEAD';
     const f = await assetService(assets).file(queryString(c, 'prefix'), queryString(c, 'path'));
     const download = c.req.query('download') === '1' || !f.inline;
     const headers: Record<string, string> = {
@@ -174,7 +176,8 @@ export function createApp(corpus: Corpus, hub: ChangeHub, options: AppOptions): 
     };
     // Images, audio and video shown on their own run nothing; the browser's PDF viewer needs its scripts.
     if (f.type !== 'application/pdf') headers['Content-Security-Policy'] = "sandbox; default-src 'none'";
-    return c.body(fileStream(f.file), 200, headers);
+    if (head) return c.body(null, 200, headers);
+    return c.body(fileStream(f.file, f.size), 200, headers);
   });
 
   // Export. A client compares what is on its disk with these, then fetches only what differs.

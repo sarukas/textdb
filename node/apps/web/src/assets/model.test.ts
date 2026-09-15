@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { actionFor, assetPath, isPointer, pointerPath, previewKind, stateLabel, syncLinkFor } from "./model";
+import { actionFor, afterChange, assetPath, inFolder, isPointer, pointerPath, previewKind, stateLabel, syncLinkFor } from "./model";
 
 describe("asset pointers", () => {
   test("a pointer names its asset, and only a .tdbasset name is a pointer", () => {
@@ -30,5 +30,20 @@ describe("asset pointers", () => {
     expect(previewKind("image/svg+xml")).toBe("download");
     expect(previewKind("application/pdf")).toBe("pdf");
     expect(previewKind("application/vnd.openxmlformats-officedocument.wordprocessingml.document")).toBe("download");
+    // Only what the server sends inline: a TIFF or a QuickTime film is a download.
+    expect(previewKind("image/tiff")).toBe("download");
+    expect(previewKind("video/quicktime")).toBe("download");
+  });
+
+  test("an asset follows its pointer when it or a folder above it moves, and knows when it went", () => {
+    const at = "/notes/img/a.png.tdbasset";
+    expect(afterChange(at, { op: "move", path: "/notes/img/b.png.tdbasset", old_path: at })).toBe("/notes/img/b.png.tdbasset");
+    expect(afterChange(at, { op: "move", path: "/archive/pics", old_path: "/notes/img" })).toBe("/archive/pics/a.png.tdbasset");
+    expect(afterChange(at, { op: "move", path: "/x", old_path: "/notes/im" })).toBeUndefined();
+    expect(afterChange(at, { op: "delete", path: "/notes", old_path: null })).toBeNull();
+    expect(afterChange(at, { op: "commit", path: at, old_path: null })).toBeUndefined();
+    expect(inFolder("/notes", "/notes/a")).toBe(true);
+    expect(inFolder("/notes", "/notesx")).toBe(false);
+    expect(inFolder("/", "/anything")).toBe(true);
   });
 });

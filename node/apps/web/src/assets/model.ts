@@ -51,14 +51,41 @@ export function stateLabel(state: string): StateLabel {
   return LABELS[state as AssetState] ?? { label: state, tone: "problem", hint: state };
 }
 
+/** The types the server sends inline; keep in step with INLINE in node/apps/server/src/assets.ts. */
+const PREVIEWS: Record<string, "image" | "pdf" | "audio" | "video"> = {
+  "image/png": "image",
+  "image/jpeg": "image",
+  "image/gif": "image",
+  "image/webp": "image",
+  "image/avif": "image",
+  "image/bmp": "image",
+  "application/pdf": "pdf",
+  "audio/mpeg": "audio",
+  "audio/ogg": "audio",
+  "audio/wav": "audio",
+  "audio/flac": "audio",
+  "video/mp4": "video",
+  "video/webm": "video",
+};
+
 /** What a browser can show of an asset's type: an image, a PDF, audio, video, or only a download. */
 export function previewKind(type: string): "image" | "pdf" | "audio" | "video" | "download" {
-  if (type === "image/svg+xml") return "download";
-  if (type.startsWith("image/")) return "image";
-  if (type === "application/pdf") return "pdf";
-  if (type.startsWith("audio/")) return "audio";
-  if (type.startsWith("video/")) return "video";
-  return "download";
+  return PREVIEWS[type] ?? "download";
+}
+
+/** `path` is `folder` or below it. */
+export function inFolder(folder: string, path: string): boolean {
+  return folder === "/" || path === folder || path.startsWith(`${folder}/`);
+}
+
+/**
+ * Where `path` is after the change `e`: where it moved (itself or a folder above it), `null` when it
+ * was deleted, `undefined` when the change left it where it was.
+ */
+export function afterChange(path: string, e: { op: string; path: string; old_path: string | null }): string | null | undefined {
+  if (e.op === "move" && e.old_path && e.old_path !== "/" && inFolder(e.old_path, path)) return e.path + path.slice(e.old_path.length);
+  if (e.op === "delete" && e.path !== "/" && inFolder(e.path, path)) return null;
+  return undefined;
 }
 
 /** The pull or push an asset in `state` calls for, if any. */

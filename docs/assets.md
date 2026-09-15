@@ -372,8 +372,9 @@ drive. These need real Google Drive and SharePoint accounts to build and test ag
 For the folders the web server syncs (`TEXTDB_SYNC`), through the CLI as for sync:
 
 - The folder view lists a pointer `NAME.tdbasset` as `NAME`, with its type, the asset's size and a
-  state badge (ok, new, changed, outdated, conflict, not pulled, …), refreshed when a pointer
-  changes. Opening it shows the asset: its state, type, size and asset store; a preview of an image,
+  state badge (ok, changed, outdated, conflict, not pulled, …), refreshed when a pointer in the
+  folder changes or something in it moves or goes. A file with no pointer yet has no row: `textdb
+  assets push` or a sync that pushes gives it one. Opening it shows the asset: its state, type, size and asset store; a preview of an image,
   PDF, audio or video file; a download of anything else; Pull or Push when its state calls for
   one; Rename and Delete (of the pointer; the next sync moves or trashes the file); and the
   pointer's versions with their authors and messages.
@@ -383,7 +384,13 @@ For the folders the web server syncs (`TEXTDB_SYNC`), through the CLI as for syn
   `POST /api/assets/push` (`{ prefix, paths?, message?, author? }`, taking the folder's turn with
   its syncs), `GET /api/assets/file?prefix=&path=[&download=1]`: the asset's file from inside the
   folder's directory only, `nosniff`, sandboxed unless a PDF, and only images, PDF, audio and video
-  inline (SVG and anything else as a download). An asset not pulled is pulled before it can be
+  inline (SVG and anything else as a download). All of them only once the folder has been synced
+  (before that the CLI would take a path inside it for the folder). A file is sent only when it is
+  the asset's own: in state ok, modified or outdated (the pointer's bytes, or bytes this directory
+  had as that asset), or new, orphan or a conflict copy (a file the rules make an asset); never a
+  file a pointer merely names, since anyone who can write a pointer to the store could otherwise
+  read any file of the directory through it. Writes are JSON only (`Content-Type:
+  application/json`), so another site's page cannot trigger them; at most four CLI runs go at once. An asset not pulled is pulled before it can be
   seen: the server never reads the asset store for a preview.
 
 ## Out of scope for now

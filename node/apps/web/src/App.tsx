@@ -401,6 +401,7 @@ export function App() {
               author={author}
               onAction={onPathAction}
               onOpenFolder={openFolder}
+              onPathChange={onPathChange}
             />
           ) : open ? (
             <DocumentPane

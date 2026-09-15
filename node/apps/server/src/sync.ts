@@ -111,7 +111,8 @@ export class SyncService {
     }
     return this.exclusive(prefix, async () => {
       const args = ['--store', this.corpus.db, '--json'];
-      if (options.author) args.push('--author', options.author);
+      // One argument, so a name starting with a dash is a name.
+      if (options.author) args.push(`--author=${options.author}`);
       args.push('sync');
       if (options.dryRun) args.push('--dry-run');
       if (options.commit) args.push('--commit');

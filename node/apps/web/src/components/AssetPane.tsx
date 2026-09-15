@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, assetFileUrl, type AssetItem, type HistoryEntry, type SyncLink } from "../api";
-import { actionFor, assetPath, isPointer, previewKind, stateLabel } from "../assets/model";
+import { actionFor, afterChange, assetPath, isPointer, previewKind, stateLabel } from "../assets/model";
 import { formatBytes } from "../import/select";
 import { authorStyle } from "../live/color";
 import { relativeTime } from "../live/time";
@@ -19,6 +19,8 @@ interface Props {
   author: string;
   onAction: (action: PathAction) => void;
   onOpenFolder: (path: string) => void;
+  /** The pointer moved (renamed here, by someone else, or with a folder above it). */
+  onPathChange: (path: string) => void;
 }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -27,41 +29,62 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
  * An asset, opened through its pointer: what state its file on the server's disk is in, a preview
  * of it where a browser can show one, pull and push, and the versions of its pointer.
  */
-export function AssetPane({ pointer, link, hub, author, onAction, onOpenFolder }: Props) {
+export function AssetPane({ pointer, link, hub, author, onAction, onOpenFolder, onPathChange }: Props) {
   const toast = useToast();
   const now = useNow(30_000);
   const asset = assetPath(pointer);
   const name = asset.slice(asset.lastIndexOf("/") + 1);
   const [item, setItem] = useState<AssetItem | null>(null);
+  // The status came back without this asset (its pointer went, or the file is no asset here).
+  const [missing, setMissing] = useState(false);
+  const [gone, setGone] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [busy, setBusy] = useState<"pull" | "push" | null>(null);
   // Bumped after a pull, a push or a change of the pointer: state, preview and versions load again.
   const [rev, setRev] = useState(0);
+  // Only the latest load's answers are shown.
+  const loads = useRef(0);
+  const pathChangeRef = useRef(onPathChange);
+  pathChangeRef.current = onPathChange;
 
   const load = useCallback(() => {
+    const seq = ++loads.current;
     const ctl = new AbortController();
     api.assets(link.prefix, asset, ctl.signal).then(
       (s) => {
-        setItem(s.assets.find((a) => a.path === asset) ?? null);
+        if (seq !== loads.current) return;
+        const found = s.assets.find((a) => a.path === asset) ?? null;
+        setItem(found);
+        setMissing(found === null);
         setError(null);
       },
       (e: unknown) => {
-        if (!ctl.signal.aborted) setError(message(e));
+        if (!ctl.signal.aborted && seq === loads.current) setError(message(e));
       },
     );
     api.history(pointer).then(
-      (h) => setHistory([...h].reverse()),
-      () => setHistory([]),
+      (h) => {
+        if (seq === loads.current) setHistory([...h].reverse());
+      },
+      () => {
+        if (seq === loads.current) setHistory([]);
+      },
     );
     return () => ctl.abort();
   }, [link.prefix, asset, pointer]);
-  useEffect(() => load(), [load, rev]);
+  useEffect(() => {
+    setGone(false);
+    return load();
+  }, [load, rev]);
 
   useEffect(
     () =>
       hub.events.on((e) => {
-        if (e.path === pointer || e.old_path === pointer) setRev((n) => n + 1);
+        const next = afterChange(pointer, e);
+        if (next === null) setGone(true);
+        else if (next !== undefined) pathChangeRef.current(next);
+        else if (e.path === pointer) setRev((n) => n + 1);
       }),
     [hub, pointer],
   );
@@ -100,6 +123,15 @@ export function AssetPane({ pointer, link, hub, author, onAction, onOpenFolder }
         <div className="empty">
           <div className="error-text">Could not look at {name}</div>
           <div className="muted">{error}</div>
+        </div>
+      );
+    }
+    if (gone) return <div className="empty muted">{name} was deleted: its pointer is gone from the store.</div>;
+    if (missing) {
+      return (
+        <div className="empty">
+          <p>{name} is not an asset of {link.prefix} any more.</p>
+          <p className="muted">Its pointer may have moved or gone; sync the folder, or open the folder to look.</p>
         </div>
       );
     }

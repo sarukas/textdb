@@ -9,7 +9,7 @@ import {
   type MouseEvent,
 } from "react";
 import { api, ApiError, type AssetItem, type AuthorCount, type LsEntry, type SearchHit, type SyncLink } from "../api";
-import { assetPath, isPointer, stateLabel } from "../assets/model";
+import { assetPath, inFolder, isPointer, stateLabel } from "../assets/model";
 import {
   COLUMNS,
   PAGE,
@@ -286,7 +286,9 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
       setFlashRev((r) => r + 1);
     };
     const off = hub.events.on((e) => {
-      if (isPointer(e.path) || isPointer(e.old_path ?? "")) {
+      // A pointer here changed, or something here moved or went: the assets' states load again.
+      const here = inFolder(path, e.path) || (e.old_path !== null && inFolder(path, e.old_path));
+      if (here && (isPointer(e.path) || isPointer(e.old_path ?? "") || e.op === "move" || e.op === "delete")) {
         pointers = true;
         timer ??= setTimeout(flush, 300);
       }

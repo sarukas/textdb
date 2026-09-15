@@ -18,6 +18,11 @@ export function parseInteger(value: string, name: string): number {
 }
 
 export async function jsonBody(c: Context): Promise<Record<string, unknown>> {
+  // Only JSON: another site's page can send a form or plain-text POST without asking (no CORS
+  // preflight), but not a JSON one.
+  if (!/^application\/json\s*(;|$)/i.test(c.req.header('content-type') ?? '')) {
+    throw badRequest('request body must be JSON, sent as Content-Type: application/json');
+  }
   let body: unknown;
   try {
     body = await c.req.json();

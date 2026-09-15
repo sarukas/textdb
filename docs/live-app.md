@@ -55,7 +55,9 @@ for a `commit` row at version `v` are `textdb_hunks(path, v - 1, v)`.
 
 ## HTTP API (node server)
 
-Base URL `http://localhost:4317`. JSON bodies, UTF-8. Errors are
+Base URL `http://localhost:4317`. JSON bodies, UTF-8, sent as `Content-Type: application/json`
+(any other type is a 400 TX004: another site's page can post a form or plain text without asking,
+but not JSON). Errors are
 `{ "code": "TX00n", "message": "…", "conflict"?: {…} }` with status 409 (TX001), 503 (TX002),
 404 (TX003), 400 (TX004), 500 (other). A malformed request (missing parameter, non-integer
 version, body that is not JSON) is a 400 with code TX004.
@@ -80,10 +82,10 @@ Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./
 | `POST /api/sync` | `{ prefix, dry_run?, commit?, base?, author? }` | the `textdb sync --json` report: `{ to_disk, to_textdb: { new, changed, deleted }, moved, merged, conflicts, unresolved, kept, unchanged, skipped, failed, problems, stopped, seq, git }`, also when there are conflicts or blocking names. One sync per folder at a time (503 `TX002` otherwise); an unknown folder is 404 |
 | `GET /api/sync/conflict?prefix=/a&rel=b.md` | | `{ rel, text }` — a file the last sync left conflict markers in, as it is on disk; any other path is 404 |
 | `POST /api/sync/resolve` | `{ prefix, rel, keep: "textdb" \| "disk", author? }` | keeps that side of every conflict in the file on disk, then syncs; the sync report |
-| `GET /api/assets?prefix=/a[&path=/a/img]` | | the `textdb assets status --json` report of the synced folder's directory, or of the part at or below `path`: `{ prefix, dir, assets: [{ path, state, type, size?, store?, sha256?, version?, file?, note? }], counts }`, see [assets.md](assets.md). An unknown folder is 404; a `path` outside it, or with `.`/`..` parts, is 400 |
+| `GET /api/assets?prefix=/a[&path=/a/img]` | | the `textdb assets status --json` report of the synced folder's directory, or of the part at or below `path`: `{ prefix, dir, assets: [{ path, state, type, size?, store?, sha256?, version?, file?, note? }], counts }`, see [assets.md](assets.md). An unknown folder is 404; a `path` outside it, or with `.`/`..` parts, a backslash or a control character, is 400; so is any asset route before the folder has been synced |
 | `POST /api/assets/pull` | `{ prefix, paths?, author? }` (at most 1000 paths, each in the folder; none means the whole folder) | the `textdb assets pull --json` report `{ dry_run, pulled, bytes, kept, failed }`, also when some failed. Takes the folder's turn with its syncs (503 `TX002` while one runs) |
 | `POST /api/assets/push` | `{ prefix, paths?, message?, author? }` | the `textdb assets push --json` report `{ dry_run, pushed, bytes, conflicts, failed }`, also when some failed or conflicted; the same turn as pull |
-| `GET /api/assets/file?prefix=/a&path=/a/img/b.png[&download=1]` | | the asset's file from inside the folder's directory (404 when it is not there: pull it first). Images, PDF, audio and video are sent inline with their type; anything else, SVG included, and any file with `download=1`, as an `application/octet-stream` attachment. Always `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`; a sandboxing `Content-Security-Policy` unless a PDF |
+| `GET /api/assets/file?prefix=/a&path=/a/img/b.png[&download=1]` | | the asset's file from inside the folder's directory (404 when it is not there: pull it first), only when it is the asset's own: state ok, modified, outdated, new, orphan or conflict copy (409 TX001 otherwise, e.g. for a file a pointer merely names). HEAD sends the headers alone. Images, PDF, audio and video are sent inline with their type; anything else, SVG included, and any file with `download=1`, as an `application/octet-stream` attachment. Always `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`; a sandboxing `Content-Security-Policy` unless a PDF |
 | `GET /api/file?path=/a/b.md[&version=n]` | | `{ path, version, head_version, content, nbytes, nlines, updated_at, updated_by }` |
 | `GET /api/chunks?path=…[&version=n]` | | `[{ ord, hash, byte_from, nbytes, line_from, nlines }]` |
 | `GET /api/history?path=…` | | `[{ version, author, ts, message, nbytes, kind, base_version }]` oldest first |
