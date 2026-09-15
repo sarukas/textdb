@@ -76,6 +76,25 @@ pub fn is_conflict_copy(rel: &str) -> bool {
     }
 }
 
+/// The asset a conflict copy was set aside from: `img/arch (conflict HOST DATE).png` is
+/// `img/arch.png`.
+pub fn original_of(rel: &str) -> Option<String> {
+    if !is_conflict_copy(rel) {
+        return None;
+    }
+    let (dir, name) = match rel.rsplit_once('/') {
+        Some((d, n)) => (Some(d), n),
+        None => (None, rel),
+    };
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if stem.ends_with(')') => (stem, Some(ext)),
+        _ => (name, None),
+    };
+    let base = &stem[..stem.rfind(" (conflict ")?];
+    let file = ext.map_or_else(|| base.to_string(), |ext| format!("{base}.{ext}"));
+    Some(dir.map_or_else(|| file.clone(), |d| format!("{d}/{file}")))
+}
+
 /// The pairs of `lost` and `found` that share a key no other item on either side has.
 pub fn one_to_one<K: Eq + Hash, A: Clone, B: Clone>(lost: impl IntoIterator<Item = (K, A)>, found: impl IntoIterator<Item = (K, B)>) -> Vec<(A, B)> {
     let mut sides: HashMap<K, (Vec<A>, Vec<B>)> = HashMap::new();
@@ -108,6 +127,9 @@ mod tests {
         for name in ["img/arch.png", "notes (conflict).png", "x (conflict h 2026-9-15).png", "x (conflict h 2026-09-15 two).png", "x (conflict  2026-09-15).png"] {
             assert!(!is_conflict_copy(name), "{name}");
         }
+        assert_eq!(original_of("img/arch (conflict LAPTOP-7 2026-09-15 2).png").as_deref(), Some("img/arch.png"));
+        assert_eq!(original_of("a/Makefile (conflict h 2026-09-15)").as_deref(), Some("a/Makefile"));
+        assert_eq!(original_of("img/arch.png"), None);
         assert_eq!(today().len(), 10);
         assert!(is_conflict_copy(&conflict_copy("z.pdf", "h", &today(), 1)));
     }

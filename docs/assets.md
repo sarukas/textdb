@@ -87,6 +87,7 @@ from a pointer changed elsewhere:
 | yes | other bytes, not what this directory last had | `conflict` (`push --force` replaces the store's copy; or move it aside and pull) |
 | no | present, classified asset | `new` (push publishes it) |
 | no | a copy a keep-both conflict left, `NAME (conflict HOST DATE).ext` | `conflict-copy` (never pushed or paired; compare it, then delete or rename it) |
+| no | where this directory had an asset whose pointer was moved or deleted in the store | `orphan` (sync moves it after its pointer or trashes it; never pushed but with `push --force`) |
 
 A file whose name differs from a pointer's only in case is that asset (on Windows and macOS it
 is the same file); a second file differing only in case is a `conflict`. A pointer whose path
@@ -181,11 +182,17 @@ textdb assets migrate-from-git [PATH] [--dir DIR] [--to NAME] [-m MSG] [--dry-ru
 textdb sync PREFIX DIR [--push] [--pull]           documents, then pointers paired with their files, then assets pushed / pulled
 ```
 
-`migrate-from-git` refuses to start while anything is staged in git, pushes the vault's assets
-whose files git tracks, removes those that are now in the asset store from git's index (the files
-stay on disk), writes the `.gitignore` block, and commits their pointers and `.gitignore` in one
-commit. A pointer the user's own `.gitignore` lines ignore is reported, not committed; assets in a
-conflict or failing to push stay in git (exit 3 or 1). Git's history keeps the old blobs.
+`migrate-from-git` refuses to start while anything is staged in git (exit 6), pushes the vault's
+assets whose files git tracks, writes the `.gitignore` block, removes from git's index those now
+in the asset store (the files stay on disk), and commits their pointers and `.gitignore` in one
+commit; the vault may be a subfolder of the checkout. What stays in git: an asset whose pointer
+the user's own `.gitignore` lines ignore (`pointers_ignored`), one that fails to push (exit 1),
+and one in any state but `new`, `modified` or `ok` (`blocked`: a conflict, outdated, orphan,
+conflict copy or invalid name; exit 3). When the commit itself fails (a hook, say), what was
+staged for it is unstaged again and the pushed assets stay pushed, so a later run starts over.
+Git's history keeps the old blobs. `--json` gives `{ dry_run, tracked_assets, bytes, to_push,
+in_store_already, blocked }` for a dry run and `{ dry_run, tracked_assets, pushed, migrated, bytes,
+pointers_ignored, blocked, conflicts, failed, gitignore_changed, commit }` otherwise.
 
 `DIR` defaults to the directory a store folder was last synced with; with `--dir`, `PATH` must be
 in the folder that directory was synced with, and only a directory never synced takes `PATH` as
@@ -213,18 +220,26 @@ Moving and trashing items in the asset store itself comes with the rclone driver
 
 ## Sync
 
-Pointers sync like any document: they are taken in whatever `--ext` says, and files the rules
-make assets never are, even with `--ext '*'`. Around that, sync pairs pointers with their real
-files:
+Pointers sync like any document: they are taken in whatever `--ext` says, and files the rules or
+their bytes make assets never are, whatever `--ext` says. A pointer deleted and made again at the
+same path is told apart by its content. Around that, sync pairs pointers with their real files:
 
-1. A pointer moved in the store (matched by its id) → the real file moves with it on disk.
+1. A pointer moved in the store (matched by its id) → the real file moves with it on disk. When a
+   file is already at the new place, the real file stays and is reported (`orphan` until
+   resolved).
 2. A pointer deleted in the store → the real file goes to
-   `.textdb/trash/<yyyymmdd-HHMMSS>-<nanos>/…` when it holds the bytes the pointer named;
-   otherwise it is kept and reported.
-3. A real file renamed on disk without its pointer (in Obsidian, say) → matched by size and
-   sha256, one to one, with a pointer unchanged on both sides whose file is missing; the pointer
-   is moved in the store and on disk. Links are left to what renamed the file, as with the other
-   moves sync makes.
+   `.textdb/trash/<yyyymmdd-HHMMSS>-<nanos>/…` when it holds the bytes the pointer named, and
+   the pointer leaves disk only once the file is there, so a move that fails is tried again by
+   the next sync; a file with other bytes is kept and reported, as a new asset.
+3. A real file renamed on disk without its pointer (in Obsidian, say) → an asset file with no
+   pointer, matched by size and sha256, one to one, with a pointer unchanged on both sides whose
+   file is missing. What the directory last had decides: it had the pointer's file (not the
+   other), so the pointer is moved in the store and on disk; it had the other file (not the
+   pointer's), so the pointer moved in the store earlier and the file is moved after it now; a
+   copy it had neither of is left alone. Asset store folders inside the directory are never
+   candidates. Links are left to what renamed the file, as with the other moves sync makes.
+   A name changed only in letter case is the same asset on Windows and macOS: nothing is paired,
+   and a case-only rename in the store renames the files in place.
 4. Both sides changed an asset (the store's pointer names new bytes, and the file here is neither
    those nor the bytes the pointer on disk named) → the file is renamed
    `name (conflict <host> <yyyy-mm-dd>).ext` and the store's bytes are pulled to its path. The
@@ -232,11 +247,16 @@ files:
 5. After the documents, assets are pushed with `--push` and pulled with `--pull`. Without either,
    the store's setting `asset_sync` decides (`off` by default, `push`, `pull` or `both`), and
    `asset_pull` says which are pulled: `linked` (the default: what the notes in the folder link
-   to) or `all`. A push takes no assets when the `.gitattributes` files changed since the last
-   sync (an id of them is recorded with the base's rules), and says so.
-6. The report (`assets` in `--json`) lists what was trashed, renamed, set aside, pushed and
-   pulled, and how many assets are in each state; it is there when the folder or directory has
-   pointers or an asset store is declared. Assets that fail to push or pull exit 1 after the sync.
+   to) or `all`. A push takes no assets while the `.gitattributes` files differ from the ones the
+   base recorded (an id of them is kept with its rules), sync after sync, and says so, until a
+   sync with `--accept-rules` records them. The store's bytes of an asset a conflict copy stands
+   next to are pulled by every sync until they are in place.
+6. The report (`assets` in `--json`): `mode`; `counts` by state; `trashed` and `trash` (the
+   folder); `renamed` and `conflict_copies` (`{from, to}`); `pushed`, `pulled` and `conflicts`;
+   `failed`; `notes`. `trashed`, `renamed` and `conflict_copies` are paths relative to the
+   directory, `pushed` and `pulled` store paths. It is there when the folder or directory has
+   pointers or an asset store is declared. After the sync, assets that failed to push or pull
+   exit 1, and assets left for a conflict exit 3 (conflict markers in documents come first).
 
 The folder-move carry and the `left behind` report stay for the other files textdb ignores.
 

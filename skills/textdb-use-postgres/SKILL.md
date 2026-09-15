@@ -132,6 +132,8 @@ SELECT op, old_path, new_path, via, version, author, ts FROM kb.path_history('/c
 SELECT kb.path_history_enabled();                 -- session setting, else store setting, else true
 SET textdb.path_history = off;                    -- this session only, e.g. for a scripted reorganisation
 SELECT kb.set_setting('path_history', 'off');     -- the store default for everyone; NULL restores on
+SELECT kb.set_setting('asset_sync', 'both');      -- what `textdb sync` does with assets: off (default), push, pull, both
+SELECT kb.set_setting('asset_pull', 'all');       -- which it pulls: linked (default: what the notes link to) or all
 ```
 
 Postgres has no trash functions yet: a deleted file's versions stay readable with

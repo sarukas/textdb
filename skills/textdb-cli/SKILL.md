@@ -257,7 +257,7 @@ document `NAME.tdbasset` sits where the file belongs. Links to them resolve to t
 editing a `.tdbasset` file:
 
 ```sh
-textdb assets status guides                 # ok / new / modified / outdated / conflict / not-pulled here
+textdb assets status guides                 # ok / new / modified / outdated / conflict / not-pulled / conflict-copy here
 textdb assets push guides -m "diagrams"     # upload new and changed files, then commit their pointers
 textdb assets pull --linked-from guides/api # fetch the files those notes link to
 textdb assets verify guides                 # exit 1 if a hash does not match here or in the asset store
@@ -281,6 +281,7 @@ bytes another pointer still names: it puts the new ones next to them.
 textdb mv guides/draft.md guides/published/intro.md -m 'publish'  # a file or a whole folder; history moves with it
 textdb rm guides/old -m 'superseded by guides/new'                 # a file or a whole folder, recursively
 textdb setting                                        # path_history: on (default) or off for this store
+textdb setting asset_sync both                        # every sync pushes and pulls assets (off by default); asset_pull linked|all
 textdb --path-history off mv archive/2024 archive/y2024   # keep one bulk reshuffle out of history
 ```
 

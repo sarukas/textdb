@@ -239,26 +239,32 @@ pub fn nothing_staged(dir: &Path) -> bool {
     run(dir, &["diff", "--cached", "--quiet"], None).is_ok()
 }
 
-/// Stop tracking `paths` (relative to `dir`), leaving the files where they are.
-pub fn untrack(dir: &Path, paths: &[String]) -> Result<()> {
+/// Run `args` with `paths` (relative to `dir`) as a NUL-separated pathspec file, from the top of the
+/// checkout: in a subdirectory, some commands (`git rm`) refuse a pathspec file.
+fn with_pathspec_file(dir: &Path, args: &[&str], paths: &[String]) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
-    let spec = nul_separated(paths.iter().map(|p| format!(":(literal){p}")));
-    run(dir, &["rm", "--cached", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"], Some(&spec))
-        .map(|_| ())
-        .map_err(StoreError::other)
+    let top = text(dir, &["rev-parse", "--show-toplevel"]).ok_or_else(|| StoreError::invalid(format!("{} is not in a git checkout", dir.display())))?;
+    let prefix = text(dir, &["rev-parse", "--show-prefix"]).unwrap_or_default();
+    let spec = nul_separated(paths.iter().map(|p| format!(":(literal){prefix}{p}")));
+    let args: Vec<&str> = args.iter().copied().chain(["--pathspec-from-file=-", "--pathspec-file-nul"]).collect();
+    run(Path::new(&top), &args, Some(&spec)).map(|_| ()).map_err(StoreError::other)
+}
+
+/// Stop tracking `paths` (relative to `dir`), leaving the files where they are.
+pub fn untrack(dir: &Path, paths: &[String]) -> Result<()> {
+    with_pathspec_file(dir, &["rm", "--cached", "-q"], paths)
 }
 
 /// Stage `paths` (relative to `dir`) as they are on disk.
 pub fn stage(dir: &Path, paths: &[String]) -> Result<()> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let spec = nul_separated(paths.iter().map(|p| format!(":(literal){p}")));
-    run(dir, &["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], Some(&spec))
-        .map(|_| ())
-        .map_err(StoreError::other)
+    with_pathspec_file(dir, &["add", "-A"], paths)
+}
+
+/// Put the index entries of `paths` (relative to `dir`) back as HEAD has them.
+pub fn unstage(dir: &Path, paths: &[String]) -> Result<()> {
+    with_pathspec_file(dir, &["reset", "-q"], paths)
 }
 
 /// Commit everything staged; the new commit.

@@ -34,6 +34,8 @@ const LIST_MAX: usize = 200;
 /// A file modified this recently may change again within its timestamp's resolution, so its
 /// size and time are not trusted to show it unchanged (git's "racy clean" problem).
 const RACY_NS: i64 = 2_000_000_000;
+/// Whether names that differ only in letter case are the same file here.
+const CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "macos"));
 
 pub struct Options {
     pub prefix: String,
@@ -76,13 +78,10 @@ impl Rules {
         format!("ext {}; skip {}{ignore}{attrs}", self.exts.join(","), self.skip_dirs.join(","))
     }
 
-    /// Whether `now` takes in what these rules did, and makes the same files assets. A base an
-    /// older build saved, without a `.gitattributes` id, matches any.
+    /// Whether `now` takes in what these rules did. The `.gitattributes` id is compared on its own:
+    /// it decides which assets a sync pushes, not which documents it takes in.
     fn same(&self, now: &Rules) -> bool {
-        self.exts == now.exts
-            && self.skip_dirs == now.skip_dirs
-            && self.ignore_file == now.ignore_file
-            && (self.gitattributes.is_none() || self.gitattributes == now.gitattributes)
+        self.exts == now.exts && self.skip_dirs == now.skip_dirs && self.ignore_file == now.ignore_file
     }
 }
 
@@ -331,13 +330,21 @@ fn remove_empty_dir(dir: &Path) -> bool {
 /// it leaves empty.
 fn move_disk(root: &Path, from: &str, to: &str) -> std::io::Result<()> {
     let target = root.join(to);
-    if target.exists() {
+    let case_only = from != to && from.to_lowercase() == to.to_lowercase();
+    if target.exists() && !(case_only && CASE_INSENSITIVE) {
         return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{to} exists already")));
     }
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::rename(root.join(from), &target)?;
+    if case_only {
+        // The same file under another case: renamed through a name of its own, so the new case sticks.
+        let aside = root.join(format!("{to}.{}.tdbcase", std::process::id()));
+        std::fs::rename(root.join(from), &aside)?;
+        std::fs::rename(&aside, &target)?;
+    } else {
+        std::fs::rename(root.join(from), &target)?;
+    }
     prune_parents(root, from);
     Ok(())
 }
@@ -464,8 +471,11 @@ struct Plan {
     candidates: Vec<String>,
     /// Files textdb does not track, moved on disk with their folder: (from, to).
     carry: Vec<(String, String)>,
-    /// Real files of asset pointers deleted in the store: moved to the vault's trash.
-    asset_trash: Vec<String>,
+    /// Real files of asset pointers deleted in the store, moved to the vault's trash before their
+    /// pointer leaves disk: (file, pointer).
+    asset_trash: Vec<(String, String)>,
+    /// Files this directory no longer has as the asset they were: forgotten from what it last had.
+    forget_had: Vec<String>,
     /// Asset pointers that follow their real file, renamed on disk: (from, to).
     pointer_renames: Vec<(String, String)>,
     /// Real files set aside for a keep-both conflict: (from, to).
@@ -476,9 +486,10 @@ struct Plan {
 #[derive(Default)]
 struct AssetPairs {
     carry: Vec<(String, String)>,
-    trash: Vec<String>,
+    trash: Vec<(String, String)>,
     renames: Vec<(String, String)>,
     copies: Vec<(String, String)>,
+    forget: Vec<String>,
 }
 
 /// Pair asset pointers with their real files (docs/assets.md, "Sync"): a pointer moved in the
@@ -498,6 +509,7 @@ fn pair_assets(
     carry: &[(String, String)],
     report: &mut Report,
 ) -> Result<AssetPairs> {
+    use crate::assets::classify::{Class, Classifier};
     use crate::assets::pairing;
     use crate::assets::pointer::{self, is_asset_pointer, Pointer};
     let real = |rel: &str| pointer::asset_path(rel).to_string();
@@ -524,9 +536,14 @@ fn pair_assets(
     let moved_from: HashSet<&String> = moved.iter().map(|(from, _)| from).collect();
     for (from, to) in &moved {
         let (file, target) = (real(from), real(to));
-        if free(&file) && !on_disk(&target) {
-            pairs.carry.push((file, target));
+        if !free(&file) {
+            continue;
         }
+        if on_disk(&target) {
+            report.kept.push(note(&file, format!("its asset pointer moved in textdb to {target}, where a file is already: left here")));
+            continue;
+        }
+        pairs.carry.push((file, target));
     }
     // Deleted in the store: the file goes to the trash when it is the bytes the pointer named.
     for (_, rel, p) in leaving.iter().filter(|(_, rel, _)| !moved_from.contains(rel)) {
@@ -535,24 +552,36 @@ fn pair_assets(
             continue;
         }
         match pointer::hash_file(&dir.join(&file)) {
-            Ok((sha, _)) if sha == p.sha256 => pairs.trash.push(file),
-            _ => report.kept.push(note(&file, "its asset pointer was deleted in textdb, and this file is not the bytes it named: kept")),
+            Ok((sha, _)) if sha == p.sha256 => pairs.trash.push((file, rel.clone())),
+            _ => {
+                report.kept.push(note(&file, "its asset pointer was deleted in textdb, and this file is not the bytes it named: kept, as a new asset"));
+                pairs.forget.push(file);
+            }
         }
     }
 
-    // Renamed on disk: a pointer unchanged on both sides whose file is gone, and a file with its
-    // bytes and no pointer.
+    // Renamed on disk: a pointer unchanged on both sides whose file is gone (in any case), and an
+    // asset file of the same bytes with no pointer, one each. What this directory last had tells a
+    // rename here (it had the pointer's file, not the other) from a move in textdb its file did not
+    // follow (it had the other file, not the pointer's), and leaves a stray copy alone.
+    let fold = |rel: &str| if CASE_INSENSITIVE { rel.to_lowercase() } else { rel.to_string() };
+    let present: HashSet<String> = walked.files.keys().map(|r| fold(r)).collect();
     let mut lost = Vec::new();
-    for rel in plan.keep.iter().filter(|r| is_asset_pointer(r) && !on_disk(&real(r))) {
+    for rel in plan.keep.iter().filter(|r| is_asset_pointer(r) && !present.contains(&fold(&real(r)))) {
         if let Ok(p) = Pointer::parse(&sides.disk(rel)?) {
             lost.push((p.sha256, p.size, rel.clone()));
         }
     }
     if !lost.is_empty() {
+        let nested: Vec<String> = walked.files.keys().filter(|r| r.ends_with("/.gitattributes")).cloned().collect();
+        let classifier = Classifier::load(dir, &nested);
+        let store_folders = crate::assets::store_folders_inside(&mut *sides.st, dir);
+        let last_had = crate::assets::last_had(dir);
         let sizes: HashSet<u64> = lost.iter().map(|(_, size, _)| *size).collect();
         let mut found = Vec::new();
         for (rel, d) in &walked.files {
             let pointer_rel = format!("{rel}{}", pointer::SUFFIX);
+            let lower = rel.to_lowercase();
             if !free(rel)
                 || is_asset_pointer(rel)
                 || pairing::is_conflict_copy(rel)
@@ -560,15 +589,24 @@ fn pair_assets(
                 || on_disk(&pointer_rel)
                 || heads.contains_key(&pointer_rel)
                 || base.contains_key(&pointer_rel)
+                || store_folders.iter().any(|f| lower.starts_with(&format!("{f}/")))
+                || classifier.classify(dir, rel) != Class::Asset
             {
                 continue;
             }
             if let Ok((sha, _)) = pointer::hash_file(&dir.join(rel)) {
-                found.push((sha, rel.clone()));
+                found.push((sha.clone(), (rel.clone(), sha)));
             }
         }
-        for (from, file) in pairing::one_to_one(lost.into_iter().map(|(sha, _, rel)| (sha, rel)), found) {
-            pairs.renames.push((from, format!("{file}{}", pointer::SUFFIX)));
+        let lost = lost.into_iter().map(|(sha, _, rel)| (sha.clone(), (rel, sha)));
+        for ((pointer_rel, sha), (file, _)) in pairing::one_to_one(lost, found) {
+            let lost_file = real(&pointer_rel);
+            let had = |rel: &str| last_had.get(rel) == Some(&sha);
+            match (had(&lost_file), had(&file)) {
+                (true, false) => pairs.renames.push((pointer_rel, format!("{file}{}", pointer::SUFFIX))),
+                (false, true) => pairs.carry.push((file, lost_file)),
+                _ => {}
+            }
         }
     }
 
@@ -632,7 +670,9 @@ fn sync_assets(st: &mut dyn Store, o: &Options, prefix: &str, plan: &Plan, attrs
     if !o.dry_run {
         if matches!(mode.as_str(), "push" | "both") {
             if attrs_changed {
-                a.notes.push("the .gitattributes files changed since the last sync, so no assets were pushed: check `textdb assets status`, then push".to_string());
+                a.notes.push(
+                    "the .gitattributes files changed since the last sync, so no assets were pushed: check `textdb assets status`, then sync with --accept-rules (or push)".to_string(),
+                );
             } else {
                 let push = PushOptions { to: None, message: Some("sync: assets push"), author: Some(&o.author), dry_run: false, force: false };
                 match assets::push_run(st, &v, &[], &push) {
@@ -645,7 +685,11 @@ fn sync_assets(st: &mut dyn Store, o: &Options, prefix: &str, plan: &Plan, attrs
                 }
             }
         }
-        let set_aside: BTreeSet<String> = plan.conflict_copies.iter().map(|(from, _)| store_path(prefix, from)).collect();
+        let mut set_aside: BTreeSet<String> = plan.conflict_copies.iter().map(|(from, _)| store_path(prefix, from)).collect();
+        // With those an earlier sync set a file aside for and could not pull then.
+        if let Ok(earlier) = assets::not_pulled_after_conflict(st, &v) {
+            set_aside.extend(earlier);
+        }
         let pull = matches!(mode.as_str(), "pull" | "both");
         if pull || !set_aside.is_empty() {
             let linked = if !pull {
@@ -881,8 +925,16 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
                 (Some(_), Some(_)) => {
                     let (tb, tv) = sides.textdb(&rel)?;
                     let db = sides.disk(&rel)?;
+                    let binary = |bytes: &[u8]| bytes.iter().take(8000).any(|&c| c == 0);
                     if tb == db {
                         plan.adopt.push((rel, tv));
+                    } else if binary(&db)
+                        || binary(&tb)
+                        || crate::assets::classify::Classifier::defaults().rule_class(&rel) == crate::assets::classify::Class::Asset
+                    {
+                        // Conflict markers would destroy a binary: the file on disk stays as it is.
+                        report.skipped.push(note(&rel, "a binary file on disk has the name of a file in textdb: left as it is"));
+                        plan.hold.push(rel);
                     } else {
                         // Nothing says which side changed: all of it is a conflict.
                         let (marked, _) = diff3_marked(b"", &tb, &db, OURS, THEIRS);
@@ -911,6 +963,9 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         let t_changed = match t {
             None => None,
             Some(t) => Some(match b.version {
+                // A pointer deleted and made again at the same path starts again at version 1:
+                // its content tells.
+                Some(v) if t.version == v && crate::assets::pointer::is_asset_pointer(&rel) => !b.matches(&sides.textdb(&rel)?.0),
                 Some(v) => t.version != v,
                 None => !b.matches(&sides.textdb(&rel)?.0),
             }),
@@ -962,6 +1017,26 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         }
     }
 
+    // A name the store changed only in letter case is the same file here on Windows and macOS: it
+    // is renamed in place (with its real file, for an asset pointer), never written and then deleted.
+    let mut case_renames: Vec<(String, String)> = Vec::new();
+    if CASE_INSENSITIVE {
+        let arriving: HashMap<String, String> =
+            plan.to_disk.iter().filter(|r| !walked.files.contains_key(*r)).map(|r| (r.to_lowercase(), r.clone())).collect();
+        plan.disk_delete.retain(|old| match arriving.get(&old.to_lowercase()) {
+            Some(new) if new != old => {
+                case_renames.push((old.clone(), new.clone()));
+                false
+            }
+            _ => true,
+        });
+        for (old, new) in case_renames.clone() {
+            use crate::assets::pointer::{asset_path, is_asset_pointer};
+            if is_asset_pointer(&old) && walked.files.contains_key(asset_path(&old)) {
+                case_renames.push((asset_path(&old).to_string(), asset_path(&new).to_string()));
+            }
+        }
+    }
     if repo.is_some() && !plan.candidates.is_empty() {
         let ignored = git::ignored(&o.dir, &plan.candidates);
         plan.candidates.retain(|rel| !ignored.contains(rel));
@@ -980,16 +1055,16 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             Err(e) => report.skipped.push(note(".textdbignore", format!("not read: {e}"))),
         }
     }
-    // Files the asset rules make assets belong to the asset store, never taken in as documents,
-    // whatever `--ext '*'` would take.
-    if o.exts.iter().any(|e| e == "*") && !plan.candidates.is_empty() {
+    // Files the asset rules (or their bytes) make assets belong to the asset store, never taken in
+    // as documents, whatever `--ext` would take.
+    if !plan.candidates.is_empty() {
         use crate::assets::classify::{Class, Classifier};
         let nested: Vec<String> = walked.files.keys().filter(|r| r.ends_with("/.gitattributes")).cloned().collect();
         let classifier = Classifier::load(&o.dir, &nested);
-        plan.candidates.retain(|rel| classifier.rule_class(rel) != Class::Asset);
+        plan.candidates.retain(|rel| classifier.classify(&o.dir, rel) != Class::Asset);
     }
     let has_pointers = heads.keys().chain(walked.files.keys()).any(|r| crate::assets::pointer::is_asset_pointer(r));
-    let rules = {
+    let mut rules = {
         let mut exts = o.exts.clone();
         exts.sort();
         exts.dedup();
@@ -1078,8 +1153,9 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     }
     let mut pairs = pair_assets(&mut sides, &o.dir, &plan, &walked, &base, &heads, &untracked, &carry, &mut report)?;
     carry.extend(std::mem::take(&mut pairs.carry));
+    carry.extend(case_renames);
     // Folders whose tracked files all leave disk but that keep untracked ones.
-    let carried: HashSet<&str> = carry.iter().map(|(from, _)| from.as_str()).chain(pairs.trash.iter().map(String::as_str)).collect();
+    let carried: HashSet<&str> = carry.iter().map(|(from, _)| from.as_str()).chain(pairs.trash.iter().map(|(file, _)| file.as_str())).collect();
     let mut emptied: BTreeSet<String> = BTreeSet::new();
     for rel in &plan.disk_delete {
         let mut d = rel.as_str();
@@ -1144,7 +1220,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     report.empty_dirs.sort();
     plan.carry = carry;
     plan.keep.retain(|rel| !pairs.renames.iter().any(|(from, _)| from == rel));
-    (plan.asset_trash, plan.pointer_renames, plan.conflict_copies) = (pairs.trash, pairs.renames, pairs.copies);
+    (plan.asset_trash, plan.pointer_renames, plan.conflict_copies, plan.forget_had) = (pairs.trash, pairs.renames, pairs.copies, pairs.forget);
 
     // Names written to disk must be able to exist next to what is there.
     let new_on_disk: Vec<&str> = plan
@@ -1156,7 +1232,13 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         .collect();
     if !new_on_disk.is_empty() {
         let deleted: HashSet<&String> = plan.disk_delete.iter().collect();
-        let mut after: Vec<String> = walked.files.keys().filter(|r| !deleted.contains(r)).cloned().collect();
+        // Files moving away (a name changed only in case among them) leave their names free.
+        let mut after: Vec<String> = walked
+            .files
+            .keys()
+            .filter(|r| !deleted.contains(r) && !plan.carry.iter().any(|(from, _)| from == *r))
+            .cloned()
+            .collect();
         after.extend(new_on_disk.iter().map(|r| r.to_string()));
         let mut problems = portable::Problems::new(Platform::current());
         portable::check_names(&after, &mut problems);
@@ -1183,7 +1265,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     if !(plan.asset_trash.is_empty() && plan.pointer_renames.is_empty() && plan.conflict_copies.is_empty()) {
         use crate::assets::pointer::asset_path;
         let a = report.assets.get_or_insert_with(Default::default);
-        a.trashed = plan.asset_trash.clone();
+        a.trashed = plan.asset_trash.iter().map(|(file, _)| file.clone()).collect();
         a.renamed = plan.pointer_renames.iter().map(|(from, to)| Move { from: asset_path(from).to_string(), to: asset_path(to).to_string() }).collect();
         a.conflict_copies = plan.conflict_copies.iter().map(|(from, to)| Move { from: from.clone(), to: to.clone() }).collect();
     }
@@ -1192,6 +1274,17 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     report.unchanged = plan.keep.len() + plan.adopt.len();
 
     // Include rules that changed since the last sync must not take in files unnoticed.
+    // Changed .gitattributes files are not taken for pushes until accepted (--accept-rules): until
+    // then the base keeps the id it had.
+    let attrs_before = stored
+        .as_ref()
+        .and_then(|b| b.rules.as_deref())
+        .and_then(|r| serde_json::from_str::<Rules>(r).ok())
+        .and_then(|b| b.gitattributes);
+    let attrs_changed = !o.accept_rules && attrs_before.as_ref().is_some_and(|before| rules.gitattributes.as_ref() != Some(before));
+    if attrs_changed {
+        rules.gitattributes = attrs_before;
+    }
     if let Some(stored) = &stored {
         let before: Option<Rules> = stored.rules.as_deref().and_then(|r| serde_json::from_str(r).ok());
         if !before.as_ref().is_some_and(|b| b.same(&rules)) {
@@ -1231,17 +1324,10 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         apply(&mut sides, &o, &plan, &base, &stored_rows, &heads, &changes, &key, from_commit.as_deref(), &mut report, &rules)?;
     }
     if !report.stopped && !report.stopped_by_rules {
-        // Assets are pushed as new only while the rules that make files assets are the ones the
-        // last sync saw.
-        let attrs_changed = stored
-            .as_ref()
-            .and_then(|b| b.rules.as_deref())
-            .and_then(|r| serde_json::from_str::<Rules>(r).ok())
-            .and_then(|b| b.gitattributes)
-            .is_some_and(|before| rules.gitattributes.as_ref() != Some(&before));
         sync_assets(&mut *sides.st, &o, &prefix, &plan, attrs_changed, has_pointers, &mut report);
     }
     let asset_failures = report.assets.as_ref().map_or(0, |a| a.failed.len());
+    let asset_conflicts = report.assets.as_ref().map_or(0, |a| a.conflicts.len());
     let rules_stop = report.stopped_by_rules && !o.dry_run;
 
     for list in [
@@ -1261,10 +1347,16 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         if report.stopped || rules_stop {
             std::process::exit(6);
         }
-        if commit_error.is_some() || asset_failures > 0 {
+        if commit_error.is_some() {
             std::process::exit(1);
         }
         if conflicted > 0 && !o.dry_run {
+            std::process::exit(3);
+        }
+        if asset_failures > 0 {
+            std::process::exit(1);
+        }
+        if asset_conflicts > 0 {
             std::process::exit(3);
         }
         return Ok(());
@@ -1289,14 +1381,17 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     if let Some(e) = commit_error {
         return Err(StoreError::other(format!("synced, but the git commit failed: {e}")));
     }
-    if asset_failures > 0 {
-        return Err(StoreError::other(format!("synced, but {asset_failures} assets could not be pushed or pulled (listed above)")));
-    }
     if conflicted > 0 && !o.dry_run {
         return Err(StoreError::conflict(format!(
             "{conflicted} {} conflict markers on disk: resolve them, then run sync again",
             if conflicted == 1 { "file has" } else { "files have" }
         )));
+    }
+    if asset_failures > 0 {
+        return Err(StoreError::other(format!("synced, but {asset_failures} assets could not be pushed or pulled (listed above)")));
+    }
+    if asset_conflicts > 0 {
+        return Err(StoreError::conflict(format!("synced, but {asset_conflicts} assets were not pushed because of conflicts (listed above)")));
     }
     Ok(())
 }
@@ -1320,6 +1415,7 @@ fn apply(
     let dir = o.dir.as_path();
     let author = o.author.as_str();
     let mut rows: BTreeMap<String, BaseFile> = BTreeMap::new();
+    let mut forget: Vec<String> = plan.forget_had.clone();
     // A failed step leaves the file's base as it was, so the next sync sees the same change.
     let failed = |report: &mut Report, rows: &mut BTreeMap<String, BaseFile>, rel: &str, reason: String| {
         report.failed.push(note(rel, reason));
@@ -1346,6 +1442,7 @@ fn apply(
             Ok(()) => match move_disk(dir, from, to) {
                 Ok(()) => {
                     rows.insert(to.clone(), base_row(dir, to, heads.get(from).map(|h| h.version), base[from].blob.clone(), false));
+                    forget.push(crate::assets::pointer::asset_path(from).to_string());
                 }
                 Err(e) => failed(report, &mut rows, from, e.to_string()),
             },
@@ -1408,25 +1505,42 @@ fn apply(
             Err(e) => failed(report, &mut rows, rel, e.to_string()),
         }
     }
-    for rel in &plan.disk_delete {
+    // A pointer whose file goes to the trash leaves disk after it, below.
+    for rel in plan.disk_delete.iter().filter(|rel| !plan.asset_trash.iter().any(|(_, pointer)| pointer == *rel)) {
         if let Err(e) = remove_disk(dir, rel) {
             failed(report, &mut rows, rel, e.to_string());
         }
     }
     for (from, to) in &plan.carry {
-        if let Err(e) = move_disk(dir, from, to) {
-            report.failed.push(note(from, format!("not moved to {to} with its folder: {e}")));
+        match move_disk(dir, from, to) {
+            Ok(()) => forget.push(from.clone()),
+            Err(e) => report.failed.push(note(from, format!("not moved to {to} with its folder: {e}"))),
         }
     }
+    // A pointer deleted in textdb leaves disk only once its file is in the trash, so a move that
+    // fails is tried again by the next sync rather than leaving the file to be pushed as new.
     let mut trash = None;
-    for rel in &plan.asset_trash {
-        let folder = trash.get_or_insert_with(|| {
-            let now = SystemTime::now();
-            let nanos = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
-            format!(".textdb/trash/{}-{nanos:09}", crate::assets::driver::stamp(now))
-        });
-        if let Err(e) = move_disk(dir, rel, &format!("{folder}/{rel}")) {
-            report.failed.push(note(rel, format!("its asset pointer was deleted in textdb, but the file was not moved to the trash: {e}")));
+    for (file, pointer_rel) in &plan.asset_trash {
+        let folder = trash
+            .get_or_insert_with(|| {
+                let now = SystemTime::now();
+                let nanos = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+                format!(".textdb/trash/{}-{nanos:09}", crate::assets::driver::stamp(now))
+            })
+            .clone();
+        match move_disk(dir, file, &format!("{folder}/{file}")) {
+            Ok(()) => {
+                forget.push(file.clone());
+                if let Err(e) = remove_disk(dir, pointer_rel) {
+                    failed(report, &mut rows, pointer_rel, e.to_string());
+                }
+            }
+            Err(e) => {
+                failed(report, &mut rows, pointer_rel, format!("its asset pointer was deleted in textdb, but {file} was not moved to the trash: {e}"));
+                if let Some(a) = report.assets.as_mut() {
+                    a.trashed.retain(|t| t != file);
+                }
+            }
         }
     }
     if let (Some(folder), Some(a)) = (trash, report.assets.as_mut()) {
@@ -1437,6 +1551,7 @@ fn apply(
             report.failed.push(note(from, format!("changed here and in textdb, but not set aside as {to}: {e}")));
         }
     }
+    crate::assets::forget_had(dir, &forget);
     if o.prune_empty_dirs {
         let mut dirs = report.empty_dirs.clone();
         dirs.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count()));
@@ -1633,7 +1748,7 @@ fn print_report(r: &Report) -> Result<()> {
         list(&mut s, "asset note", &a.notes);
         if !a.counts.is_empty() {
             let counts: Vec<String> = a.counts.iter().map(|(state, n)| format!("{n} {}", state.replace('-', " "))).collect();
-            s.push_str(&format!("{:<15} {} (asset_sync {})\n", "assets", counts.join(", "), a.mode));
+            s.push_str(&format!("{:<15} {} (push and pull: {})\n", "assets", counts.join(", "), a.mode));
         }
     }
     let verb = if r.stopped || (r.stopped_by_rules && !r.dry_run) {

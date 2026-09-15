@@ -409,6 +409,15 @@ impl VaultCache {
             merged.files.extend(self.files.iter().filter(|(k, _)| mine(0, k)).map(|(k, v)| (k.clone(), v.clone())));
             merged.sniffed.extend(self.sniffed.iter().filter(|(k, _)| mine(1, k)).map(|(k, v)| (k.clone(), *v)));
             merged.seen.extend(self.seen.iter().filter(|(k, _)| mine(2, k)).map(|(k, v)| (k.clone(), v.clone())));
+            // What this process forgot is forgotten there too.
+            for (kind, k) in &self.touched {
+                match kind {
+                    0 if !self.files.contains_key(k) => drop(merged.files.remove(k)),
+                    1 if !self.sniffed.contains_key(k) => drop(merged.sniffed.remove(k)),
+                    2 if !self.seen.contains_key(k) => drop(merged.seen.remove(k)),
+                    _ => {}
+                }
+            }
             (merged.host, merged.dir) = (self.host.clone(), self.dir.clone());
             let Ok(text) = serde_json::to_string(&merged) else { return };
             if let Some(parent) = path.parent() {
@@ -519,6 +528,11 @@ fn items(v: &Vault, scan: &Scan, cache: &mut VaultCache, scope: &[String]) -> Re
                     } else if pairing::is_conflict_copy(rel) {
                         item.note = Some("kept from a conflict: compare it with the asset, then delete it, or rename it to push it".into());
                         "conflict-copy"
+                    } else if cache.seen.contains_key(rel) {
+                        item.note = Some(
+                            "this directory had an asset here whose pointer was moved or deleted in textdb: sync moves the file after it or trashes it (push --force publishes it as a new asset)".into(),
+                        );
+                        "orphan"
                     } else {
                         "new"
                     };
@@ -826,6 +840,9 @@ fn push_one(
             Ok(h) => h,
             Err(e) => return Outcome::Failed(format!("{}: {}", item.path, e.message)),
         };
+        // Read every pointer's version again: a change number alone can miss a commit that
+        // finished after a later one (Postgres hands them out before commit).
+        in_use.seq = -1;
         if let Err(e) = in_use.refresh(st) {
             return Outcome::Failed(format!("{}: {}", item.path, e.message));
         }
@@ -903,6 +920,51 @@ fn record_in_sync_base(st: &mut dyn Store, v: &Vault, written: &[Written]) -> Re
         .collect();
     st.put_sync_files(&base.prefix, &base.dir, &rows)?;
     Ok(())
+}
+
+/// What the directory `dir` last had of each asset: its SHA-256, by the asset's path relative to
+/// the directory.
+pub(crate) fn last_had(dir: &Path) -> HashMap<String, String> {
+    VaultCache::open(&Vault { prefix: "/".to_string(), dir: dir.to_path_buf() }).seen.into_iter().collect()
+}
+
+/// Forget what the directory `dir` had at `rels`: files that moved after their pointer, or went to
+/// the trash, so a new file there is new.
+pub(crate) fn forget_had(dir: &Path, rels: &[String]) {
+    if rels.is_empty() {
+        return;
+    }
+    let mut cache = VaultCache::open(&Vault { prefix: "/".to_string(), dir: dir.to_path_buf() });
+    for rel in rels {
+        if cache.seen.remove(rel).is_some() {
+            cache.touched.insert((2, rel.clone()));
+            cache.dirty = true;
+        }
+    }
+    cache.save();
+}
+
+/// The folders below `dir` (relative to it, in lower case) that asset stores bound on this
+/// computer keep their files in.
+pub(crate) fn store_folders_inside(st: &mut dyn Store, dir: &Path) -> Vec<String> {
+    let Ok(stores) = st.asset_stores() else { return Vec::new() };
+    stores
+        .iter()
+        .filter_map(|s| driver::open(s).ok())
+        .filter_map(|d| d.local_root().and_then(|root| dir_inside(dir, root)))
+        .map(|rel| rel.to_lowercase())
+        .collect()
+}
+
+/// The vault's assets that are not pulled and have a conflict copy next to them: the store's bytes
+/// a sync set a file aside for and could not pull then.
+pub(crate) fn not_pulled_after_conflict(st: &mut dyn Store, v: &Vault) -> Result<BTreeSet<String>> {
+    let scan = scan(st, v)?;
+    let mut cache = VaultCache::open(v);
+    let found = items(v, &scan, &mut cache, &[])?;
+    cache.save();
+    let originals: HashSet<String> = found.iter().filter(|i| i.state == "conflict-copy").filter_map(|i| pairing::original_of(&i.rel)).collect();
+    Ok(found.iter().filter(|i| i.state == "not-pulled" && originals.contains(&i.rel)).map(|i| i.path.clone()).collect())
 }
 
 /// How many of the vault's assets are in each state.
@@ -996,6 +1058,7 @@ pub(crate) fn push_run(st: &mut dyn Store, v: &Vault, scope: &[String], o: &Push
         match item.state {
             "new" | "modified" => todo.push(item),
             "conflict" if o.force && item.case_of.is_none() => todo.push(item),
+            "orphan" if o.force => todo.push(item),
             "conflict" => conflicts.push(format!("{}: {}", item.path, item.note.as_deref().unwrap_or("conflict"))),
             _ => {}
         }

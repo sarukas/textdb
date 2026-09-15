@@ -110,6 +110,7 @@ file inside an entry with `via` = the folder — while the store's `path_history
 SELECT op, old_path, new_path, via, version, author, ts FROM textdb_path_history('/clients/acme/notes.md');
 SELECT textdb_setting('path_history');            -- NULL = default (on)
 SELECT textdb_setting('path_history', 'off');     -- stop recording for everyone; NULL as the value restores the default
+SELECT textdb_setting('asset_sync', 'both');      -- what `textdb sync` does with assets: off (default), push, pull, both
 ```
 
 ## Trash

@@ -998,6 +998,77 @@ fn sync_pairs_assets_with_their_real_files() {
 }
 
 #[test]
+fn sync_pairing_leaves_stray_copies_and_letter_case_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let dirs: Vec<std::path::PathBuf> = ["v1", "v2", "v3", "bucket", "config"].iter().map(|d| tmp.path().join(d)).collect();
+    let (v1, v2, v3, bucket, config) = (&dirs[0], &dirs[1], &dirs[2], &dirs[3], &dirs[4]);
+    for d in [v1.join("img"), v2.clone(), v3.join("other"), bucket.clone()] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.env("TEXTDB_CONFIG_DIR", config).args(args);
+        c
+    };
+    let (d1, d2, d3) = (v1.to_str().unwrap(), v2.to_str().unwrap(), v3.to_str().unwrap());
+    let exists = |path: &str| run(&mut t(&["stat", path]), None).status == 0;
+    let names = |dir: &Path| -> Vec<String> {
+        std::fs::read_dir(dir.join("img")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_lowercase()).collect()
+    };
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", bucket.to_str().unwrap()]), None);
+    std::fs::write(v1.join("notes.md"), "![[a.png]]\n").unwrap();
+    std::fs::write(v1.join("img/a.png"), b"\x89PNG A").unwrap();
+    std::fs::write(v1.join("img/b.png"), b"\x89PNG B").unwrap();
+    ok(&mut t(&["sync", "--push", "/", d1]), None);
+    ok(&mut t(&["sync", "--pull", "/", d2]), None);
+
+    // A copy of an asset's bytes in a directory that never had the asset is not a rename of it.
+    ok(&mut t(&["sync", "/", d3]), None);
+    std::fs::write(v3.join("other/logo.png"), b"\x89PNG B").unwrap();
+    ok(&mut t(&["sync", "/", d3]), None);
+    assert!(exists("/img/b.png.tdbasset") && !exists("/other/logo.png.tdbasset"));
+
+    // A name changed only in letter case, here or in the store, keeps the pointer and every file.
+    std::fs::rename(v1.join("img/a.png"), v1.join("img/A.png")).unwrap();
+    for _ in 0..3 {
+        ok(&mut t(&["sync", "/", d1]), None);
+    }
+    assert!(exists("/img/a.png.tdbasset") || exists("/img/A.png.tdbasset"));
+    let (now, other) = if exists("/img/a.png.tdbasset") { ("/img/a.png", "/img/A.png") } else { ("/img/A.png", "/img/a.png") };
+    ok(&mut t(&["mv", now, other]), None);
+    for _ in 0..2 {
+        ok(&mut t(&["sync", "/", d2]), None);
+    }
+    let in_v2 = names(v2);
+    assert!(in_v2.contains(&"a.png".to_string()) && in_v2.contains(&"a.png.tdbasset".to_string()), "{in_v2:?}");
+    assert_eq!(ok(&mut t(&["--json", "assets", "status", "--dir", d2]), None).json()["counts"]["ok"], 1);
+
+    // A pointer moved to a name without its suffix stays a pointer; a folder is no asset's name.
+    ok(&mut t(&["mv", "/img/b.png.tdbasset", "/img/b2.png"]), None);
+    assert!(exists("/img/b2.png.tdbasset") && !exists("/img/b2.png"));
+    assert_eq!(run(&mut t(&["mv", "/img/b2.png", "/img"]), None).status, 6);
+    assert_eq!(run(&mut t(&["mv", "/img/b2.png", "/pics/"]), None).status, 6);
+
+    // The asset settings show their own defaults.
+    assert_eq!(ok(&mut t(&["--json", "setting", "asset_sync"]), None).json()["asset_sync"]["effective"], "off");
+    assert_eq!(ok(&mut t(&["--json", "setting", "asset_pull"]), None).json()["asset_pull"]["effective"], "linked");
+
+    // Changed .gitattributes files stop automatic pushes, sync after sync, until accepted; what they
+    // make an asset is never taken in as a document.
+    ok(&mut t(&["setting", "asset_sync", "push"]), None);
+    std::fs::write(v1.join(".gitattributes"), "*.txt textdb=asset\n").unwrap();
+    std::fs::write(v1.join("draft.txt"), "a text the rules make an asset\n").unwrap();
+    for _ in 0..2 {
+        let s = ok(&mut t(&["--json", "sync", "/", d1]), None).json();
+        assert_eq!(s["assets"]["pushed"], serde_json::json!([]), "{s}");
+        assert!(!s["to_textdb"]["new"].as_array().unwrap().iter().any(|p| p == "draft.txt"), "{s}");
+    }
+    let accepted = ok(&mut t(&["--json", "sync", "--accept-rules", "/", d1]), None).json();
+    assert_eq!(accepted["assets"]["pushed"], serde_json::json!(["/draft.txt"]), "{accepted}");
+}
+
+#[test]
 fn assets_migrate_from_git_moves_tracked_binaries_out_of_git() {
     if !has_git() {
         return;
@@ -1052,6 +1123,23 @@ fn assets_migrate_from_git_moves_tracked_binaries_out_of_git() {
     // Run again: nothing git tracks is a binary any more.
     let again = ok(&mut t(&["--json", "assets", "migrate-from-git", "--dir", d]), None).json();
     assert_eq!((again["tracked_assets"].as_u64(), &again["commit"]), (Some(0), &serde_json::Value::Null), "{again}");
+
+    // A vault in a subfolder of the repository.
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("vault/img")).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "T"]);
+    std::fs::write(repo.join("vault/img/z.png"), b"\x89PNG z").unwrap();
+    std::fs::write(repo.join("README.md"), "r\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "start"]);
+    let dv = repo.join("vault");
+    ok(&mut t(&["sync", "/sub", dv.to_str().unwrap()]), None);
+    let sub = ok(&mut t(&["--json", "assets", "migrate-from-git", "--dir", dv.to_str().unwrap()]), None).json();
+    assert_eq!(sub["migrated"], serde_json::json!(["/sub/img/z.png"]), "{sub}");
+    let tracked = git(&repo, &["ls-files"]);
+    assert!(tracked.lines().any(|l| l == "vault/img/z.png.tdbasset") && !tracked.lines().any(|l| l == "vault/img/z.png"), "{tracked}");
 }
 
 fn has_git() -> bool {

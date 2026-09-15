@@ -87,15 +87,16 @@ pub fn migrate_from_git(st: &mut dyn Store, path: Option<&str>, dir: Option<&Pat
 
     // What is in the asset store now, with its pointer next to it, leaves git's index.
     let after = tracked_assets(st, &v, &tracked)?;
-    let migrated: Vec<&Item> = after.iter().filter(|i| i.state == "ok" && v.dir.join(format!("{}{SUFFIX}", i.rel)).is_file()).collect();
-    let files: Vec<String> = migrated.iter().filter_map(|i| i.file.clone()).collect();
-    git::untrack(&v.dir, &files)?;
+    let ready: Vec<&Item> = after.iter().filter(|i| i.state == "ok" && v.dir.join(format!("{}{SUFFIX}", i.rel)).is_file()).collect();
     let gi = write_gitignore_block(st, &v.dir, false)?;
-    let pointers: Vec<String> = migrated.iter().map(|i| format!("{}{SUFFIX}", i.rel)).collect();
-    // A pointer the user's own .gitignore lines ignore cannot be added: reported, not committed.
-    let ignored = git::ignored(&v.dir, &pointers);
-    let mut stage: Vec<String> = pointers.iter().filter(|p| !ignored.contains(*p)).cloned().collect();
+    // A pointer the user's own .gitignore lines ignore cannot be committed: its file stays in git.
+    let candidates: Vec<String> = ready.iter().map(|i| format!("{}{SUFFIX}", i.rel)).collect();
+    let ignored = git::ignored(&v.dir, &candidates);
+    let migrated: Vec<&Item> = ready.into_iter().filter(|i| !ignored.contains(&format!("{}{SUFFIX}", i.rel))).collect();
+    let files: Vec<String> = migrated.iter().filter_map(|i| i.file.clone()).collect();
+    let mut stage: Vec<String> = migrated.iter().map(|i| format!("{}{SUFFIX}", i.rel)).collect();
     stage.push(".gitignore".to_string());
+    git::untrack(&v.dir, &files)?;
     git::stage(&v.dir, &stage)?;
     let migrated_bytes: u64 = migrated.iter().filter_map(|i| i.size).sum();
     let commit = if git::nothing_staged(&v.dir) {
@@ -110,7 +111,18 @@ pub fn migrate_from_git(st: &mut dyn Store, path: Option<&str>, dir: Option<&Pat
             size_text(migrated_bytes),
             stores.join(", ")
         );
-        Some(git::commit_staged(&v.dir, &text)?)
+        match git::commit_staged(&v.dir, &text) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                // Nothing half done is left staged: the next run starts from the same place.
+                let touched: Vec<String> = files.iter().chain(stage.iter()).cloned().collect();
+                let what = match git::unstage(&v.dir, &touched) {
+                    Ok(()) => "what was staged for it is unstaged again (the assets stay pushed); fix that and run it again",
+                    Err(_) => "what was staged for it is still staged: commit it, or `git reset` it",
+                };
+                return Err(StoreError::other(format!("the git commit failed ({}); {what}", e.message)));
+            }
+        }
     };
 
     if json {
@@ -133,7 +145,7 @@ pub fn migrate_from_git(st: &mut dyn Store, path: Option<&str>, dir: Option<&Pat
             s.push_str(&format!("  migrated   {}\n", i.path));
         }
         for p in &ignored {
-            s.push_str(&format!("  ignored    {p}: your .gitignore ignores this pointer, so it was not committed\n"));
+            s.push_str(&format!("  ignored    {p}: your .gitignore ignores this pointer, so its file stays in git\n"));
         }
         for b in &blocked {
             s.push_str(&format!("  blocked    {b}\n"));

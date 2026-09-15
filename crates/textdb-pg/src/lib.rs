@@ -197,16 +197,21 @@ $$ SELECT replace(replace(replace(p, '\', '\\'), '%', '\%'), '_', '\_') || '/%' 
 
 -- An on/off value: on, true, yes, 1 / off, false, no, 0 in any case; NULL for anything else.
 CREATE FUNCTION kb._switch(v text) RETURNS boolean LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
-  SELECT CASE lower(trim(v)) WHEN 'on' THEN true WHEN 'true' THEN true WHEN 'yes' THEN true WHEN '1' THEN true
+  SELECT CASE lower(btrim(v, E' \t\r\n')) WHEN 'on' THEN true WHEN 'true' THEN true WHEN 'yes' THEN true WHEN '1' THEN true
                              WHEN 'off' THEN false WHEN 'false' THEN false WHEN 'no' THEN false WHEN '0' THEN false END
 $$;
 
 -- Store settings. kb.setting(key) is NULL at the default; kb.set_setting(key, NULL) returns a
 -- setting to its default. path_history is on or off; link_updates (what a move does to links
--- that pointed at what moved) is off, report or rewrite.
-CREATE FUNCTION kb.setting(k text) RETURNS text LANGUAGE sql STABLE AS $$
-  SELECT s.value FROM kb.setting s WHERE s.key = k
-$$;
+-- that pointed at what moved) is off, report or rewrite; asset_sync (what `textdb sync` does
+-- with assets) is off, push, pull or both; asset_pull (which assets it pulls) is linked or all.
+CREATE FUNCTION kb.setting(k text) RETURNS text LANGUAGE plpgsql STABLE AS $$
+BEGIN
+  IF k IS NULL OR k NOT IN ('path_history', 'link_updates', 'asset_sync', 'asset_pull') THEN
+    PERFORM kb._raise('TX004', format('unknown setting ''%s'' (known: path_history, link_updates, asset_sync, asset_pull)', k), NULL);
+  END IF;
+  RETURN (SELECT s.value FROM kb.setting s WHERE s.key = k);
+END $$;
 CREATE FUNCTION kb.set_setting(k text, v text) RETURNS text LANGUAGE plpgsql VOLATILE AS $$
 DECLARE norm text;
 BEGIN
@@ -218,19 +223,19 @@ BEGIN
     RETURN NULL;
   END IF;
   IF k = 'link_updates' THEN
-    norm := lower(trim(v));
+    norm := lower(btrim(v, E' \t\r\n'));
     IF norm NOT IN ('off', 'report', 'rewrite') THEN
       PERFORM kb._raise('TX004', format('%s is off, report or rewrite, not ''%s''', k, v), NULL);
     END IF;
   ELSIF k = 'asset_sync' THEN
     -- What sync does with assets: off (lists them), push, pull or both.
-    norm := lower(trim(v));
+    norm := lower(btrim(v, E' \t\r\n'));
     IF norm NOT IN ('off', 'push', 'pull', 'both') THEN
       PERFORM kb._raise('TX004', format('%s is off, push, pull, both, not ''%s''', k, v), NULL);
     END IF;
   ELSIF k = 'asset_pull' THEN
     -- Which assets sync pulls: linked (the ones notes link to) or all.
-    norm := lower(trim(v));
+    norm := lower(btrim(v, E' \t\r\n'));
     IF norm NOT IN ('linked', 'all') THEN
       PERFORM kb._raise('TX004', format('%s is linked, all, not ''%s''', k, v), NULL);
     END IF;

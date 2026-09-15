@@ -136,7 +136,8 @@ enum Cmd {
         #[arg(long)]
         commit: bool,
         /// Take in the files that changed include rules (extensions, skipped folders,
-        /// .textdbignore) add since the last sync; without it such a sync stops and lists them.
+        /// .textdbignore) add since the last sync; without it such a sync stops and lists them. It
+        /// also accepts changed .gitattributes files for pushing assets.
         #[arg(long)]
         accept_rules: bool,
         /// Remove directories on disk that hold no files.
@@ -907,9 +908,8 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
         } => {
             let update = if update_links { Some(true) } else if no_update_links { Some(false) } else { None };
             // An asset is named by its own path: its pointer moves, and the next sync moves the file.
-            let named = from.clone();
             let from = store_or_pointer(st, &from);
-            let to = if from != named && !assets::pointer::is_asset_pointer(&to) { format!("{to}{}", assets::pointer::SUFFIX) } else { to };
+            let to = if assets::pointer::is_asset_pointer(&from) { pointer_destination(st, &from, &to)? } else { to };
             let untracked = untracked_on_disk(st, &from);
             let moved_links = st.mv_links(&from, &to, author, message.as_deref(), update)?;
             let removed = if keep_empty_folders { Vec::new() } else { prune_empty_folders(st, &from, author)? };
@@ -980,6 +980,18 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
                     return emit_json(&json!({ key.as_str(): { "value": stored, "effective": effective } }));
                 }
                 return line(format!("{key}  {}", stored.unwrap_or_else(|| format!("{effective} (default)"))));
+            }
+            let asset_default = match key.as_str() {
+                "asset_sync" => Some("off"),
+                "asset_pull" => Some("linked"),
+                _ => None,
+            };
+            if let Some(default) = asset_default {
+                let effective = stored.clone().unwrap_or_else(|| default.to_string());
+                if json {
+                    return emit_json(&json!({ key.as_str(): { "value": stored, "effective": effective } }));
+                }
+                return line(format!("{key}  {}", stored.unwrap_or_else(|| format!("{default} (default)"))));
             }
             let effective = st.path_history_enabled()?;
             if json {
@@ -1781,13 +1793,27 @@ enum MetaOp {
 
 /// `path`, or the pointer of the asset at `path` when the store holds nothing there itself.
 fn store_or_pointer(st: &mut dyn Store, path: &str) -> String {
-    if st.stat(path).is_err() {
+    // `PATH/` names a folder, never an asset.
+    if !path.ends_with('/') && st.stat(path).is_err() {
         let pointer = format!("{}{}", path.trim_end_matches('/'), assets::pointer::SUFFIX);
         if st.stat(&pointer).is_ok_and(|s| s.kind == "file") {
             return pointer;
         }
     }
     path.to_string()
+}
+
+/// Where the pointer `from` goes when moved to `to`: the pointer of the asset path `to` names, so a
+/// pointer stays a pointer. A folder, or a name without an asset's name, is refused.
+fn pointer_destination(st: &mut dyn Store, from: &str, to: &str) -> Result<String> {
+    use assets::pointer::{asset_path, SUFFIX};
+    let asset = asset_path(to);
+    let name = asset.rsplit('/').next().unwrap_or(asset);
+    if to.ends_with('/') || name.is_empty() || st.stat(asset).is_ok_and(|s| s.kind != "file") {
+        let own = asset_path(from).rsplit('/').next().unwrap_or("");
+        return Err(StoreError::invalid(format!("{to}: name the asset's new path, as in {}/{own}", asset.trim_end_matches('/'))));
+    }
+    Ok(format!("{asset}{SUFFIX}"))
 }
 
 /// Directories synced with the store folder `path` that hold files textdb does not track, which
