@@ -17,6 +17,12 @@ use textdb_md::resolve::{line_of_offset, resolve, rewritten_target, Lookup};
 use crate::db::{subtree_bounds, to_hash, TextDb};
 use crate::storage::sql_err;
 
+/// Ids or names per `IN (...)` statement.
+///
+/// Fixed so the statement text repeats and the cache can hold it: a chunk sized to whatever
+/// happened to be left over would compile a new statement every time.
+const CHUNK: usize = 500;
+
 /// A link that pointed at a file a move took elsewhere, and no longer reaches it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinkChange {
@@ -141,25 +147,32 @@ impl<'c> TextDb<'c> {
 
     /// Resolve again the links of live files matching `cond` (over `l`, the link row).
     pub(crate) fn relink_where(&self, cond: &str, args: Vec<Value>) -> Result<()> {
-        type Row = (i64, i64, String, String, String, Option<String>, bool);
+        type Row = (i64, i64, String, String, String, Option<String>, bool, Option<i64>, Option<String>);
         let rows: Vec<Row> = {
             let mut st = self
                 .conn
-                .prepare(&format!(
-                    "SELECT l.rowid, l.file_id, n.path, coalesce(l.kind, ''), l.target_path, l.anchor, l.external \
+                .prepare_cached(&format!(
+                    "SELECT l.rowid, l.file_id, n.path, coalesce(l.kind, ''), l.target_path, l.anchor, l.external, \
+                            l.resolved_id, l.status \
                      FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL WHERE ({cond})",
                     p = self.p
                 ))
                 .map_err(sql_err)?;
             let it = st
                 .query_map(rusqlite::params_from_iter(args.iter()), |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get::<_, i64>(6)? != 0))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get::<_, i64>(6)? != 0, r.get(7)?, r.get(8)?))
                 })
                 .map_err(sql_err)?;
             it.collect::<rusqlite::Result<_>>().map_err(sql_err)?
         };
-        for (rowid, file_id, path, kind, target, anchor, external) in rows {
+        for (rowid, file_id, path, kind, target, anchor, external, had_id, had_status) in rows {
             let (id, status) = self.resolve_link(file_id, &path, &kind, &target, anchor.as_deref(), external)?;
+            // Most re-resolutions confirm what the row already said — a folder rename moves a
+            // file and the siblings its relative links point at together, so the answer does
+            // not change — and writing that back cost an UPDATE and a WAL record per link.
+            if had_id == id && had_status.as_deref() == Some(status) {
+                continue;
+            }
             self.conn
                 .prepare_cached(&format!("UPDATE {}link SET resolved_id = ?1, status = ?2 WHERE rowid = ?3", self.p))
                 .map_err(sql_err)?
@@ -171,17 +184,38 @@ impl<'c> TextDb<'c> {
 
     /// Resolve again every link that could point to a file named one of `names`, or points to
     /// or is written in one of the files `ids`.
+    /// Does this store record any links at all?
+    ///
+    /// A move or a delete has link bookkeeping to do only if something could point at what it
+    /// touches. Without this, a store of plain text paid to list the whole moved subtree and
+    /// query the empty link table just to find out there was nothing to do.
+    pub(crate) fn has_links(&self) -> Result<bool> {
+        let any: Option<i64> = self
+            .conn
+            .prepare_cached(&format!("SELECT 1 FROM {}link LIMIT 1", self.p))
+            .map_err(sql_err)?
+            .query_row([], |r| r.get(0))
+            .optional()
+            .map_err(sql_err)?;
+        Ok(any.is_some())
+    }
+
     pub(crate) fn relink(&self, names: &[String], ids: &[i64]) -> Result<()> {
-        for chunk in names.chunks(500) {
+        if (names.is_empty() && ids.is_empty()) || !self.has_links()? {
+            return Ok(());
+        }
+        for chunk in names.chunks(CHUNK) {
             let marks = vec!["?"; chunk.len()].join(",");
             self.relink_where(&format!("l.target_name IN ({marks})"), chunk.iter().map(|n| Value::Text(n.clone())).collect())?;
         }
-        for chunk in ids.chunks(500) {
-            let marks = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
-            self.relink_where(
-                &format!("l.resolved_id IN ({marks}) OR l.file_id IN ({marks})"),
-                chunk.iter().map(|i| Value::Integer(*i)).collect(),
-            )?;
+        // Two statements rather than one with `OR`: `resolved_id` and `file_id` have an index
+        // each, and an `OR` across both columns lets SQLite use neither, so what should be two
+        // index seeks became a scan of the whole link table on every move.
+        for chunk in ids.chunks(CHUNK) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let args: Vec<Value> = chunk.iter().map(|i| Value::Integer(*i)).collect();
+            self.relink_where(&format!("l.resolved_id IN ({marks})"), args.clone())?;
+            self.relink_where(&format!("l.file_id IN ({marks})"), args)?;
         }
         Ok(())
     }

@@ -138,17 +138,44 @@ totals are all paid once per commit regardless of size. Reads are untouched.
 
 Two things are identified; the rest is not, and this entry does not pretend otherwise.
 
-**Rename re-resolves the link graph unconditionally.** `rename_links` ends with a `relink`
-over every name and id in the moved subtree, and that call sits *outside* the
-`link_updates` check that precedes it — so `link_updates = off` does not skip it. Measured
-directly on a 1000-file folder rename: 30 ms at the default, 25 ms with `link_updates off`,
-24 ms with both that and `path_history off`. Turning the documented knobs off recovers
-about 20 %, so the settings are not where the 5.7x lives; `relink` is. It also uses
-`prepare` rather than `prepare_cached`, recompiling per chunk of 500.
+**Rename re-resolves the link graph, and did so even with no links in the store.**
+`git bisect` over the 85 commits, running NS-03 on `textdb-sqlite` at each step, names
+`59f6ec3` "Links: resolved in the store" as the first commit to cross the threshold — though
+the readings climb (897, 1423, 2827, 3681 us), so it is cumulative rather than one cliff.
+That commit added two full subtree listings and a `relink` to every move and delete.
 
-Worth asking whether it has to run at all when nothing about the move can change a
-resolution, and whether it can be narrowed to the links that actually point into or out of
-the moved subtree rather than every link sharing a name with something in it.
+An earlier draft of this entry said `relink` was where the 5.7x lived, on the strength of
+the `link_updates` settings recovering only ~20 %. That was wrong, and the measurement that
+corrected it is simple: a **1000-file folder rename in a store with no links at all took
+24 ms**, against 29 ms with one link per file. The links were never the bulk of it — the
+bookkeeping around them was, and it ran whether or not there was anything to book.
+
+Four things fixed, in order of what they were worth:
+
+1. **Skip the bookkeeping when the store records no links.** `has_links()` is one indexed
+   probe; without it a plain-text store listed the whole moved subtree and queried the empty
+   link table to discover there was nothing to do. 1000-file rename 24 ms -> 14 ms.
+2. **Derive the post-move listing instead of re-querying it.** `after` is `before` with the
+   path prefix substituted — exactly what the `UPDATE` did — so the second full subtree scan
+   was asking the database for what the caller already knew.
+3. **Split the `OR`.** `l.resolved_id IN (...) OR l.file_id IN (...)` let SQLite use neither
+   the `link_resolved` nor the `link_file` index, turning two seeks into a scan of the link
+   table on every move. Two statements, one per column.
+4. **Skip no-op link updates, and cache the statement.** Re-resolving usually confirms what
+   the row already said (a folder rename moves a file and the siblings its relative links
+   point at together), yet every row was rewritten regardless — an `UPDATE` and a WAL record
+   each. `relink_where` also used `prepare` rather than `prepare_cached`, recompiling a
+   500-placeholder statement per chunk.
+
+Measured on current `main` after all four: NS-03 folder rename 19,633 -> 14,770 us (0.75x),
+NS-04 delete 5,957 -> 4,756 us (0.80x), creates unchanged. 131 workspace tests and the 8
+Postgres CLI tests pass, and the links still resolve to their new paths after the move.
+
+Not recovered: the old code did NS-03 in 588 us at `xs` against about 3,200 us now. What is
+left is `resolve_link` running once per link row in the moved subtree, which for the NS-03
+corpus is every file. Removing that needs a sound argument about when a resolution *cannot*
+change — for a folder rename, a relative link between two files that both moved keeps its
+target — and that is a correctness question, not a tuning one. Left alone deliberately.
 
 **The sidecar is now measured rather than inferred.** MD-01 writes the same bytes as `.md`
 and `.txt` and reports the difference: 34 % on create for front matter and eight headings

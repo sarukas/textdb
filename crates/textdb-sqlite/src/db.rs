@@ -966,9 +966,16 @@ impl<'c> TextDb<'c> {
             }
             let parent = db.ensure_folder(parent_of(&to))?;
             let now = Self::now();
-            let before = db.files_at(&from)?;
+            // Listing the subtree is only ever for the link bookkeeping below, so a store
+            // that records no links skips both.
+            let linked = db.has_links()?;
+            let before = if linked { db.files_at(&from)? } else { Vec::new() };
             let mode = db.link_updates_mode()?;
-            let pointing = if mode == crate::links::LinkUpdates::Off { Vec::new() } else { db.links_into(&before)? };
+            let pointing = if mode == crate::links::LinkUpdates::Off || !linked {
+                Vec::new()
+            } else {
+                db.links_into(&before)?
+            };
             let moved = db.subtree_totals(src.id)?;
             db.add_to_ancestors(&from, &moved.neg(), &now)?;
             let seq = db.record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, db.message.as_deref())?;
@@ -995,11 +1002,16 @@ impl<'c> TextDb<'c> {
                 .execute(params![to, name_of(&to), parent, now, src.id])
                 .map_err(sql_err)?;
             db.add_to_ancestors(&to, &moved, &now)?;
-            let after = db.files_at(&to)?;
-            let mut names: Vec<String> = before.iter().chain(&after).map(|(_, p)| crate::links::name_key(p)).collect();
-            names.sort();
-            names.dedup();
-            db.relink(&names, &after.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
+            if linked {
+                // The same files with the same ids under the new prefix: exactly the
+                // substitution the UPDATE above performed. Asking the database to list the
+                // subtree a second time cost another full scan to learn what is already known.
+                let after: Vec<(i64, String)> = before.iter().map(|(id, p)| (*id, format!("{}{}", to, &p[from.len()..]))).collect();
+                let mut names: Vec<String> = before.iter().chain(&after).map(|(_, p)| crate::links::name_key(p)).collect();
+                names.sort();
+                names.dedup();
+                db.relink(&names, &after.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
+            }
             db.follow_move(pointing, &from, &to, mode, author)
         })
     }
@@ -1018,7 +1030,9 @@ impl<'c> TextDb<'c> {
             }
             let n = db.node_by_path(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
             let now = Self::now();
-            let files = db.files_at(&path)?;
+            // As in the rename above: the listing exists only for the link bookkeeping.
+            let linked = db.has_links()?;
+            let files = if linked { db.files_at(&path)? } else { Vec::new() };
             let gone = db.subtree_totals(n.id)?;
             db.add_to_ancestors(&path, &gone.neg(), &now)?;
             let seq = db.record_change("delete", n.id, n.kind, &path, None, None, None, None, author, db.message.as_deref())?;
@@ -1035,8 +1049,10 @@ impl<'c> TextDb<'c> {
                 .map_err(sql_err)?
                 .execute(params![path, now, lo, hi])
                 .map_err(sql_err)?;
-            let names: Vec<String> = files.iter().map(|(_, p)| crate::links::name_key(p)).collect();
-            db.relink(&names, &files.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
+            if linked {
+                let names: Vec<String> = files.iter().map(|(_, p)| crate::links::name_key(p)).collect();
+                db.relink(&names, &files.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
+            }
             Ok(())
         })
     }
