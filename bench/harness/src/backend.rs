@@ -155,6 +155,14 @@ pub trait Backend: Send + Sync {
     fn extra_stats(&self, _path: &str) -> R<Vec<(&'static str, f64)>> {
         Ok(vec![])
     }
+    /// Leaf chunk hashes of a document at HEAD, for "how many leaves did this edit change".
+    ///
+    /// `None` from a backend that has no leaves — the ME-04 counters are simply not reported
+    /// for it. A chunked backend that returns `None` silently withholds the measurement claim
+    /// 1 is judged on, which is how `textdb-pg` came to look like a failure.
+    fn leaf_hashes(&self, _path: &str) -> R<Option<std::collections::HashSet<textdb_core::Hash>>> {
+        Ok(None)
+    }
     /// Cheap warm-up so first-use costs (thread-local connections) stay out of timings.
     fn warm(&self) -> R<()> {
         Ok(())

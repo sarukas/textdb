@@ -391,6 +391,29 @@ Second part: provider item ids and remote renames by id, SharePoint's rewriting 
 the asset store when their pointers move or go, and detection of changes made directly in the
 drive. These need real Google Drive and SharePoint accounts to build and test against.
 
+**A stand-in for rclone.** CI runs the driver against real rclone on its local backend, which
+proves the command line and the JSON, but a local backend never misbehaves: it always keeps a
+SHA-256, never rewrites what it stores, and renames atomically. So the paths that only run against
+a real provider had no test. `crates/textdb-cli/src/bin/textdb-fake-rclone.rs` stands in for
+rclone — `TEXTDB_RCLONE` already takes any executable, so nothing in the driver changes — and can
+be told to behave as the providers documentably do:
+
+| variable | what it imitates | test |
+|---|---|---|
+| `TEXTDB_FAKE_RCLONE_NO_SHA256` | OneDrive and SharePoint hash with QuickXorHash, so `--hash-type SHA256` gives nothing and the bytes must be read back | `an_asset_store_that_keeps_no_sha256_is_hashed_by_reading_it_back` |
+| `TEXTDB_FAKE_RCLONE_REWRITE` | SharePoint silently rewriting Office files on upload | `an_asset_store_that_rewrites_uploads_fails_the_push_and_publishes_no_pointer` |
+| `TEXTDB_FAKE_RCLONE_MOVE_GAP` | a server-side move that clears the destination and then fails | `a_move_that_clears_the_destination_and_fails_puts_the_old_bytes_back` |
+| `TEXTDB_FAKE_RCLONE_LIST_LAG` | a provider that does not list a lock file straight away | `a_push_finishes_when_the_provider_lists_its_lock_file_late` |
+
+`fake_rclone_round_trips_a_push_and_a_pull` keeps the stand-in honest: if a plain push and pull
+do not work through it, nothing the other four claim means anything.
+
+It is a **fault injector, not a Drive emulator**, and it does not retire the need for real
+accounts. What it removes from that list is narrow and worth naming: the SharePoint rewrite is now
+a reproducible failure rather than something to discover on a tenant, and the move gap — the one
+place a provider hiccup could lose an asset outright — is covered. What still needs an account is
+what a mock can only guess at: item ids, version tags, and how far behind a real listing runs.
+
 ### Stage 4 — Web app
 
 For the folders the web server syncs (`TEXTDB_SYNC`), through the CLI as for sync:

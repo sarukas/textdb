@@ -115,18 +115,25 @@ and `results-before.jsonl`, `hotspots.md` and `hotspots-before.md`, `probe-after
 `probe-before.txt`, `manifest.json`, `report.md`, `run.log`
 **Manifest:** size `s` (scale 0.3) · profile `poc` · mode `fast` · seed 20260912 ·
 4 CPUs, 15.7 GiB, Linux container, ext4 · SQLite 3.53.2 · ripgrep 14.1.0 · PostgreSQL 16
-**Status:** complete — 39 tests, `fs` + `sql-text-sqlite` + `textdb-sqlite`, run twice on a
-quiet machine: once with the binary from `ba598a5`, once with `182a64b`
+**Status:** complete. Two sets of runs. A **before/after pair** — 39 tests,
+`fs` + `sql-text-sqlite` + `textdb-sqlite`, run back to back on a quiet machine with the
+binaries from `ba598a5` and `182a64b` — and a **five-backend run** adding `sql-text-pg` and
+`textdb-pg` ([`results/2026-09-13-s-five/`](results/2026-09-13-s-five/)). `fs-git` is
+excluded and not measurable on this host; see that section for why.
 
-| check | outcome (both runs, identical) |
-|---|---|
-| accuracy checks | **834 pass, 0 fail** (96 n/a) |
-| timings voided | **0 cells** |
+| check | before/after pair (identical in both) | five-backend run |
+|---|---|---|
+| accuracy checks | **834 pass, 0 fail** (96 n/a) | **1397 pass, 0 fail** (161 n/a) |
+| timings voided | **0 cells** | **0 cells** |
 
 First run on Linux rather than Windows, and the first where every surface in the repository
-could actually be built — see *What was broken* below. CW-03, the lost-update failure from
-the `xs` run, did not reproduce in either run here; it was intermittent on that host and is
-not resolved by anything in this pass, so treat it as open.
+could actually be built — see *What was broken* below.
+
+CW-03, the lost-update failure recorded against `textdb-sqlite` on the Windows `xs` run, did
+not reproduce in any run here: `lost_updates` is 0 in every CW cell, for both bindings, across
+five runs at size `s`. Nothing in this pass touches the CAS or rebase path, so that is absence
+of evidence on a different host, not a fix. **Treat it as open** until it is either reproduced
+deliberately or traced.
 
 ### Against `sql-text-sqlite` (ratio, lower is better; 1.00 is parity)
 
@@ -232,6 +239,79 @@ CI now builds both SQLite crates on their own, runs the Python suite, and runs a
 surface answers. Verified by hand here as well: the Postgres extension installs and answers,
 all four Python examples run, the CLI loads and searches a folder, and the `sqlite3` shell
 invocation in INSTALL.md works as written.
+
+### The full matrix, five backends
+
+A second run at the same size adding `sql-text-pg` and `textdb-pg`, once the Postgres
+extension could be built at all. **Artefacts:**
+[`results/2026-09-13-s-five/`](results/2026-09-13-s-five/) — `results.jsonl`,
+`manifest.json`, `report.md`, `verdict.md`, `key-metrics.md`, `hotspots-sqlite.md`,
+`hotspots-pg.md`, `run.log`.
+
+| backend | accuracy checks | timings voided | operation errors |
+|---|---|---|---|
+| `fs` | 280 pass, 0 fail | 0 | 0 |
+| `sql-text-sqlite` | 280 pass, 0 fail | 0 | 0 |
+| `sql-text-pg` | 277 pass, 0 fail | 0 | 2 (see LL-04 below) |
+| **`textdb-sqlite`** | **280 pass, 0 fail** | **0** | **0** |
+| **`textdb-pg`** | **280 pass, 0 fail** | **0** | **0** |
+
+1397 checks pass, none fail, no cell has its timings voided. **`fs-git` is excluded and not
+measurable on this host:** an unrelated process held roughly 19,800 of the ~20,000 available
+file descriptors for most of the session, so every `git` invocation failed through the
+commit-signing helper. Three six-backend runs were attempted; `fs-git` accumulated 22
+operation errors and 65 voided cells in the worst of them, and the textdb results were
+identical in all three. The harness did the right thing — it failed those cells and withheld
+their latencies — but `fs-git` numbers from this machine are not publishable.
+
+#### `sql-text-pg` cannot store a large document at all
+
+```
+LL-04 sql-text-pg create: db error 54000:
+  string is too long for tsvector (1515944 bytes, max 1048575 bytes)
+```
+
+PostgreSQL caps one `tsvector` at 1 MB, so a backend that indexes whole documents has a hard
+ceiling on document size. textdb indexes chunks of about a kilobyte, so `textdb-pg` stored
+the same corpus without trouble. This is claim 3 showing up as the baseline *failing* rather
+than merely being slower, and it is a structural limit, not a tuning question.
+
+#### Footprint across backends
+
+| test | `fs` | `sql-text-sqlite` | `sql-text-pg` | **`textdb-sqlite`** | **`textdb-pg`** |
+|---|---|---|---|---|---|
+| LL-04, many versions of one ~3 MB file | 3.1 MB (no history) | 84.4 MB, 26.8x | *could not store it* | **14.6 MB, 4.66x** | **18.5 MB, 5.89x** |
+| LL-04 growth across versions | — | 67.5 MB | — | **0 B** | **0.23 MB** |
+| ME-05, 1 MiB with Zipf line edits | 0.3 MB (no history) | 186.7 MB, 630x | 217.2 MB, 732x | **9.6 MB, 32.4x** | **20.5 MB, 69.2x** |
+| FP-01/02 after maintenance | — | 16.8 MB, 11.7x | 7.3 MB, 5.07x | **10.3 MB, 7.14x** | 11.4 MB, 7.95x |
+
+`sql-text-pg` is the smaller store after `VACUUM FULL` on FP-01/02, which is worth saying
+plainly: at that corpus and edit count, full-copy history in Postgres compacts better than
+chunk sharing plus its metadata. The picture inverts as versions accumulate — ME-05 is the
+same comparison after many more edits, and there the gap is 36x.
+
+#### Claims
+
+| claim | verdict | reading |
+|---|---|---|
+| 1 — O(edit) writes | FAIL | On the threshold, not the behaviour. `leaves_changed_max` is **1.00** for both bindings and `leaves_unchanged_frac_min` **0.968**: exactly one leaf is rewritten per edit. But the pass condition is `write_amplification <= 10`, a ratio, and a three-line replace must write at least one ~1 KB chunk plus tree nodes — so the floor for any chunked store is tens. Measured 441 (`textdb-sqlite`) and 81.8 (`textdb-pg`) against 199,585 for `sql-text-sqlite`. The "flat across sizes" half is not evaluable at size `s`, where XL runs a single size. **The criterion needs a decision; it was not relaxed here.** |
+| 2 — conflict rate | FAIL | Narrowly, and passing the case that matters most. CW-01 (disjoint sections) at N=20: **0.000** conflict for both bindings against 0.300 for `sql-text-sqlite` and 0.906 for `sql-text-pg`. CW-02 (same section, distinct lines) is 0.050 against 0.350 and 0.117 against 0.900 — 0.14x and 0.13x, just outside the 0.1x bar. **Zero lost updates in every cell, including CW-03.** |
+| 3 — insert-only index | FAIL | Growth per edit on SR-04 is 3,221 B (`textdb-sqlite`) against 3,607 B (`sql-text-sqlite`) — the criterion wants under half, and at this corpus a 100 KiB document is only a few chunks, so "chunk-sized" and "document-sized" are not far apart. LL-04 and ME-05 above are where the claim is visible. |
+| 4 — SQL surface | **PASS** | RT-06, NS-03 and NS-04 all clean on `textdb-pg` through the `kb.file` / `kb.folder` view and trigger path. **First time this claim could be evaluated at all**, because the Postgres extension did not build before this pass. |
+
+#### Two harness defects the Postgres backends exposed
+
+Both were latent behind the build break and affected `sql-text-pg` and `textdb-pg` equally,
+so both were fixed symmetrically.
+
+| # | Where | Effect |
+|---|---|---|
+| 1 | `maintenance` on both PG backends | Ran `VACUUM FULL` through `batch_execute`, which PostgreSQL wraps in an implicit transaction: "25001: VACUUM cannot run inside a transaction block". SR-04 and FP-01/02 reported an error instead of a maintenance time, and every footprint-after-maintenance figure for either backend was missing. |
+| 2 | `leaf_set` in the ME suite | Implemented for `textdb-sqlite` only, so ME-04's `leaves_changed` counters were never recorded for `textdb-pg` — and claim 1 is judged on them, so it could never pass for that binding whatever it did. `kb.leaf_hashes(path)` is the hook it needed. |
+
+One measurement gap found and **not** fixed: `write_amplification` reads 0.0 for `textdb-pg`,
+because `bytes_written_since_reset` reports nothing for the Postgres backends on this host.
+That is why claim 1's `textdb-pg` figure above (81.8) comes from XL-04 rather than ME-04.
 
 ### What is left
 

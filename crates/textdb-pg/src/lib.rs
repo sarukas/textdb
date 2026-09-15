@@ -1773,6 +1773,26 @@ mod kb {
         TableIterator::once((d, l))
     }
 
+    /// Leaf chunk hashes of a file at HEAD, in order (benchmark hook).
+    ///
+    /// `tree_stats` gives the leaf *count*, which cannot answer "how many leaves did this
+    /// edit change" — that needs the identities. Without it the harness could compute
+    /// ME-04's `leaves_changed` for `textdb-sqlite` only, so claim 1 could never pass for
+    /// this binding no matter how it behaved.
+    #[pg_extern(stable)]
+    fn leaf_hashes(path: &str) -> TableIterator<'static, (name!(ord, i64), name!(hash, Vec<u8>))> {
+        let path = ok(normalize_path(path));
+        let n = file_by_path(&path);
+        let st = SpiStorage::new();
+        let root = n.root.unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
+        let rows: Vec<(i64, Vec<u8>)> = ok(leaves(&st, &root))
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| (i as i64, l.hash.to_vec()))
+            .collect();
+        TableIterator::new(rows)
+    }
+
     /// Full-text search: terms ANDed at document level, `"a b"` phrase, `foo*` prefix.
     /// Chunk hits → `chunk_ref` → live files under `prefix` → line via the tree.
     #[pg_extern(stable)]

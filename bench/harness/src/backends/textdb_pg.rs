@@ -314,6 +314,19 @@ impl Backend for TextdbPg {
             Ok("VACUUM FULL + gin_clean_pending_list (GC stub: none)")
         })
     }
+    fn leaf_hashes(&self, path: &str) -> R<Option<std::collections::HashSet<textdb_core::Hash>>> {
+        self.with(|c| {
+            let mut out = std::collections::HashSet::new();
+            for row in c.query("SELECT hash FROM kb.leaf_hashes($1)", &[&path])? {
+                let h: Vec<u8> = row.get(0);
+                let Ok(h) = <[u8; 32]>::try_from(h.as_slice()) else {
+                    return Err(BackendError::Other("kb.leaf_hashes returned a non-32-byte hash".into()));
+                };
+                out.insert(h);
+            }
+            Ok(Some(out))
+        })
+    }
     fn extra_stats(&self, path: &str) -> R<Vec<(&'static str, f64)>> {
         self.with(|c| {
             let chunks = c.query_one("SELECT count(*) FROM kb.chunk", &[])?.get::<_, i64>(0);
