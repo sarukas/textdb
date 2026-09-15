@@ -187,8 +187,49 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
   provider's trash; a lock of a process of this computer that is not running any more is removed,
   and one that could not be removed is reported. A Google document (no bytes) is never an asset.
   The local and rclone drivers' locks do not see each other: one team should reach a store
-  through one driver. Still to come: provider item ids, SharePoint's rewriting of Office files on upload, and
-  changes made directly in the drive (see stage 3 below).
+  through one driver. Google Drive remotes work as below; SharePoint's rewriting of Office files
+  on upload is still to come (see stage 3 below).
+- **Google Drive** (an rclone remote of type `drive`, as `rclone listremotes --long` shows; a
+  shared drive in a team). Planned; what Drive does was tried against a test shared drive:
+  - *Item* = the Drive file id, recorded in the pointer's `item`. An id stays with a file through
+    renames, moves and in-place overwrites; a pointer an earlier build wrote (item = path) gets its
+    id at its next push.
+  - *One listing per command.* Every rclone run costs seconds (starting up and reaching Drive), so
+    a command lists the store root once, recursively, with ids, sizes and SHA-256 (Drive keeps
+    one for each upload), and the files in Drive's trash under it when it needs them, and works
+    from that. Shortcuts and Google documents are left out of every listing (`--drive-skip-shortcuts`,
+    `--drive-skip-gdocs`); a shortcut would otherwise look like a copy of its target.
+  - *Ids stay inside the store.* The person running textdb may reach other shared drives, and a
+    pointer anyone wrote to the store could name any file id: an id is read, moved or trashed only
+    when that listing has it under the store's root (live or in Drive's trash). Any other is
+    `invalid-item` and never touched.
+  - *Push overwrites in place* (so the file keeps its id and people browsing the drive keep their
+    links): with the path's lock held, and the file at the path being the pointer's id holding the
+    bytes it replaces, a server-side copy of it goes to `.textdb-trash/…` and is checked (rclone
+    cannot read Drive's revisions, so this keeps older versions a pointer may still name); then
+    the new bytes are uploaded onto the same file, which readers see whole or not at all (Drive
+    shows the old bytes until the upload finishes), and hashed; bytes other than the upload's put
+    the trash copy back in place and fail the push. A new asset is uploaded to its free path, and a
+    listing afterwards reports two files of that name in the folder (Drive allows it). Bytes that
+    are not the ones replaced are kept, and the upload goes beside them, as today.
+  - *Pull downloads by id* (`rclone backend copyid`) to its partial file and checks the hash, so
+    an asset renamed or moved in the drive, or in Drive's trash, is still found. A pointer naming
+    older bytes than its id holds now is fetched from the trash copy with its SHA-256.
+  - *Pointers moved in textdb* (sync, `mv`) move their file server-side by id (`rclone backend
+    moveid` to `REMOTE:path`), keeping the id; a file in Drive's trash is restored first. A file
+    another pointer also names stays where it is.
+  - *Pointers deleted in textdb* send their file to Drive's trash once no pointer names its id;
+    Drive empties it after 30 days, and until then a pull still finds it.
+  - *Changes made directly in the drive* show in `assets status` and are followed on pull, never
+    undone in the drive: `changed-in-store` (same id, other bytes: someone replaced it; a pull
+    takes them as the pointer's new version, or a conflict when the local file changed too),
+    `moved-in-store` (the id is at another path: pulled from there, the pointer's path unchanged),
+    `trashed-in-store` (only in Drive's trash: still pulled), and not found once Drive purged it.
+    Two files listed at one path are `ambiguous` and never overwritten. `verify` lists files in the
+    store folder that no pointer names.
+  - Tests run only on a person's own computer, against a remote named by
+    `TEXTDB_TEST_GDRIVE` (a folder named `textdb-test`), each in a new subfolder removed at the
+    end; CI keeps testing rclone's local backend.
 
 What a vault last had of each asset (to tell a local edit from a remote one) is kept in the same
 cache, keyed by host and directory and never roaming with a profile (a cache an older build kept
@@ -386,10 +427,16 @@ one (else read back), locks by lock files and listing, rclone found through `TEX
 to `textdb` (a vault's `.textdb/bin`) or the PATH, and CI running the tests against rclone's local
 backend.
 
-Second part: provider item ids and remote renames by id, SharePoint's rewriting of Office files
-(tracking the provider's version tag instead of comparing hashes), moving and trashing items in
-the asset store when their pointers move or go, and detection of changes made directly in the
-drive. These need real Google Drive and SharePoint accounts to build and test against.
+Second part, Google Drive (as described under asset stores): Drive file ids as items, one
+store listing per command with the id guard, pushes overwriting in place after a checked trash
+copy, pulls by id, moves by id and Drive's trash following pointers, the `changed-in-store`,
+`moved-in-store`, `trashed-in-store`, `invalid-item` and `ambiguous` states, and tests against a
+real shared drive. Sprints: (1) ids, listing, guard, pull by id; (2) push in place and trash
+copies; (3) moves and trash following pointers; (4) changes made in the drive; each reviewed.
+
+Third part, SharePoint: its rewriting of Office files on upload (tracking the provider's version
+tag instead of comparing hashes), with the same id-based moves and change detection. Needs a
+SharePoint account to build and test against.
 
 ### Stage 4 — Web app
 
