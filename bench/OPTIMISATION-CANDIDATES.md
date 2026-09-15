@@ -23,6 +23,53 @@ structure sidecar and the index writes into a single number.
 Absolute numbers are host-specific. Ratios inside one run are the part to trust, and a
 before/after pair should come from one quiet machine, back to back.
 
+## The feature work since 2026-09-13 cost the write path (2026-09-15)
+
+Re-running the matrix on current `main` turned up a broad write regression. It is not the
+host, and it is not noise: the prior run's commit (`c93a7b7`) was built in a worktree and
+the two binaries were run **back to back on one machine, twice each**, over RT-01, NS-03 and
+NS-04.
+
+| cell | old | new | ratio |
+|---|---|---|---|
+| NS-03 folder rename, 1000 files | 3,185 us | 18,257 us | **5.73x** |
+| NS-04 folder delete | 1,338 us | 6,012 us | **4.49x** |
+| RT-01 create, 512 B | 163 us | 592 us | **3.63x** |
+| RT-01 create, 4 KiB | 400 us | 957 us | 2.39x |
+| RT-01 create, 1 MiB | 44,244 us | 74,932 us | 1.69x |
+| RT-01 read, 1 MiB | 275 us | 329 us | 1.20x |
+
+The control is `fs`, which is identical code in both trees. Its best-sampled cell, NS-04
+delete, moves 1.12x across the same pair of runs while textdb moves 4.49x on that same cell
+in that same run. (`fs`'s RT-01 create cells are too thinly sampled to use — one reads
+0.17x and another 1.60x. Quote the NS-04 control, not those.)
+
+**The shape says fixed cost per write, not cost per byte.** The regression is worst at the
+smallest documents (3.6x at 512 B) and fades as they grow (1.7x at 1 MiB), which is what
+per-commit bookkeeping looks like — sidecar rows, the change feed, path events and folder
+totals are all paid once per commit regardless of size. Reads are untouched.
+
+Two things are identified; the rest is not, and this entry does not pretend otherwise.
+
+**Rename re-resolves the link graph unconditionally.** `rename_links` ends with a `relink`
+over every name and id in the moved subtree, and that call sits *outside* the
+`link_updates` check that precedes it — so `link_updates = off` does not skip it. Measured
+directly on a 1000-file folder rename: 30 ms at the default, 25 ms with `link_updates off`,
+24 ms with both that and `path_history off`. Turning the documented knobs off recovers
+about 20 %, so the settings are not where the 5.7x lives; `relink` is. It also uses
+`prepare` rather than `prepare_cached`, recompiling per chunk of 500.
+
+Worth asking whether it has to run at all when nothing about the move can change a
+resolution, and whether it can be narrowed to the links that actually point into or out of
+the moved subtree rather than every link sharing a name with something in it.
+
+**The sidecar is now measured rather than inferred.** MD-01 writes the same bytes as `.md`
+and `.txt` and reports the difference: 34 % on create for front matter and eight headings
+alone, 87 % at 8 links per document, 257 % at 64. That is a real cost but it is not 3x, so
+the sidecar is part of the small-document create regression and not all of it. The change
+feed, path events and folder totals are the untested remainder — the next step is a probe
+that switches each off in turn, which `textdb-probe writepath` is the right place for.
+
 ## Why the matrix alone was misleading
 
 Three things the published `2026-09-12` entry concluded do not survive decomposition.
