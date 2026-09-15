@@ -961,6 +961,41 @@ fn defaults_are_added_unless_the_rules_say_otherwise_and_binary_notes_are_never_
 }
 
 #[test]
+fn loosening_textdbignore_stops_moves_and_changes_of_what_it_left_out_even_with_a_bom() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let vault = tmp.path().join("vault");
+    std::fs::create_dir_all(vault.join("secret")).unwrap();
+    std::fs::write(vault.join("secret/s.md"), "s").unwrap();
+    std::fs::write(vault.join("a.md"), "a").unwrap();
+    let dir = vault.to_str().unwrap();
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.args(args);
+        c
+    };
+    ok(&mut t(&["sync", "/", dir]), None);
+    let bom = "\u{feff}";
+    std::fs::write(vault.join(".textdbignore"), format!("{bom}secret/\n{SEEDED_RULES}")).unwrap();
+    run(&mut t(&["sync", "/", dir]), None);
+
+    // The line goes and the file moves on disk: the store's file is not moved.
+    std::fs::write(vault.join(".textdbignore"), format!("{bom}# nothing\n{SEEDED_RULES}")).unwrap();
+    std::fs::create_dir_all(vault.join("notes")).unwrap();
+    std::fs::rename(vault.join("secret/s.md"), vault.join("notes/s.md")).unwrap();
+    let stopped = run(&mut t(&["sync", "/", dir]), None);
+    assert_eq!(stopped.status, 6, "{}", stopped.stdout);
+    assert_eq!(run(&mut t(&["stat", "/secret/s.md"]), None).status, 0, "{}", stopped.stdout);
+
+    // Nor is a change on disk taken in.
+    std::fs::rename(vault.join("notes/s.md"), vault.join("secret/s.md")).unwrap();
+    std::fs::write(vault.join("secret/s.md"), "changed on disk").unwrap();
+    let stopped = run(&mut t(&["sync", "/", dir]), None);
+    assert_eq!(stopped.status, 6, "{}", stopped.stdout);
+    assert_eq!(ok(&mut t(&["--json", "stat", "/secret/s.md"]), None).json()["nbytes"], 1, "{}", stopped.stdout);
+}
+
+#[test]
 fn binary_files_are_not_taken_in_and_sync_says_what_to_do() {
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("kb.db");

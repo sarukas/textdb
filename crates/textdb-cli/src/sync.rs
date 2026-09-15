@@ -1222,16 +1222,17 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         .and_then(|b| b.rules.as_deref())
         .and_then(|r| serde_json::from_str::<Rules>(r).ok())
         .is_some_and(|r| r.ignore_seeded);
-    let mut ignore_write: Option<(String, bool)> = None;
+    // The text to write, and what the file held when read.
+    let mut ignore_write: Option<(String, Option<String>)> = None;
     if !ignore_seeded {
         ignore_seeded = true;
-        if let Some(add) = default_ignore_additions(ignore_text.as_deref().unwrap_or("")) {
+        if let Some(add) = default_ignore_additions(ignore_text.as_deref().unwrap_or("").trim_start_matches('\u{feff}')) {
             let mut text = ignore_text.clone().unwrap_or_default();
             if !text.is_empty() && !text.ends_with('\n') {
                 text.push('\n');
             }
             text.push_str(&add);
-            ignore_write = Some((text.clone(), ignore_text.is_none()));
+            ignore_write = Some((text.clone(), ignore_text.clone()));
             ignore_text = Some(text);
         }
     }
@@ -1673,7 +1674,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         let before: Option<Rules> = stored.rules.as_deref().and_then(|r| serde_json::from_str(r).ok());
         if !before.as_ref().is_some_and(|b| b.same(&rules)) {
             // What the last sync's `.textdbignore` left out, taken in or written now, counts too.
-            let before_ignore = before.as_ref().and_then(|b| b.ignore_text.as_deref()).and_then(|t| ignore_rules(&o.dir, t).0);
+            let before_ignore = before.as_ref().and_then(|b| b.ignore_text.as_deref()).and_then(|t| ignore_rules(&o.dir, t.trim_start_matches('\u{feff}')).0);
             let was_ignored = |rel: &str| before_ignore.as_ref().is_some_and(|gi| ignored_by(gi, rel));
             let left_out = |rel: &str| {
                 let dirs: Vec<&str> = rel.split('/').rev().skip(1).collect();
@@ -1682,7 +1683,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
                     Some(b) => dirs.iter().any(|s| b.skip_dirs.iter().any(|d| d == s)) || !eligible(rel, &b.exts) || was_ignored(rel),
                 }
             };
-            let newly_included: Vec<String> = plan
+            let mut newly_included: Vec<String> = plan
                 .to_textdb
                 .iter()
                 .filter(|(rel, v)| v.is_none() && !heads.contains_key(rel) && !base.contains_key(rel) && left_out(rel))
@@ -1690,6 +1691,8 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
                 .chain(
                     plan.to_disk
                         .iter()
+                        .chain(plan.to_textdb.iter().map(|(rel, _)| rel))
+                        .chain(plan.moves.iter().flat_map(|(from, to)| [from, to]))
                         .chain(plan.merges.iter().map(|(rel, ..)| rel))
                         .chain(plan.conflicts.iter().map(|(rel, ..)| rel))
                         .chain(&plan.disk_delete)
@@ -1698,6 +1701,8 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
                         .cloned(),
                 )
                 .collect();
+            newly_included.sort();
+            newly_included.dedup();
             report.stopped_by_rules = !newly_included.is_empty() && !o.accept_rules;
             report.rules = Some(RulesChange { before, now: rules.clone(), newly_included });
         }
@@ -1719,16 +1724,18 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
 
     // The default lines for `.textdbignore`, written first when the sync goes ahead (never through
     // a link); if they cannot be, they are tried again next time.
-    if let Some((text, new)) = ignore_write.as_ref().filter(|_| !report.stopped && !report.stopped_by_rules) {
+    if let Some((text, before)) = ignore_write.as_ref().filter(|_| !report.stopped && !report.stopped_by_rules) {
         let written = if o.dry_run {
             Ok(())
         } else if std::fs::symlink_metadata(&ignore_path).is_ok_and(|m| m.file_type().is_symlink()) {
             Err(std::io::Error::other("it is a link, which sync never writes through"))
+        } else if std::fs::read(&ignore_path).ok() != before.as_ref().map(|b| b.as_bytes().to_vec()) {
+            Err(std::io::Error::other("it changed during the sync"))
         } else {
             std::fs::create_dir_all(&o.dir).and_then(|()| std::fs::write(&ignore_path, text))
         };
         match written {
-            Ok(()) if *new => report.to_disk.new.push(IGNORE_FILE.to_string()),
+            Ok(()) if before.is_none() => report.to_disk.new.push(IGNORE_FILE.to_string()),
             Ok(()) => report.to_disk.changed.push(IGNORE_FILE.to_string()),
             Err(e) => {
                 report.skipped.push(note(IGNORE_FILE, format!("the default lines could not be added ({e}): used for this sync, and tried again next time")));
@@ -2097,6 +2104,10 @@ fn commit_message(
     let merged = plan.merges.iter().map(|m| &m.0).filter(done).count();
     if merged > 0 {
         *authors.entry(o.author.clone()).or_default() += merged;
+    }
+    if parts.is_empty() {
+        // Nothing else written: the default lines sync put in `.textdbignore`.
+        parts.push(format!("{IGNORE_FILE} default lines"));
     }
     let mut m = format!("textdb sync {prefix}: {}\n\n", parts.join(", "));
     if !authors.is_empty() {
