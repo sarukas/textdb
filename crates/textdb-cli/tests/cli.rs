@@ -922,6 +922,82 @@ fn assets_push_keeps_bytes_in_use_and_records_only_what_it_wrote() {
 }
 
 #[test]
+fn sync_pairs_assets_with_their_real_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let (v1, v2, bucket, config) = (tmp.path().join("v1"), tmp.path().join("v2"), tmp.path().join("bucket"), tmp.path().join("config"));
+    for d in [v1.join("img"), v2.clone(), bucket.clone()] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.env("TEXTDB_CONFIG_DIR", &config).args(args);
+        c
+    };
+    let (d1, d2) = (v1.to_str().unwrap(), v2.to_str().unwrap());
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", bucket.to_str().unwrap()]), None);
+    std::fs::write(v1.join("notes.md"), "![[a.png]] ![[b.png]]\n").unwrap();
+    for (name, bytes) in [("a", &b"\x89PNG A"[..]), ("b", b"\x89PNG B"), ("c", b"\x89PNG C")] {
+        std::fs::write(v1.join(format!("img/{name}.png")), bytes).unwrap();
+    }
+
+    // Assets are never taken in as documents, whatever --ext takes.
+    let all = ok(&mut t(&["--json", "sync", "--dry-run", "--ext", "*", "/", d1]), None).json();
+    assert!(!all["to_textdb"]["new"].as_array().unwrap().iter().any(|p| p.as_str().unwrap().ends_with(".png")), "{all}");
+
+    // --push pushes new assets after the documents; --pull fetches what the notes link to.
+    let s1 = ok(&mut t(&["--json", "sync", "--push", "/", d1]), None).json();
+    assert_eq!(s1["assets"]["pushed"], serde_json::json!(["/img/a.png", "/img/b.png", "/img/c.png"]), "{s1}");
+    let s2 = ok(&mut t(&["--json", "sync", "--pull", "/", d2]), None).json();
+    assert_eq!(s2["assets"]["pulled"], serde_json::json!(["/img/a.png", "/img/b.png"]), "{s2}");
+    assert_eq!(s2["assets"]["counts"], serde_json::json!({ "not-pulled": 1, "ok": 2 }), "{s2}");
+
+    // Moved in the store (by the asset's own path): the file moves with its pointer.
+    ok(&mut t(&["mv", "/img/a.png", "/pics/a.png"]), None);
+    let moved = ok(&mut t(&["--json", "sync", "/", d2]), None).json();
+    assert!(v2.join("pics/a.png").exists() && !v2.join("img/a.png").exists(), "{moved}");
+
+    // Deleted in the store: the file goes to the directory's trash.
+    ok(&mut t(&["rm", "/img/b.png"]), None);
+    let deleted = ok(&mut t(&["--json", "sync", "/", d2]), None).json();
+    assert_eq!(deleted["assets"]["trashed"], serde_json::json!(["img/b.png"]), "{deleted}");
+    assert!(!v2.join("img/b.png").exists());
+    let trash = deleted["assets"]["trash"].as_str().unwrap();
+    assert_eq!(std::fs::read(v2.join(trash).join("img/b.png")).unwrap(), b"\x89PNG B");
+
+    // Renamed on disk: the pointer follows its file.
+    ok(&mut t(&["sync", "/", d1]), None);
+    assert!(v1.join("pics/a.png").exists() && !v1.join("img/b.png").exists());
+    std::fs::rename(v1.join("img/c.png"), v1.join("img/renamed.png")).unwrap();
+    let renamed = ok(&mut t(&["--json", "sync", "/", d1]), None).json();
+    assert_eq!(renamed["assets"]["renamed"], serde_json::json!([{ "from": "img/c.png", "to": "img/renamed.png" }]), "{renamed}");
+    assert_eq!(run(&mut t(&["stat", "/img/renamed.png.tdbasset"]), None).status, 0);
+    assert_eq!(run(&mut t(&["stat", "/img/c.png.tdbasset"]), None).status, 5);
+    assert!(v1.join("img/renamed.png.tdbasset").exists() && !v1.join("img/c.png.tdbasset").exists());
+
+    // Changed on both sides: the store's bytes come in, this directory's are kept next to them.
+    std::fs::write(v1.join("pics/a.png"), b"\x89PNG A from v1").unwrap();
+    ok(&mut t(&["sync", "--push", "/", d1]), None);
+    std::fs::write(v2.join("pics/a.png"), b"\x89PNG A from v2").unwrap();
+    let both = ok(&mut t(&["--json", "sync", "/", d2]), None).json();
+    let copies = both["assets"]["conflict_copies"].as_array().unwrap();
+    assert_eq!(copies.len(), 1, "{both}");
+    let copy = copies[0]["to"].as_str().unwrap();
+    assert!(copy.starts_with("pics/a (conflict ") && copy.ends_with(").png"), "{copy}");
+    assert_eq!(std::fs::read(v2.join(copy)).unwrap(), b"\x89PNG A from v2");
+    assert_eq!(std::fs::read(v2.join("pics/a.png")).unwrap(), b"\x89PNG A from v1");
+    // The copy is never pushed on its own.
+    let again = ok(&mut t(&["--json", "sync", "--push", "/", d2]), None).json();
+    assert_eq!((&again["assets"]["pushed"], &again["assets"]["counts"]["conflict-copy"]), (&serde_json::json!([]), &serde_json::json!(1)), "{again}");
+
+    // The store's asset_sync setting decides when the command line does not.
+    ok(&mut t(&["setting", "asset_sync", "both"]), None);
+    std::fs::write(v1.join("img/new.png"), b"\x89PNG N").unwrap();
+    let auto = ok(&mut t(&["--json", "sync", "/", d1]), None).json();
+    assert_eq!((auto["assets"]["mode"].as_str(), &auto["assets"]["pushed"]), (Some("both"), &serde_json::json!(["/img/new.png"])), "{auto}");
+}
+
+#[test]
 fn assets_migrate_from_git_moves_tracked_binaries_out_of_git() {
     if !has_git() {
         return;

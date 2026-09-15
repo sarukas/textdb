@@ -261,7 +261,13 @@ textdb assets status guides                 # ok / new / modified / outdated / c
 textdb assets push guides -m "diagrams"     # upload new and changed files, then commit their pointers
 textdb assets pull --linked-from guides/api # fetch the files those notes link to
 textdb assets verify guides                 # exit 1 if a hash does not match here or in the asset store
+textdb sync guides ~/vault --push --pull    # documents, then assets: moved, trashed and renamed files follow their pointers
+textdb assets migrate-from-git guides       # binaries git tracks go to the asset store; one git commit
+textdb mv guides/img/arch.png guides/diagrams/arch.png   # an asset by its own path: its pointer moves, sync moves the file
 ```
+
+A file named `NAME (conflict HOST DATE).ext` is a copy sync kept when an asset changed both here and
+in the store; it is never pushed. Compare it with the asset, then delete it or rename it.
 
 Exit 3 from `assets push` means something was left for a conflict: a pointer changed or was deleted
 in the store since this directory synced (`sync`, then push again), or the file here is neither the

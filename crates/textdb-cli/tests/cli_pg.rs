@@ -370,6 +370,49 @@ fn assets_push_pull_verify_and_links() {
 }
 
 #[test]
+fn sync_pairs_assets_and_pushes_and_pulls_them() {
+    let Some(db) = database() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let (v1, v2, bucket, config) = (tmp.path().join("v1"), tmp.path().join("v2"), tmp.path().join("bucket"), tmp.path().join("config"));
+    for d in [v1.join("img"), v2.clone(), bucket.clone()] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let t = |args: &[&str]| {
+        let mut c = textdb(&db);
+        c.env("TEXTDB_CONFIG_DIR", &config).args(args);
+        c
+    };
+    let (d1, d2) = (v1.to_str().unwrap(), v2.to_str().unwrap());
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", bucket.to_str().unwrap()]), None);
+    std::fs::write(v1.join("notes.md"), "![[a.png]]\n").unwrap();
+    std::fs::write(v1.join("img/a.png"), b"\x89PNG A").unwrap();
+    std::fs::write(v1.join("img/b.png"), b"\x89PNG B").unwrap();
+
+    let s1 = ok(&mut t(&["--json", "sync", "--push", "/", d1]), None).json();
+    assert_eq!(s1["assets"]["pushed"], serde_json::json!(["/img/a.png", "/img/b.png"]), "{s1}");
+
+    // The settings decide when the command line does not: pull, and all of them.
+    ok(&mut t(&["setting", "asset_sync", "pull"]), None);
+    ok(&mut t(&["setting", "asset_pull", "all"]), None);
+    let s2 = ok(&mut t(&["--json", "sync", "/", d2]), None).json();
+    assert_eq!((s2["assets"]["mode"].as_str(), &s2["assets"]["pulled"]), (Some("pull"), &serde_json::json!(["/img/a.png", "/img/b.png"])), "{s2}");
+
+    // Moved and deleted in the store: the files follow on disk.
+    ok(&mut t(&["mv", "/img/a.png", "/pics/a.png"]), None);
+    ok(&mut t(&["rm", "/img/b.png"]), None);
+    let s3 = ok(&mut t(&["--json", "sync", "/", d2]), None).json();
+    assert!(v2.join("pics/a.png").exists() && !v2.join("img/b.png").exists(), "{s3}");
+    assert_eq!(s3["assets"]["trashed"], serde_json::json!(["img/b.png"]), "{s3}");
+
+    // A push records its pointers in the sync base, so the next sync has nothing to take in.
+    ok(&mut t(&["sync", "/", d1]), None);
+    std::fs::write(v1.join("img/c.png"), b"\x89PNG C").unwrap();
+    ok(&mut t(&["assets", "push", "--dir", d1]), None);
+    let quiet = ok(&mut t(&["--json", "sync", "--dry-run", "/", d1]), None).json();
+    assert_eq!((&quiet["to_textdb"]["new"], &quiet["to_disk"]["new"]), (&serde_json::json!([]), &serde_json::json!([])), "{quiet}");
+}
+
+#[test]
 fn sync_reconciles_both_sides_merges_and_marks_conflicts() {
     let Some(db) = database() else { return };
     let tmp = tempfile::tempdir().unwrap();

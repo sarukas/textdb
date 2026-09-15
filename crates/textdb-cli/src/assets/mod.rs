@@ -514,7 +514,14 @@ fn items(v: &Vault, scan: &Scan, cache: &mut VaultCache, scope: &[String]) -> Re
                     let mut item = Item::new(v, rel);
                     item.size = Some(size);
                     item.file = Some(rel.clone());
-                    item.state = if portable_rel(rel) { "new" } else { "invalid-path" };
+                    item.state = if !portable_rel(rel) {
+                        "invalid-path"
+                    } else if pairing::is_conflict_copy(rel) {
+                        item.note = Some("kept from a conflict: compare it with the asset, then delete it, or rename it to push it".into());
+                        "conflict-copy"
+                    } else {
+                        "new"
+                    };
                     out.push(item);
                 }
             }
@@ -896,6 +903,15 @@ fn record_in_sync_base(st: &mut dyn Store, v: &Vault, written: &[Written]) -> Re
         .collect();
     st.put_sync_files(&base.prefix, &base.dir, &rows)?;
     Ok(())
+}
+
+/// How many of the vault's assets are in each state.
+pub(crate) fn state_counts(st: &mut dyn Store, v: &Vault) -> Result<BTreeMap<String, usize>> {
+    let scan = scan(st, v)?;
+    let mut cache = VaultCache::open(v);
+    let found = items(v, &scan, &mut cache, &[])?;
+    cache.save();
+    Ok(counts(&found).into_iter().map(|(state, n)| (state.to_string(), n)).collect())
 }
 
 /// What a push did: the assets pushed (as JSON rows), their bytes, and what was left for a

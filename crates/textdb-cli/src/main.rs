@@ -142,6 +142,14 @@ enum Cmd {
         /// Remove directories on disk that hold no files.
         #[arg(long)]
         prune_empty_dirs: bool,
+        /// Also push new and changed assets, as `textdb assets push` does (the store's
+        /// asset_sync setting decides when neither --push nor --pull is given).
+        #[arg(long)]
+        push: bool,
+        /// Also pull assets: the ones the notes link to, or all of them when the store's
+        /// asset_pull setting is `all`.
+        #[arg(long)]
+        pull: bool,
     },
     /// When a store folder was last synced, what changed in it since, and how it compares with a
     /// git commit (by git blob id).
@@ -537,6 +545,8 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             commit,
             accept_rules,
             prune_empty_dirs,
+            push,
+            pull,
         } => sync::sync(
             st,
             sync::Options {
@@ -550,6 +560,12 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
                 store: config::redact(&cli.store),
                 accept_rules,
                 prune_empty_dirs,
+                assets: match (push, pull) {
+                    (true, true) => Some("both".to_string()),
+                    (true, false) => Some("push".to_string()),
+                    (false, true) => Some("pull".to_string()),
+                    (false, false) => None,
+                },
             },
             json,
         ),
