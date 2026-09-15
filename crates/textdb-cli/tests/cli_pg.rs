@@ -406,6 +406,8 @@ fn sync_pairs_assets_and_pushes_and_pulls_them() {
 
     // A push records its pointers in the sync base, so the next sync has nothing to take in.
     ok(&mut t(&["sync", "/", d1]), None);
+    assert!(v1.join("pics/a.png").exists() && !v1.join("img").exists(), "img/ is left empty and removed");
+    std::fs::create_dir_all(v1.join("img")).unwrap();
     std::fs::write(v1.join("img/c.png"), b"\x89PNG C").unwrap();
     ok(&mut t(&["assets", "push", "--dir", d1]), None);
     let quiet = ok(&mut t(&["--json", "sync", "--dry-run", "/", d1]), None).json();
