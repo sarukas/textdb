@@ -777,10 +777,15 @@ struct Written {
     text: String,
 }
 
-/// A location as [`InUse`] compares it: without case, since Windows and macOS keep `a.png` and
-/// `A.png` in the same file.
+/// A location as [`InUse`] compares it: a store path without case, since Windows and macOS keep
+/// `a.png` and `A.png` in the same file; a provider's file id (Google Drive's) as it is, since ids
+/// differing only in case are other files.
 fn location_key(location: &str) -> String {
-    location.to_lowercase()
+    if location.starts_with('/') {
+        location.to_lowercase()
+    } else {
+        location.to_string()
+    }
 }
 
 /// What every pointer in the store names: by pointer path, its version and its asset store and

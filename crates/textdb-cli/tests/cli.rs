@@ -1093,8 +1093,20 @@ fn link_dir(target: &Path, link: &Path) -> bool {
     }
 }
 
-/// rclone for tests: `TEXTDB_RCLONE`, else `rclone` on the PATH. Without one the test is skipped,
-/// unless `TEXTDB_REQUIRE_RCLONE` is set (as in CI).
+/// rclone as the driver runs it: without flags from `RCLONE_*` variables (its configuration still
+/// comes through), which could send a test's commands somewhere the driver does not go.
+fn rclone_command(exe: &std::path::Path) -> Command {
+    let mut c = Command::new(exe);
+    for (key, _) in std::env::vars_os() {
+        let Some(key) = key.to_str() else { continue };
+        let upper = key.to_ascii_uppercase();
+        if upper.starts_with("RCLONE_") && !upper.starts_with("RCLONE_CONFIG") && upper != "RCLONE_PASSWORD_COMMAND" {
+            c.env_remove(key);
+        }
+    }
+    c
+}
+
 /// rclone for tests: `TEXTDB_RCLONE` only, as CI sets it, never one found on the PATH. These tests
 /// rewrite and rename files quickly, which security software on a person's own computer may take
 /// for ransomware. Without it the test is skipped, unless `TEXTDB_REQUIRE_RCLONE` is set.
@@ -1113,7 +1125,12 @@ fn test_gdrive() -> Option<(std::path::PathBuf, String)> {
     let base = std::env::var("TEXTDB_TEST_GDRIVE").ok().filter(|b| !b.is_empty())?;
     let base = base.trim_end_matches('/').to_string();
     assert_eq!(base.rsplit(['/', ':']).next(), Some("textdb-test"), "TEXTDB_TEST_GDRIVE must name a folder called textdb-test, not {base}");
-    Some((test_rclone().expect("TEXTDB_TEST_GDRIVE is set, but rclone does not run"), base))
+    let rclone = test_rclone().expect("TEXTDB_TEST_GDRIVE is set, but rclone does not run");
+    let remote = base.split_once(':').map_or("", |(r, _)| r).to_string();
+    let listed = rclone_command(&rclone).args(["listremotes", "--long"]).output().unwrap();
+    let on_drive = String::from_utf8_lossy(&listed.stdout).lines().any(|l| l.split_once(':').is_some_and(|(n, t)| n.trim() == remote && t.split_whitespace().next() == Some("drive")));
+    assert!(on_drive, "TEXTDB_TEST_GDRIVE must be on a Google Drive remote, not {base}");
+    Some((rclone, base))
 }
 
 #[test]
@@ -1123,14 +1140,14 @@ fn assets_on_google_drive_are_pulled_by_file_id_and_never_from_outside_the_store
     let run_dir = format!("{base}/cli-{}-{nanos}", std::process::id());
     let root = format!("{run_dir}/store");
     let rc = |args: &[&str]| {
-        let out = Command::new(&rclone).args(args).output().unwrap();
+        let out = rclone_command(&rclone).args(args).output().unwrap();
         assert!(out.status.success(), "rclone {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
     struct Purge(std::path::PathBuf, String);
     impl Drop for Purge {
         fn drop(&mut self) {
-            let _ = Command::new(&self.0).args(["purge", "--drive-use-trash=false", &self.1]).output();
+            let _ = rclone_command(&self.0).args(["purge", "--drive-use-trash=false", &self.1]).output();
         }
     }
     rc(&["mkdir", &root]);
