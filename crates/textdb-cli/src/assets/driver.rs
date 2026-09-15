@@ -1,6 +1,6 @@
 //! Where asset bytes are kept. An asset store is declared in the textdb store (a name, a driver
 //! and the store-side root) and bound on each computer to where it is reachable from there: a
-//! local folder, or (stage 3) an rclone remote.
+//! local folder, or an rclone remote (see `rclone.rs`).
 //!
 //! The layout mirrors the vault: the asset at store path `/accounts/acme/arch.png` is kept at
 //! `<root>/accounts/acme/arch.png`, so people can browse the store. What a push replaces goes to
@@ -82,7 +82,14 @@ pub fn stamp(t: SystemTime) -> String {
 }
 
 /// How long a push waits for another one putting the same path.
-const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+pub(crate) const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The name of the lock of store path `path`, its case ignored: 32 hex digits of its hash.
+pub(crate) fn lock_name(path: &str) -> String {
+    use sha2::Digest;
+    let name = super::pointer::hex(&sha2::Sha256::digest(path.to_lowercase().as_bytes()));
+    name[..32].to_string()
+}
 
 /// The process id in a lock file's `held by process PID on HOST since …` line, when that process
 /// is of this computer and not running any more.
@@ -103,15 +110,15 @@ impl Drop for Lock {
     }
 }
 
-/// Locks held on paths of an asset store, released when dropped.
+/// Locks held on paths of an asset store (lock files here or on a remote), released when dropped.
 #[derive(Default)]
 pub struct Held {
-    _locks: Vec<Lock>,
+    _locks: Vec<Box<dyn std::any::Any>>,
 }
 
 impl Held {
-    fn of(lock: Lock) -> Held {
-        Held { _locks: vec![lock] }
+    pub(crate) fn of(lock: impl std::any::Any) -> Held {
+        Held { _locks: vec![Box::new(lock)] }
     }
 }
 
@@ -148,11 +155,9 @@ impl LocalDriver {
 
     /// The lock file of store path `path` (its case ignored), waiting while another push holds it.
     fn lock_file(&self, path: &str) -> Result<Lock> {
-        use sha2::Digest;
         let dir = self.root.join(TRASH).join("locks");
         std::fs::create_dir_all(&dir).map_err(|e| io(dir.display(), e))?;
-        let name = super::pointer::hex(&sha2::Sha256::digest(path.to_lowercase().as_bytes()));
-        let file = dir.join(format!("{}.lock", &name[..32]));
+        let file = dir.join(format!("{}.lock", lock_name(path)));
         let started = std::time::Instant::now();
         let mut told = false;
         let mut checked: Option<std::time::Instant> = None;
@@ -279,7 +284,7 @@ impl LocalDriver {
 
 /// `/img/a.png` as `/img/a (1a2b3c4d).png`, the start of `sha256` in brackets; `-2`, `-3`… after
 /// it for further ones.
-fn beside(path: &str, sha256: &str, n: u32) -> String {
+pub(crate) fn beside(path: &str, sha256: &str, n: u32) -> String {
     let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
     let short = sha256.get(..8).unwrap_or(sha256);
     let tag = if n <= 1 { short.to_string() } else { format!("{short}-{n}") };
@@ -290,16 +295,21 @@ fn beside(path: &str, sha256: &str, n: u32) -> String {
 }
 
 /// This computer's name as one word of a file name.
-fn host_word() -> String {
+pub(crate) fn host_word() -> String {
     super::host().chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect()
 }
 
-/// A hidden name next to `file` for a copy in progress, unique to this computer, process and
+/// A hidden name for a copy of the file `name` in progress, unique to this computer, process and
 /// moment: `.NAME.HOST-PID-NANOS.tdbpart`.
+pub(crate) fn partial_name(name: &str) -> String {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    format!(".{name}.{}-{}-{nanos:09}.tdbpart", host_word(), std::process::id())
+}
+
+/// The [`partial_name`] of `file`, next to it.
 pub fn partial(file: &Path) -> PathBuf {
     let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
-    file.with_file_name(format!(".{name}.{}-{}-{nanos:09}.tdbpart", host_word(), std::process::id()))
+    file.with_file_name(partial_name(&name))
 }
 
 /// Whether a process with id `pid` runs on this computer; `true` when that cannot be told.
@@ -529,7 +539,14 @@ pub fn open(store: &AssetStore) -> Result<Box<dyn Driver>> {
             }
             Ok(Box::new(LocalDriver { root }))
         }
-        "rclone" => Err(StoreError::invalid(format!("asset store {}: the rclone driver is not in this build yet", store.name))),
+        "rclone" => {
+            // The remote this computer reaches the store by (another remote name for the same
+            // drive, say), else the store's root.
+            let root = binding::get(&store.name).map_or_else(|| store.root.clone(), |(l, _)| l);
+            let d = super::rclone::RcloneDriver::new(super::rclone::executable(), root);
+            d.check().map_err(|e| StoreError::invalid(format!("asset store {}: {}", store.name, e.message)))?;
+            Ok(Box::new(d))
+        }
         other => Err(StoreError::invalid(format!("asset store {}: unknown driver {other}", store.name))),
     }
 }

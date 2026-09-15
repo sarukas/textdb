@@ -701,6 +701,69 @@ fn assets_push_pull_verify_links_and_gitignore() {
     assert_eq!((stores[0]["reachable"].as_bool(), stores[0]["bound_to"].as_str()), (Some(true), bucket.to_str()), "{stores}");
 }
 
+/// rclone for tests: `TEXTDB_RCLONE`, else `rclone` on the PATH. Without one the test is skipped,
+/// unless `TEXTDB_REQUIRE_RCLONE` is set (as in CI).
+fn test_rclone() -> Option<std::path::PathBuf> {
+    let exe = std::env::var_os("TEXTDB_RCLONE").filter(|e| !e.is_empty()).map_or_else(|| "rclone".into(), std::path::PathBuf::from);
+    let runs = Command::new(&exe).arg("version").output().is_ok_and(|o| o.status.success());
+    if !runs && std::env::var_os("TEXTDB_REQUIRE_RCLONE").is_some() {
+        panic!("TEXTDB_REQUIRE_RCLONE is set, but {} does not run", exe.display());
+    }
+    runs.then_some(exe)
+}
+
+#[test]
+fn assets_through_an_rclone_store() {
+    let Some(rclone) = test_rclone() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let (vault, other, bucket, config) = (tmp.path().join("vault"), tmp.path().join("other"), tmp.path().join("remote bucket"), tmp.path().join("config"));
+    std::fs::create_dir_all(vault.join("img")).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::create_dir_all(&bucket).unwrap();
+    std::fs::write(vault.join("notes.md"), "![[arch.png]]\n").unwrap();
+    std::fs::write(vault.join("img/arch.png"), [137u8, 80, 78, 71, 0, 1]).unwrap();
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.env("TEXTDB_CONFIG_DIR", &config).env("TEXTDB_RCLONE", &rclone).args(args);
+        c
+    };
+    let (dir, other_dir) = (vault.to_str().unwrap(), other.to_str().unwrap());
+    ok(&mut t(&["sync", "/", dir]), None);
+
+    // A remote folder that is not there is reported; bound on this computer to where rclone
+    // reaches the store, it is used.
+    ok(&mut t(&["assets", "stores", "--add", "team", "--driver", "rclone", "--root", "nowhere-remote:textdb"]), None);
+    let stores = ok(&mut t(&["--json", "assets", "stores"]), None).json();
+    assert_eq!(stores[0]["reachable"], false, "{stores}");
+    assert_eq!(run(&mut t(&["assets", "push"]), None).status, 1);
+    let remote = bucket.to_str().unwrap().replace('\\', "/");
+    ok(&mut t(&["assets", "stores", "--bind", &format!("team={remote}")]), None);
+    let stores = ok(&mut t(&["--json", "assets", "stores"]), None).json();
+    assert_eq!(stores[0]["reachable"], true, "{stores}");
+
+    let pushed = ok(&mut t(&["--json", "assets", "push"]), None).json();
+    assert_eq!(pushed["pushed"].as_array().unwrap().len(), 1, "{pushed}");
+    assert_eq!(std::fs::read(bucket.join("img/arch.png")).unwrap(), [137u8, 80, 78, 71, 0, 1]);
+
+    // Changed here: replaced there, the old bytes in the remote's trash.
+    std::fs::write(vault.join("img/arch.png"), [137u8, 80, 78, 71, 0, 2]).unwrap();
+    ok(&mut t(&["assets", "push"]), None);
+    assert_eq!(std::fs::read(bucket.join("img/arch.png")).unwrap(), [137u8, 80, 78, 71, 0, 2]);
+    let trashed: Vec<_> = std::fs::read_dir(bucket.join(".textdb-trash")).unwrap().flatten().map(|e| e.path().join("img/arch.png")).filter(|p| p.is_file()).collect();
+    assert_eq!(trashed.len(), 1, "{trashed:?}");
+    assert_eq!(std::fs::read(&trashed[0]).unwrap(), [137u8, 80, 78, 71, 0, 1]);
+
+    // Pulled into another directory, and verified; bytes changed in the remote directly are caught.
+    ok(&mut t(&["sync", "/", other_dir]), None);
+    ok(&mut t(&["assets", "pull", "--dir", other_dir]), None);
+    assert_eq!(std::fs::read(other.join("img/arch.png")).unwrap(), [137u8, 80, 78, 71, 0, 2]);
+    let verified = run(&mut t(&["assets", "verify", "--dir", other_dir]), None);
+    assert_eq!(verified.status, 0, "{}{}", verified.stdout, verified.stderr);
+    std::fs::write(bucket.join("img/arch.png"), [0u8; 6]).unwrap();
+    assert_eq!(run(&mut t(&["assets", "verify", "--dir", other_dir]), None).status, 1);
+}
+
 #[test]
 fn assets_between_vaults_conflicts_outdated_case_and_junk() {
     let tmp = tempfile::tempdir().unwrap();

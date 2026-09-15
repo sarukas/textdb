@@ -156,10 +156,24 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
   (`TEXTDB_CONFIG_DIR/cache`, else `%LOCALAPPDATA%\textdb`, `$XDG_CACHE_HOME/textdb` or
   `~/.cache/textdb`; `assets-*.json`, written atomically), by size and modification time, and only
   for files not modified in the last two seconds; `verify` never uses the cache.
-- **rclone driver** (stage 3): runs `rclone` (a single native executable on Windows, macOS and
-  Linux) for copy, move, delete (to the provider's trash) and listing with hashes and item ids.
-  Google shared drives report SHA-256; SharePoint only its QuickXorHash and rewrites Office files
-  on upload, so for those textdb tracks the provider's version tag instead of comparing hashes.
+- **rclone driver**: runs `rclone` (a single native executable on Windows, macOS and Linux;
+  `TEXTDB_RCLONE`, else the one next to `textdb` such as a vault's `.textdb/bin`, else the PATH)
+  with the rclone configuration of the person running it. The store's root is an rclone remote
+  path (`teamdrive:textdb`); a binding names another remote for the same folder on a computer
+  whose rclone calls it differently. `assets stores` reports a root rclone cannot reach or that is
+  not a folder. Layout, item (= path), trash, partial copies and the `beside` names are the local
+  driver's, kept on the remote. An upload goes to a partial name next to its path and is hashed
+  there (the provider's SHA-256 where it keeps one, such as Google Drive; else rclone reads it
+  back) before it is moved into place; bytes a push replaces are first copied to the remote's
+  `.textdb-trash/…` and checked, so the asset is never missing from its path. Every copy and move
+  passes `--ignore-times`: rclone otherwise skips a copy onto a file of the same size and time, and
+  a move then deletes the new bytes and keeps the old. rclone cannot create a file only when none
+  is there, so pushes take turns by each writing its own lock file (`HOST-PID-NANOS.lock`) into
+  `.textdb-trash/locks/<hash of the path>/` and holding the lock only when a listing shows its
+  file alone; otherwise it removes its file and tries again a moment later. A lock of a process of
+  this computer that is not running any more is removed. A Google document (no bytes) is never an
+  asset. Still to come: provider item ids, SharePoint's rewriting of Office files on upload, and
+  changes made directly in the drive (see stage 3 below).
 
 What a vault last had of each asset (to tell a local edit from a remote one) is kept in the same
 cache, keyed by host and directory and never roaming with a profile (a cache an older build kept
@@ -216,7 +230,7 @@ operations take the asset's real path: `textdb mv /a/arch.png /b/arch.png` moves
 the next sync moves the real file on disk of every directory synced with the folder; the asset
 store keeps the bytes where they were put, which the pointer's item still names. `textdb rm
 /a/arch.png` deletes the pointer, and the next sync moves the real file to `.textdb/trash/`.
-Moving and trashing items in the asset store itself comes with the rclone driver (stage 3).
+Moving and trashing items in the asset store itself is still to come (stage 3, second part).
 
 ## Sync
 
@@ -324,9 +338,16 @@ and the `asset_sync` settings; `mv`/`rm` by real path; recorded rules include `.
 
 ### Stage 3 — rclone driver
 
-Google shared drive and SharePoint through rclone: item ids, provider hashes and version tags,
-the Office-file exception, provider trash on delete, remote renames by item id, detection of
-changes made directly in the drive; rclone shipped next to `textdb.exe` in a vault's `.textdb/bin`.
+First part (done): the `rclone` driver: push, pull and verify through any rclone remote, with
+the local driver's layout, trash, partial copies and names beside, provider SHA-256 where there is
+one (else read back), locks by lock files and listing, rclone found through `TEXTDB_RCLONE`, next
+to `textdb` (a vault's `.textdb/bin`) or the PATH, and CI running the tests against rclone's local
+backend.
+
+Second part: provider item ids and remote renames by id, SharePoint's rewriting of Office files
+(tracking the provider's version tag instead of comparing hashes), moving and trashing items in
+the asset store when their pointers move or go, and detection of changes made directly in the
+drive. These need real Google Drive and SharePoint accounts to build and test against.
 
 ### Stage 4 — Web app
 

@@ -19,6 +19,7 @@ pub mod driver;
 pub mod migrate;
 pub mod pairing;
 pub mod pointer;
+pub mod rclone;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};

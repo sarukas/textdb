@@ -7,6 +7,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # rclone for the rclone asset store tests, which must run here rather than skip.
+      - run: |
+          curl -sSL -o /tmp/rclone.zip https://downloads.rclone.org/v1.75.1/rclone-v1.75.1-linux-amd64.zip
+          mkdir -p "$HOME/.local/rclone" && unzip -q -j /tmp/rclone.zip '*/rclone' -d "$HOME/.local/rclone"
+          echo "TEXTDB_RCLONE=$HOME/.local/rclone/rclone" >> "$GITHUB_ENV"
+          echo "TEXTDB_REQUIRE_RCLONE=1" >> "$GITHUB_ENV"
       - run: cargo build --workspace --release
       - run: cargo test --workspace --release
       # The workspace build unifies Cargo features across its members, which hides a

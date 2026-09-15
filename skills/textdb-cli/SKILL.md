@@ -266,6 +266,11 @@ textdb assets migrate-from-git guides       # binaries git tracks go to the asse
 textdb mv guides/img/arch.png guides/diagrams/arch.png   # an asset by its own path: its pointer moves, sync moves the file
 ```
 
+When a push or pull fails because an asset store is not reachable, run `textdb assets stores`: it
+names each store's driver (`local` folder or `rclone` remote), where this computer reaches it and
+why not. An rclone store uses the rclone configuration of whoever runs textdb; rclone is found
+through `TEXTDB_RCLONE`, next to `textdb`, or on the PATH. Leave binding stores to the person.
+
 A file named `NAME (conflict HOST DATE).ext` is a copy sync kept when an asset changed both here and
 in the store; it is never pushed. Compare it with the asset, then delete it or rename it.
 

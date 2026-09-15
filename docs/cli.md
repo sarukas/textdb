@@ -300,6 +300,7 @@ belongs, versioned in the store and in git like any document. The design is in
 ```sh
 textdb assets stores --add team --root 'G:\Shared drives\Team\textdb'   # declared once, for everyone
 textdb assets stores --bind team='/Volumes/GoogleDrive/Shared drives/Team/textdb'   # where this computer reaches it
+textdb assets stores --add drive --driver rclone --root teamdrive:textdb   # or through an rclone remote
 textdb sync /handbook ~/src/handbook               # the vault: a directory synced with a folder
 textdb assets status /handbook                     # ok, new, modified, outdated, conflict, not-pulled, conflict-copy
 textdb assets push /handbook -m "diagrams"         # upload and check the bytes, then commit the pointers
@@ -316,6 +317,11 @@ textdb setting asset_sync both                     # make that what every sync o
   (`*.dat textdb=asset`, `*.svg textdb=document`, `*.log textdb=ignore`, `!textdb` for the
   default), with git's rules for patterns and precedence. A file nothing decides is an asset when
   it has a NUL byte in its first 8000 bytes.
+- **Asset stores:** `local` is a folder this computer reaches (a NAS, a USB disk, a cloud drive
+  synced to a folder); `rclone` is an rclone remote path, used with the rclone configuration of
+  whoever runs textdb. rclone is `TEXTDB_RCLONE`, else the one next to `textdb` (a vault's
+  `.textdb/bin`), else on the PATH; `--bind NAME=REMOTE:PATH` names another remote for the same
+  folder on one computer. `assets stores` tells whether each store is reachable.
 - **The directory** is the one the store folder was last synced with; `--dir DIR` names it.
 - **Links** to an asset resolve to its pointer: `links` shows the asset's path with `asset: true`,
   `backlinks` takes the asset's path, `links --broken --dir DIR` lists assets not pulled into DIR,
