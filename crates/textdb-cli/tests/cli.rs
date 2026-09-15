@@ -805,6 +805,69 @@ fn asset_pointers_never_reach_into_git_or_tell_of_other_files() {
     assert_eq!(std::fs::read_to_string(vault.join(".gitattributes")).unwrap(), rules, "written through its short name");
 }
 
+#[test]
+fn store_pointers_never_move_or_trash_rules_files_nor_sync_write_through_short_folder_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let (vault, bucket, config) = (tmp.path().join("vault"), tmp.path().join("bucket"), tmp.path().join("config"));
+    for d in ["attachments", "config", "project files"] {
+        std::fs::create_dir_all(vault.join(d)).unwrap();
+    }
+    std::fs::create_dir_all(&bucket).unwrap();
+    let png: &[u8] = &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01];
+    std::fs::write(vault.join(".gitattributes"), "private.pdf textdb=ignore").unwrap();
+    std::fs::write(vault.join("private.pdf"), "%PDF-1.4 private").unwrap();
+    std::fs::write(vault.join("attachments/.gitattributes"), "* binary").unwrap();
+    std::fs::write(vault.join("attachments/pic.png"), png).unwrap();
+    // An asset with the very bytes of the root rules, so a pointer can name them.
+    std::fs::write(vault.join("attachments/copy.dat"), std::fs::read(vault.join(".gitattributes")).unwrap()).unwrap();
+    std::fs::write(vault.join("config/.env"), "SECRET=1").unwrap();
+    std::fs::write(vault.join("config/readme.md"), "config notes").unwrap();
+    std::fs::write(vault.join("project files/settings.json"), "LOCAL").unwrap();
+    std::fs::write(vault.join("project files/note.md"), "local note").unwrap();
+    std::fs::write(vault.join("my~secrets file.json"), "LOCAL").unwrap();
+    let dir = vault.to_str().unwrap();
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.env("TEXTDB_CONFIG_DIR", &config).args(args);
+        c
+    };
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", bucket.to_str().unwrap()]), None);
+    ok(&mut t(&["assets", "push"]), None);
+    run(&mut t(&["sync", "/", dir, "--push"]), None);
+    assert!(bucket.join("attachments/copy.dat").exists() && !bucket.join("private.pdf").exists());
+    let with_id = |n: u32| {
+        let pointer = std::fs::read_to_string(vault.join("attachments/copy.dat.tdbasset")).unwrap();
+        pointer.lines().map(|l| if l.starts_with("id: ") { format!("id: 01a0a37c-6564-709a-9f90-00000000000{n}") } else { l.to_string() }).collect::<Vec<_>>().join("\n") + "\n"
+    };
+
+    // A pointer deleted in the store does not take the rules file it names to the trash.
+    ok(&mut t(&["write", "/.gitattributes.tdbasset"]), Some(&with_id(1)));
+    run(&mut t(&["sync", "/", dir, "--push"]), None);
+    ok(&mut t(&["rm", "/.gitattributes.tdbasset"]), None);
+    let synced = run(&mut t(&["sync", "/", dir, "--push"]), None);
+    assert!(vault.join(".gitattributes").exists(), "the rules went to the trash: {}", synced.stdout);
+    assert!(!bucket.join("private.pdf").exists(), "pushed without its rule: {}", synced.stdout);
+
+    // A pointer moved in the store does not carry the rules file it names to another folder.
+    ok(&mut t(&["write", "/attachments/.gitattributes.tdbasset"]), Some(&with_id(2)));
+    run(&mut t(&["sync", "/", dir, "--push"]), None);
+    ok(&mut t(&["mv", "/attachments/.gitattributes.tdbasset", "/config/.gitattributes.tdbasset"]), None);
+    let synced = run(&mut t(&["sync", "/", dir, "--push"]), None);
+    assert!(vault.join("attachments/.gitattributes").exists() && !vault.join("config/.gitattributes").exists(), "carried: {}", synced.stdout);
+    assert!(!bucket.join("config/.env").exists(), "pushed under carried rules: {}", synced.stdout);
+
+    // Nothing is written through the 8.3 short name of a folder, or of a name that has a `~` itself.
+    for rel in ["/PROJEC~1/settings.json", "/PROJEC~1/note.md", "/MY~SEC~1.JSO"] {
+        run(&mut t(&["write", rel]), Some("FROM STORE"));
+    }
+    let synced = run(&mut t(&["sync", "/", dir]), None);
+    for (rel, was) in [("project files/settings.json", "LOCAL"), ("project files/note.md", "local note"), ("my~secrets file.json", "LOCAL")] {
+        assert_eq!(std::fs::read_to_string(vault.join(rel)).unwrap(), was, "{rel} written through a short name: {}", synced.stdout);
+    }
+}
+
 /// Make `link` a link to the folder `target`: a junction on Windows (which needs no privilege), a
 /// symbolic link elsewhere.
 fn link_dir(target: &Path, link: &Path) -> bool {

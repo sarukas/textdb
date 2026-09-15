@@ -239,28 +239,31 @@ fn refuse_protected(rel: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// A write or move onto a name shaped like an 8.3 short name (`GITATT~1`, `NOTES~1.MD`) that is
-/// on disk under another name is refused: it would reach that other file (`.gitattributes`, say).
+/// A write or move through another name Windows gives a file or folder already on disk, an 8.3
+/// short name (`GITATT~1`, `PROJEC~1/note.md`, `MY~SEC~1.JSO`), is refused: it would reach that
+/// file (`.gitattributes`, say) under a name sync does not know. Short names always hold a `~`, so
+/// each such part of the path that exists must be listed in its folder under that name.
 fn refuse_short_alias(root: &Path, rel: &str) -> std::io::Result<()> {
-    let name = rel.rsplit('/').next().unwrap_or(rel);
-    if !crate::assets::classify::looks_short(name) {
-        return Ok(());
+    let mut at = root.to_path_buf();
+    for seg in rel.split('/') {
+        let parent = at.clone();
+        at.push(seg);
+        if std::fs::symlink_metadata(&at).is_err() {
+            return Ok(());
+        }
+        if !seg.contains('~') {
+            continue;
+        }
+        let seg = seg.to_lowercase();
+        let listed = std::fs::read_dir(&parent).is_ok_and(|entries| entries.flatten().any(|e| e.file_name().to_string_lossy().to_lowercase() == seg));
+        if !listed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{rel} is another name (an 8.3 short name) of a file or folder already on disk, which sync never writes through"),
+            ));
+        }
     }
-    let target = root.join(rel);
-    if std::fs::symlink_metadata(&target).is_err() {
-        return Ok(());
-    }
-    let listed = target
-        .parent()
-        .and_then(|parent| std::fs::read_dir(parent).ok())
-        .is_some_and(|entries| entries.flatten().any(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name)));
-    if listed {
-        return Ok(());
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::PermissionDenied,
-        format!("{rel} is another name (an 8.3 short name) of a file already on disk, which sync never writes through"),
-    ))
+    Ok(())
 }
 
 /// A write, move or delete that would go through a symbolic link or junction already on disk,
@@ -622,6 +625,10 @@ fn pair_assets(
     };
     let mut had = crate::assets::DirCache::open(dir);
     let mut pairs = AssetPairs::default();
+    // Only asset files follow their pointers or go to the trash with them: a pointer anyone put in
+    // the store may name a `.gitattributes` or a `.env`.
+    let classifier = std::cell::OnceCell::new();
+    let is_asset = |rel: &str| classifier.get_or_init(|| Classifier::load(dir, &nested_rules_files(walked))).classify(dir, rel) == Class::Asset;
 
     // Moved in the store: a pointer leaves disk and a new one with its id arrives.
     let mut leaving = Vec::new();
@@ -643,6 +650,10 @@ fn pair_assets(
         if !free(&file) {
             continue;
         }
+        if !is_asset(&file) {
+            report.kept.push(note(&file, format!("its asset pointer moved in textdb to {target}, but it is not an asset file: left here")));
+            continue;
+        }
         if disk_name(&target).is_some_and(|there| there != file) {
             report.kept.push(note(&file, format!("its asset pointer moved in textdb to {target}, where a file is already: left here")));
             continue;
@@ -653,6 +664,10 @@ fn pair_assets(
     for (_, rel, p) in leaving.iter().filter(|(_, rel, _)| !moved_from.contains(rel)) {
         let Some(file) = disk_name(&real(rel)) else { continue };
         if !free(&file) {
+            continue;
+        }
+        if !is_asset(&file) {
+            report.kept.push(note(&file, "its asset pointer was deleted in textdb, but it is not an asset file: kept"));
             continue;
         }
         match pointer::hash_file(&dir.join(&file)) {
@@ -687,8 +702,6 @@ fn pair_assets(
     let orphans = !lost.is_empty()
         && walked.files.keys().any(|r| free(r) && !is_asset_pointer(r) && had.had(r).is_some() && !on_disk(&format!("{r}{}", pointer::SUFFIX)));
     if renames_possible || orphans {
-        let nested = nested_rules_files(walked);
-        let classifier = Classifier::load(dir, &nested);
         let store_folders = crate::assets::store_folders_inside(&mut *sides.st, dir);
         let sizes: HashSet<u64> = lost.iter().map(|(_, size, _)| *size).collect();
         let (mut found, mut unsure_sizes) = (Vec::new(), HashSet::new());
@@ -705,7 +718,7 @@ fn pair_assets(
                 || base.contains_key(&pointer_rel)
                 || (!had_file && (!renames_possible || had.was_present(rel) == Some(true)))
                 || store_folders.iter().any(|f| lower.starts_with(&format!("{f}/")))
-                || classifier.classify(dir, rel) != Class::Asset
+                || !is_asset(rel)
             {
                 continue;
             }
@@ -743,7 +756,7 @@ fn pair_assets(
     let changed: Vec<String> = plan.to_disk.iter().filter(|r| is_asset_pointer(r) && on_disk(r)).cloned().collect();
     for rel in changed {
         let Some(file) = disk_name(&real(&rel)) else { continue };
-        if !free(&file) || pairing::is_conflict_copy(&file) {
+        if !free(&file) || pairing::is_conflict_copy(&file) || !is_asset(&file) {
             continue;
         }
         let (Ok(old), Ok(new)) = (Pointer::parse(&sides.disk(&rel)?), Pointer::parse(&sides.textdb(&rel)?.0)) else { continue };
@@ -796,14 +809,19 @@ fn sync_assets(st: &mut dyn Store, o: &Options, prefix: &str, plan: &Plan, attrs
     let mode = o.assets.clone().or_else(|| st.setting("asset_sync").ok().flatten()).unwrap_or_else(|| "off".to_string());
     let v = assets::Vault { prefix: prefix.to_string(), dir: o.dir.clone() };
     if !o.dry_run {
-        // A .gitattributes this very sync brought from textdb is not trusted to make files assets:
-        // a file anyone put in the store could name `.env`. The next sync sees the rules changed.
+        // A .gitattributes this very sync brought from textdb, or moved, set aside or deleted on
+        // disk, is not trusted to decide what is an asset: a file anyone put in the store could name
+        // `.env`, or take away the rule that kept it out. The next sync sees the rules changed.
         let attrs_arriving = plan
             .to_disk
             .iter()
+            .chain(&plan.disk_delete)
             .chain(plan.merges.iter().map(|(rel, ..)| rel))
             .chain(plan.conflicts.iter().map(|(rel, ..)| rel))
-            .chain(plan.moves.iter().map(|(_, to)| to))
+            .chain(plan.moves.iter().flat_map(|(from, to)| [from, to]))
+            .chain(plan.carry.iter().flat_map(|(from, to)| [from, to]))
+            .chain(plan.conflict_copies.iter().flat_map(|(from, to)| [from, to]))
+            .chain(plan.asset_trash.iter().map(|(file, _)| file))
             .any(|rel| rel.rsplit('/').next().is_some_and(|name| crate::assets::classify::names_dir(name, &[".gitattributes"])));
         if matches!(mode.as_str(), "push" | "both") {
             if attrs_changed || attrs_arriving {

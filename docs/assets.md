@@ -245,10 +245,12 @@ deleted. These checks take a name as Windows would resolve it, so `.GIT`, `.git.
 `.git::$INDEX_ALLOCATION` and the 8.3 short names Windows may give those folders (`GIT~1`,
 `NODE_M~1`, or the hashed `GI3F2A~1`) are those folders, while other names that only look like
 short names (`photos~1`, `report~1.pdf`) are not. Neither sync nor pull writes, moves or deletes
-through a symbolic link or junction already in the directory, and sync never writes to a name
-shaped like a short name (`GITATT~1`, `NOTES~1.MD`) that is on disk as another file. `.gitattributes`
-files count in any letter case (`.GitAttributes`, which Windows loads all the same) and under their
-short name. A sync that brings a `.gitattributes` from textdb pushes no assets: the next sync reports the rules changed, and only
+through a symbolic link or junction already in the directory, and sync never writes through
+another name Windows gives a file or folder already there, its 8.3 short name (`GITATT~1`,
+`PROJEC~1/note.md`). `.gitattributes` files count in any letter case (`.GitAttributes`, which
+Windows loads all the same) and under their short name, and they and `.textdbignore` are never
+assets: a pointer moved or deleted in textdb moves or trashes only an asset file. A sync that
+brings a `.gitattributes` from textdb, or moves, sets aside or deletes one on disk, pushes no assets: the next sync reports the rules changed, and only
 `--accept-rules` (or an explicit push) takes files the new rules make assets. `verify` counts an asset store it cannot reach as a
 problem. `status --json` gives `{ prefix, dir, assets, counts }`, each asset with `path`, `state`,
 `type` (the pointer's media type, or one from the name), and where known `size`, `store`,

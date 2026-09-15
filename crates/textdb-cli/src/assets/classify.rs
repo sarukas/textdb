@@ -110,11 +110,11 @@ pub fn is_rules_file(name: &str) -> bool {
     if cfg!(any(windows, target_os = "macos")) { name.eq_ignore_ascii_case(".gitattributes") } else { name == ".gitattributes" }
 }
 
-/// Files that are never assets: a store's database and its copies, system clutter, lock files,
-/// downloads and copies in progress.
+/// Files that are never assets: the rules files, a store's database and its copies, system
+/// clutter, lock files, downloads and copies in progress.
 fn ignored_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    matches!(lower.as_str(), ".ds_store" | "thumbs.db" | "ehthumbs.db" | "desktop.ini" | "icon\r")
+    matches!(lower.as_str(), ".gitattributes" | ".textdbignore" | ".ds_store" | "thumbs.db" | "ehthumbs.db" | "desktop.ini" | "icon\r")
         || lower.starts_with("kb.db")
         || name.starts_with("~$")
         || name.starts_with("._")
