@@ -921,6 +921,63 @@ fn assets_push_keeps_bytes_in_use_and_records_only_what_it_wrote() {
     }
 }
 
+#[test]
+fn assets_migrate_from_git_moves_tracked_binaries_out_of_git() {
+    if !has_git() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let (v, bucket, config) = (tmp.path().join("v"), tmp.path().join("bucket"), tmp.path().join("config"));
+    std::fs::create_dir_all(v.join("img")).unwrap();
+    std::fs::create_dir_all(&bucket).unwrap();
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.env("TEXTDB_CONFIG_DIR", &config).args(args);
+        c
+    };
+    let d = v.to_str().unwrap();
+    git(&v, &["init", "-q"]);
+    git(&v, &["config", "user.email", "t@example.com"]);
+    git(&v, &["config", "user.name", "T"]);
+    std::fs::write(v.join("a.md"), "![[x.png]]\n").unwrap();
+    std::fs::write(v.join("img/x.png"), b"\x89PNG x").unwrap();
+    std::fs::write(v.join("img/y.pdf"), b"%PDF-1.4 y").unwrap();
+    git(&v, &["add", "-A"]);
+    git(&v, &["commit", "-q", "-m", "start"]);
+    ok(&mut t(&["sync", "/", d]), None);
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", bucket.to_str().unwrap()]), None);
+
+    // A dry run lists what would move and changes nothing.
+    let dry = ok(&mut t(&["--json", "assets", "migrate-from-git", "--dir", d, "--dry-run"]), None).json();
+    assert_eq!(dry["to_push"], serde_json::json!(["/img/x.png", "/img/y.pdf"]), "{dry}");
+    assert!(git(&v, &["ls-files"]).lines().any(|l| l == "img/x.png"));
+    assert!(!bucket.join("img/x.png").exists());
+
+    // Something staged already: refused, so the migration's commit holds the migration only.
+    std::fs::write(v.join("b.md"), "b\n").unwrap();
+    git(&v, &["add", "b.md"]);
+    assert_eq!(run(&mut t(&["assets", "migrate-from-git", "--dir", d]), None).status, 6);
+    git(&v, &["reset", "-q"]);
+
+    let done = ok(&mut t(&["--json", "assets", "migrate-from-git", "--dir", d, "-m", "binaries out"]), None).json();
+    assert_eq!(done["migrated"], serde_json::json!(["/img/x.png", "/img/y.pdf"]), "{done}");
+    let tracked = git(&v, &["ls-files"]);
+    let tracked: Vec<&str> = tracked.lines().collect();
+    for (rel, want) in [("img/x.png", false), ("img/y.pdf", false), ("img/x.png.tdbasset", true), ("img/y.pdf.tdbasset", true), (".gitignore", true), ("a.md", true)] {
+        assert_eq!(tracked.contains(&rel), want, "{rel} in {tracked:?}");
+    }
+    assert_eq!(std::fs::read(v.join("img/x.png")).unwrap(), b"\x89PNG x", "the files stay on disk");
+    assert_eq!(std::fs::read(bucket.join("img/y.pdf")).unwrap(), b"%PDF-1.4 y");
+    assert!(git(&v, &["log", "-1", "--format=%s"]).starts_with("binaries out:"));
+    assert_eq!(git(&v, &["status", "--porcelain"]), "?? b.md", "nothing else is left over");
+    assert_eq!(ok(&mut t(&["--json", "assets", "status", "--dir", d]), None).json()["counts"], serde_json::json!({ "ok": 2 }));
+
+    // Run again: nothing git tracks is a binary any more.
+    let again = ok(&mut t(&["--json", "assets", "migrate-from-git", "--dir", d]), None).json();
+    assert_eq!((again["tracked_assets"].as_u64(), &again["commit"]), (Some(0), &serde_json::Value::Null), "{again}");
+}
+
 fn has_git() -> bool {
     Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success())
 }

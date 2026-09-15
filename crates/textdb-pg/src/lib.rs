@@ -210,8 +210,8 @@ $$;
 CREATE FUNCTION kb.set_setting(k text, v text) RETURNS text LANGUAGE plpgsql VOLATILE AS $$
 DECLARE norm text;
 BEGIN
-  IF k IS NULL OR k NOT IN ('path_history', 'link_updates') THEN
-    PERFORM kb._raise('TX004', format('unknown setting ''%s'' (known: path_history, link_updates)', k), NULL);
+  IF k IS NULL OR k NOT IN ('path_history', 'link_updates', 'asset_sync', 'asset_pull') THEN
+    PERFORM kb._raise('TX004', format('unknown setting ''%s'' (known: path_history, link_updates, asset_sync, asset_pull)', k), NULL);
   END IF;
   IF v IS NULL THEN
     DELETE FROM kb.setting s WHERE s.key = k;
@@ -221,6 +221,18 @@ BEGIN
     norm := lower(trim(v));
     IF norm NOT IN ('off', 'report', 'rewrite') THEN
       PERFORM kb._raise('TX004', format('%s is off, report or rewrite, not ''%s''', k, v), NULL);
+    END IF;
+  ELSIF k = 'asset_sync' THEN
+    -- What sync does with assets: off (lists them), push, pull or both.
+    norm := lower(trim(v));
+    IF norm NOT IN ('off', 'push', 'pull', 'both') THEN
+      PERFORM kb._raise('TX004', format('%s is off, push, pull, both, not ''%s''', k, v), NULL);
+    END IF;
+  ELSIF k = 'asset_pull' THEN
+    -- Which assets sync pulls: linked (the ones notes link to) or all.
+    norm := lower(trim(v));
+    IF norm NOT IN ('linked', 'all') THEN
+      PERFORM kb._raise('TX004', format('%s is linked, all, not ''%s''', k, v), NULL);
     END IF;
   ELSE
     IF kb._switch(v) IS NULL THEN

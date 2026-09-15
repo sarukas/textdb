@@ -30,8 +30,22 @@ pub struct PathEventRow {
     pub author: Option<String>,
 }
 
+/// What `sync` does with assets (docs/assets.md): `off` (lists them), `push`, `pull` or `both`.
+pub const ASSET_SYNC_SETTING: &str = "asset_sync";
+/// Which assets `sync` pulls: `linked` (the ones notes link to) or `all`.
+pub const ASSET_PULL_SETTING: &str = "asset_pull";
+
 /// The settings a store knows.
-const SETTINGS: &[&str] = &[PATH_HISTORY_SETTING, LINK_UPDATES_SETTING];
+const SETTINGS: &[&str] = &[PATH_HISTORY_SETTING, LINK_UPDATES_SETTING, ASSET_SYNC_SETTING, ASSET_PULL_SETTING];
+
+/// `v` as one of `allowed`, ignoring case and surrounding space.
+fn one_of(key: &str, v: &str, allowed: &[&'static str]) -> Result<&'static str> {
+    allowed
+        .iter()
+        .find(|a| a.eq_ignore_ascii_case(v.trim()))
+        .copied()
+        .ok_or_else(|| TextdbError::InvalidEdit(format!("{key} is {}, not '{v}'", allowed.join(", "))))
+}
 
 fn known(key: &str) -> Result<()> {
     if SETTINGS.contains(&key) {
@@ -58,16 +72,19 @@ impl<'c> TextDb<'c> {
         known(key)?;
         match value {
             Some(v) => {
-                let value = if key == LINK_UPDATES_SETTING {
-                    LinkUpdates::parse(v)
+                let value = match key {
+                    LINK_UPDATES_SETTING => LinkUpdates::parse(v)
                         .map(LinkUpdates::as_str)
-                        .ok_or_else(|| TextdbError::InvalidEdit(format!("{key} is off, report or rewrite, not '{v}'")))?
-                } else {
-                    let on = parse_switch(v).ok_or_else(|| TextdbError::InvalidEdit(format!("{key} is on or off, not '{v}'")))?;
-                    if on {
-                        "on"
-                    } else {
-                        "off"
+                        .ok_or_else(|| TextdbError::InvalidEdit(format!("{key} is off, report or rewrite, not '{v}'")))?,
+                    ASSET_SYNC_SETTING => one_of(key, v, &["off", "push", "pull", "both"])?,
+                    ASSET_PULL_SETTING => one_of(key, v, &["linked", "all"])?,
+                    _ => {
+                        let on = parse_switch(v).ok_or_else(|| TextdbError::InvalidEdit(format!("{key} is on or off, not '{v}'")))?;
+                        if on {
+                            "on"
+                        } else {
+                            "off"
+                        }
                     }
                 };
                 self.conn

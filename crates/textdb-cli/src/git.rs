@@ -224,6 +224,49 @@ pub fn commit(dir: &Path, paths: &[String], message: &str) -> Result<Option<Stri
     resolve(dir, "HEAD").map(Some)
 }
 
+/// The files git tracks below `dir`, relative to it.
+pub fn tracked(dir: &Path) -> Result<Vec<String>> {
+    let out = run(dir, &["ls-files", "-z", "--", "."], None).map_err(StoreError::other)?;
+    Ok(out
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect())
+}
+
+/// Whether nothing is staged in the checkout `dir` is in.
+pub fn nothing_staged(dir: &Path) -> bool {
+    run(dir, &["diff", "--cached", "--quiet"], None).is_ok()
+}
+
+/// Stop tracking `paths` (relative to `dir`), leaving the files where they are.
+pub fn untrack(dir: &Path, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let spec = nul_separated(paths.iter().map(|p| format!(":(literal){p}")));
+    run(dir, &["rm", "--cached", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"], Some(&spec))
+        .map(|_| ())
+        .map_err(StoreError::other)
+}
+
+/// Stage `paths` (relative to `dir`) as they are on disk.
+pub fn stage(dir: &Path, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let spec = nul_separated(paths.iter().map(|p| format!(":(literal){p}")));
+    run(dir, &["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], Some(&spec))
+        .map(|_| ())
+        .map_err(StoreError::other)
+}
+
+/// Commit everything staged; the new commit.
+pub fn commit_staged(dir: &Path, message: &str) -> Result<String> {
+    run(dir, &["commit", "-q", "-m", message], None).map_err(StoreError::other)?;
+    resolve(dir, "HEAD")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

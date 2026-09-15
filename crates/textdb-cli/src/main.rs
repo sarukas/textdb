@@ -725,6 +725,13 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             AssetsOp::Pull { paths, dir, linked_from, dry_run } => assets::pull(st, &paths, dir.as_deref(), linked_from.as_deref(), dry_run, json),
             AssetsOp::Verify { path, dir } => assets::verify(st, path.as_deref(), dir.as_deref(), json),
             AssetsOp::Gitignore { path, dir, dry_run } => assets::gitignore(st, path.as_deref(), dir.as_deref(), dry_run, json),
+            AssetsOp::MigrateFromGit { path, dir, to, message, dry_run } => assets::migrate::migrate_from_git(
+                st,
+                path.as_deref(),
+                dir.as_deref(),
+                assets::migrate::MigrateOptions { to: to.as_deref(), message: message.as_deref(), author, dry_run },
+                json,
+            ),
         },
         Cmd::Meta { op } => match op {
             MetaOp::Get { path, key } => meta::get(st, &path, key.as_deref(), json),
@@ -883,6 +890,10 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             no_update_links,
         } => {
             let update = if update_links { Some(true) } else if no_update_links { Some(false) } else { None };
+            // An asset is named by its own path: its pointer moves, and the next sync moves the file.
+            let named = from.clone();
+            let from = store_or_pointer(st, &from);
+            let to = if from != named && !assets::pointer::is_asset_pointer(&to) { format!("{to}{}", assets::pointer::SUFFIX) } else { to };
             let untracked = untracked_on_disk(st, &from);
             let moved_links = st.mv_links(&from, &to, author, message.as_deref(), update)?;
             let removed = if keep_empty_folders { Vec::new() } else { prune_empty_folders(st, &from, author)? };
@@ -910,6 +921,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             message,
             keep_empty_folders,
         } => {
+            let path = store_or_pointer(st, &path);
             let untracked = untracked_on_disk(st, &path);
             // Links from elsewhere into what is deleted, unless the store turned link reports off.
             let broken: Vec<store::LinkRow> = match st.setting(textdb_sqlite::links::LINK_UPDATES_SETTING) {
@@ -1693,6 +1705,24 @@ enum AssetsOp {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Move the binaries git tracks to the asset store: push them, remove them from git's index
+    /// (the files stay on disk), write the .gitignore block, and commit their pointers and
+    /// .gitignore in one commit. Nothing may be staged beforehand. Git's history keeps the old
+    /// blobs.
+    MigrateFromGit {
+        #[arg(value_parser = store_path)]
+        path: Option<String>,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// The asset store for them (needed when several are declared).
+        #[arg(long, value_name = "NAME")]
+        to: Option<String>,
+        /// Message of the pointer commits and the git commit (default `assets migrate-from-git`).
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1731,6 +1761,17 @@ enum MetaOp {
         #[arg(long, short = 'm')]
         message: Option<String>,
     },
+}
+
+/// `path`, or the pointer of the asset at `path` when the store holds nothing there itself.
+fn store_or_pointer(st: &mut dyn Store, path: &str) -> String {
+    if st.stat(path).is_err() {
+        let pointer = format!("{}{}", path.trim_end_matches('/'), assets::pointer::SUFFIX);
+        if st.stat(&pointer).is_ok_and(|s| s.kind == "file") {
+            return pointer;
+        }
+    }
+    path.to_string()
 }
 
 /// Directories synced with the store folder `path` that hold files textdb does not track, which

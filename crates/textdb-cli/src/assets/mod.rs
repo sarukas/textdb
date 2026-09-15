@@ -16,6 +16,8 @@
 
 pub mod classify;
 pub mod driver;
+pub mod migrate;
+pub mod pairing;
 pub mod pointer;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -896,13 +898,64 @@ fn record_in_sync_base(st: &mut dyn Store, v: &Vault, written: &[Written]) -> Re
     Ok(())
 }
 
+/// What a push did: the assets pushed (as JSON rows), their bytes, and what was left for a
+/// conflict or failed.
+#[derive(Default)]
+pub(crate) struct PushReport {
+    pub pushed: Vec<serde_json::Value>,
+    pub bytes: u64,
+    pub conflicts: Vec<String>,
+    pub failed: Vec<String>,
+}
+
 pub fn push(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, o: PushOptions, json: bool) -> Result<()> {
     let v = vault(st, paths.first().map(String::as_str), dir)?;
     let scope = scope_of(paths)?;
-    check_scope(&v, &scope)?;
-    let scan = scan(st, &v)?;
-    let mut cache = VaultCache::open(&v);
-    let found = items(&v, &scan, &mut cache, &scope)?;
+    let PushReport { pushed, bytes, conflicts, failed } = push_run(st, &v, &scope, &o)?;
+    if !o.dry_run && !pushed.is_empty() && crate::git::repo(&v.dir).is_some() {
+        let files: Vec<String> = pushed.iter().filter_map(|p| p["file"].as_str().map(str::to_string)).collect();
+        let ignored = crate::git::ignored(&v.dir, &files);
+        let loose: Vec<&String> = files.iter().filter(|f| !ignored.contains(*f)).collect();
+        if let Some(first) = loose.first() {
+            eprintln!(
+                "note: git does not ignore {} of the pushed assets ({first}{}): `textdb assets gitignore` covers them, and git keeps tracking what it tracks until `git rm --cached` (or `textdb assets migrate-from-git`)",
+                loose.len(),
+                if loose.len() > 1 { ", …" } else { "" }
+            );
+        }
+    }
+    if json {
+        emit_json(&json!({ "dry_run": o.dry_run, "pushed": pushed, "bytes": bytes, "conflicts": conflicts, "failed": failed }))?;
+    } else {
+        let verb = if o.dry_run { "would push" } else { "pushed" };
+        let mut s = format!("{verb} {} assets ({})\n", pushed.len(), size_text(bytes));
+        for p in &pushed {
+            s.push_str(&format!("  {:<10} {}\n", p["state"].as_str().unwrap_or(""), p["path"].as_str().unwrap_or("")));
+        }
+        for c in &conflicts {
+            s.push_str(&format!("  conflict   {c}\n"));
+        }
+        for f in &failed {
+            s.push_str(&format!("  failed     {f}\n"));
+        }
+        out(s.as_bytes())?;
+    }
+    if !failed.is_empty() {
+        return Err(StoreError::other(format!("{} assets could not be pushed", failed.len())));
+    }
+    if !conflicts.is_empty() {
+        return Err(StoreError::conflict(format!("{} assets were not pushed because of conflicts", conflicts.len())));
+    }
+    Ok(())
+}
+
+/// Push the vault's `new` and `modified` assets within `scope` (all of them when it is empty), and
+/// with `force` its `conflict` ones.
+pub(crate) fn push_run(st: &mut dyn Store, v: &Vault, scope: &[String], o: &PushOptions) -> Result<PushReport> {
+    check_scope(v, scope)?;
+    let scan = scan(st, v)?;
+    let mut cache = VaultCache::open(v);
+    let found = items(v, &scan, &mut cache, scope)?;
     let mut drivers = Drivers::new(st)?;
     let names = drivers.names();
     // The pointers this directory's last sync had: one only on disk now was deleted in the store.
@@ -952,31 +1005,40 @@ pub fn push(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, o: PushOpt
         }
     }
     cache.save();
-    if let Err(e) = record_in_sync_base(st, &v, &written) {
+    if let Err(e) = record_in_sync_base(st, v, &written) {
         failed.push(format!("the pushed pointers could not be recorded in the sync base ({}); the next sync compares them itself", e.message));
     }
-    if !o.dry_run && !pushed.is_empty() && crate::git::repo(&v.dir).is_some() {
-        let files: Vec<String> = pushed.iter().filter_map(|p| p["file"].as_str().map(str::to_string)).collect();
-        let ignored = crate::git::ignored(&v.dir, &files);
-        let loose: Vec<&String> = files.iter().filter(|f| !ignored.contains(*f)).collect();
-        if let Some(first) = loose.first() {
-            eprintln!(
-                "note: git does not ignore {} of the pushed assets ({first}{}): `textdb assets gitignore` covers them, and git keeps tracking what it tracks until `git rm --cached`",
-                loose.len(),
-                if loose.len() > 1 { ", …" } else { "" }
-            );
-        }
-    }
+    Ok(PushReport { pushed, bytes, conflicts, failed })
+}
+
+/// What a pull did: the assets pulled (as JSON rows), their bytes, and the files kept or failed.
+#[derive(Default)]
+pub(crate) struct PullReport {
+    pub pulled: Vec<serde_json::Value>,
+    pub bytes: u64,
+    pub kept: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+/// The assets the notes at or below `path` link to.
+pub(crate) fn linked_assets(st: &mut dyn Store, path: &str) -> Result<BTreeSet<String>> {
+    Ok(st.links(path, &[])?.into_iter().filter(|l| l.asset).filter_map(|l| l.resolved).collect())
+}
+
+pub fn pull(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, linked_from: Option<&str>, dry_run: bool, json: bool) -> Result<()> {
+    let v = vault(st, paths.first().map(String::as_str).or(linked_from), dir)?;
+    let scope = scope_of(paths)?;
+    let linked = linked_from.map(|p| linked_assets(st, p)).transpose()?;
+    let PullReport { pulled, bytes, kept, failed } = pull_run(st, &v, &scope, linked.as_ref(), dry_run)?;
     if json {
-        emit_json(&json!({ "dry_run": o.dry_run, "pushed": pushed, "bytes": bytes, "conflicts": conflicts, "failed": failed }))?;
+        emit_json(&json!({ "dry_run": dry_run, "pulled": pulled, "bytes": bytes, "kept": kept, "failed": failed }))?;
     } else {
-        let verb = if o.dry_run { "would push" } else { "pushed" };
-        let mut s = format!("{verb} {} assets ({})\n", pushed.len(), size_text(bytes));
-        for p in &pushed {
+        let mut s = format!("{} {} assets ({})\n", if dry_run { "would pull" } else { "pulled" }, pulled.len(), size_text(bytes));
+        for p in &pulled {
             s.push_str(&format!("  {:<10} {}\n", p["state"].as_str().unwrap_or(""), p["path"].as_str().unwrap_or("")));
         }
-        for c in &conflicts {
-            s.push_str(&format!("  conflict   {c}\n"));
+        for k in &kept {
+            s.push_str(&format!("  kept       {k}\n"));
         }
         for f in &failed {
             s.push_str(&format!("  failed     {f}\n"));
@@ -984,29 +1046,22 @@ pub fn push(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, o: PushOpt
         out(s.as_bytes())?;
     }
     if !failed.is_empty() {
-        return Err(StoreError::other(format!("{} assets could not be pushed", failed.len())));
-    }
-    if !conflicts.is_empty() {
-        return Err(StoreError::conflict(format!("{} assets were not pushed because of conflicts", conflicts.len())));
+        return Err(StoreError::other(format!("{} assets could not be pulled", failed.len())));
     }
     Ok(())
 }
 
-pub fn pull(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, linked_from: Option<&str>, dry_run: bool, json: bool) -> Result<()> {
-    let v = vault(st, paths.first().map(String::as_str).or(linked_from), dir)?;
-    let scope = scope_of(paths)?;
-    check_scope(&v, &scope)?;
-    let scan = scan(st, &v)?;
-    let mut cache = VaultCache::open(&v);
-    let found = items(&v, &scan, &mut cache, &scope)?;
-    let linked: Option<BTreeSet<String>> = match linked_from {
-        Some(p) => Some(st.links(p, &[])?.into_iter().filter(|l| l.asset).filter_map(|l| l.resolved).collect()),
-        None => None,
-    };
+/// Pull the vault's `not-pulled` and `outdated` assets within `scope` (all of them when it is
+/// empty), only those in `linked` when it is given.
+pub(crate) fn pull_run(st: &mut dyn Store, v: &Vault, scope: &[String], linked: Option<&BTreeSet<String>>, dry_run: bool) -> Result<PullReport> {
+    check_scope(v, scope)?;
+    let scan = scan(st, v)?;
+    let mut cache = VaultCache::open(v);
+    let found = items(v, &scan, &mut cache, scope)?;
     let mut drivers = Drivers::new(st)?;
     let (mut pulled, mut kept, mut failed, mut bytes) = (Vec::new(), Vec::new(), Vec::new(), 0u64);
     for item in found {
-        if linked.as_ref().is_some_and(|l| !l.contains(&item.path)) {
+        if linked.is_some_and(|l| !l.contains(&item.path)) {
             continue;
         }
         match item.state {
@@ -1076,25 +1131,7 @@ pub fn pull(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, linked_fro
         pulled.push(json!({ "path": item.path, "state": item.state, "size": p.size, "store": p.store }));
     }
     cache.save();
-    if json {
-        emit_json(&json!({ "dry_run": dry_run, "pulled": pulled, "bytes": bytes, "kept": kept, "failed": failed }))?;
-    } else {
-        let mut s = format!("{} {} assets ({})\n", if dry_run { "would pull" } else { "pulled" }, pulled.len(), size_text(bytes));
-        for p in &pulled {
-            s.push_str(&format!("  {:<10} {}\n", p["state"].as_str().unwrap_or(""), p["path"].as_str().unwrap_or("")));
-        }
-        for k in &kept {
-            s.push_str(&format!("  kept       {k}\n"));
-        }
-        for f in &failed {
-            s.push_str(&format!("  failed     {f}\n"));
-        }
-        out(s.as_bytes())?;
-    }
-    if !failed.is_empty() {
-        return Err(StoreError::other(format!("{} assets could not be pulled", failed.len())));
-    }
-    Ok(())
+    Ok(PullReport { pulled, bytes, kept, failed })
 }
 
 pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: bool) -> Result<()> {
@@ -1232,15 +1269,43 @@ pub fn gitignore(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, dry
         Some(d) => d.to_path_buf(),
         None => vault(st, path, None)?.dir,
     };
-    let (mut files, nested) = walk(&root)?;
-    leave_out_asset_stores(st, &root, &mut files)?;
-    let classifier = Classifier::load(&root, &nested);
+    let GitignoreBlock { file, changed, patterns, single } = write_gitignore_block(st, &root, dry_run)?;
+    if json {
+        return emit_json(&json!({ "file": file.display().to_string(), "changed": changed, "dry_run": dry_run, "patterns": patterns, "single_files": single }));
+    }
+    let what = match (changed, dry_run) {
+        (false, _) => "up to date",
+        (true, true) => "would be updated",
+        (true, false) => "updated",
+    };
+    out(format!(
+        "{}: {what}, {} patterns ({single} of them for single files the others get wrong; run it again as files come and go). Files git already tracks stay tracked until they are removed from its index (git rm --cached, or textdb assets migrate-from-git).\n",
+        file.display(),
+        patterns.len(),
+    )
+    .as_bytes())
+}
+
+/// What writing the managed `.gitignore` block did.
+pub(crate) struct GitignoreBlock {
+    pub file: PathBuf,
+    pub changed: bool,
+    pub patterns: Vec<String>,
+    /// How many of the patterns name single files.
+    pub single: usize,
+}
+
+/// Write the managed block of the `.gitignore` in the directory `root` (not with `dry_run`).
+pub(crate) fn write_gitignore_block(st: &mut dyn Store, root: &Path, dry_run: bool) -> Result<GitignoreBlock> {
+    let (mut files, nested) = walk(root)?;
+    leave_out_asset_stores(st, root, &mut files)?;
+    let classifier = Classifier::load(root, &nested);
     for w in &classifier.warnings {
         eprintln!("warning: {w}");
     }
     let mut patterns = classifier.gitignore_patterns();
-    let mut cache = VaultCache::open(&Vault { prefix: "/".to_string(), dir: root.clone() });
-    let single = single_file_lines(&root, &files, &classifier, &mut cache, &patterns);
+    let mut cache = VaultCache::open(&Vault { prefix: "/".to_string(), dir: root.to_path_buf() });
+    let single = single_file_lines(root, &files, &classifier, &mut cache, &patterns);
     cache.save();
     // Before the last line, which keeps every pointer in git.
     let last = patterns.pop();
@@ -1263,21 +1328,7 @@ pub fn gitignore(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, dry
     if changed && !dry_run {
         std::fs::write(&file, &updated).map_err(|e| io_err(file.display(), e))?;
     }
-    if json {
-        return emit_json(&json!({ "file": file.display().to_string(), "changed": changed, "dry_run": dry_run, "patterns": patterns, "single_files": single.len() }));
-    }
-    let what = match (changed, dry_run) {
-        (false, _) => "up to date",
-        (true, true) => "would be updated",
-        (true, false) => "updated",
-    };
-    out(format!(
-        "{}: {what}, {} patterns ({} of them for single files the others get wrong; run it again as files come and go). Files git already tracks stay tracked until they are removed from its index (git rm --cached).\n",
-        file.display(),
-        patterns.len(),
-        single.len()
-    )
-    .as_bytes())
+    Ok(GitignoreBlock { file, changed, patterns, single: single.len() })
 }
 
 pub struct StoresOptions {
