@@ -41,8 +41,9 @@ pub fn executable() -> PathBuf {
 /// (`:sftp,ssh=…:`, `remote,option=…:`) sets backend options, some of which run programs, and a
 /// leading `-` would read as a flag. Anything else is bound on each computer.
 pub fn shared_root_problem(root: &str) -> Option<String> {
+    // A one-letter name is a Windows drive: a folder of this computer, not a configured remote.
     let valid = root.split_once(':').is_some_and(|(name, _)| {
-        !name.is_empty() && !name.starts_with(['-', ' ']) && !name.ends_with(' ') && name.chars().all(|c| c.is_alphanumeric() || "_-.+@ ".contains(c))
+        name.chars().count() > 1 && !name.starts_with(['-', ' ']) && !name.ends_with(' ') && name.chars().all(|c| c.is_alphanumeric() || "_-.+@ ".contains(c))
     });
     (!valid).then(|| {
         format!("{root} is not REMOTE:path: an rclone asset store's root names a remote of each person's own rclone configuration (connection strings and options go in that configuration, or in a binding on one computer)")
@@ -89,10 +90,14 @@ fn join(root: &str, rel: &str) -> String {
     format!("{root}{sep}{rel}")
 }
 
-/// The process id in the lock file name `KEY-HOST-PID-NANOS.lock`, when that process is of this
-/// computer and not running any more.
+/// The process id in the lock file name `KEY-MILLIS-HOST-PID-NANOS.lock`, when that process is of
+/// this computer and not running any more.
 fn abandoned(name: &str, key: &str) -> Option<u32> {
     let rest = name.strip_prefix(&format!("{key}-"))?.strip_suffix(".lock")?;
+    let (millis, rest) = rest.split_once('-')?;
+    if millis.is_empty() || !millis.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let rest = rest.strip_prefix(&format!("{}-", host_word()))?;
     let (pid, nanos) = rest.split_once('-')?;
     if nanos.is_empty() || !nanos.bytes().all(|b| b.is_ascii_digit()) {
@@ -154,8 +159,11 @@ impl RcloneDriver {
         let mut c = Command::new(&self.exe);
         // A flag set through the environment (RCLONE_IGNORE_EXISTING, RCLONE_DRY_RUN…) would
         // change what these commands do; rclone's configuration still comes through.
+        // Names compared in upper case: Windows, and rclone there, do not tell them apart.
         for (key, _) in std::env::vars_os() {
-            if let Some(key) = key.to_str().filter(|k| k.starts_with("RCLONE_") && !k.starts_with("RCLONE_CONFIG") && *k != "RCLONE_PASSWORD_COMMAND") {
+            let Some(key) = key.to_str() else { continue };
+            let upper = key.to_ascii_uppercase();
+            if upper.starts_with("RCLONE_") && !upper.starts_with("RCLONE_CONFIG") && upper != "RCLONE_PASSWORD_COMMAND" {
                 c.env_remove(key);
             }
         }
@@ -286,34 +294,60 @@ impl RcloneDriver {
     }
 
     /// Hold the lock of `path` (its case ignored). rclone cannot create a file only when none is
-    /// there, so a push writes a lock file of its own (`KEY-HOST-PID-NANOS.lock`) and lists the
-    /// lock folder: it holds the lock when the listing shows its file and no other of that path,
-    /// twice a moment apart, and otherwise removes its file and tries again a little later. Of two
-    /// pushes that write at once, the one that lists later sees the other's file, as long as the
-    /// provider lists what was written.
+    /// there, so a push lists the lock folder first and writes a lock file of its own
+    /// (`KEY-MILLIS-HOST-PID-NANOS.lock`) only when no other push's file of that path is listed; it
+    /// holds the lock when two listings a moment apart show its file and no other. Where several
+    /// wrote at once, the file whose name sorts first (the push that started first) stays and the
+    /// others are removed; while another file is listed a push waits, longer each time. Of two
+    /// pushes that wrote at once, the one that lists later sees the other's file, as long as the
+    /// provider lists what was written, so both never hold the lock.
     fn lock_remote(&self, path: &str) -> Result<RemoteLock> {
         let folder = format!("/{TRASH}/locks");
         let key = lock_name(path);
         let now = SystemTime::now();
-        let nanos = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
-        let mine = format!("{key}-{}-{}-{nanos:09}.lock", host_word(), std::process::id());
+        let since = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+        let mine = format!("{key}-{:020}-{}-{}-{:09}.lock", since.as_millis(), host_word(), std::process::id(), since.subsec_nanos());
         let mine_path = format!("{folder}/{mine}");
         let body = format!("{path}\nheld by process {} on {} since {}\n", std::process::id(), host_word(), stamp(now));
         let started = Instant::now();
-        let (mut told, mut checked) = (false, None::<Instant>);
+        let (mut told, mut checked, mut wait) = (false, None::<Instant>, Duration::from_millis(200));
+        // This push's lock file, once written; removed when dropped.
+        let mut written: Option<RemoteLock> = None;
         loop {
-            self.write_small(&mine_path, &body).inspect_err(|_| drop(self.delete(&mine_path)))?;
-            let lock = RemoteLock { driver: RcloneDriver::new(self.exe.clone(), self.root.clone()), path: mine_path.clone() };
-            let alone = |files: &[String]| files.len() == 1 && files[0] == mine;
             let files = self.lock_files(&folder, &key)?;
-            if alone(&files) {
-                std::thread::sleep(Duration::from_millis(300));
-                if alone(&self.lock_files(&folder, &key)?) {
-                    return Ok(lock);
-                }
+            let others: Vec<String> = files.iter().filter(|f| **f != mine).cloned().collect();
+            if started.elapsed() > LOCK_WAIT {
+                return Err(StoreError::other(format!(
+                    "{path} is locked ({}) and was not released in {} minutes; if that push is not running any more, remove its file from {}",
+                    if others.is_empty() { "this push's lock file was not listed".to_string() } else { others.join(", ") },
+                    LOCK_WAIT.as_secs() / 60,
+                    self.folder(&folder).unwrap_or_default()
+                )));
             }
-            drop(lock);
-            let others: Vec<String> = files.into_iter().filter(|f| *f != mine).collect();
+            if others.is_empty() {
+                match &written {
+                    None => {
+                        self.write_small(&mine_path, &body).inspect_err(|_| drop(self.delete(&mine_path)))?;
+                        written = Some(RemoteLock { driver: RcloneDriver::new(self.exe.clone(), self.root.clone()), path: mine_path.clone() });
+                    }
+                    Some(_) if files.len() == 1 => {
+                        std::thread::sleep(Duration::from_millis(300));
+                        let again = self.lock_files(&folder, &key)?;
+                        if again.len() == 1 && again[0] == mine {
+                            if let Some(lock) = written.take() {
+                                return Ok(lock);
+                            }
+                        }
+                    }
+                    // Written, not listed yet.
+                    Some(_) => std::thread::sleep(Duration::from_millis(200)),
+                }
+                continue;
+            }
+            // Of pushes that wrote at once, the one that started first keeps its file.
+            if written.is_some() && others.iter().any(|o| *o < mine) {
+                written = None;
+            }
             // A lock left by a process of this computer that is not running any more (a push that
             // was killed) is removed, now and then looked at again.
             if checked.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
@@ -325,21 +359,14 @@ impl RcloneDriver {
                     }
                 }
             }
-            if started.elapsed() > LOCK_WAIT {
-                return Err(StoreError::other(format!(
-                    "{path} is locked ({}) and was not released in {} minutes; if that push is not running any more, remove its file from {}",
-                    if others.is_empty() { "its lock file was not listed".to_string() } else { others.join(", ") },
-                    LOCK_WAIT.as_secs() / 60,
-                    self.folder(&folder).unwrap_or_default()
-                )));
-            }
-            if !told && !others.is_empty() {
+            if !told {
                 eprintln!("waiting for another push of {path}");
                 told = true;
             }
-            // Apart from one another, so two pushes that keep meeting stop doing so.
+            // Apart from one another, so pushes that keep meeting stop doing so.
             let spread = u64::from(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()) ^ std::process::id().wrapping_mul(2_654_435_761));
-            std::thread::sleep(Duration::from_millis(200 + spread % 800));
+            std::thread::sleep(wait + Duration::from_millis(spread % (wait.as_millis() as u64 + 1)));
+            wait = (wait * 3 / 2).min(Duration::from_secs(4));
         }
     }
 
@@ -376,7 +403,8 @@ impl RcloneDriver {
             e
         };
         let source = src.to_string_lossy();
-        self.ok(&format!("uploading {} to {part}", src.display()), &["copyto", "--ignore-times", "--", &source, &part]).map_err(discard)?;
+        // Straight to the partial name (already this push's own), so rclone leaves no partial of its own.
+        self.ok(&format!("uploading {} to {part}", src.display()), &["copyto", "--ignore-times", "--inplace", "--", &source, &part]).map_err(discard)?;
         match self.hash(&part_path, None).map_err(discard)? {
             Some((sha, _)) if sha == sha256 => {}
             _ => return Err(discard(StoreError::other(format!("{} changed while it was copied to the asset store; push it again", src.display())))),
@@ -387,7 +415,7 @@ impl RcloneDriver {
                 // A copy in the trash first, checked to be what this push replaces (not bytes put
                 // there some other way).
                 let copy = self.trash_for(path);
-                let copied = self.ok(&format!("copying {dest} to the trash"), &["copyto", "--ignore-times", "--", &dest, &self.remote(&copy)?]).and_then(|_| self.hash(&copy, None));
+                let copied = self.ok(&format!("copying {dest} to the trash"), &["copyto", "--ignore-times", "--inplace", "--", &dest, &self.remote(&copy)?]).and_then(|_| self.hash(&copy, None));
                 match copied {
                     Ok(Some((sha, _))) if sha == expected => trashed = Some(copy),
                     Ok(_) => {
@@ -408,11 +436,24 @@ impl RcloneDriver {
         // empty for a moment: what is there afterwards is checked, and when it is not the new
         // bytes, what was there is put back from the trash.
         let moved = self.ok(&format!("putting {dest} in place"), &["moveto", "--ignore-times", "--", &part, &dest]);
-        let found = self.hash(path, None);
+        // Looked at again after a failure to look, so a moment's trouble reaching the provider is
+        // not taken for a failed move.
+        let mut found = self.hash(path, None);
+        for _ in 0..2 {
+            if found.is_err() {
+                std::thread::sleep(Duration::from_secs(1));
+                found = self.hash(path, None);
+            }
+        }
         if matches!(&found, Ok(Some((sha, _))) if sha == sha256) {
             if moved.is_err() {
                 let _ = self.delete(&part_path);
             }
+            return Ok(true);
+        }
+        // The move went through and what it put there cannot be looked at: the copy it moved was
+        // checked, so the bytes are placed.
+        if moved.is_ok() && found.is_err() {
             return Ok(true);
         }
         let why = match (moved, &found) {
@@ -483,16 +524,25 @@ impl Driver for RcloneDriver {
 
     /// `dest` is the caller's own partial name, so rclone downloads straight to it.
     fn get(&self, path: &str, item: Option<&str>, dest: &Path) -> Result<()> {
-        let from = self.remote(item.unwrap_or(path))?;
+        let at = item.unwrap_or(path);
+        let from = self.remote(at)?;
         if dest.exists() {
             return Err(StoreError::invalid(format!("{} exists already", dest.display())));
+        }
+        // A folder there would be copied whole.
+        if self.stat(at, false)?.is_none() {
+            return Err(StoreError::not_found(format!("{from} is not a file in the asset store")));
         }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| StoreError::other(format!("{}: {e}", parent.display())))?;
         }
-        let fetched = self.ok(&format!("downloading {from}"), &["copyto", "--ignore-times", "--", &from, &dest.to_string_lossy()]).map(|_| ());
+        let fetched = self.ok(&format!("downloading {from}"), &["copyto", "--ignore-times", "--inplace", "--", &from, &dest.to_string_lossy()]).map(|_| ());
+        let fetched = fetched.and_then(|_| match dest.is_file() {
+            true => Ok(()),
+            false => Err(StoreError::other(format!("downloading {from}: not a file"))),
+        });
         if fetched.is_err() {
-            let _ = std::fs::remove_file(dest);
+            let _ = if dest.is_dir() { std::fs::remove_dir_all(dest) } else { std::fs::remove_file(dest) };
         }
         fetched
     }
@@ -531,7 +581,7 @@ mod tests {
         for ok in ["teamdrive:textdb", "team drive:Shared/textdb", "s3.eu:bucket/prefix", "remote:", "my_remote-2@x+y:a,b"] {
             assert_eq!(shared_root_problem(ok), None, "{ok}");
         }
-        for bad in [":sftp,host=x,ssh='cmd /c calc':x", "remote,ssh=x:path", "-x:path", "--config=x:y", " a:b", "no-colon", ":local:/tmp", "a/b:c"] {
+        for bad in [":sftp,host=x,ssh='cmd /c calc':x", "remote,ssh=x:path", "-x:path", "--config=x:y", " a:b", "no-colon", ":local:/tmp", "a/b:c", "C:/Users/x", "C:"] {
             assert!(shared_root_problem(bad).is_some(), "{bad}");
         }
         assert_eq!(join("teamdrive:", "img/a.png"), "teamdrive:img/a.png");
@@ -545,11 +595,13 @@ mod tests {
     #[test]
     fn lock_file_names_tell_abandoned_locks_of_this_computer() {
         let key = lock_name("/a.png");
-        assert_eq!(abandoned(&format!("{key}-{}-4000000000-000000001.lock", host_word()), &key), Some(4_000_000_000));
-        assert_eq!(abandoned(&format!("{key}-{}-{}-000000001.lock", host_word(), std::process::id()), &key), None);
-        assert_eq!(abandoned(&format!("{key}-another-host-4000000000-000000001.lock"), &key), None);
-        assert_eq!(abandoned(&format!("{}-{}-4000000000-000000001.lock", lock_name("/b.png"), host_word()), &key), None);
-        assert_eq!(abandoned(&format!("{key}-{}-2-4000000000-1.lock", host_word()), &key), None, "host {}-2 is another computer", host_word());
+        let millis = "00000001789460100000";
+        assert_eq!(abandoned(&format!("{key}-{millis}-{}-4000000000-000000001.lock", host_word()), &key), Some(4_000_000_000));
+        assert_eq!(abandoned(&format!("{key}-{millis}-{}-{}-000000001.lock", host_word(), std::process::id()), &key), None);
+        assert_eq!(abandoned(&format!("{key}-{millis}-another-host-4000000000-000000001.lock"), &key), None);
+        assert_eq!(abandoned(&format!("{}-{millis}-{}-4000000000-000000001.lock", lock_name("/b.png"), host_word()), &key), None);
+        assert_eq!(abandoned(&format!("{key}-{millis}-{}-2-4000000000-1.lock", host_word()), &key), None, "host {}-2 is another computer", host_word());
+        assert_eq!(abandoned(&format!("{key}-{}-4000000000-000000001.lock", host_word()), &key), None, "no time in the name");
     }
 
     #[test]
@@ -620,7 +672,7 @@ mod tests {
         // What a killed push of this computer left is cleared: its lock, and its partial copy.
         let locks = root.join(TRASH).join("locks");
         std::fs::create_dir_all(&locks).unwrap();
-        std::fs::write(locks.join(format!("{}-{}-4000000000-000000001.lock", lock_name("/acc/c.png"), host_word())), "/acc/c.png\n").unwrap();
+        std::fs::write(locks.join(format!("{}-00000000000000000001-{}-4000000000-000000001.lock", lock_name("/acc/c.png"), host_word())), "/acc/c.png\n").unwrap();
         let left = root.join(format!("acc/.c.png.{}-4000000000-1.tdbpart", host_word()));
         std::fs::write(&left, b"half").unwrap();
         let held = d.lock("/acc/c.png").unwrap();
@@ -636,7 +688,37 @@ mod tests {
         assert!(d.get("/acc/a.png", None, &out).is_err());
         assert!(d.get("/acc/missing.png", None, &tmp.join("vault/missing.png")).is_err());
         assert!(!tmp.join("vault/missing.png").exists());
+        assert!(d.get("/acc", None, &tmp.join("vault/folder.png")).is_err(), "a folder is not an asset's bytes");
+        assert!(!tmp.join("vault/folder.png").exists());
         assert!(d.size("/../escape", None).is_err());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn rclone_locks_let_several_pushes_through_one_at_a_time() {
+        let Some(exe) = test_rclone() else { return };
+        let tmp = std::env::temp_dir().join(format!("textdb-rclone-locks-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let root = tmp.to_string_lossy().replace('\\', "/");
+        let busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Instant::now();
+        let pushes: Vec<_> = (0..5)
+            .map(|_| {
+                let (exe, root, busy) = (exe.clone(), root.clone(), busy.clone());
+                std::thread::spawn(move || {
+                    let held = RcloneDriver::new(exe, root).lock("/img/a.png").unwrap();
+                    assert!(!busy.swap(true, Ordering::SeqCst), "two pushes held the lock at once");
+                    std::thread::sleep(Duration::from_millis(300));
+                    busy.store(false, Ordering::SeqCst);
+                    drop(held);
+                })
+            })
+            .collect();
+        for push in pushes {
+            push.join().unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_secs(120), "five pushes took {:?}", started.elapsed());
+        assert!(walk(&tmp.join(TRASH).join("locks")).is_empty());
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

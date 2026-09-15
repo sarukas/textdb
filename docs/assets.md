@@ -161,25 +161,29 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
   with the rclone configuration of the person running it. The store's root, shared with everyone
   using the store, must be `REMOTE:path` naming a remote of each person's own configuration
   (`teamdrive:textdb`): a connection string or options (some rclone options run programs) or a
-  leading `-` is refused, and a computer that needs one binds it locally, as it binds another
-  remote name for the same folder. Only `assets` commands start rclone (sync's check for store
-  folders inside a vault looks at local stores only), and `assets stores` reports a root rclone
-  cannot reach within about 30 seconds or that is not a folder. rclone flags set through
-  `RCLONE_*` environment variables are not passed on (its `RCLONE_CONFIG*` settings are), and
-  paths follow `--`. Layout, item (= path), trash, partial copies and the `beside` names are the
+  leading `-` or a one-letter name (a Windows drive) is refused, and a computer that needs one binds
+  it locally, as it binds another remote name for the same folder. rclone runs only to push, pull
+  or verify assets (`assets` commands, or a sync that pushes or pulls them) and for `assets
+  stores`, which reports a root rclone cannot reach within about 30 seconds or that is not a
+  folder; sync's check for store folders inside a vault looks at local stores only. rclone flags
+  set through `RCLONE_*` environment variables, in any letter case, are not passed on (its
+  `RCLONE_CONFIG*` settings are), and paths follow `--`. Layout, item (= path), trash, partial copies and the `beside` names are the
   local driver's, kept on the remote. An upload goes to a partial name next to its path and is
   hashed there (the provider's SHA-256 where it keeps one, such as Google Drive; else rclone reads
   it back) before it is moved into place; bytes a push replaces are first copied to the remote's
   `.textdb-trash/…` and checked. rclone removes what is at a path before a server-side move onto
   it, so the asset is briefly missing while it is replaced: the path is hashed after the move, and
-  when it does not hold the new bytes the push fails and what was there is copied back from the
-  trash. Every copy and move passes `--ignore-times`: rclone otherwise skips a copy onto a file of
-  the same size and time, and a move then deletes the new bytes and keeps the old. rclone cannot
-  create a file only when none is there, so pushes take turns by each writing its own lock file
-  (`<hash of the path>-HOST-PID-NANOS.lock`) into `.textdb-trash/locks/` and holding the lock only
-  when two listings a moment apart show its file and no other of that path; otherwise it removes
-  its file and tries again a little later. This relies on the provider listing what was just
-  written. Lock files, partial copies and failed trash copies are deleted outright, not into the
+  when it holds other bytes or none the push fails and what was there is copied back from the
+  trash (when the provider cannot be asked, after retries, a move rclone reported done counts).
+  Every copy and move passes `--ignore-times`: rclone otherwise skips a copy onto a file of the
+  same size and time, and a move then deletes the new bytes and keeps the old. A pull refuses a
+  folder where the asset's file should be. rclone cannot create a file only when none is there, so
+  pushes take turns through lock files (`<hash of the path>-MILLIS-HOST-PID-NANOS.lock`) in
+  `.textdb-trash/locks/`: a push writes its own only when a listing shows no other of that path,
+  and holds the lock when two listings a moment apart show its file alone; where several wrote at
+  once, the push that started first keeps its file and the others remove theirs, and a push waits,
+  longer each time, while another file is listed. This relies on the provider listing what was
+  just written. Lock files, partial copies and failed trash copies are deleted outright, not into the
   provider's trash; a lock of a process of this computer that is not running any more is removed,
   and one that could not be removed is reported. A Google document (no bytes) is never an asset.
   The local and rclone drivers' locks do not see each other: one team should reach a store
