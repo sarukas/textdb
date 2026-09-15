@@ -33,6 +33,9 @@ CREATE OR REPLACE TEMP VIEW folders AS
          files, folders, nbytes, nlines, nwords, versions, updated_at FROM kb.entry WHERE kind = 'folder';
 CREATE OR REPLACE TEMP VIEW frontmatter AS
   SELECT n.path, f.data FROM kb.frontmatter f JOIN kb.node n ON n.id = f.file_id AND n.deleted_at IS NULL;
+CREATE OR REPLACE TEMP VIEW properties AS
+  SELECT n.path, r.key, r.val_txt AS value, r.val_num AS number, r.ord
+  FROM kb.property r JOIN kb.node n ON n.id = r.file_id AND n.deleted_at IS NULL;
 CREATE OR REPLACE TEMP VIEW sections AS
   SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to
   FROM kb.section s JOIN kb.node n ON n.id = s.file_id AND n.deleted_at IS NULL;

@@ -467,3 +467,78 @@ fn sync_reconciles_both_sides_merges_and_marks_conflicts() {
     assert_eq!(quiet["unchanged"], 5, "{quiet}");
     assert_eq!(std::fs::read(dir.join("logo.png")).unwrap(), [0u8, 1, 2]);
 }
+
+/// The property index on Postgres: the same query language, the same answers.
+///
+/// Worth its own test rather than trusting the SQLite one: the two compile the query
+/// separately, and Postgres numbers its placeholders, which `!=` shifts along.
+#[test]
+fn properties_are_indexed_and_queryable_on_postgres() {
+    let Some(db) = database() else { return };
+    let note = |title: &str, status: &str, tags: &str, priority: u32, extra: &str| {
+        format!(
+            "---\ntitle: {title}\nstatus: {status}\ntags: [{tags}]\npriority: {priority}\nproject:\n  name: atlas\n---\n{extra}\n# {title}\n\nbody\n"
+        )
+    };
+    ok(textdb(&db).args(["write", "/a.md"]), Some(&note("A", "draft", "cvm, telco", 5, "")));
+    ok(textdb(&db).args(["write", "/b.md"]), Some(&note("B", "review", "telco", 2, "")));
+    ok(textdb(&db).args(["write", "/c.md"]), Some(&note("C", "draft", "cvm", 1, "")));
+    ok(textdb(&db).args(["write", "/plain.md"]), Some("# Plain\n\nno front matter\n"));
+
+    let keys = ok(textdb(&db).args(["--json", "meta", "keys"]), None).json();
+    let by_key: std::collections::HashMap<String, Value> = keys
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["key"].as_str().unwrap().to_string(), r.clone()))
+        .collect();
+    assert_eq!(by_key["tags"]["docs"], 3, "a document with several tags counts once");
+    assert_eq!(by_key["priority"]["kind"], "number");
+    assert!(by_key.contains_key("project.name"), "nested keys are dotted");
+
+    let values = ok(textdb(&db).args(["--json", "meta", "values", "status"]), None).json();
+    let vs: Vec<(&str, i64)> = values
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["value"].as_str().unwrap(), r["docs"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(vs, vec![("draft", 2), ("review", 1)]);
+
+    let find = |q: &str| -> Vec<String> {
+        ok(textdb(&db).args(["--json", "meta", "find", q]), None).json()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["path"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(find("status:draft"), vec!["/a.md", "/c.md"]);
+    assert_eq!(find("tags:telco"), vec!["/a.md", "/b.md"]);
+    assert_eq!(find("status:draft tags:telco"), vec!["/a.md"]);
+    assert_eq!(find("status:draft OR status:review").len(), 3);
+    assert_eq!(find("-status:draft"), vec!["/b.md"]);
+    assert_eq!(find("priority:>3"), vec!["/a.md"], "numbers compare numerically");
+    assert_eq!(find("tags:c*"), vec!["/a.md", "/c.md"]);
+    assert_eq!(find("title:~B"), vec!["/b.md"]);
+    // The placeholder shift `!=` needs is exactly what a second subquery could get wrong.
+    assert_eq!(find("status:!=draft"), vec!["/b.md"]);
+    assert_eq!(find("status:draft").len() + find("status:!=draft").len(), 3);
+    // A property search is over documents that have properties, so /plain.md is in none.
+    assert_eq!(find("").len(), 3);
+
+    ok(textdb(&db).args(["meta", "set", "/c.md", "status", "published"]), None);
+    assert_eq!(find("status:draft"), vec!["/a.md"]);
+    ok(textdb(&db).args(["rm", "/b.md"]), None);
+    assert_eq!(find("tags:telco"), vec!["/a.md"]);
+
+    // The `properties` view exposes the same rows to SQL, list order included.
+    let rows = ok(textdb(&db).args(["--json", "sql", "SELECT key, value, ord FROM properties WHERE key = 'tags' AND path = '/a.md' ORDER BY ord"]), None).json();
+    let vals: Vec<(&str, i64)> = rows["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["value"].as_str().unwrap(), r["ord"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(vals, vec![("cvm", 0), ("telco", 1)]);
+}

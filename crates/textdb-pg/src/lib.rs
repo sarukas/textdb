@@ -503,6 +503,17 @@ mod kb {
     const P: ChunkParams = ChunkParams::DEFAULT;
     const RETRIES: usize = textdb_core::DEFAULT_RETRIES;
 
+    /// Raise `e` with its textdb SQLSTATE.
+    ///
+    /// Known gap, and not specific to any one caller: from a **set-returning** function the
+    /// custom code is lost and Postgres reports `XX000` with the message intact. `kb.content`
+    /// raises `TX003` correctly; `kb.leaf_hashes` and `kb.prop_find`, which return
+    /// `TableIterator`, report the same failure as `XX000`. Clients that switch on the code
+    /// — the CLI's exit status, the SDKs' error classes — therefore see a generic error from
+    /// those functions where SQLite gives them a specific one. The message is unaffected, so
+    /// nothing is silently wrong, only less precise. Fixing it means raising without going
+    /// through SPI, which is a change to the extension's whole error path rather than to one
+    /// function, so it is recorded here rather than bolted onto a caller.
     fn fail(e: TextdbError) -> ! {
         match &e {
             TextdbError::Conflict(c) => raise("TX001", &e.to_string(), &serde_json::to_string(c).unwrap_or_default()),
@@ -1815,6 +1826,20 @@ mod kb {
         TableIterator::new(rows)
     }
 
+    /// Build the property rows for every document that has front matter and none yet.
+    ///
+    /// A store whose documents predate the `property` table answers metadata queries with
+    /// nothing until this has run — silently, which is worse than slowly, so it is a named
+    /// repair rather than something hidden in a read path. Idempotent: it skips documents
+    /// that already have rows, so running it twice costs one query.
+    #[pg_extern]
+    fn rebuild_properties() -> i64 {
+        ok(crate::property::backfill());
+        Spi::get_one::<i64>("SELECT count(*) FROM kb.property")
+            .unwrap_or(Some(0))
+            .unwrap_or(0)
+    }
+
     /// `[lo, hi)` covering everything that starts with `p`, so a prefix match reads an index
     /// range instead of `LIKE 'p%'`.
     fn prefix_range(p: &str) -> (String, String) {
@@ -1935,6 +1960,7 @@ mod kb {
                     (SELECT f.data::text FROM kb.frontmatter f WHERE f.file_id = n.id AND f.version = n.version)
                FROM kb.node n
               WHERE n.deleted_at IS NULL AND n.kind = 1
+                AND EXISTS (SELECT 1 FROM kb.property u WHERE u.file_id = n.id)
                 AND ({where_clause})
                 AND (${folder_i} = '/' OR n.path = ${folder_i} OR n.path LIKE ${like_i} ESCAPE '\\')
               ORDER BY n.path

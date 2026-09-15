@@ -413,6 +413,33 @@ impl Backend for TextdbSqlite {
             Ok(())
         })
     }
+    fn property_keys(&self, prefix: &str) -> R<Vec<(String, u64)>> {
+        self.with(|c| {
+            let mut st = c.prepare_cached("SELECT key, docs FROM textdb_prop_keys(?1, 10000)")?;
+            let rows = st
+                .query_map(params![prefix], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+    fn property_values(&self, key: &str, prefix: &str) -> R<Vec<(String, u64)>> {
+        self.with(|c| {
+            let mut st = c.prepare_cached("SELECT value, docs FROM textdb_prop_values(?1, ?2, 10000)")?;
+            let rows = st
+                .query_map(params![key, prefix], |r| {
+                    Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, i64>(1)? as u64))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+    fn property_find(&self, query: &str) -> R<Vec<String>> {
+        self.with(|c| {
+            let mut st = c.prepare_cached("SELECT path FROM textdb_prop_find(?1, '/', 1000000)")?;
+            let rows = st.query_map(params![query], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
     fn sync_dir(&self, prefix: &str, dir: &std::path::Path) -> R<crate::backend::SyncStats> {
         super::run_sync(&self.file.display().to_string(), prefix, dir)
     }

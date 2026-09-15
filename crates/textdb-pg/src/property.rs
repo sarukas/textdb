@@ -21,17 +21,6 @@ pub fn write_rows(file_id: i64, version: i64, data: Option<&serde_json::Value>) 
     insert(file_id, version, &textdb_md::query::flatten(data))
 }
 
-/// Carry the rows forward when a commit changed content but not structure: they are keyed to
-/// the document's current version, so a stale one would hide them from every query.
-pub fn touch_version(file_id: i64, version: i64) -> Result<()> {
-    Spi::run_with_args(
-        "UPDATE kb.property SET version = $1 WHERE file_id = $2 AND version <> $1",
-        &[version.into(), file_id.into()],
-    )
-    .map_err(storage_err)?;
-    Ok(())
-}
-
 fn insert(file_id: i64, version: i64, props: &[Prop]) -> Result<()> {
     for batch in props.chunks(ROW_BATCH) {
         // Unnested arrays rather than a statement per row: a document with a dozen properties
@@ -63,8 +52,9 @@ fn insert(file_id: i64, version: i64, props: &[Prop]) -> Result<()> {
 
 /// Build the rows for every document that has front matter and none yet.
 ///
-/// The extension creates its schema fresh, so this is for a store whose documents were
-/// written by a build without the table — it runs from `kb.migrate`.
+/// A fresh `CREATE EXTENSION` makes the table with the schema, so this is for a store whose
+/// documents were written by a build that had no such table. Reached through
+/// `kb.rebuild_properties()`, next to `kb.rebuild_folder_totals()`.
 pub fn backfill() -> Result<()> {
     let pending: Vec<(i64, i64, String)> = Spi::connect(|client| {
         let rows = client

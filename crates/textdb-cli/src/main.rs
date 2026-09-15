@@ -172,7 +172,7 @@ enum Cmd {
         op: AssetsOp,
     },
     /// Run one SQL statement against the store and print its rows. Besides `kb` and the textdb
-    /// functions, the views files, folders, frontmatter, sections, links, commits and authors
+    /// functions, the views files, folders, frontmatter, properties, sections, links, commits and authors
     /// describe the live store by path. Read-only unless --write.
     Sql {
         /// The statement; read from stdin when omitted or `-`.
@@ -1815,6 +1815,11 @@ enum MetaOp {
     /// `NOT` (or a leading `-`) and parentheses work as written. Quote a value with spaces.
     Find {
         /// The query. An empty one lists every document that has front matter.
+        ///
+        /// `allow_hyphen_values`: `-status:archived` is the documented way to negate a term,
+        /// and without this clap reads it as `-s tatus:archived` — the store flag — and
+        /// searches an empty store instead of complaining.
+        #[arg(allow_hyphen_values = true)]
         query: Option<String>,
         /// Only below this folder.
         #[arg(long, default_value = "/")]

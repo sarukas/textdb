@@ -2297,3 +2297,126 @@ fn a_push_finishes_when_the_provider_lists_its_lock_file_late() {
     let left: Vec<_> = std::fs::read_dir(&locks).into_iter().flatten().flatten().map(|e| e.file_name()).collect();
     assert!(left.is_empty(), "locks left behind: {left:?}");
 }
+
+/// The front-matter property index: what a vault uses, what each property holds, and the
+/// query language over both.
+///
+/// The counts matter as much as the paths: a list has one row per element, so a note tagged
+/// three ways must still count once, and `meta keys` reporting three would quietly mislead
+/// every UI that shows it.
+#[test]
+fn properties_are_indexed_and_queryable_by_name_and_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let note = |title: &str, status: &str, tags: &str, priority: u32, extra: &str| {
+        format!(
+            "---\ntitle: {title}\nstatus: {status}\ntags: [{tags}]\npriority: {priority}\nproject:\n  name: atlas\n  phase: pilot\n{extra}---\n\n# {title}\n\nbody\n"
+        )
+    };
+    ok(textdb(&store).args(["write", "/a.md"]), Some(&note("A", "draft", "cvm, telco", 5, "budget: 120\n")));
+    ok(textdb(&store).args(["write", "/b.md"]), Some(&note("B", "review", "telco", 2, "")));
+    ok(textdb(&store).args(["write", "/c.md"]), Some(&note("C", "draft", "cvm", 1, "")));
+    // No front matter at all: it must not appear in any property answer.
+    ok(textdb(&store).args(["write", "/plain.md"]), Some("# Plain\n\nno front matter\n"));
+
+    let keys = ok(textdb(&store).args(["--json", "meta", "keys"]), None).json();
+    let by_key: std::collections::HashMap<String, serde_json::Value> = keys
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["key"].as_str().unwrap().to_string(), r.clone()))
+        .collect();
+    // Three documents carry `tags`, not five rows' worth.
+    assert_eq!(by_key["tags"]["docs"], 3, "a document with several tags counts once");
+    assert_eq!(by_key["status"]["values"], 2, "draft and review");
+    assert_eq!(by_key["priority"]["kind"], "number", "so a UI knows > means something here");
+    assert_eq!(by_key["status"]["kind"], "text");
+    assert_eq!(by_key["budget"]["docs"], 1, "a property only one note has is still listed");
+    assert!(by_key.contains_key("project.name"), "nested keys are dotted: {:?}", by_key.keys());
+
+    // The prefix is the autosuggest call.
+    let pro = ok(textdb(&store).args(["--json", "meta", "keys", "pro"]), None).json();
+    let names: Vec<&str> = pro.as_array().unwrap().iter().map(|r| r["key"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["project.name", "project.phase"]);
+
+    let values = ok(textdb(&store).args(["--json", "meta", "values", "status"]), None).json();
+    let vs: Vec<(&str, i64)> = values
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["value"].as_str().unwrap(), r["docs"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(vs, vec![("draft", 2), ("review", 1)], "most-used first");
+
+    let find = |q: &str| -> Vec<String> {
+        let rows = ok(textdb(&store).args(["--json", "meta", "find", q]), None).json();
+        rows.as_array().unwrap().iter().map(|r| r["path"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(find("status:draft"), vec!["/a.md", "/c.md"]);
+    // A list contains a value: indexed one row per element, so this is an ordinary equality.
+    assert_eq!(find("tags:telco"), vec!["/a.md", "/b.md"]);
+    assert_eq!(find("status:draft tags:telco"), vec!["/a.md"], "a space means AND");
+    assert_eq!(find("status:draft OR status:review").len(), 3);
+    assert_eq!(find("-status:draft"), vec!["/b.md"]);
+    assert_eq!(find("NOT status:draft"), vec!["/b.md"], "either spelling of NOT");
+    assert_eq!(find("(status:draft OR status:review) has:budget"), vec!["/a.md"]);
+    assert_eq!(find("project.name:atlas").len(), 3, "nested keys resolve");
+    // Numbers compare numerically: lexically "5" would sort below "2" here.
+    assert_eq!(find("priority:>3"), vec!["/a.md"]);
+    assert_eq!(find("priority:<=2").len(), 2);
+    assert_eq!(find("tags:c*"), vec!["/a.md", "/c.md"], "starts with");
+    assert_eq!(find("title:~B"), vec!["/b.md"], "contains, ignoring case");
+    // `!=` means "has it, but not as that" — /plain.md has no status and is not an answer.
+    assert_eq!(find("status:!=draft"), vec!["/b.md"]);
+    // The two partition the documents that have the property, exactly.
+    assert_eq!(find("status:draft").len() + find("status:!=draft").len(), 3);
+    // An empty query is every document that has front matter, so not /plain.md.
+    assert_eq!(find("").len(), 3, "a document with no front matter is in no property answer");
+
+    // Editing front matter moves the document between answers.
+    ok(textdb(&store).args(["meta", "set", "/c.md", "status", "published"]), None);
+    assert_eq!(find("status:draft"), vec!["/a.md"]);
+    assert_eq!(find("status:published"), vec!["/c.md"]);
+    // Removing the property removes the rows with it.
+    ok(textdb(&store).args(["meta", "unset", "/c.md", "status"]), None);
+    assert_eq!(find("has:status").len(), 2);
+    // And deleting the document takes it out of every answer.
+    ok(textdb(&store).args(["rm", "/b.md"]), None);
+    assert_eq!(find("tags:telco"), vec!["/a.md"]);
+
+    // A malformed query is an invalid edit (exit 6), named with the offset it went wrong at.
+    let bad = run(textdb(&store).args(["meta", "find", "status:draft AND"]), None);
+    assert_eq!(bad.status, 6, "{}", bad.stderr);
+    assert!(bad.stderr.contains("ends early"), "{}", bad.stderr);
+}
+
+/// `meta find --show` prints property columns beside the path, and the `properties` view
+/// exposes the same rows to SQL.
+#[test]
+fn property_columns_and_the_sql_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    ok(
+        textdb(&store).args(["write", "/a.md"]),
+        Some("---\nstatus: draft\ntags: [cvm, telco]\npriority: 4\n---\n\n# A\n"),
+    );
+    let shown = ok(textdb(&store).args(["meta", "find", "status:draft", "--show", "status,tags,missing"]), None).stdout;
+    assert!(shown.contains("status=draft"), "{shown}");
+    // A list joins with commas rather than printing as JSON, and a property the document does
+    // not have is a dash rather than a blank that reads as an empty value.
+    assert!(shown.contains("tags=cvm,telco"), "{shown}");
+    assert!(shown.contains("missing=-"), "{shown}");
+
+    let rows = ok(
+        textdb(&store).args(["--json", "sql", "SELECT key, value, ord FROM properties WHERE key = 'tags' ORDER BY ord"]),
+        None,
+    )
+    .json();
+    let vals: Vec<(&str, i64)> = rows["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["value"].as_str().unwrap(), r["ord"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(vals, vec![("cvm", 0), ("telco", 1)], "a list keeps its order in `ord`");
+}

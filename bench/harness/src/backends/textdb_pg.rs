@@ -363,6 +363,27 @@ impl Backend for TextdbPg {
             Ok(())
         })
     }
+    fn property_keys(&self, prefix: &str) -> R<Vec<(String, u64)>> {
+        self.with(|c| {
+            let rows = c.query("SELECT key, docs FROM kb.prop_keys($1, 10000)", &[&prefix])?;
+            Ok(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1) as u64)).collect())
+        })
+    }
+    fn property_values(&self, key: &str, prefix: &str) -> R<Vec<(String, u64)>> {
+        self.with(|c| {
+            let rows = c.query("SELECT value, docs FROM kb.prop_values($1, $2, 10000)", &[&key, &prefix])?;
+            Ok(rows
+                .iter()
+                .map(|r| (r.get::<_, Option<String>>(0).unwrap_or_default(), r.get::<_, i64>(1) as u64))
+                .collect())
+        })
+    }
+    fn property_find(&self, query: &str) -> R<Vec<String>> {
+        self.with(|c| {
+            let rows = c.query("SELECT path FROM kb.prop_find($1, '/', 1000000)", &[&query])?;
+            Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+        })
+    }
     fn sync_dir(&self, prefix: &str, dir: &std::path::Path) -> R<crate::backend::SyncStats> {
         super::run_sync(&self.url, prefix, dir)
     }

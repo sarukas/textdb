@@ -217,6 +217,19 @@ pub trait Backend: Send + Sync {
     fn set_link_mode(&self, _mode: &str) -> R<()> {
         Err(BackendError::NotSupported("no link rewriting"))
     }
+    /// Front-matter property names in use, as `(key, documents)`.
+    fn property_keys(&self, _prefix: &str) -> R<Vec<(String, u64)>> {
+        Err(BackendError::NotSupported("no property index"))
+    }
+    /// The values one property takes, as `(value, documents)`.
+    fn property_values(&self, _key: &str, _prefix: &str) -> R<Vec<(String, u64)>> {
+        Err(BackendError::NotSupported("no property index"))
+    }
+    /// Paths matching a property query.
+    fn property_find(&self, _query: &str) -> R<Vec<String>> {
+        Err(BackendError::NotSupported("no property index"))
+    }
+
     /// Reconcile the store folder `prefix` with the directory `dir`, both ways.
     ///
     /// No baseline has this: `fs` *is* a directory, and the `sql-text-*` stores have no

@@ -7,7 +7,7 @@ import uuid
 
 import pytest
 
-from textdb import Conflict, Corpus, InvalidEdit, NotFound
+from textdb import Conflict, Corpus, InvalidEdit, NotFound, TextdbError
 from textdb.backends.sqlite import find_extension
 
 URLS = []
@@ -131,3 +131,108 @@ def test_edit_with_retry(kb):
     for _ in range(5):
         kb.edit_with_retry(p, lambda t: t.replace(f"count: {int(t.split(':')[1])}", f"count: {int(t.split(':')[1]) + 1}"))
     assert kb.read(p) == "count: 5\n"
+
+
+def _note(title, status, tags, priority, extra=""):
+    return (
+        f"---\ntitle: {title}\nstatus: {status}\ntags: [{', '.join(tags)}]\n"
+        f"priority: {priority}\nproject:\n  name: atlas\n---\n{extra}\n# {title}\n\nbody\n"
+    )
+
+
+@pytest.fixture
+def vault(kb):
+    """Four documents under this test's own root.
+
+    The Postgres fixture shares one database between tests, so everything here is scoped to
+    `P(kb, ...)` and every query names that folder — otherwise these assertions would count
+    whatever else happens to be in the database.
+    """
+    kb.write(P(kb, "/a.md"), _note("A", "draft", ["cvm", "telco"], 5))
+    kb.write(P(kb, "/b.md"), _note("B", "review", ["telco"], 2))
+    kb.write(P(kb, "/c.md"), _note("C", "draft", ["cvm"], 1))
+    kb.write(P(kb, "/plain.md"), "# Plain\n\nno front matter\n")
+    return kb
+
+
+def _paths(kb, q):
+    """Matching paths, with this test's root stripped so the assertions read plainly."""
+    root = getattr(kb, "_root", "")
+    return [h.path[len(root):] for h in kb.property_find(q, folder=root or "/")]
+
+
+def test_property_keys_count_documents_not_rows(vault):
+    by_key = {k.key: k for k in vault.property_keys()}
+    # Three documents carry `tags`; five rows of them, since a list is one row per element.
+    # On Postgres the store is shared, so this counts at least three rather than exactly.
+    assert by_key["tags"].docs >= 3
+    # A UI offers `>` only where it means something.
+    assert by_key["priority"].kind == "number"
+    assert by_key["status"].kind == "text"
+    assert "project.name" in by_key, "nested keys are dotted"
+
+
+def test_property_keys_and_values_narrow_by_prefix(vault):
+    # Containment, not equality: the Postgres fixture shares one database, so other tests'
+    # documents can contribute keys under the same prefix.
+    assert "project.name" in [k.key for k in vault.property_keys("project.")]
+    values = {v.value for v in vault.property_values("status")}
+    assert {"draft", "review"} <= values
+    assert [v.value for v in vault.property_values("tags", "tel")] == ["telco"]
+
+
+def test_property_find_handles_the_whole_grammar(vault):
+    paths = lambda q: _paths(vault, q)  # noqa: E731
+    assert paths("status:draft") == ["/a.md", "/c.md"]
+    # A list containing a value is an ordinary equality, because lists are rows.
+    assert paths("tags:telco") == ["/a.md", "/b.md"]
+    assert paths("status:draft tags:telco") == ["/a.md"]
+    assert len(paths("status:draft OR status:review")) == 3
+    assert paths("-status:draft") == ["/b.md"]
+    assert paths("NOT status:draft") == ["/b.md"]
+    assert len(paths("project.name:atlas")) == 3
+    # Numbers compare numerically: lexically "5" would sort below "2".
+    assert paths("priority:>3") == ["/a.md"]
+    assert paths("tags:c*") == ["/a.md", "/c.md"]
+    assert paths("title:~B") == ["/b.md"]
+    assert paths("(status:draft OR status:review) has:priority") == ["/a.md", "/b.md", "/c.md"]
+
+
+def test_not_equal_means_has_it_but_not_as_that(vault):
+    paths = lambda q: _paths(vault, q)  # noqa: E731
+    # /plain.md has no status at all, so it is not a document whose status is not draft.
+    assert paths("status:!=draft") == ["/b.md"]
+    assert len(paths("status:draft")) + len(paths("status:!=draft")) == 3
+
+
+def test_a_property_search_is_over_documents_that_have_properties(vault):
+    hits = _paths(vault, "")
+    assert len(hits) == 3
+    assert "/plain.md" not in hits
+
+
+def test_hits_carry_the_whole_front_matter(vault):
+    root = getattr(vault, "_root", "")
+    hit = vault.property_find("status:draft tags:telco", folder=root or "/")[0]
+    assert hit.frontmatter["status"] == "draft"
+    assert hit.frontmatter["tags"] == ["cvm", "telco"]
+    assert hit.frontmatter["priority"] == 5
+    assert hit.nbytes > 0
+
+
+def test_the_index_follows_edits_and_deletes(vault):
+    paths = lambda q: _paths(vault, q)  # noqa: E731
+    vault.write(P(vault, "/c.md"), _note("C", "published", ["cvm"], 1))
+    assert paths("status:draft") == ["/a.md"]
+    assert paths("status:published") == ["/c.md"]
+    vault.delete(P(vault, "/b.md"))
+    assert paths("tags:telco") == ["/a.md"]
+
+
+def test_a_malformed_query_raises_naming_where(vault):
+    # The message names the offset on both backends. The *class* differs: Postgres loses a
+    # custom SQLSTATE raised from a set-returning function (see `fail` in textdb-pg), so it
+    # arrives as a plain TextdbError rather than InvalidEdit — a pre-existing gap that
+    # kb.leaf_hashes has too, not something this query path introduced.
+    with pytest.raises(TextdbError, match="ends early"):
+        vault.property_find("status:draft AND")

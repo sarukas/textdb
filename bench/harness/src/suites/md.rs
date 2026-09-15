@@ -25,6 +25,7 @@ pub fn markdown(ctx: &Ctx) -> anyhow::Result<()> {
         "frontmatter" => frontmatter(ctx),
         "sections" => sections(ctx),
         "feed" => feed(ctx),
+        "property_search" => property_search(ctx),
         other => anyhow::bail!("unknown md variant {}", other),
     }
 }
@@ -676,5 +677,127 @@ fn feed(ctx: &Ctx) -> anyhow::Result<()> {
         }
     }
     ctx.cell.lat("", "feed_full", &full);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// MD-07 — searching front matter
+// ---------------------------------------------------------------------------------------
+
+/// Property queries over a corpus whose front matter is known, so every count is checked.
+///
+/// The two autosuggest calls are the ones that decide whether the UI feels instant: they run
+/// on every keystroke, so they are reported separately from the search itself. `keys` is the
+/// one that used to be worst — enumerating property names meant reading every document's JSON,
+/// 67 ms over 50,000 notes — and is now an index range.
+fn property_search(ctx: &Ctx) -> anyhow::Result<()> {
+    let n = ctx.params.usize("n_files", 500);
+    let size = ctx.params.usize("file_size", 2048);
+    // Front matter with a known distribution: every fourth note is a draft, every third is
+    // tagged `telco`, and `budget` is the long tail a real vault always has.
+    let docs: Vec<(String, Vec<u8>)> = (0..n)
+        .map(|i| {
+            let status = ["draft", "review", "published", "archived"][i % 4];
+            let tags = if i % 3 == 0 { "telco, cvm" } else { "cvm" };
+            let mut body = format!(
+                "---\ntitle: Note {i}\nstatus: {status}\ntags: [{tags}]\npriority: {}\nproject:\n  name: atlas\n",
+                1 + (i % 5)
+            );
+            if i % 10 == 0 {
+                body.push_str(&format!("budget: {}\n", 100 + i));
+            }
+            body.push_str("---\n\n# Note\n\n");
+            while body.len() < size {
+                body.push_str("Filler prose that is long enough to be chunked sensibly.\n");
+            }
+            (format!("/prop/f{:05}.md", i), body.into_bytes())
+        })
+        .collect();
+    let mut lat = Latencies::default();
+    for (path, body) in &docs {
+        if let Err(e) = ctx.op(ops::CREATE, &mut lat, || ctx.backend.create(path, body)) {
+            ctx.err("", "create", &e);
+            return Ok(());
+        }
+    }
+    ctx.cell.lat("", "create", &lat);
+
+    // What the vault uses. The oracle is the generator: eight names, and `budget` on a tenth.
+    let mut keys = Latencies::default();
+    match ctx.op(ops::PROP_KEYS, &mut keys, || ctx.backend.property_keys("")) {
+        Ok(rows) => {
+            let by: std::collections::HashMap<&str, u64> = rows.iter().map(|(k, d)| (k.as_str(), *d)).collect();
+            // A list is one row per element, so a note tagged twice must still count once.
+            let tags_ok = by.get("tags") == Some(&(n as u64));
+            let budget_ok = by.get("budget") == Some(&(n as u64).div_ceil(10));
+            if tags_ok && budget_ok && by.contains_key("project.name") {
+                ctx.cell.metric("", "keys_match_corpus", 1.0);
+            } else {
+                ctx.cell.fail("", "keys_match_corpus", &format!("{:?}", rows));
+            }
+        }
+        Err(e) => {
+            if unsupported(ctx, "property_keys", &e) {
+                return Ok(());
+            }
+            ctx.err("", "property_keys", &e);
+            return Ok(());
+        }
+    }
+    ctx.cell.lat("", "prop_keys", &keys);
+
+    // The same call a UI makes per keystroke while a name is being typed.
+    let mut prefix = Latencies::default();
+    for p in ["p", "pr", "pro", "proj"] {
+        if ctx.op(ops::PROP_KEYS, &mut prefix, || ctx.backend.property_keys(p)).is_err() {
+            break;
+        }
+    }
+    ctx.cell.lat("", "prop_keys_prefix", &prefix);
+
+    let mut values = Latencies::default();
+    match ctx.op(ops::PROP_VALUES, &mut values, || ctx.backend.property_values("status", "")) {
+        Ok(rows) => {
+            let total: u64 = rows.iter().map(|(_, d)| d).sum();
+            if rows.len() == 4 && total == n as u64 {
+                ctx.cell.metric("", "values_match_corpus", 1.0);
+            } else {
+                ctx.cell.fail("", "values_match_corpus", &format!("{} values, {} docs", rows.len(), total));
+            }
+        }
+        Err(e) => {
+            ctx.err("", "property_values", &e);
+        }
+    }
+    ctx.cell.lat("", "prop_values", &values);
+
+    // Each query's answer is arithmetic on the generator, so a wrong index fails rather than
+    // merely looking fast.
+    let quarter = n.div_ceil(4);
+    let cases: [(&str, usize); 6] = [
+        ("status:draft", quarter),
+        ("tags:telco", n.div_ceil(3)),
+        ("priority:>3", (0..n).filter(|i| 1 + (i % 5) > 3).count()),
+        ("status:draft tags:telco", (0..n).filter(|i| i % 4 == 0 && i % 3 == 0).count()),
+        ("has:budget", n.div_ceil(10)),
+        ("status:!=draft", n - quarter),
+    ];
+    for (query, want) in cases {
+        let mut one = Latencies::default();
+        match ctx.op(ops::PROP_FIND, &mut one, || ctx.backend.property_find(query)) {
+            Ok(paths) => {
+                if paths.len() == want {
+                    ctx.cell.metric(query, "hits", paths.len() as f64);
+                } else {
+                    ctx.cell.fail(query, "hits", &format!("{} of {}", paths.len(), want));
+                }
+            }
+            Err(e) => {
+                ctx.err(query, "property_find", &e);
+                break;
+            }
+        }
+        ctx.cell.lat(query, "find", &one);
+    }
     Ok(())
 }

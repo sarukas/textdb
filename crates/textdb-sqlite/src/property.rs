@@ -109,6 +109,12 @@ pub struct Sql {
 
 /// Compile a parsed query into a predicate over `{p}node n`.
 ///
+/// The caller pairs this with "the document has at least one property row", which is what
+/// makes the answers consistent. Without it the universe is every document, so `-status:draft`
+/// returns notes with no front matter at all — they are not draft, after all — while an empty
+/// query returns them too, and the two disagree with everything else the family reports. A
+/// property search is over documents that have properties.
+///
 /// Every term becomes an `EXISTS` against the property rows of the row being tested, which is
 /// what keeps `NOT` honest: `-status:archived` has to mean "no property row says archived",
 /// not "some row says something else", and a join would have given the second. It also makes
@@ -330,6 +336,7 @@ impl TextDb<'_> {
                         (SELECT f.data FROM {p}frontmatter f WHERE f.file_id = n.id AND f.version = n.version)
                    FROM {p}node n
                   WHERE n.deleted_at IS NULL AND n.kind = 1
+                    AND EXISTS (SELECT 1 FROM {p}property u WHERE u.file_id = n.id)
                     AND ({where_clause})
                     AND (? = '/' OR n.path = ? OR (n.path >= ? AND n.path < ?))
                   ORDER BY n.path

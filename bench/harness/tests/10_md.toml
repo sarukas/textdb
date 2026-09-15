@@ -98,3 +98,17 @@ file_size = 4096
 n_files = 200
 n_changes = 2000
 file_size = 2048
+
+[[test]]
+id = "MD-07"
+family = "MD"
+kind = "markdown"
+reps = 3
+note = "front-matter property search: what the vault uses, what a property holds, and queries over both — with the autosuggest calls timed separately, since they run per keystroke"
+[test.spec]
+variant = "property_search"
+n_files = 20000
+file_size = 4096
+[test.poc]
+n_files = 2000
+file_size = 2048
