@@ -86,6 +86,29 @@ CREATE TABLE IF NOT EXISTS {p}frontmatter (
   file_id INTEGER NOT NULL, version INTEGER NOT NULL, data TEXT,
   PRIMARY KEY (file_id, version)
 );
+-- One row per (document, property path, value), derived from `frontmatter` at every
+-- commit. Front matter is JSON, and neither SQLite nor a scan of it can be indexed, so
+-- asking "which notes have status: draft" read every row and parsed it. These rows make
+-- that an index seek, and make a list membership (`tags` contains `telco`) an ordinary
+-- equality rather than a search inside an array. HEAD only, like the other structure
+-- tables (ADR 0007).
+CREATE TABLE IF NOT EXISTS {p}property (
+  file_id INTEGER NOT NULL,
+  version INTEGER NOT NULL,
+  key     TEXT NOT NULL,                      -- dotted path as written: `project.name`
+  key_lc  TEXT NOT NULL,                      -- and folded, which is what the indexes carry
+  val_txt TEXT NULL,                          -- every value as text; NULL for a null property
+  val_lc  TEXT NULL,
+  val_num REAL NULL,                          -- also as a number, when it is one
+  ord     INTEGER NOT NULL DEFAULT 0          -- position within a list; 0 for a scalar
+);
+-- Folded once on write rather than with `lower()` on read. A `lower(key) = ?` predicate is a
+-- function of the column, so SQLite cannot use an index for it and every lookup became a
+-- scan — measured at 13 ms where the seek is 0.2 ms. Folding in Rust also gets Unicode right,
+-- which SQLite's own `lower()` does not.
+CREATE INDEX IF NOT EXISTS {p}property_kv ON {p}property(key_lc, val_lc);
+CREATE INDEX IF NOT EXISTS {p}property_kn ON {p}property(key_lc, val_num);
+CREATE INDEX IF NOT EXISTS {p}property_file ON {p}property(file_id);
 CREATE TABLE IF NOT EXISTS {p}checkpoint (
   name TEXT NOT NULL, file_id INTEGER NOT NULL, path TEXT NOT NULL, root BLOB NOT NULL, version INTEGER NOT NULL,
   PRIMARY KEY (name, file_id)
@@ -210,6 +233,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("change", "batch", "TEXT NULL"),
     // Sync: the include rules each base was made with.
     ("sync", "rules", "TEXT"),
+    // Properties: the folded forms the indexes are built on.
+    ("property", "key_lc", "TEXT NOT NULL DEFAULT ''"),
+    ("property", "val_lc", "TEXT NULL"),
 ];
 
 /// Indexes on columns an older store gains in `migrate`, so they are created after them.
@@ -219,7 +245,10 @@ fn index_sql(p: &str) -> String {
          CREATE INDEX IF NOT EXISTS {p}link_resolved ON {p}link(resolved_id);
          CREATE INDEX IF NOT EXISTS {p}node_lower_name ON {p}node(lower(name)) WHERE deleted_at IS NULL;
          CREATE INDEX IF NOT EXISTS {p}node_lower_path ON {p}node(lower(path)) WHERE deleted_at IS NULL;
-         CREATE INDEX IF NOT EXISTS {p}change_batch ON {p}change(batch) WHERE batch IS NOT NULL;"
+         CREATE INDEX IF NOT EXISTS {p}change_batch ON {p}change(batch) WHERE batch IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS {p}property_kv ON {p}property(key_lc, val_lc);
+         CREATE INDEX IF NOT EXISTS {p}property_kn ON {p}property(key_lc, val_num);
+         CREATE INDEX IF NOT EXISTS {p}property_file ON {p}property(file_id);"
     )
 }
 
@@ -246,6 +275,10 @@ pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> 
     }
     if missing.is_empty() {
         conn.execute_batch(&index_sql(p))?;
+        // `property` arrives as a whole new table rather than as a column, so a store that is
+        // otherwise current still reaches here with it empty. Backfilling is what makes the
+        // first `meta find` on an existing vault return anything.
+        crate::property::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
         return Ok(0);
     }
     let backfill = missing.iter().any(|(table, _, _)| **table == "node");
@@ -262,6 +295,7 @@ pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> 
         if backfill_links {
             crate::links::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
         }
+        crate::property::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
         Ok(())
     };
     match run() {
@@ -276,7 +310,7 @@ pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> 
 
 pub fn drop_sql(p: &str) -> String {
     [
-        "node", "commit", "chunk", "tree_node", "chunk_ref", "section", "link", "frontmatter", "checkpoint", "change", "path_event",
+        "node", "commit", "chunk", "tree_node", "chunk_ref", "section", "link", "frontmatter", "property", "checkpoint", "change", "path_event",
         "setting", "file_author", "sync", "sync_file", "asset_store", "fts",
     ]
     .iter()

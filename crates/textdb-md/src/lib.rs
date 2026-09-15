@@ -8,6 +8,7 @@ use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use textdb_core::structure::{Link, Section, Structure, StructureExtractor};
 
 pub mod links;
+pub mod query;
 pub mod resolve;
 mod yaml;
 

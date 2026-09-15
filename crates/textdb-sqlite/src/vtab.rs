@@ -504,6 +504,9 @@ pub enum FnKind {
     Hunks,
     Chunks,
     PathHistory,
+    PropKeys,
+    PropValues,
+    PropFind,
 }
 
 pub struct FnSpec {
@@ -521,6 +524,9 @@ impl FnKind {
             FnKind::Feed => c"CREATE TABLE x(seq INTEGER, ts TEXT, op TEXT, path TEXT, old_path TEXT, node_kind TEXT, version INTEGER, base_version INTEGER, commit_kind TEXT, author TEXT, message TEXT, since INTEGER HIDDEN, lim INTEGER HIDDEN)",
             FnKind::Hunks => c"CREATE TABLE x(old_from INTEGER, old_count INTEGER, new_from INTEGER, new_count INTEGER, old_text TEXT, new_text TEXT, path TEXT HIDDEN, v1 INTEGER HIDDEN, v2 INTEGER HIDDEN)",
             FnKind::Chunks => c"CREATE TABLE x(ord INTEGER, hash TEXT, byte_from INTEGER, nbytes INTEGER, line_from INTEGER, nlines INTEGER, path TEXT HIDDEN, version INTEGER HIDDEN)",
+            FnKind::PropKeys => c"CREATE TABLE x(key TEXT, docs INTEGER, values_n INTEGER, kind TEXT, prefix TEXT HIDDEN, lim INTEGER HIDDEN)",
+            FnKind::PropValues => c"CREATE TABLE x(value TEXT, docs INTEGER, key TEXT HIDDEN, prefix TEXT HIDDEN, lim INTEGER HIDDEN)",
+            FnKind::PropFind => c"CREATE TABLE x(path TEXT, nbytes INTEGER, updated_at TEXT, frontmatter TEXT, query TEXT HIDDEN, folder TEXT HIDDEN, lim INTEGER HIDDEN)",
             FnKind::PathHistory => c"CREATE TABLE x(id INTEGER, ts TEXT, op TEXT, old_path TEXT, new_path TEXT, via TEXT, version INTEGER, author TEXT, path TEXT HIDDEN, node_id INTEGER HIDDEN)",
         }
     }
@@ -535,6 +541,9 @@ impl FnKind {
             FnKind::Hunks => 6,
             FnKind::Chunks => 6,
             FnKind::PathHistory => 8,
+            FnKind::PropKeys => 4,
+            FnKind::PropValues => 2,
+            FnKind::PropFind => 4,
         }
     }
     fn n_hidden(self) -> c_int {
@@ -547,6 +556,9 @@ impl FnKind {
             FnKind::Hunks => 3,
             FnKind::Chunks => 2,
             FnKind::PathHistory => 2,
+            FnKind::PropKeys => 2,
+            FnKind::PropValues => 3,
+            FnKind::PropFind => 3,
         }
     }
 }
@@ -722,6 +734,49 @@ unsafe impl VTabCursor for FnCursor<'_> {
                     .map_err(map_err)?
                     .into_iter()
                     .map(|h| vec![Value::Text(h.path), Value::Integer(h.line), Value::Text(h.snippet), Value::Real(h.rank)])
+                    .collect()
+            }
+            FnKind::PropKeys => {
+                let prefix = s(&hidden[0]).unwrap_or_default();
+                let lim = hidden_i64(&hidden[1]).map(|i| i.max(0) as usize).unwrap_or(200);
+                db.property_keys(&prefix, lim)
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(|k| {
+                        vec![
+                            Value::Text(k.key),
+                            Value::Integer(k.docs),
+                            Value::Integer(k.values),
+                            Value::Text(k.kind),
+                        ]
+                    })
+                    .collect()
+            }
+            FnKind::PropValues => {
+                let key = s(&hidden[0]).ok_or_else(|| Error::ModuleError("TX004 key is required".into()))?;
+                let prefix = s(&hidden[1]).unwrap_or_default();
+                let lim = hidden_i64(&hidden[2]).map(|i| i.max(0) as usize).unwrap_or(200);
+                db.property_values(&key, &prefix, lim)
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(|v| vec![v.value.map(Value::Text).unwrap_or(Value::Null), Value::Integer(v.docs)])
+                    .collect()
+            }
+            FnKind::PropFind => {
+                let q = s(&hidden[0]).unwrap_or_default();
+                let folder = s(&hidden[1]).unwrap_or_else(|| "/".into());
+                let lim = hidden_i64(&hidden[2]).map(|i| i.max(0) as usize).unwrap_or(500);
+                db.property_find(&q, &folder, lim)
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(|h| {
+                        vec![
+                            Value::Text(h.path),
+                            Value::Integer(h.nbytes),
+                            Value::Text(h.updated_at),
+                            h.frontmatter.map(Value::Text).unwrap_or(Value::Null),
+                        ]
+                    })
                     .collect()
             }
             FnKind::History => {

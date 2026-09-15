@@ -668,6 +668,7 @@ impl<'c> TextDb<'c> {
     /// one statement per row.
     fn write_structure(&self, file_id: i64, version: i64, s: &textdb_core::structure::Structure) -> Result<()> {
         if self.structure_matches(file_id, s)? {
+            self.touch_property_version(file_id, version)?;
             for t in ["section", "link"] {
                 self.conn
                     .prepare_cached(&format!("UPDATE {}{} SET version = ?1 WHERE file_id = ?2 AND version <> ?1", self.p, t))
@@ -734,6 +735,9 @@ impl<'c> TextDb<'c> {
                 .execute(params![file_id, version, fm.to_string()])
                 .map_err(sql_err)?;
         }
+        // The indexed form of the same front matter. Always called, including with `None`, so
+        // a document that loses its front matter loses its property rows with it.
+        self.write_property_rows(file_id, version, s.frontmatter.as_ref())?;
         // This file's links, and links to its headings, which may have changed.
         self.relink_where("l.file_id = ?1 OR (l.resolved_id = ?1 AND l.anchor IS NOT NULL)", vec![file_id.into()])?;
         Ok(())
