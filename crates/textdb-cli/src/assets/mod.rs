@@ -698,28 +698,67 @@ struct Written {
     text: String,
 }
 
-/// Every pointer in the store by what it names, its asset store and the item there: the paths of
-/// the assets naming it.
-type Locations = HashMap<(String, String), BTreeSet<String>>;
-
-/// A location as [`Locations`] keys it: without case, since Windows and macOS keep `a.png` and
+/// A location as [`InUse`] compares it: without case, since Windows and macOS keep `a.png` and
 /// `A.png` in the same file.
 fn location_key(location: &str) -> String {
     location.to_lowercase()
 }
 
-fn pointer_locations(st: &mut dyn Store) -> Result<Locations> {
-    let mut found: Locations = HashMap::new();
-    for head in st.file_heads("/")? {
-        if !is_asset_pointer(&head.path) {
-            continue;
-        }
-        if let Ok(p) = Pointer::parse(&st.read(&head.path, None)?.0) {
-            let path = asset_path(&head.path).to_string();
-            found.entry((p.store.clone(), location_key(p.item.as_deref().unwrap_or(&path)))).or_default().insert(path);
-        }
+/// What every pointer in the store names: by pointer path, its version and its asset store and
+/// location. Read again, for the pointers that changed, whenever the store changed.
+struct InUse {
+    seq: i64,
+    pointers: HashMap<String, (i64, Option<(String, String)>)>,
+}
+
+impl InUse {
+    fn new() -> InUse {
+        InUse { seq: -1, pointers: HashMap::new() }
     }
-    Ok(found)
+
+    fn refresh(&mut self, st: &mut dyn Store) -> Result<()> {
+        let seq = st.last_seq()?;
+        if seq == self.seq {
+            return Ok(());
+        }
+        let mut live = HashSet::new();
+        for head in st.file_heads("/")? {
+            if !is_asset_pointer(&head.path) {
+                continue;
+            }
+            live.insert(head.path.clone());
+            if self.pointers.get(&head.path).is_some_and(|(v, _)| *v == head.version) {
+                continue;
+            }
+            let names = Pointer::parse(&st.read(&head.path, Some(head.version))?.0)
+                .ok()
+                .map(|p| (p.store.clone(), location_key(p.item.as_deref().unwrap_or(asset_path(&head.path)))));
+            self.pointers.insert(head.path, (head.version, names));
+        }
+        self.pointers.retain(|path, _| live.contains(path));
+        self.seq = seq;
+        Ok(())
+    }
+
+    /// Whether a pointer other than the asset `own`'s names `location` in `store`.
+    fn shared(&self, store: &str, location: &str, own: &str) -> bool {
+        let key = (store.to_string(), location_key(location));
+        self.pointers
+            .iter()
+            .any(|(path, (_, names))| names.as_ref() == Some(&key) && location_key(asset_path(path)) != location_key(own))
+    }
+
+    /// Where the upload of `item` goes, and the bytes it may replace there: the asset's own where
+    /// they are kept (its path, or the item its pointer names), unless another pointer names them
+    /// too; otherwise the asset's path, next to anything already there.
+    fn target<'p>(&self, store: &str, item: &'p Item) -> (String, Option<&'p str>) {
+        item.pointer
+            .as_ref()
+            .filter(|p| p.store == store)
+            .map(|p| (p.item.clone().unwrap_or_else(|| item.path.clone()), p.sha256.as_str()))
+            .filter(|(location, _)| !self.shared(store, location, &item.path))
+            .map_or_else(|| (item.path.clone(), None), |(location, sha)| (location, Some(sha)))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -729,7 +768,7 @@ fn push_one(
     drivers: &mut Drivers,
     o: &PushOptions,
     cache: &mut VaultCache,
-    in_use: &Locations,
+    in_use: &mut InUse,
     item: &Item,
     written: &mut Vec<Written>,
 ) -> Outcome {
@@ -765,24 +804,33 @@ fn push_one(
         Err(e) => return Outcome::Failed(format!("{}: {e}", item.path)),
     };
     let old = item.pointer.as_ref();
-    // The upload replaces the asset's own bytes where they are kept (its path, or the item its
-    // pointer names), unless another pointer names them too; otherwise it goes to the asset's
-    // path, next to anything already there.
-    let shared = |location: &str| {
-        in_use
-            .get(&(store.clone(), location_key(location)))
-            .is_some_and(|users| users.iter().any(|u| location_key(u) != location_key(&item.path)))
+    // The target's lock is held until the pointer is committed, and which pointers name the
+    // target is read again once it is held: a push that reuses bytes already there commits its
+    // pointer before another push may decide to replace them.
+    let mut decided = None;
+    for _ in 0..8 {
+        if let Err(e) = in_use.refresh(st) {
+            return Outcome::Failed(format!("{}: {}", item.path, e.message));
+        }
+        let (target, _) = in_use.target(&store, item);
+        let held = match d.lock(&target) {
+            Ok(h) => h,
+            Err(e) => return Outcome::Failed(format!("{}: {}", item.path, e.message)),
+        };
+        if let Err(e) = in_use.refresh(st) {
+            return Outcome::Failed(format!("{}: {}", item.path, e.message));
+        }
+        let (again, replaces) = in_use.target(&store, item);
+        if again == target {
+            decided = Some((target, replaces, held));
+            break;
+        }
+    }
+    let Some((target, replaces, _held)) = decided else {
+        return Outcome::Conflict(format!("{}: the pointers naming its bytes kept changing during this push; run it again", item.path));
     };
-    let own = old
-        .filter(|p| p.store == store)
-        .map(|p| (p.item.clone().unwrap_or_else(|| item.path.clone()), p.sha256.as_str()))
-        .filter(|(location, _)| !shared(location));
-    let (target, replaces) = match &own {
-        Some((location, sha)) => (location.clone(), Some(*sha)),
-        None => (item.path.clone(), None),
-    };
-    let provider_item = match d.put(&target, &src, &sha, replaces) {
-        Ok(id) => id,
+    let (provider_item, _also_held) = match d.put(&target, &src, &sha, replaces) {
+        Ok(put) => put,
         Err(e) => return Outcome::Failed(format!("{}: {}", item.path, e.message)),
     };
     let p = Pointer {
@@ -797,7 +845,7 @@ fn push_one(
     // The bytes are in the asset store and checked; now the pointer, unless another push got there first.
     if st.stat(&pointer_path).ok().map(|s| s.version) != item.version {
         return Outcome::Conflict(format!(
-            "{}: its pointer changed in the store during this push; run it again (anything the upload replaced is in the asset store's trash)",
+            "{}: its pointer changed in the store during this push; run it again (the uploaded bytes stay in the asset store unused, and anything they replaced is in its trash)",
             item.path
         ));
     }
@@ -813,6 +861,9 @@ fn push_one(
     let on_disk = v.dir.join(format!("{}{SUFFIX}", item.rel));
     if let Err(e) = std::fs::write(&on_disk, &text) {
         return Outcome::Failed(format!("{}: the pointer is committed but could not be written to {} ({e}); sync writes it", item.path, on_disk.display()));
+    }
+    if let Some(location) = p.item.as_deref() {
+        in_use.pointers.insert(pointer_path.clone(), (w.version, Some((store.clone(), location_key(location)))));
     }
     // Recorded as synced only now that both sides have it.
     written.push(Written { path: pointer_path, version: w.version, text });
@@ -888,15 +939,11 @@ pub fn push(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, o: PushOpt
             return Err(StoreError::invalid(format!("several asset stores ({}): choose one for new assets with --to", names.join(", "))));
         }
     }
-    let mut in_use = if todo.is_empty() || o.dry_run { HashMap::new() } else { pointer_locations(st)? };
+    let mut in_use = InUse::new();
     let mut written = Vec::new();
     for item in &todo {
-        match push_one(st, &v, &mut drivers, &o, &mut cache, &in_use, item, &mut written) {
+        match push_one(st, &v, &mut drivers, &o, &mut cache, &mut in_use, item, &mut written) {
             Outcome::Done(j) => {
-                // What this push placed is in use for the assets after it.
-                if let (Some(store), Some(location)) = (j["store"].as_str(), j["item"].as_str()) {
-                    in_use.entry((store.to_string(), location_key(location))).or_default().insert(item.path.clone());
-                }
                 bytes += j["size"].as_u64().unwrap_or(0);
                 pushed.push(j);
             }

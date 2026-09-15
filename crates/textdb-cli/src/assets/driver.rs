@@ -41,10 +41,17 @@ pub trait Driver {
     fn size(&self, path: &str, item: Option<&str>) -> Result<Option<u64>>;
     /// The stored file's SHA-256 and size, `None` when it is not there. Reads the whole file.
     fn hash(&self, path: &str, item: Option<&str>) -> Result<Option<(String, u64)>>;
-    /// Keep `src`, whose SHA-256 is `sha256`, at `path`. Bytes there whose SHA-256 is `replaces`
-    /// go to the trash first; any other bytes there are kept, and `src` goes next to them. Returns
-    /// the item the bytes are at: the provider's id, or the path for a local store.
-    fn put(&self, path: &str, src: &Path, sha256: &str, replaces: Option<&str>) -> Result<Option<String>>;
+    /// Hold the lock of `path` (its case ignored), waiting while another push holds it. Pushes
+    /// hold it from deciding what to do at `path` until their pointer is committed.
+    fn lock(&self, _path: &str) -> Result<Held> {
+        Ok(Held::default())
+    }
+    /// Keep `src`, whose SHA-256 is `sha256`, at `path`, whose lock the caller holds. Bytes there
+    /// whose SHA-256 is `replaces` go to the trash first; any other bytes there are kept, and `src`
+    /// goes next to them. Returns the item the bytes are at (the provider's id, or the path for a
+    /// local store), and the locks of any other path it used, to hold until the pointer is
+    /// committed.
+    fn put(&self, path: &str, src: &Path, sha256: &str, replaces: Option<&str>) -> Result<(Option<String>, Held)>;
     /// Copy the stored file to `dest`, which must not exist.
     fn get(&self, path: &str, item: Option<&str>, dest: &Path) -> Result<()>;
     /// The folder on this computer the store keeps its files in, for a local store.
@@ -86,6 +93,18 @@ impl Drop for Lock {
     }
 }
 
+/// Locks held on paths of an asset store, released when dropped.
+#[derive(Default)]
+pub struct Held {
+    _locks: Vec<Lock>,
+}
+
+impl Held {
+    fn of(lock: Lock) -> Held {
+        Held { _locks: vec![lock] }
+    }
+}
+
 /// A folder reachable from this computer: a NAS, a USB disk, or a cloud drive synced to a folder.
 pub struct LocalDriver {
     pub root: PathBuf,
@@ -117,8 +136,8 @@ impl LocalDriver {
         }
     }
 
-    /// Hold the lock of store path `path` (its case ignored), waiting for another push holding it.
-    fn lock(&self, path: &str) -> Result<Lock> {
+    /// The lock file of store path `path` (its case ignored), waiting while another push holds it.
+    fn lock_file(&self, path: &str) -> Result<Lock> {
         use sha2::Digest;
         let dir = self.root.join(TRASH).join("locks");
         std::fs::create_dir_all(&dir).map_err(|e| io(dir.display(), e))?;
@@ -129,13 +148,15 @@ impl LocalDriver {
         loop {
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&file) {
                 Ok(mut f) => {
-                    let _ = writeln!(f, "{path}\npid {}", std::process::id());
+                    let _ = writeln!(f, "{path}\nheld by process {} on {} since {}", std::process::id(), super::host(), stamp(SystemTime::now()));
                     return Ok(Lock(file));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if started.elapsed() > LOCK_WAIT {
+                        let holder = std::fs::read_to_string(&file).unwrap_or_default();
+                        let holder = holder.lines().nth(1).unwrap_or("held by another push");
                         return Err(StoreError::other(format!(
-                            "another push has been putting {path} for {} minutes; if none is running, remove {}",
+                            "{path} is locked ({holder}) and was not released in {} minutes; if that push is not running any more, remove {}",
                             LOCK_WAIT.as_secs() / 60,
                             file.display()
                         )));
@@ -151,17 +172,19 @@ impl LocalDriver {
         }
     }
 
-    /// Keep `src` next to `path`, under the first [`beside`] name that is free or holds these bytes.
-    fn put_beside(&self, path: &str, src: &Path, sha256: &str) -> Result<Option<String>> {
+    /// Keep `src` next to `path`, under the first [`beside`] name that is free or holds these
+    /// bytes, whose lock is returned held.
+    fn put_beside(&self, path: &str, src: &Path, sha256: &str) -> Result<(Option<String>, Held)> {
         let mut n = 1;
         loop {
             let alt = beside(path, sha256, n);
+            let lock = self.lock_file(&alt)?;
             match self.hash(&alt, None)? {
-                Some((sha, _)) if sha == sha256 => return Ok(Some(alt)),
+                Some((sha, _)) if sha == sha256 => return Ok((Some(alt), Held::of(lock))),
                 Some(_) => n += 1,
                 None => {
                     self.place(&alt, src, sha256, None)?;
-                    return Ok(Some(alt));
+                    return Ok((Some(alt), Held::of(lock)));
                 }
             }
         }
@@ -303,26 +326,29 @@ impl Driver for LocalDriver {
         hash_file(&self.file(path)?).map(Some).map_err(|e| io(self.location(path), e))
     }
 
-    fn put(&self, path: &str, src: &Path, sha256: &str, replaces: Option<&str>) -> Result<Option<String>> {
+    fn put(&self, path: &str, src: &Path, sha256: &str, replaces: Option<&str>) -> Result<(Option<String>, Held)> {
         self.file(path)?;
         if !self.root.is_dir() {
             return Err(StoreError::other(format!("the asset store folder {} is not there", self.root.display())));
         }
         // The item of a local store is the path its bytes were put at, so a pointer moved in the
         // store still finds them.
-        // One push at a time decides what happens at a path, from the look at what is there to
-        // the new copy in place.
-        let _lock = self.lock(path)?;
+        let here = || (Some(path.to_string()), Held::default());
         match self.hash(path, None)? {
-            Some((sha, _)) if sha == sha256 => Ok(Some(path.to_string())),
-            None => self.place(path, src, sha256, None).map(|_| Some(path.to_string())),
+            Some((sha, _)) if sha == sha256 => Ok(here()),
+            None => self.place(path, src, sha256, None).map(|_| here()),
             Some((sha, _)) if Some(sha.as_str()) == replaces => match self.place(path, src, sha256, replaces)? {
-                true => Ok(Some(path.to_string())),
+                true => Ok(here()),
                 false => self.put_beside(path, src, sha256),
             },
             // Bytes something else may still name: kept, and these go next to them.
             Some(_) => self.put_beside(path, src, sha256),
         }
+    }
+
+    fn lock(&self, path: &str) -> Result<Held> {
+        self.file(path)?;
+        Ok(Held::of(self.lock_file(path)?))
     }
 
     fn local_root(&self) -> Option<&Path> {
@@ -465,7 +491,7 @@ mod tests {
         let (sha1, _) = hash_file(&src).unwrap();
         d.put("/acc/a.png", &src, &sha1, None).unwrap();
         assert_eq!(d.size("/acc/a.png", None).unwrap(), Some(3));
-        assert_eq!(d.put("/acc/a.png", &src, &sha1, None).unwrap().as_deref(), Some("/acc/a.png"), "the same bytes again copy nothing");
+        assert_eq!(d.put("/acc/a.png", &src, &sha1, None).unwrap().0.as_deref(), Some("/acc/a.png"), "the same bytes again copy nothing");
         assert_eq!(walk(&root).len(), 1);
         std::fs::write(&src, b"two!").unwrap();
         let (sha2, _) = hash_file(&src).unwrap();
@@ -489,10 +515,18 @@ mod tests {
         // Bytes the caller does not replace are kept; the new ones go next to them.
         std::fs::write(&src, b"five").unwrap();
         let sha5 = hash_file(&src).unwrap().0;
-        let beside = d.put("/acc/a.png", &src, &sha5, None).unwrap().unwrap();
+        let (placed, held) = d.put("/acc/a.png", &src, &sha5, None).unwrap();
+        let beside = placed.unwrap();
         assert_eq!(beside, format!("/acc/a ({}).png", &sha5[..8]));
+        assert_eq!(walk(&root.join(TRASH).join("locks")).len(), 1, "the lock of the name beside is held until dropped");
+        drop(held);
+        assert_eq!(walk(&root.join(TRASH).join("locks")).len(), 0);
         assert_eq!(d.hash("/acc/a.png", None).unwrap().unwrap().0, sha2);
-        assert_eq!(d.put("/acc/a.png", &src, &sha5, Some(&sha1)).unwrap().as_deref(), Some(beside.as_str()), "found there, not copied again");
+        assert_eq!(d.put("/acc/a.png", &src, &sha5, Some(&sha1)).unwrap().0.as_deref(), Some(beside.as_str()), "found there, not copied again");
+        let held = d.lock("/ACC/A.png").unwrap();
+        assert_eq!(walk(&root.join(TRASH).join("locks")).len(), 1);
+        drop(held);
+        assert!(d.lock("/acc/a.png").is_ok(), "released when dropped, and case does not matter");
         assert_eq!(walk(&root.join(TRASH)).len(), 4, "one, two!, three and four! were each replaced once; five replaced nothing");
         // Another push replaced the bytes while this one copied: they are put back, not trashed.
         assert!(!d.place("/acc/a.png", &src, &sha5, Some(&sha1)).unwrap());

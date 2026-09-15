@@ -139,7 +139,10 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
   names), and only when no other pointer names them (locations compared without case); anything
   else is kept and the upload goes to the asset's path, next to what is there, as
   `NAME (<first 8 of its sha256>).ext`, which the pointer's item records. Pushes of the same path
-  take turns (a lock file in `<root>/.textdb-trash/locks/`, waited on for up to ten minutes);
+  take turns (a lock file in `<root>/.textdb-trash/locks/`, naming the process and host that
+  holds it, waited on for up to ten minutes), holding it from reading which pointers name the
+  path until their own pointer is committed, so a push reusing bytes and one replacing them never
+  cross;
   what a push replaces is hard-linked into the trash and checked before the new copy replaces it
   in one step, so the asset is never missing from its path, and bytes put there some other way
   are kept. Within one push, what it has placed counts as in use for the assets after it. An
