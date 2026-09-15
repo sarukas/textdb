@@ -84,6 +84,16 @@ pub fn stamp(t: SystemTime) -> String {
 /// How long a push waits for another one putting the same path.
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// The process id in a lock file's `held by process PID on HOST since …` line, when that process
+/// is of this computer and not running any more.
+fn abandoned_lock(content: &str) -> Option<u32> {
+    let line = content.lines().nth(1)?.strip_prefix("held by process ")?;
+    let (pid, rest) = line.split_once(" on ")?;
+    let host = rest.split(" since ").next()?;
+    let pid: u32 = pid.parse().ok()?;
+    (host.eq_ignore_ascii_case(&host_word()) && !process_running(pid)).then_some(pid)
+}
+
 /// A held lock file, removed when dropped.
 struct Lock(PathBuf);
 
@@ -145,13 +155,27 @@ impl LocalDriver {
         let file = dir.join(format!("{}.lock", &name[..32]));
         let started = std::time::Instant::now();
         let mut told = false;
+        let mut checked: Option<std::time::Instant> = None;
         loop {
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&file) {
                 Ok(mut f) => {
-                    let _ = writeln!(f, "{path}\nheld by process {} on {} since {}", std::process::id(), super::host(), stamp(SystemTime::now()));
+                    let _ = writeln!(f, "{path}\nheld by process {} on {} since {}", std::process::id(), host_word(), stamp(SystemTime::now()));
                     return Ok(Lock(file));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // A lock left by a process of this computer that is not running any more (a
+                    // push that was killed) is removed, now and then looked at again.
+                    if checked.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(10)) {
+                        checked = Some(std::time::Instant::now());
+                        let content = std::fs::read_to_string(&file).unwrap_or_default();
+                        if let Some(pid) = abandoned_lock(&content) {
+                            if std::fs::read_to_string(&file).is_ok_and(|now| now == content) {
+                                eprintln!("removing the lock of {path} left by process {pid}, which is not running any more");
+                                let _ = std::fs::remove_file(&file);
+                                continue;
+                            }
+                        }
+                    }
                     if started.elapsed() > LOCK_WAIT {
                         let holder = std::fs::read_to_string(&file).unwrap_or_default();
                         let holder = holder.lines().nth(1).unwrap_or("held by another push");
@@ -196,6 +220,8 @@ impl LocalDriver {
     /// nothing is placed.
     pub(crate) fn place(&self, path: &str, src: &Path, sha256: &str, replace: Option<&str>) -> Result<bool> {
         let dest = self.file(path)?;
+        // The caller holds the path's lock: copies a killed push left here are nobody's.
+        remove_abandoned_partials(&dest);
         // The new copy first, complete and checked, next to where it goes; only then does the copy
         // it replaces move to the trash. A copy that fails leaves the store as it was.
         let part = partial(&dest);
@@ -263,11 +289,50 @@ fn beside(path: &str, sha256: &str, n: u32) -> String {
     }
 }
 
-/// A hidden name next to `file` for a copy in progress, unique to this process and moment.
+/// This computer's name as one word of a file name.
+fn host_word() -> String {
+    super::host().chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect()
+}
+
+/// A hidden name next to `file` for a copy in progress, unique to this computer, process and
+/// moment: `.NAME.HOST-PID-NANOS.tdbpart`.
 pub fn partial(file: &Path) -> PathBuf {
     let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
-    file.with_file_name(format!(".{name}.{}-{nanos:09}.tdbpart", std::process::id()))
+    file.with_file_name(format!(".{name}.{}-{}-{nanos:09}.tdbpart", host_word(), std::process::id()))
+}
+
+/// Whether a process with id `pid` runs on this computer; `true` when that cannot be told.
+pub fn process_running(pid: u32) -> bool {
+    use std::process::Command;
+    if pid == std::process::id() {
+        return true;
+    }
+    if cfg!(windows) {
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
+            .unwrap_or(true)
+    } else {
+        Command::new("ps").args(["-p", &pid.to_string(), "-o", "pid="]).output().map(|o| o.status.success()).unwrap_or(true)
+    }
+}
+
+/// Remove the partial copies of `file` a process on this computer that is not running any more
+/// left next to it.
+fn remove_abandoned_partials(file: &Path) {
+    let (Some(dir), Some(name)) = (file.parent(), file.file_name()) else { return };
+    let start = format!(".{}.{}-", name.to_string_lossy(), host_word());
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let found = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = found.strip_prefix(&start).and_then(|r| r.strip_suffix(".tdbpart")) else { continue };
+        let pid = rest.split('-').next().and_then(|p| p.parse::<u32>().ok());
+        if pid.is_some_and(|pid| !process_running(pid)) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Copy `src` to `to` (created or truncated), flushed to disk.
@@ -524,9 +589,25 @@ mod tests {
         assert_eq!(d.hash("/acc/a.png", None).unwrap().unwrap().0, sha2);
         assert_eq!(d.put("/acc/a.png", &src, &sha5, Some(&sha1)).unwrap().0.as_deref(), Some(beside.as_str()), "found there, not copied again");
         let held = d.lock("/ACC/A.png").unwrap();
-        assert_eq!(walk(&root.join(TRASH).join("locks")).len(), 1);
+        let locks = walk(&root.join(TRASH).join("locks"));
+        assert_eq!(locks.len(), 1);
         drop(held);
-        assert!(d.lock("/acc/a.png").is_ok(), "released when dropped, and case does not matter");
+        assert!(d.lock("/acc/a.png").is_ok(), "released when dropped");
+        // What a killed push of this computer left is cleared: its lock, and its partial copy.
+        assert!(process_running(std::process::id()) && !process_running(4_000_000_000));
+        std::fs::write(&locks[0], format!("/acc/a.png\nheld by process 4000000000 on {} since 20260915-000000\n", host_word())).unwrap();
+        assert_eq!(abandoned_lock(&std::fs::read_to_string(&locks[0]).unwrap()), Some(4_000_000_000));
+        assert_eq!(abandoned_lock("/acc/a.png\nheld by process 4000000000 on another-host since 20260915-000000\n"), None);
+        drop(d.lock("/acc/a.png").unwrap());
+        assert_eq!(walk(&root.join(TRASH).join("locks")).len(), 0);
+        let left = root.join(format!("acc/.c.png.{}-4000000000-1.tdbpart", host_word()));
+        std::fs::write(&left, b"half").unwrap();
+        let held = d.lock("/acc/c.png").unwrap();
+        std::fs::write(&src, b"six").unwrap();
+        d.put("/acc/c.png", &src, &hash_file(&src).unwrap().0, None).unwrap();
+        drop(held);
+        assert!(!left.exists());
+        std::fs::write(&src, b"five").unwrap();
         assert_eq!(walk(&root.join(TRASH)).len(), 4, "one, two!, three and four! were each replaced once; five replaced nothing");
         // Another push replaced the bytes while this one copied: they are put back, not trashed.
         assert!(!d.place("/acc/a.png", &src, &sha5, Some(&sha1)).unwrap());

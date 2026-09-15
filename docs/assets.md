@@ -133,14 +133,16 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
 - Layout: the asset at store path `/accounts/acme/arch.png` is kept at `<root>/accounts/acme/arch.png`.
 - **local driver**: plain filesystem operations (works for a NAS, a USB disk, and Google Drive for
   Desktop / OneDrive clients in mirror mode). Item = path. Copies go through a hidden partial file
-  (`.NAME.PID-NANOS.tdbpart`), flushed and renamed into place, and are hashed after the copy; bytes
+  (`.NAME.HOST-PID-NANOS.tdbpart`; one a process of this computer that is no longer running left
+  is removed by the next push of that path), flushed and renamed into place, and are hashed after the copy; bytes
   a push replaces move to `<root>/.textdb-trash/<yyyymmdd-HHMMSS>-<nanos>-<pid>-<n>/…`. A push
   replaces only the asset's own bytes where they are kept (its path, or the item its pointer
   names), and only when no other pointer names them (locations compared without case); anything
   else is kept and the upload goes to the asset's path, next to what is there, as
   `NAME (<first 8 of its sha256>).ext`, which the pointer's item records. Pushes of the same path
   take turns (a lock file in `<root>/.textdb-trash/locks/`, naming the process and host that
-  holds it, waited on for up to ten minutes), holding it from reading which pointers name the
+  holds it, waited on for up to ten minutes, and removed at once when that process was of this
+  computer and is not running any more), holding it from reading which pointers name the
   path until their own pointer is committed, so a push reusing bytes and one replacing them never
   cross;
   what a push replaces is hard-linked into the trash and checked before the new copy replaces it
