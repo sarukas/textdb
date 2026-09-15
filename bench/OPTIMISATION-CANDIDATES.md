@@ -184,6 +184,84 @@ the sidecar is part of the small-document create regression and not all of it. T
 feed, path events and folder totals are the untested remainder — the next step is a probe
 that switches each off in turn, which `textdb-probe writepath` is the right place for.
 
+## Front-matter search is a full scan on both engines (2026-09-15)
+
+What the store does well already: `textdb-md` parses YAML front matter into JSON with types
+and structure intact — nested objects, arrays, integers and booleans, keys sorted — and the
+rows are kept current at HEAD on every write. The *parsing* is not the problem.
+
+The problem is that **nothing indexes it**. The only index on `frontmatter` is the primary
+key `(file_id, version)`, so every query by property name or value is
+`SCAN f` plus a JSON parse per row. Measured on a generated 5,000-note vault with realistic
+front matter (title, status, author, a `tags` list, priority, a nested `project` object, and
+a long tail of rarer keys), then at 50,000:
+
+| query | 5k | 50k |
+|---|---|---|
+| `status = draft` | 3.7 ms | 37 ms |
+| `tags` contains `telco` | 6 ms | 60 ms |
+| distinct property names | 6 ms | 67 ms |
+
+Exactly linear, about 0.74 us per note per query. A dashboard with five property filters is
+five scans.
+
+Postgres is no better and in one case far worse. `data` is `jsonb` with no GIN index:
+containment runs 9-12 ms at 50k, and `jsonb_object_keys` over the table — the query behind
+"what properties does this vault use?" — takes **1,007 ms**.
+
+### What fixes it, measured
+
+**Postgres: one line.** `CREATE INDEX ... USING gin (data)`. On a selective query (50 rows
+of 50,000) the plan goes from `Seq Scan` at 8.84 ms to `Bitmap Index Scan` at 0.18 ms —
+**49x**. The index is 4.8 MB against an 11 MB table. It does *not* help unselective queries
+(returning 25 % of rows, a scan is the right plan) and does *not* help key enumeration.
+
+**SQLite: a property table**, because SQLite cannot index inside JSON at all. One row per
+(file, property path, value), arrays expanded to a row per element, nested objects flattened
+to dotted paths, and typed columns so numbers compare as numbers:
+
+```sql
+fm_prop(file_id, key, val_txt, val_num, ord)
+  INDEX (key, val_txt), (key, val_num), (file_id)
+```
+
+At 50,000 notes that is 548,760 rows, built from the existing JSON in 843 ms (17 us a note;
+incrementally it is ~11 rows per write):
+
+| query | JSON scan | property table |
+|---|---|---|
+| `status = draft` | 37 ms | 2 ms |
+| `tags` contains `telco` | 60 ms | 1 ms |
+| nested `project.name = atlas` | 37 ms | 0.7 ms |
+| `priority > 3` (numeric) | 37 ms | 0.9 ms |
+| distinct property names | 67 ms | **0.11 ms** |
+| distinct values of `status` | 37 ms | **0.05 ms** |
+| property-name prefix autocomplete | — | **0.04 ms** |
+| selective two-property AND, with paths | — | 6 ms |
+
+Arrays stop being a special case: `tags` contains `telco` is just a row, which is why it goes
+from the *slowest* query to the fastest.
+
+Two honest caveats. **Multi-property AND is the weak spot**: two non-selective properties
+intersect in 20 ms (`INTERSECT` beats a self-`JOIN`'s 33 ms), so it improves on the 60 ms
+scan but not by the order of magnitude the single-property cases do; selective ANDs are
+6 ms. And **it costs space**: +43 MB for 50,000 notes with all three indexes, about 860 B a
+note. In this corpus the bodies are tiny so that reads as 2.5x the store; against realistic
+4 KB notes it is nearer 20 %.
+
+### What is missing beyond the index
+
+Even with the storage fixed there is no way to *ask*. `textdb meta` is get/set/unset on one
+file. There is no vault-wide equivalent of what Obsidian's property view gives: no
+`meta keys` (what properties exist), no `meta values KEY` (what values does it take), no
+`meta find KEY=VALUE`. Today that is `textdb sql` with hand-written `json_extract`, which
+also means every caller writes the scan themselves.
+
+A complete answer is three pieces, in this order: the property table (SQLite) and a GIN
+index (Postgres); a `kb.property` view over both so one query text works on either; and the
+CLI verbs on top. None of it is on the write path's critical section — the rows derive from
+front matter already parsed at commit.
+
 ## A round of per-row batching on both engines, stopped at diminishing returns (2026-09-15)
 
 Three changes, chosen from the `writepath` and `ops` probes rather than from guesses. All
