@@ -85,10 +85,21 @@ impl Rules {
     }
 }
 
+/// The `.gitattributes` files among `walked`'s below the top.
+fn nested_rules_files(walked: &Walk) -> Vec<String> {
+    walked
+        .files
+        .keys()
+        .filter(|r| r.rsplit_once('/').is_some_and(|(_, name)| crate::assets::classify::is_rules_file(name)))
+        .cloned()
+        .collect()
+}
+
 /// One id for the `.gitattributes` files among `walked`'s (`""` when there are none).
 fn gitattributes_id(dir: &Path, walked: &Walk) -> String {
     let mut all = Vec::new();
-    for rel in walked.files.keys().filter(|r| r.rsplit('/').next() == Some(".gitattributes")) {
+    // Any letter case counts, wherever it is: the id only holds back pushes when it changes.
+    for rel in walked.files.keys().filter(|r| r.rsplit('/').next().is_some_and(|n| n.eq_ignore_ascii_case(".gitattributes"))) {
         all.extend_from_slice(rel.as_bytes());
         all.push(0);
         all.extend(std::fs::read(dir.join(rel)).unwrap_or_default());
@@ -228,6 +239,30 @@ fn refuse_protected(rel: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// A write or move onto a name shaped like an 8.3 short name (`GITATT~1`, `NOTES~1.MD`) that is
+/// on disk under another name is refused: it would reach that other file (`.gitattributes`, say).
+fn refuse_short_alias(root: &Path, rel: &str) -> std::io::Result<()> {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    if !crate::assets::classify::looks_short(name) {
+        return Ok(());
+    }
+    let target = root.join(rel);
+    if std::fs::symlink_metadata(&target).is_err() {
+        return Ok(());
+    }
+    let listed = target
+        .parent()
+        .and_then(|parent| std::fs::read_dir(parent).ok())
+        .is_some_and(|entries| entries.flatten().any(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name)));
+    if listed {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("{rel} is another name (an 8.3 short name) of a file already on disk, which sync never writes through"),
+    ))
+}
+
 /// A write, move or delete that would go through a symbolic link or junction already on disk,
 /// whose folder may be anywhere (a `.git` included), is refused.
 fn refuse_link(root: &Path, rel: &str) -> std::io::Result<()> {
@@ -325,6 +360,7 @@ fn walk(root: &Path, tracked_dirs: &HashSet<String>) -> Result<Walk> {
 fn write_disk(root: &Path, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
     refuse_protected(rel)?;
     refuse_link(root, rel)?;
+    refuse_short_alias(root, rel)?;
     let target = root.join(rel);
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
@@ -336,6 +372,7 @@ fn write_disk(root: &Path, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Delete a file, then the directories it leaves empty (never `root`).
 fn remove_disk(root: &Path, rel: &str) -> std::io::Result<()> {
+    refuse_protected(rel)?;
     refuse_link(root, rel)?;
     let file = root.join(rel);
     if let Err(e) = std::fs::remove_file(&file) {
@@ -371,8 +408,10 @@ fn move_disk(root: &Path, from: &str, to: &str) -> std::io::Result<()> {
     // textdb's own trash (`.textdb/trash/<time>/<file>`) is the one such folder files move into;
     // the file's own path is checked all the same.
     refuse_protected(to.strip_prefix(".textdb/trash/").and_then(|rest| rest.split_once('/')).map_or(to, |(_, file)| file))?;
+    refuse_protected(from)?;
     refuse_link(root, from)?;
     refuse_link(root, to)?;
+    refuse_short_alias(root, to)?;
     let target = root.join(to);
     let case_only = from != to && from.to_lowercase() == to.to_lowercase();
     if target.exists() && !(case_only && CASE_INSENSITIVE) {
@@ -648,7 +687,7 @@ fn pair_assets(
     let orphans = !lost.is_empty()
         && walked.files.keys().any(|r| free(r) && !is_asset_pointer(r) && had.had(r).is_some() && !on_disk(&format!("{r}{}", pointer::SUFFIX)));
     if renames_possible || orphans {
-        let nested: Vec<String> = walked.files.keys().filter(|r| r.ends_with("/.gitattributes")).cloned().collect();
+        let nested = nested_rules_files(walked);
         let classifier = Classifier::load(dir, &nested);
         let store_folders = crate::assets::store_folders_inside(&mut *sides.st, dir);
         let sizes: HashSet<u64> = lost.iter().map(|(_, size, _)| *size).collect();
@@ -765,7 +804,7 @@ fn sync_assets(st: &mut dyn Store, o: &Options, prefix: &str, plan: &Plan, attrs
             .chain(plan.merges.iter().map(|(rel, ..)| rel))
             .chain(plan.conflicts.iter().map(|(rel, ..)| rel))
             .chain(plan.moves.iter().map(|(_, to)| to))
-            .any(|rel| rel.rsplit('/').next().is_some_and(|name| name.eq_ignore_ascii_case(".gitattributes")));
+            .any(|rel| rel.rsplit('/').next().is_some_and(|name| crate::assets::classify::names_dir(name, &[".gitattributes"])));
         if matches!(mode.as_str(), "push" | "both") {
             if attrs_changed || attrs_arriving {
                 a.notes.push(
@@ -1051,10 +1090,13 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             plan.hold.push(rel);
             continue;
         }
-        // In a folder sync never writes into: what textdb has there stays in textdb only, whether
-        // a file is on disk there or not (a submodule's `.git` file under its short name, say).
-        if protected_rel(&rel) && heads.contains_key(&rel) {
-            report.skipped.push(note(&rel, "inside a folder sync never writes into (.git, .textdb, node_modules, …): kept in textdb only"));
+        // In a folder sync never writes into, moves out of or deletes in: nothing there is synced
+        // either way, whether textdb, the last sync or only the disk has it (a submodule's `.git`
+        // file under its short name, a plugin deleted in textdb, a plugin taken in from disk).
+        if protected_rel(&rel) {
+            if heads.contains_key(&rel) || base.contains_key(&rel) {
+                report.skipped.push(note(&rel, "inside a folder sync never writes into (.git, .textdb, node_modules, …): not synced"));
+            }
             plan.hold.push(rel);
             continue;
         }
@@ -1205,7 +1247,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     // as documents, whatever `--ext` would take.
     if !plan.candidates.is_empty() {
         use crate::assets::classify::{Class, Classifier};
-        let nested: Vec<String> = walked.files.keys().filter(|r| r.ends_with("/.gitattributes")).cloned().collect();
+        let nested = nested_rules_files(&walked);
         let classifier = Classifier::load(&o.dir, &nested);
         plan.candidates.retain(|rel| classifier.classify(&o.dir, rel) != Class::Asset);
     }
@@ -2133,6 +2175,22 @@ mod tests {
         assert!(!deep.exists());
         // A directory that still holds files keeps its attribute and stays.
         assert!(std::fs::metadata(tmp.path().join("a")).unwrap().permissions().readonly());
+    }
+
+    #[test]
+    fn never_deletes_moves_or_writes_in_protected_folders_or_through_short_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join(".obsidian/plugins/p");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(plugin.join("main.js"), "run()").unwrap();
+        assert!(remove_disk(tmp.path(), ".obsidian/plugins/p/main.js").is_err());
+        assert!(move_disk(tmp.path(), ".obsidian/plugins/p/main.js", "elsewhere.js").is_err());
+        assert!(write_disk(tmp.path(), ".textdb/bin/textdb.cmd", b"x").is_err());
+        assert!(plugin.join("main.js").exists() && !tmp.path().join("elsewhere.js").exists());
+        // A name shaped like a short name is written when it is its own name, not another's.
+        std::fs::write(tmp.path().join("report~1.pdf"), "a").unwrap();
+        write_disk(tmp.path(), "report~1.pdf", b"b").unwrap();
+        assert_eq!(std::fs::read(tmp.path().join("report~1.pdf")).unwrap(), b"b");
     }
 
     #[test]

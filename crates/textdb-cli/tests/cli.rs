@@ -791,6 +791,18 @@ fn asset_pointers_never_reach_into_git_or_tell_of_other_files() {
     assert!(!bucket.join("secret.txt").exists(), "pushed in the sync that brought the rule");
     run(&mut t(&["sync", "/", dir, "--push"]), None);
     assert!(!bucket.join("secret.txt").exists(), "pushed before the rules were accepted");
+
+    // Nor under another spelling of its name: other letter case (which Windows loads all the same),
+    // or the 8.3 short name of the .gitattributes already there.
+    let rules = std::fs::read_to_string(vault.join(".gitattributes")).unwrap();
+    std::fs::write(vault.join("secret2.txt"), "TOKEN=2\n").unwrap();
+    run(&mut t(&["write", "/sub2/.GitAttributes"]), Some("secret2.txt textdb=asset\n"));
+    run(&mut t(&["write", "/GITATT~1"]), Some("secret2.txt textdb=asset\n"));
+    for _ in 0..2 {
+        run(&mut t(&["sync", "/", dir, "--push"]), None);
+        assert!(!bucket.join("secret2.txt").exists(), "pushed under a rule with another name");
+    }
+    assert_eq!(std::fs::read_to_string(vault.join(".gitattributes")).unwrap(), rules, "written through its short name");
 }
 
 /// Make `link` a link to the folder `target`: a junction on Windows (which needs no privilege), a

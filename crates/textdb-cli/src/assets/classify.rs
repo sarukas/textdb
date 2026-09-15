@@ -73,17 +73,23 @@ fn short_stem(name: &str) -> String {
     base.chars().filter(|c| *c != ' ' && *c != '.').flat_map(char::to_uppercase).take(6).collect()
 }
 
+/// Whether `seg` has the shape of an 8.3 short name: up to six characters, `~`, digits, and up to
+/// three more after a dot (`NOTES~1.MD`).
+pub fn looks_short(seg: &str) -> bool {
+    let Some((stem, rest)) = seg.split_once('~') else { return false };
+    let (num, ext) = rest.split_once('.').unwrap_or((rest, ""));
+    (1..=6).contains(&stem.chars().count()) && !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) && ext.chars().count() <= 3 && !ext.contains('.')
+}
+
 /// Whether `seg` is an 8.3 short name Windows may have given one of `dirs`: `GIT~1` for `.git`,
 /// `NODE_M~1` for `node_modules`, or the hashed form it uses when many names share a start
 /// (`GI3F2A~1`: two letters of the stem and four hex digits). Other names that look like short
 /// names (`photos~1`, `report~1.pdf`) are not.
 fn short_name_of(seg: &str, dirs: &[&str]) -> bool {
-    let Some((stem, rest)) = seg.split_once('~') else { return false };
-    let (num, ext) = rest.split_once('.').unwrap_or((rest, ""));
-    if !(1..=6).contains(&stem.chars().count()) || num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) || ext.chars().count() > 3 || ext.contains('.') {
+    if !looks_short(seg) {
         return false;
     }
-    let stem = stem.to_uppercase();
+    let stem = seg.split_once('~').map_or(seg, |(stem, _)| stem).to_uppercase();
     dirs.iter().map(|d| short_stem(d)).any(|s| {
         let start: String = s.chars().take(2).collect();
         stem == s || (stem.chars().count() == 6 && start.chars().count() == 2 && stem.starts_with(&start) && stem.chars().skip(2).all(|c| c.is_ascii_hexdigit()))
@@ -96,6 +102,12 @@ fn short_name_of(seg: &str, dirs: &[&str]) -> bool {
 pub fn names_dir(seg: &str, dirs: &[&str]) -> bool {
     let name = resolved(seg);
     dirs.iter().any(|d| d.eq_ignore_ascii_case(&name)) || short_name_of(&name, dirs)
+}
+
+/// Whether a file named `name` is a `.gitattributes` file: in any letter case where the file system
+/// ignores case (`.GitAttributes`), since git there reads it all the same.
+pub fn is_rules_file(name: &str) -> bool {
+    if cfg!(any(windows, target_os = "macos")) { name.eq_ignore_ascii_case(".gitattributes") } else { name == ".gitattributes" }
 }
 
 /// Files that are never assets: a store's database and its copies, system clutter, lock files,

@@ -239,13 +239,16 @@ or learn about other files through a pointer, and `push --force` never uploads a
 only names. For the same reason sync never writes, moves or deletes a store file inside `.git`,
 `.textdb`, `node_modules`, `.trash`, `.textdb-trash`, `__pycache__`, the system folders textdb
 leaves out, or `.obsidian/plugins`, `snippets` and `themes` (Obsidian's other settings sync on
-purpose): such a file stays in textdb only and is reported as skipped, whether a file is on disk
-there or not. These checks take a name as Windows would resolve it, so `.GIT`, `.git.`,
+purpose): nothing there is synced either way — a file textdb or the last sync has there is
+reported as skipped, a file only on disk there is not taken in, and none is written, moved or
+deleted. These checks take a name as Windows would resolve it, so `.GIT`, `.git.`,
 `.git::$INDEX_ALLOCATION` and the 8.3 short names Windows may give those folders (`GIT~1`,
 `NODE_M~1`, or the hashed `GI3F2A~1`) are those folders, while other names that only look like
 short names (`photos~1`, `report~1.pdf`) are not. Neither sync nor pull writes, moves or deletes
-through a symbolic link or junction already in the directory. And a sync that brings a
-`.gitattributes` from textdb pushes no assets: the next sync reports the rules changed, and only
+through a symbolic link or junction already in the directory, and sync never writes to a name
+shaped like a short name (`GITATT~1`, `NOTES~1.MD`) that is on disk as another file. `.gitattributes`
+files count in any letter case (`.GitAttributes`, which Windows loads all the same) and under their
+short name. A sync that brings a `.gitattributes` from textdb pushes no assets: the next sync reports the rules changed, and only
 `--accept-rules` (or an explicit push) takes files the new rules make assets. `verify` counts an asset store it cannot reach as a
 problem. `status --json` gives `{ prefix, dir, assets, counts }`, each asset with `path`, `state`,
 `type` (the pointer's media type, or one from the name), and where known `size`, `store`,

@@ -208,7 +208,7 @@ fn walk(root: &Path) -> Result<(Files, Vec<String>)> {
                     pending.push((entry.path(), rel));
                 }
             } else if kind.is_file() {
-                if name == ".gitattributes" && !rel_dir.is_empty() {
+                if classify::is_rules_file(&name) && !rel_dir.is_empty() {
                     attrs.push(rel.clone());
                 }
                 let meta = entry.metadata()?;
