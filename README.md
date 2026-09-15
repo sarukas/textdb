@@ -124,3 +124,5 @@ survives a create/read/delete round-trip, and afterwards every document is compa
 against a reference model. A cell that fails one publishes no timings at all, so a broken
 backend cannot post a fast number. See [`bench/README.md`](bench/README.md) for the knobs,
 the ten test families and what each measures.
+
+Front-matter property search is documented in [`docs/properties.md`](docs/properties.md).

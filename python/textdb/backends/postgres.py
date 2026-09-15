@@ -146,6 +146,21 @@ class PostgresBackend(Backend):
         return [dict(path=r[0], line=r[1], snippet=r[2], rank=r[3]) for r in rows]
 
     @_wrap
+    def property_keys(self, prefix: str, limit: int):
+        rows = self._rows("SELECT key, docs, values_n, kind FROM kb.prop_keys(%s, %s)", (prefix, limit))
+        return [dict(key=r[0], docs=r[1], values=r[2], kind=r[3]) for r in rows]
+
+    @_wrap
+    def property_values(self, key: str, prefix: str, limit: int):
+        rows = self._rows("SELECT value, docs FROM kb.prop_values(%s, %s, %s)", (key, prefix, limit))
+        return [dict(value=r[0], docs=r[1]) for r in rows]
+
+    @_wrap
+    def property_find(self, query: str, folder: str, limit: int):
+        rows = self._rows("SELECT path, nbytes, updated_at, frontmatter FROM kb.prop_find(%s, %s, %s)", (query, folder, limit))
+        return [dict(path=r[0], nbytes=r[1], updated_at=r[2], frontmatter=r[3]) for r in rows]
+
+    @_wrap
     def checkpoint(self, name: str) -> int:
         return int(self._one("SELECT kb.checkpoint(%s)", (name,)))
 

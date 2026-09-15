@@ -1,6 +1,7 @@
 """`Corpus`: the user-facing API over a backend, plus file/folder loaders."""
 
 import fnmatch
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,35 @@ class Hit:
     line: int
     snippet: str
     rank: float
+
+
+@dataclass
+class PropertyKey:
+    """A front-matter property name in use across the store."""
+    key: str
+    #: Documents carrying it — a note with three tags counts once.
+    docs: int
+    #: Distinct values it takes.
+    values: int
+    #: ``number``, ``text`` or ``mixed``; a UI offers ``>`` only where it means something.
+    kind: str
+
+
+@dataclass
+class PropertyValue:
+    """One value a property takes, and how many documents use it."""
+    value: Optional[str]
+    docs: int
+
+
+@dataclass
+class PropertyHit:
+    """A document matched by a property query."""
+    path: str
+    nbytes: int
+    updated_at: str
+    #: The whole front matter, so a table view needs no query per cell.
+    frontmatter: Optional[Dict[str, Any]]
 
 
 @dataclass
@@ -183,6 +213,39 @@ class Corpus:
     def search(self, query: str, prefix: str = "/", *, limit: int = 100) -> List[Hit]:
         """Terms are ANDed per document; "quoted phrase"; prefix*. Hits carry the first matching line."""
         return [Hit(r["path"], r["line"], r["snippet"], r["rank"]) for r in self.backend.search(query, normalize(prefix), limit)]
+
+    def property_keys(self, prefix: str = "", *, limit: int = 200) -> List[PropertyKey]:
+        """Property names in use, most-used first.
+
+        ``prefix`` is what the user has typed: this is the autosuggest call, so it reads an
+        index range rather than scanning.
+        """
+        return [PropertyKey(r["key"], r["docs"], r["values"], r["kind"]) for r in self.backend.property_keys(prefix, limit)]
+
+    def property_values(self, key: str, prefix: str = "", *, limit: int = 200) -> List[PropertyValue]:
+        """The values one property takes, most-used first; ``prefix`` narrows them as above."""
+        return [PropertyValue(r["value"], r["docs"]) for r in self.backend.property_values(key, prefix, limit)]
+
+    def property_find(self, query: str = "", folder: str = "/", *, limit: int = 500) -> List[PropertyHit]:
+        """Documents matching a property query: ``status:draft tags:telco -priority:>3``.
+
+        ``key:value`` equals, ``has:key`` exists, ``key:>3`` compares, ``key:val*`` starts
+        with, ``key:~val`` contains, ``key:!=val`` has it but not as that. A space means AND;
+        ``OR``, ``NOT`` (or a leading ``-``) and parentheses work as written. An empty query
+        lists every document that has front matter.
+        """
+        out = []
+        for r in self.backend.property_find(query, normalize(folder), limit):
+            data = r["frontmatter"]
+            if isinstance(data, str):
+                # A row whose JSON will not parse is reported as having no front matter
+                # rather than failing the whole search.
+                try:
+                    data = json.loads(data)
+                except ValueError:
+                    data = None
+            out.append(PropertyHit(r["path"], r["nbytes"], r["updated_at"], data if isinstance(data, dict) else None))
+        return out
 
     def checkpoint(self, name: str) -> int:
         return self.backend.checkpoint(name)

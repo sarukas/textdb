@@ -335,6 +335,32 @@ async function request<T>(method: string, url: string, body?: unknown, signal?: 
   return json as T;
 }
 
+/** A front-matter property name in use across the store. */
+export interface PropertyKey {
+  key: string;
+  /** Documents carrying it — a note with three tags counts once. */
+  docs: number;
+  /** Distinct values it takes. */
+  valuesN: number;
+  /** Whether `>` and `<` mean anything on this property. */
+  kind: "number" | "text" | "mixed";
+}
+
+/** One value a property takes, and how many documents use it. */
+export interface PropertyValue {
+  value: string | null;
+  docs: number;
+}
+
+/** A document matched by a property query. */
+export interface PropertyHit {
+  path: string;
+  nbytes: number;
+  updatedAt: string;
+  /** The whole front matter, so the results table can show any column without refetching. */
+  frontmatter: Record<string, unknown> | null;
+}
+
 export const api = {
   info: () => request<Info>("GET", "/api/info"),
   ls: (path: string, signal?: AbortSignal) => request<LsEntry[]>("GET", `/api/ls?${qs({ path })}`, undefined, signal),
@@ -388,6 +414,20 @@ export const api = {
   diff: (path: string, from: number, to: number) => request<{ diff: string }>("GET", `/api/diff?${qs({ path, from, to })}`),
   search: (q: string, opts: { prefix?: string; limit?: number; signal?: AbortSignal } = {}) =>
     request<SearchHit[]>("GET", `/api/search?${qs({ q, prefix: opts.prefix, limit: opts.limit })}`, undefined, opts.signal),
+  // Front-matter discovery. `metaKeys` and `metaValues` back the autosuggest and are called
+  // on every keystroke, so both take an abort signal — a stale suggestion list arriving after
+  // a newer one would make the dropdown flicker between answers.
+  metaKeys: (opts: { prefix?: string; limit?: number; signal?: AbortSignal } = {}) =>
+    request<PropertyKey[]>("GET", `/api/meta/keys?${qs({ prefix: opts.prefix, limit: opts.limit })}`, undefined, opts.signal),
+  metaValues: (key: string, opts: { prefix?: string; limit?: number; signal?: AbortSignal } = {}) =>
+    request<PropertyValue[]>(
+      "GET",
+      `/api/meta/values?${qs({ key, prefix: opts.prefix, limit: opts.limit })}`,
+      undefined,
+      opts.signal,
+    ),
+  metaFind: (q: string, opts: { folder?: string; limit?: number; signal?: AbortSignal } = {}) =>
+    request<PropertyHit[]>("GET", `/api/meta/find?${qs({ q, folder: opts.folder, limit: opts.limit })}`, undefined, opts.signal),
   write: (body: { path: string; content: string; base_version?: number; author?: string; message?: string }) =>
     request<WriteResult>("PUT", "/api/file", body),
   importBatch: (body: { author?: string; files: { path: string; content: string }[] }) =>
