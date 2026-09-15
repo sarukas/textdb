@@ -996,6 +996,29 @@ fn loosening_textdbignore_stops_moves_and_changes_of_what_it_left_out_even_with_
 }
 
 #[test]
+fn loosening_textdbignore_stops_a_folder_move_carrying_what_it_left_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let vault = tmp.path().join("vault");
+    std::fs::create_dir_all(vault.join("proj")).unwrap();
+    std::fs::write(vault.join("proj/a.md"), "a").unwrap();
+    std::fs::write(vault.join("proj/secret.json"), "{}").unwrap();
+    std::fs::write(vault.join(".textdbignore"), format!("proj/secret.json\n{SEEDED_RULES}")).unwrap();
+    let dir = vault.to_str().unwrap();
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.args(args);
+        c
+    };
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["mv", "/proj", "/proj2"]), None);
+    std::fs::write(vault.join(".textdbignore"), SEEDED_RULES).unwrap();
+    let stopped = run(&mut t(&["sync", "/", dir]), None);
+    assert_eq!(stopped.status, 6, "{}", stopped.stdout);
+    assert!(vault.join("proj/secret.json").exists() && !vault.join("proj2/secret.json").exists(), "{}", stopped.stdout);
+}
+
+#[test]
 fn binary_files_are_not_taken_in_and_sync_says_what_to_do() {
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("kb.db");

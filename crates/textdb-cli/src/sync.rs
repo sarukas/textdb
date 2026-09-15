@@ -1697,6 +1697,8 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
                         .chain(plan.conflicts.iter().map(|(rel, ..)| rel))
                         .chain(&plan.disk_delete)
                         .chain(&plan.textdb_delete)
+                        .chain(plan.carry.iter().chain(&plan.pointer_renames).chain(&plan.conflict_copies).flat_map(|(from, to)| [from, to]))
+                        .chain(plan.asset_trash.iter().map(|(file, _)| file))
                         .filter(|rel| was_ignored(rel))
                         .cloned(),
                 )
@@ -1729,10 +1731,18 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             Ok(())
         } else if std::fs::symlink_metadata(&ignore_path).is_ok_and(|m| m.file_type().is_symlink()) {
             Err(std::io::Error::other("it is a link, which sync never writes through"))
-        } else if std::fs::read(&ignore_path).ok() != before.as_ref().map(|b| b.as_bytes().to_vec()) {
-            Err(std::io::Error::other("it changed during the sync"))
         } else {
-            std::fs::create_dir_all(&o.dir).and_then(|()| std::fs::write(&ignore_path, text))
+            let now = std::fs::read(&ignore_path);
+            let unchanged = match (&now, before) {
+                (Ok(bytes), Some(b)) => bytes.as_slice() == b.as_bytes(),
+                (Err(e), None) => e.kind() == std::io::ErrorKind::NotFound,
+                _ => false,
+            };
+            match now {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ if !unchanged => Err(std::io::Error::other("it changed during the sync")),
+                _ => std::fs::create_dir_all(&o.dir).and_then(|()| std::fs::write(&ignore_path, text)),
+            }
         };
         match written {
             Ok(()) if before.is_none() => report.to_disk.new.push(IGNORE_FILE.to_string()),
@@ -1796,8 +1806,8 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     if rules_stop {
         let n = report.rules.as_ref().map_or(0, |r| r.newly_included.len());
         return Err(StoreError::invalid(format!(
-            "sync stopped before writing anything: the include rules changed since the last sync, and {n} {} would be \
-             taken in that it left out (listed above). Pass --accept-rules to take them in, or list them in .textdbignore",
+            "sync stopped before writing anything: the include rules changed since the last sync, and {n} {} they left out \
+             would be synced now (listed above). Pass --accept-rules to go ahead, or list them in .textdbignore",
             if n == 1 { "file" } else { "files" }
         )));
     }
@@ -2042,7 +2052,7 @@ fn apply(
             .cloned()
             .collect();
         if !paths.is_empty() {
-            let message = commit_message(o, &prefix, plan, heads, from_commit, seq, &not_done);
+            let message = commit_message(o, &prefix, plan, report, heads, from_commit, seq, &not_done);
             let result = git::commit(dir, &paths, &message);
             if let Some(g) = report.git.as_mut() {
                 match result {
@@ -2081,15 +2091,17 @@ fn commit_message(
     o: &Options,
     prefix: &str,
     plan: &Plan,
+    report: &Report,
     heads: &BTreeMap<String, FileHead>,
     from_commit: Option<&str>,
     seq: i64,
     not_done: &HashSet<&str>,
 ) -> String {
     let done = |rel: &&String| !not_done.contains(rel.as_str());
-    let added = plan.to_disk.iter().filter(done).filter(|rel| !o.dir.join(rel).exists() || !heads.contains_key(*rel)).count();
-    let changed = plan.to_disk.iter().filter(done).count() - added + plan.merges.iter().map(|m| &m.0).filter(done).count();
-    let deleted = plan.disk_delete.iter().filter(done).count();
+    // What was written, as the report has it (a file new on disk is added, `.textdbignore` too).
+    let added = report.to_disk.new.iter().filter(done).count();
+    let changed = report.to_disk.changed.iter().filter(done).count() + plan.merges.iter().map(|m| &m.0).filter(done).count();
+    let deleted = report.to_disk.deleted.iter().filter(done).count();
     let mut parts = Vec::new();
     for (n, what) in [(changed, "changed"), (added, "added"), (deleted, "deleted")] {
         if n > 0 {
