@@ -487,6 +487,52 @@ impl Store for PgStore {
         Ok(text.map(String::into_bytes))
     }
 
+    fn property_keys(&mut self, prefix: &str, limit: i64) -> Result<Vec<crate::store::PropKey>> {
+        let rows = self
+            .client
+            .query("SELECT key, docs, values_n, kind FROM kb.prop_keys($1, $2)", &[&prefix, &limit.max(1)])
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::store::PropKey {
+                key: r.get(0),
+                docs: r.get(1),
+                values: r.get(2),
+                kind: r.get(3),
+            })
+            .collect())
+    }
+    fn property_values(&mut self, key: &str, prefix: &str, limit: i64) -> Result<Vec<crate::store::PropValue>> {
+        let rows = self
+            .client
+            .query("SELECT value, docs FROM kb.prop_values($1, $2, $3)", &[&key, &prefix, &limit.max(1)])
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::store::PropValue {
+                value: r.get(0),
+                docs: r.get(1),
+            })
+            .collect())
+    }
+    fn property_find(&mut self, query: &str, folder: &str, limit: i64) -> Result<Vec<crate::store::PropHit>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT path, nbytes, updated_at, frontmatter FROM kb.prop_find($1, $2, $3)",
+                &[&query, &folder, &limit.max(1)],
+            )
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::store::PropHit {
+                path: r.get(0),
+                nbytes: r.get(1),
+                updated_at: r.get(2),
+                frontmatter: r.get::<_, Option<String>>(3).and_then(|t| serde_json::from_str(&t).ok()),
+            })
+            .collect())
+    }
     fn search(&mut self, query: &str, prefix: &str, limit: i64) -> Result<Vec<Hit>> {
         let rows = self
             .client

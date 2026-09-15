@@ -13,6 +13,9 @@ import {
   type Info,
   type ListOptions,
   type ListPage,
+  type PropertyHit,
+  type PropertyKey,
+  type PropertyValue,
   SORT_KEYS,
   type SearchHit,
   type SortKey,
@@ -381,6 +384,57 @@ export class Corpus {
     );
   }
 
+  /**
+   * Front-matter property names in use, most-used first.
+   *
+   * `prefix` is what the user has typed: this runs on every keystroke, so it is an index
+   * range rather than a scan.
+   */
+  propertyKeys(options: { prefix?: string; limit?: number } = {}): PropertyKey[] {
+    return this.sql
+      .all<{ key: string; docs: number; values_n: number; kind: PropertyKey['kind'] }>(
+        'SELECT key, docs, values_n, kind FROM textdb_prop_keys(?, ?)',
+        options.prefix ?? '',
+        options.limit ?? 200,
+      )
+      .map((r) => ({ key: r.key, docs: r.docs, valuesN: r.values_n, kind: r.kind }));
+  }
+
+  /** The values one property takes, most-used first; `prefix` narrows them as above. */
+  propertyValues(key: string, options: { prefix?: string; limit?: number } = {}): PropertyValue[] {
+    return this.sql.all<PropertyValue>(
+      'SELECT value, docs FROM textdb_prop_values(?, ?, ?)',
+      key,
+      options.prefix ?? '',
+      options.limit ?? 200,
+    );
+  }
+
+  /**
+   * Documents matching a property query: `status:draft tags:telco -priority:>3`.
+   *
+   * See `textdb_md::query` for the grammar. A malformed query raises, with the offset it
+   * went wrong at in the message, so an editor can point at it.
+   */
+  propertyFind(query: string, options: { folder?: string; limit?: number } = {}): PropertyHit[] {
+    return this.sql
+      .all<{ path: string; nbytes: number; updated_at: string; frontmatter: string | null }>(
+        'SELECT path, nbytes, updated_at, frontmatter FROM textdb_prop_find(?, ?, ?)',
+        query,
+        options.folder ?? '/',
+        options.limit ?? 500,
+      )
+      .map((r) => ({
+        path: r.path,
+        nbytes: r.nbytes,
+        updatedAt: r.updated_at,
+        // Parsed here so every caller does not: the column is the JSON the store keeps, and a
+        // document whose front matter failed to parse is reported as having none rather than
+        // failing the whole query.
+        frontmatter: r.frontmatter ? safeJson(r.frontmatter) : null,
+      }));
+  }
+
   /** Writes the whole document, creating it if missing; rebased over commits newer than `baseVersion`. */
   write(filePath: string, content: string, options: WriteOptions = {}): WriteResult {
     return parseWrite(
@@ -676,4 +730,14 @@ function countNewlines(text: string): number {
   let n = 0;
   for (let i = text.indexOf('\n'); i >= 0; i = text.indexOf('\n', i + 1)) n++;
   return n;
+}
+
+/** Parse JSON, or `null` rather than throwing: one unreadable row must not fail a search. */
+function safeJson(text: string): Record<string, unknown> | null {
+  try {
+    const v: unknown = JSON.parse(text);
+    return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
 }

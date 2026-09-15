@@ -360,7 +360,7 @@ impl Drop for SpiStorage {
     }
 }
 
-fn map(e: pgrx::spi::Error) -> TextdbError {
+pub fn map(e: pgrx::spi::Error) -> TextdbError {
     TextdbError::Storage(e.to_string())
 }
 

@@ -116,6 +116,33 @@ export function createApp(corpus: Corpus, hub: ChangeHub, options: AppOptions): 
     ),
   );
 
+  // Front-matter property discovery. `keys` and `values` are the autosuggest calls and run on
+  // every keystroke, so both take a prefix and answer from an index range.
+  app.get('/api/meta/keys', (c) =>
+    c.json(
+      corpus.propertyKeys({
+        prefix: c.req.query('prefix') || '',
+        limit: queryInt(c, 'limit') ?? 200,
+      }),
+    ),
+  );
+  app.get('/api/meta/values', (c) =>
+    c.json(
+      corpus.propertyValues(queryString(c, 'key'), {
+        prefix: c.req.query('prefix') || '',
+        limit: queryInt(c, 'limit') ?? 200,
+      }),
+    ),
+  );
+  app.get('/api/meta/find', (c) =>
+    c.json(
+      corpus.propertyFind(c.req.query('q') ?? '', {
+        folder: c.req.query('folder') || '/',
+        limit: queryInt(c, 'limit') ?? 500,
+      }),
+    ),
+  );
+
   app.put('/api/file', async (c) => {
     const body = await jsonBody(c);
     const result = corpus.write(bodyString(body, 'path'), bodyString(body, 'content'), {

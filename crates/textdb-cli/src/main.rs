@@ -752,6 +752,14 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
         },
         Cmd::Meta { op } => match op {
             MetaOp::Get { path, key } => meta::get(st, &path, key.as_deref(), json),
+            MetaOp::Keys { prefix, limit } => meta::keys(st, prefix.as_deref().unwrap_or(""), limit, json),
+            MetaOp::Values { key, prefix, limit } => meta::values(st, &key, prefix.as_deref().unwrap_or(""), limit, json),
+            MetaOp::Find {
+                query,
+                folder,
+                limit,
+                show,
+            } => meta::find(st, query.as_deref().unwrap_or(""), &folder, limit, show.as_deref(), json),
             MetaOp::Set {
                 path,
                 key,
@@ -1784,6 +1792,38 @@ enum MetaOp {
         /// Commit message (default `meta set KEY`).
         #[arg(long, short = 'm')]
         message: Option<String>,
+    },
+    /// Property names used anywhere in the store, most-used first.
+    Keys {
+        /// Only names starting with this.
+        prefix: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        limit: i64,
+    },
+    /// The values one property takes, most-used first.
+    Values {
+        key: String,
+        /// Only values starting with this.
+        prefix: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        limit: i64,
+    },
+    /// Documents matching a property query: `status:draft tags:telco -priority:>3`.
+    ///
+    /// `key:value` equals, `has:key` exists, `key:>3` compares, `key:val*` starts with,
+    /// `key:~val` contains, `key:!=val` has it but not as that. A space means AND; `OR`,
+    /// `NOT` (or a leading `-`) and parentheses work as written. Quote a value with spaces.
+    Find {
+        /// The query. An empty one lists every document that has front matter.
+        query: Option<String>,
+        /// Only below this folder.
+        #[arg(long, default_value = "/")]
+        folder: String,
+        #[arg(long, default_value_t = 500)]
+        limit: i64,
+        /// Show these property columns, comma separated (`status,tags`).
+        #[arg(long)]
+        show: Option<String>,
     },
     /// Remove a top-level key and its lines.
     Unset {

@@ -432,6 +432,33 @@ pub struct ImportStats {
 }
 
 /// A textdb store. Paths are `/folder/file.md`; versions are per file and consecutive.
+/// A property name in use across the store.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PropKey {
+    pub key: String,
+    pub docs: i64,
+    pub values: i64,
+    /// `number`, `text` or `mixed`.
+    pub kind: String,
+}
+
+/// One value a property takes.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PropValue {
+    pub value: Option<String>,
+    pub docs: i64,
+}
+
+/// A document a property query matched.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PropHit {
+    pub path: String,
+    pub nbytes: i64,
+    pub updated_at: String,
+    /// The document's whole front matter, so a table view needs no query per row.
+    pub frontmatter: Option<serde_json::Value>,
+}
+
 pub trait Store {
     fn backend(&self) -> &'static str;
     /// Make the store usable: create what is missing, upgrade what is old.
@@ -446,6 +473,12 @@ pub trait Store {
     fn read(&mut self, path: &str, version: Option<i64>) -> Result<(Vec<u8>, i64)>;
     fn section(&mut self, path: &str, heading: &str) -> Result<Option<Vec<u8>>>;
     fn search(&mut self, query: &str, prefix: &str, limit: i64) -> Result<Vec<Hit>>;
+    /// Front-matter property names in use, most-used first; `prefix` narrows them.
+    fn property_keys(&mut self, prefix: &str, limit: i64) -> Result<Vec<PropKey>>;
+    /// The values one property takes, most-used first.
+    fn property_values(&mut self, key: &str, prefix: &str, limit: i64) -> Result<Vec<PropValue>>;
+    /// Documents matching a property query, under `folder`.
+    fn property_find(&mut self, query: &str, folder: &str, limit: i64) -> Result<Vec<PropHit>>;
     fn write(
         &mut self,
         path: &str,

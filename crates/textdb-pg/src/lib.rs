@@ -15,6 +15,7 @@ use pgrx::prelude::*;
 
 mod bulk;
 mod links;
+mod property;
 mod store;
 
 extension_sql!(
@@ -109,6 +110,24 @@ CREATE INDEX link_file ON kb.link(file_id, version);
 CREATE INDEX link_target_name ON kb.link(target_name);
 CREATE INDEX link_resolved ON kb.link(resolved_id);
 CREATE TABLE kb.frontmatter (file_id bigint NOT NULL, version bigint NOT NULL, data jsonb, PRIMARY KEY (file_id, version));
+-- One row per (document, property path, value), derived from `frontmatter` at every commit.
+-- jsonb can be searched without this, but only by scanning: containment ran 9-12 ms over
+-- 50,000 notes and `jsonb_object_keys` — the query behind "what properties does this vault
+-- use" — took 1,007 ms. These rows make both an index seek, and give the same shape as the
+-- SQLite binding so one query text means the same thing on either.
+CREATE TABLE kb.property (
+  file_id bigint NOT NULL,
+  version bigint NOT NULL,
+  key     text NOT NULL,                 -- dotted path as written: `project.name`
+  key_lc  text NOT NULL,                 -- and folded, which is what the indexes carry
+  val_txt text NULL,
+  val_lc  text NULL,
+  val_num double precision NULL,
+  ord     bigint NOT NULL DEFAULT 0
+);
+CREATE INDEX property_kv ON kb.property(key_lc, val_lc);
+CREATE INDEX property_kn ON kb.property(key_lc, val_num);
+CREATE INDEX property_file ON kb.property(file_id);
 CREATE TABLE kb.checkpoint (name text NOT NULL, file_id bigint NOT NULL, path text NOT NULL, root bytea NOT NULL, version bigint NOT NULL, PRIMARY KEY (name, file_id));
 -- Path history (textdb_core::path): one row per node a rename, move or delete touched — the
 -- node it named and everything below a folder — next to the versions in kb.commit.
@@ -868,7 +887,7 @@ mod kb {
     /// rows' version moves: no rows are rewritten and no link is resolved again.
     fn write_structure(file_id: i64, version: i64, s: &textdb_core::structure::Structure) -> Result<(), TextdbError> {
         if structure_matches(file_id, s)? {
-            for t in ["kb.section", "kb.link", "kb.frontmatter"] {
+            for t in ["kb.section", "kb.link", "kb.frontmatter", "kb.property"] {
                 Spi::run_with_args(&format!("UPDATE {t} SET version = $1 WHERE file_id = $2 AND version <> $1"), &[version.into(), file_id.into()])
                     .map_err(storage_err)?;
             }
@@ -899,6 +918,9 @@ mod kb {
             )
             .map_err(storage_err)?;
         }
+        // The indexed form of the same front matter. Always called, including with `None`, so
+        // a document that loses its front matter loses its property rows with it.
+        crate::property::write_rows(file_id, version, s.frontmatter.as_ref())?;
         // This file's links, and links to its headings, which may have changed.
         crate::links::relink_file(file_id)
     }
@@ -1790,6 +1812,160 @@ mod kb {
             .enumerate()
             .map(|(i, l)| (i as i64, l.hash.to_vec()))
             .collect();
+        TableIterator::new(rows)
+    }
+
+    /// `[lo, hi)` covering everything that starts with `p`, so a prefix match reads an index
+    /// range instead of `LIKE 'p%'`.
+    fn prefix_range(p: &str) -> (String, String) {
+        let mut hi = p.to_string();
+        // The successor of "pro" is "prp", so `[pro, prp)` is exactly the keys beginning "pro".
+        while let Some(c) = hi.pop() {
+            if let Some(next) = char::from_u32(c as u32 + 1) {
+                hi.push(next);
+                return (p.to_string(), hi);
+            }
+        }
+        // Empty prefix: the caller's `$1 = ''` branch matches everything and these go unused.
+        (String::new(), String::new())
+    }
+
+    /// Front-matter property names in use, most-used first; `prefix` narrows them.
+    ///
+    /// This is the autosuggest call — it runs on every keystroke — so it reads an index range
+    /// over the folded key rather than enumerating `jsonb` keys, which took 1,007 ms over
+    /// 50,000 notes.
+    #[pg_extern(stable)]
+    fn prop_keys(
+        prefix: default!(&str, "''"),
+        lim: default!(i64, 200),
+    ) -> TableIterator<'static, (name!(key, String), name!(docs, i64), name!(values_n, i64), name!(kind, String))> {
+        let lower = prefix.to_lowercase();
+        let (lo, hi) = prefix_range(&lower);
+        let rows = Spi::connect(|client| {
+            let r = client
+                .select(
+                    "SELECT r.key, count(DISTINCT r.file_id), count(DISTINCT r.val_lc),
+                            CASE WHEN count(r.val_num) = 0 THEN 'text'
+                                 WHEN count(r.val_num) = count(r.val_txt) THEN 'number'
+                                 ELSE 'mixed' END
+                       FROM kb.property r
+                       JOIN kb.node n ON n.id = r.file_id AND n.deleted_at IS NULL
+                      WHERE ($1 = '' OR (r.key_lc >= $2 AND r.key_lc < $3))
+                      GROUP BY r.key
+                      ORDER BY count(DISTINCT r.file_id) DESC, r.key
+                      LIMIT $4",
+                    None,
+                    &[lower.as_str().into(), lo.as_str().into(), hi.as_str().into(), lim.max(1).into()],
+                )
+                .unwrap_or_else(|e| spi_err(e));
+            let mut out = Vec::new();
+            for row in r {
+                out.push((
+                    row.get::<String>(1).unwrap_or_default().unwrap_or_default(),
+                    row.get::<i64>(2).unwrap_or_default().unwrap_or(0),
+                    row.get::<i64>(3).unwrap_or_default().unwrap_or(0),
+                    row.get::<String>(4).unwrap_or_default().unwrap_or_default(),
+                ));
+            }
+            out
+        });
+        TableIterator::new(rows)
+    }
+
+    /// The values one property takes, most-used first; `prefix` narrows them as above.
+    #[pg_extern(stable)]
+    fn prop_values(
+        key: &str,
+        prefix: default!(&str, "''"),
+        lim: default!(i64, 200),
+    ) -> TableIterator<'static, (name!(value, Option<String>), name!(docs, i64))> {
+        let lower = prefix.to_lowercase();
+        let (lo, hi) = prefix_range(&lower);
+        let k = key.to_lowercase();
+        let rows = Spi::connect(|client| {
+            let r = client
+                .select(
+                    "SELECT r.val_txt, count(DISTINCT r.file_id)
+                       FROM kb.property r
+                       JOIN kb.node n ON n.id = r.file_id AND n.deleted_at IS NULL
+                      WHERE r.key_lc = $1
+                        AND ($2 = '' OR (r.val_lc >= $3 AND r.val_lc < $4))
+                      GROUP BY r.val_txt
+                      ORDER BY count(DISTINCT r.file_id) DESC, r.val_txt
+                      LIMIT $5",
+                    None,
+                    &[k.as_str().into(), lower.as_str().into(), lo.as_str().into(), hi.as_str().into(), lim.max(1).into()],
+                )
+                .unwrap_or_else(|e| spi_err(e));
+            let mut out = Vec::new();
+            for row in r {
+                out.push((row.get::<String>(1).unwrap_or_default(), row.get::<i64>(2).unwrap_or_default().unwrap_or(0)));
+            }
+            out
+        });
+        TableIterator::new(rows)
+    }
+
+    /// Documents matching a property query, under `folder`.
+    ///
+    /// The grammar is `textdb_md::query`, the same one the SQLite binding parses, so a query
+    /// written against one store means the same thing against the other.
+    #[pg_extern(stable)]
+    fn prop_find(
+        query: default!(&str, "''"),
+        folder: default!(&str, "'/'"),
+        lim: default!(i64, 500),
+    ) -> TableIterator<'static, (name!(path, String), name!(nbytes, i64), name!(updated_at, String), name!(frontmatter, Option<String>))> {
+        let expr = match textdb_md::query::parse(query) {
+            Ok(e) => e,
+            Err(e) => raise("TX004", &e.to_string(), ""),
+        };
+        let (where_clause, args) = match crate::property::compile(&expr) {
+            Ok(v) => v,
+            Err(e) => raise("TX004", &e.to_string(), ""),
+        };
+        let n = args.len();
+        let folder = ok(normalize_path(folder));
+        // The same escaping `kb._subtree_like` applies, so a folder named `100%_done` selects
+        // itself and not `100XXXdone`.
+        let like = format!("{}/%", folder.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+        let sql = format!(
+            "SELECT n.path, coalesce(n.nbytes, 0), coalesce(n.updated_at::text, ''),
+                    (SELECT f.data::text FROM kb.frontmatter f WHERE f.file_id = n.id AND f.version = n.version)
+               FROM kb.node n
+              WHERE n.deleted_at IS NULL AND n.kind = 1
+                AND ({where_clause})
+                AND (${folder_i} = '/' OR n.path = ${folder_i} OR n.path LIKE ${like_i} ESCAPE '\\')
+              ORDER BY n.path
+              LIMIT ${lim_i}",
+            folder_i = n + 1,
+            like_i = n + 2,
+            lim_i = n + 3,
+        );
+        let rows = Spi::connect(|client| {
+            let mut bound: Vec<pgrx::datum::DatumWithOid> = Vec::with_capacity(n + 3);
+            for a in &args {
+                match a {
+                    crate::property::Arg::Text(t) => bound.push(t.as_str().into()),
+                    crate::property::Arg::Num(f) => bound.push((*f).into()),
+                }
+            }
+            bound.push(folder.as_str().into());
+            bound.push(like.as_str().into());
+            bound.push(lim.max(1).into());
+            let r = client.select(&sql, None, &bound).unwrap_or_else(|e| spi_err(e));
+            let mut out = Vec::new();
+            for row in r {
+                out.push((
+                    row.get::<String>(1).unwrap_or_default().unwrap_or_default(),
+                    row.get::<i64>(2).unwrap_or_default().unwrap_or(0),
+                    row.get::<String>(3).unwrap_or_default().unwrap_or_default(),
+                    row.get::<String>(4).unwrap_or_default(),
+                ));
+            }
+            out
+        });
         TableIterator::new(rows)
     }
 

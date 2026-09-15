@@ -121,6 +121,32 @@ export interface SearchHit {
   rank: number;
 }
 
+/** A front-matter property name in use across the store. */
+export interface PropertyKey {
+  key: string;
+  /** Documents carrying it — a note with three tags counts once. */
+  docs: number;
+  /** Distinct values it takes. */
+  valuesN: number;
+  /** `number`, `text` or `mixed`; a UI offers `>` and `<` only where they mean something. */
+  kind: 'number' | 'text' | 'mixed';
+}
+
+/** One value a property takes, and how many documents use it. */
+export interface PropertyValue {
+  value: string | null;
+  docs: number;
+}
+
+/** A document matched by a property query. */
+export interface PropertyHit {
+  path: string;
+  nbytes: number;
+  updatedAt: string;
+  /** The whole front matter, so a result table can show any column without a query per row. */
+  frontmatter: Record<string, unknown> | null;
+}
+
 export interface WriteResult {
   version: number;
   kind: WriteKind;

@@ -252,3 +252,68 @@ mod tests {
         assert_eq!(scalar("- x"), "\"- x\"");
     }
 }
+
+/// Property names used anywhere in the store, most-used first.
+pub fn keys(st: &mut dyn Store, prefix: &str, limit: i64, json: bool) -> Result<()> {
+    let rows = st.property_keys(prefix, limit)?;
+    if json {
+        return emit_json(&rows);
+    }
+    let mut text = String::new();
+    for k in &rows {
+        // The counts are what make a listing useful for deciding what to filter on, and the
+        // kind is what tells a reader whether `>` will mean anything on this property.
+        text.push_str(&format!("{}  {} docs, {} values, {}\n", k.key, k.docs, k.values, k.kind));
+    }
+    out(text.as_bytes())
+}
+
+/// The values one property takes, most-used first.
+pub fn values(st: &mut dyn Store, key: &str, prefix: &str, limit: i64, json: bool) -> Result<()> {
+    let rows = st.property_values(key, prefix, limit)?;
+    if json {
+        return emit_json(&rows);
+    }
+    let mut text = String::new();
+    for v in &rows {
+        // A property present but empty is a real state in a vault, so it is listed rather
+        // than dropped, and named rather than shown as a blank line.
+        let shown = v.value.as_deref().unwrap_or("(empty)");
+        text.push_str(&format!("{}  {} docs\n", shown, v.docs));
+    }
+    out(text.as_bytes())
+}
+
+/// Documents matching a property query.
+pub fn find(st: &mut dyn Store, query: &str, folder: &str, limit: i64, show: Option<&str>, json: bool) -> Result<()> {
+    let rows = st.property_find(query, folder, limit)?;
+    if json {
+        return emit_json(&rows);
+    }
+    let columns: Vec<&str> = show.map(|s| s.split(',').map(str::trim).filter(|c| !c.is_empty()).collect()).unwrap_or_default();
+    let mut text = String::new();
+    for hit in &rows {
+        if columns.is_empty() {
+            text.push_str(&hit.path);
+            text.push('\n');
+            continue;
+        }
+        let shown: Vec<String> = columns
+            .iter()
+            .map(|c| {
+                let v = hit.frontmatter.as_ref().and_then(|f| f.get(*c));
+                format!("{}={}", c, v.map(plain_or_list).unwrap_or_else(|| "-".into()))
+            })
+            .collect();
+        text.push_str(&format!("{}  {}\n", hit.path, shown.join("  ")));
+    }
+    out(text.as_bytes())
+}
+
+/// A property value for a table cell: a list joins with commas rather than printing as JSON.
+fn plain_or_list(v: &Value) -> String {
+    match v {
+        Value::Array(items) => items.iter().map(plain).collect::<Vec<_>>().join(","),
+        other => plain(other),
+    }
+}

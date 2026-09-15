@@ -239,6 +239,40 @@ impl Store for SqliteStore {
         Ok(self.db().section(path, heading)?)
     }
 
+    fn property_keys(&mut self, prefix: &str, limit: i64) -> Result<Vec<crate::store::PropKey>> {
+        Ok(self
+            .db()
+            .property_keys(prefix, limit.max(1) as usize)?
+            .into_iter()
+            .map(|k| crate::store::PropKey {
+                key: k.key,
+                docs: k.docs,
+                values: k.values,
+                kind: k.kind,
+            })
+            .collect())
+    }
+    fn property_values(&mut self, key: &str, prefix: &str, limit: i64) -> Result<Vec<crate::store::PropValue>> {
+        Ok(self
+            .db()
+            .property_values(key, prefix, limit.max(1) as usize)?
+            .into_iter()
+            .map(|v| crate::store::PropValue { value: v.value, docs: v.docs })
+            .collect())
+    }
+    fn property_find(&mut self, query: &str, folder: &str, limit: i64) -> Result<Vec<crate::store::PropHit>> {
+        Ok(self
+            .db()
+            .property_find(query, folder, limit.max(1) as usize)?
+            .into_iter()
+            .map(|h| crate::store::PropHit {
+                path: h.path,
+                nbytes: h.nbytes,
+                updated_at: h.updated_at,
+                frontmatter: h.frontmatter.and_then(|t| serde_json::from_str(&t).ok()),
+            })
+            .collect())
+    }
     fn search(&mut self, query: &str, prefix: &str, limit: i64) -> Result<Vec<Hit>> {
         Ok(self
             .db()
@@ -859,6 +893,9 @@ fn sql_views(p: &str) -> String {
                   r.path LIKE '%.tdbasset' AS asset
            FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL
            LEFT JOIN {p}node r ON r.id = l.resolved_id AND r.deleted_at IS NULL;
+         CREATE TEMP VIEW IF NOT EXISTS properties AS
+           SELECT n.path, r.key, r.val_txt AS value, r.val_num AS number, r.ord
+           FROM {p}property r JOIN {p}node n ON n.id = r.file_id AND n.deleted_at IS NULL;
          CREATE TEMP VIEW IF NOT EXISTS commits AS
            SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines, c.batch
            FROM {p}commit c JOIN {p}node n ON n.id = c.file_id AND n.deleted_at IS NULL;
