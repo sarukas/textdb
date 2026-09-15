@@ -3,7 +3,7 @@
 //! made by another process.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -19,6 +19,36 @@ impl Output {
     fn json(&self) -> Value {
         serde_json::from_str(self.stdout.trim()).unwrap_or_else(|e| panic!("not JSON ({e}): {}\n{}", self.stdout, self.stderr))
     }
+}
+
+/// Does making a file read-only actually stop this process writing to it?
+///
+/// On Unix root ignores the permission bits, so a test that makes a file read-only to provoke a
+/// write failure quietly tests nothing — and asserts the opposite of what happens. Containers
+/// usually run as root, which is where anyone would be debugging. Asking the filesystem beats
+/// asking who we are: it is the property the test actually depends on, and it needs no extra
+/// dependency and no per-platform guess (on Windows the bit binds administrators too).
+fn read_only_blocks_writes() -> bool {
+    let Ok(dir) = tempfile::tempdir() else { return true };
+    let probe = dir.path().join("probe");
+    if std::fs::write(&probe, b"before").is_err() {
+        return true;
+    }
+    let Ok(meta) = std::fs::metadata(&probe) else { return true };
+    let mut perms = meta.permissions();
+    perms.set_readonly(true);
+    if std::fs::set_permissions(&probe, perms).is_err() {
+        return true;
+    }
+    let blocked = std::fs::write(&probe, b"after").is_err();
+    // Put the bit back so the temporary directory can remove the file on Windows.
+    if let Ok(meta) = std::fs::metadata(&probe) {
+        let mut perms = meta.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(&probe, perms);
+    }
+    blocked
 }
 
 fn textdb(store: &Path) -> Command {
@@ -1281,13 +1311,22 @@ fn assets_push_keeps_bytes_in_use_and_records_only_what_it_wrote() {
         p.set_readonly(yes);
         std::fs::set_permissions(&on_disk, p).unwrap();
     };
-    set_readonly(true);
-    let failed = run(&mut t(&["assets", "push", "--dir", d]), None);
-    set_readonly(false);
-    assert_eq!(failed.status, 1, "{}", failed.stdout);
-    ok(&mut t(&["sync", "/", d]), None);
-    assert_eq!(std::fs::read_to_string(&on_disk).unwrap(), ok(&mut t(&["cat", "/img/a.png.tdbasset"]), None).stdout);
-    assert_eq!(ok(&mut t(&["--json", "assets", "status", "--dir", d]), None).json()["counts"], serde_json::json!({ "ok": 2 }));
+    if read_only_blocks_writes() {
+        set_readonly(true);
+        let failed = run(&mut t(&["assets", "push", "--dir", d]), None);
+        set_readonly(false);
+        assert_eq!(failed.status, 1, "{}", failed.stdout);
+        ok(&mut t(&["sync", "/", d]), None);
+        assert_eq!(std::fs::read_to_string(&on_disk).unwrap(), ok(&mut t(&["cat", "/img/a.png.tdbasset"]), None).stdout);
+        assert_eq!(ok(&mut t(&["--json", "assets", "status", "--dir", d]), None).json()["counts"], serde_json::json!({ "ok": 2 }));
+    } else {
+        // Running as root (a container, usually), where the read-only bit does not bind: the
+        // push would succeed and this would assert the opposite of what happens. Push it the
+        // ordinary way instead, so the rest of the test carries on from the same state.
+        eprintln!("skipping the unwritable-pointer case: read-only files are writable by this user");
+        ok(&mut t(&["assets", "push", "--dir", d]), None);
+        assert_eq!(ok(&mut t(&["--json", "assets", "status", "--dir", d]), None).json()["counts"], serde_json::json!({ "ok": 2 }));
+    }
 
     // A pointer deleted in the store is not brought back by pushing a changed file.
     ok(&mut t(&["rm", "/img/a.png.tdbasset"]), None);
@@ -2044,4 +2083,217 @@ fn watch_follows_commits_made_by_another_process() {
     let ops: Vec<(&str, &str)> = seen.iter().map(|c| (c["op"].as_str().unwrap(), c["path"].as_str().unwrap())).collect();
     assert_eq!(ops, [("mkdir", "/live"), ("create", "/live/a.md"), ("commit", "/live/a.md")]);
     assert_eq!(seen[2]["author"], "agent-9");
+}
+
+// ---------------------------------------------------------------------------
+// The rclone driver against a provider that misbehaves
+//
+// `assets_through_an_rclone_store` above runs against real rclone on its local backend, which
+// proves the command line and the JSON are right. It cannot prove anything about the paths that
+// only run against a real provider, because the local backend never misbehaves: it always keeps
+// a SHA-256, never rewrites what it stores, and renames atomically. Those paths carry the most
+// risk in the driver and had no test at all. `textdb-fake-rclone` stands in for rclone and can
+// be told to behave as the providers documentably do.
+// ---------------------------------------------------------------------------
+
+/// A store, a vault synced with it, and an rclone store served by the stand-in.
+///
+/// Returns a command builder whose environment points `TEXTDB_RCLONE` at the stand-in, plus the
+/// vault and the directory the "remote" keeps its bytes in.
+fn fake_rclone_vault(tmp: &Path, name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let (store, vault, remote, config) =
+        (tmp.join("kb.db"), tmp.join("vault"), tmp.join("remote"), tmp.join("config"));
+    std::fs::create_dir_all(vault.join("img")).unwrap();
+    // The root the stand-in serves; the driver addresses it as `fake:NAME`.
+    std::fs::create_dir_all(remote.join(name)).unwrap();
+    (store, vault, remote, config)
+}
+
+/// `textdb` with the stand-in wired in as rclone.
+fn with_fake_rclone(store: &Path, remote: &Path, config: &Path, args: &[&str]) -> Command {
+    let mut c = textdb(store);
+    c.env("TEXTDB_CONFIG_DIR", config)
+        .env("TEXTDB_RCLONE", env!("CARGO_BIN_EXE_textdb-fake-rclone"))
+        .env("TEXTDB_FAKE_RCLONE_ROOT", remote)
+        .args(args);
+    c
+}
+
+/// The stand-in is faithful enough to push, pull and verify through: if this fails, nothing the
+/// other tests in this group claim about the driver means anything.
+#[test]
+fn fake_rclone_round_trips_a_push_and_a_pull() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, vault, remote, config) = fake_rclone_vault(tmp.path(), "textdb");
+    let other = tmp.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(vault.join("notes.md"), "![[arch.png]]\n").unwrap();
+    std::fs::write(vault.join("img/arch.png"), b"\x89PNG first").unwrap();
+    let t = |args: &[&str]| with_fake_rclone(&store, &remote, &config, args);
+    let (dir, other_dir) = (vault.to_str().unwrap(), other.to_str().unwrap());
+
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "stores", "--add", "drive", "--driver", "rclone", "--root", "fake:textdb"]), None);
+    let stores = ok(&mut t(&["--json", "assets", "stores"]), None).json();
+    assert_eq!(stores[0]["reachable"], true, "{stores}");
+
+    let pushed = ok(&mut t(&["--json", "assets", "push", "--dir", dir]), None).json();
+    assert_eq!(pushed["pushed"].as_array().unwrap().len(), 1, "{pushed}");
+    assert_eq!(std::fs::read(remote.join("textdb/img/arch.png")).unwrap(), b"\x89PNG first");
+    assert_eq!(ok(&mut t(&["--json", "assets", "status", "--dir", dir]), None).json()["counts"], serde_json::json!({ "ok": 1 }));
+    assert_eq!(ok(&mut t(&["--json", "assets", "verify", "--dir", dir]), None).json()["problems"], 0);
+
+    // And out again into a second directory.
+    ok(&mut t(&["sync", "/", other_dir]), None);
+    ok(&mut t(&["assets", "pull", "--dir", other_dir]), None);
+    assert_eq!(std::fs::read(other.join("img/arch.png")).unwrap(), b"\x89PNG first");
+}
+
+/// OneDrive and SharePoint hash with QuickXorHash, so `--hash-type SHA256` gives nothing back and
+/// the driver has to read the bytes to hash them. Real rclone's local backend always answers with
+/// a SHA-256, so this fallback has never run under test — and it is what every push verification
+/// and every `verify` against those providers would go through.
+#[test]
+fn an_asset_store_that_keeps_no_sha256_is_hashed_by_reading_it_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, vault, remote, config) = fake_rclone_vault(tmp.path(), "textdb");
+    std::fs::write(vault.join("notes.md"), "![[a.png]]\n").unwrap();
+    std::fs::write(vault.join("img/a.png"), b"\x89PNG no provider hash").unwrap();
+    let t = |args: &[&str]| {
+        let mut c = with_fake_rclone(&store, &remote, &config, args);
+        c.env("TEXTDB_FAKE_RCLONE_NO_SHA256", "1");
+        c
+    };
+    let dir = vault.to_str().unwrap();
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "stores", "--add", "sharepoint", "--driver", "rclone", "--root", "fake:textdb"]), None);
+
+    ok(&mut t(&["assets", "push", "--dir", dir]), None);
+    assert_eq!(std::fs::read(remote.join("textdb/img/a.png")).unwrap(), b"\x89PNG no provider hash");
+    assert_eq!(ok(&mut t(&["--json", "assets", "status", "--dir", dir]), None).json()["counts"], serde_json::json!({ "ok": 1 }));
+    // `verify` hashes both sides, so it exercises the read-back path on purpose.
+    assert_eq!(ok(&mut t(&["--json", "assets", "verify", "--dir", dir]), None).json()["problems"], 0);
+
+    // And it still catches bytes changed in the store directly, which is the point of hashing.
+    std::fs::write(remote.join("textdb/img/a.png"), b"tampered").unwrap();
+    assert_eq!(run(&mut t(&["assets", "verify", "--dir", dir]), None).status, 1);
+}
+
+/// SharePoint "silently modifies uploaded files, mainly Office files (.docx, .xlsx, etc.), causing
+/// file size and hash checks to fail" (rclone's own OneDrive documentation). The bytes that land
+/// are then not the bytes the pointer names, so the push must fail and commit no pointer — never
+/// publish a pointer whose sha256 nothing in the store matches.
+///
+/// This is the failure every Office-file push against real SharePoint would hit today, and the
+/// reason stage 3's second part wants a provider version tag rather than a hash comparison.
+#[test]
+fn an_asset_store_that_rewrites_uploads_fails_the_push_and_publishes_no_pointer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, vault, remote, config) = fake_rclone_vault(tmp.path(), "textdb");
+    std::fs::write(vault.join("notes.md"), "![[report.docx]]\n").unwrap();
+    std::fs::write(vault.join("img/report.docx"), b"PK\x03\x04 office bytes").unwrap();
+    let t = |args: &[&str]| {
+        let mut c = with_fake_rclone(&store, &remote, &config, args);
+        c.env("TEXTDB_FAKE_RCLONE_REWRITE", "1");
+        c
+    };
+    let dir = vault.to_str().unwrap();
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "stores", "--add", "sharepoint", "--driver", "rclone", "--root", "fake:textdb"]), None);
+
+    let failed = run(&mut t(&["assets", "push", "--dir", dir]), None);
+    assert_eq!(failed.status, 1, "{}{}", failed.stdout, failed.stderr);
+    assert!(failed.stdout.contains("report.docx"), "{}", failed.stdout);
+
+    // No pointer was committed, so the asset is still waiting to be published rather than
+    // recorded as stored under a hash the store cannot produce.
+    assert_eq!(run(&mut t(&["stat", "/img/report.docx.tdbasset"]), None).status, 5);
+    let counts = ok(&mut t(&["--json", "assets", "status", "--dir", dir]), None).json()["counts"].clone();
+    assert_eq!(counts, serde_json::json!({ "new": 1 }), "{counts}");
+
+    // "One asset failing does not stop the others": a file the provider leaves alone goes up in
+    // the same run, and the run still exits 1 for the one that did not.
+    std::fs::write(vault.join("img/plain.png"), b"\x89PNG untouched").unwrap();
+    ok(&mut t(&["sync", "/", dir]), None);
+    let both = run(&mut t(&["--json", "assets", "push", "--dir", dir]), None);
+    assert_eq!(both.status, 1, "{}{}", both.stdout, both.stderr);
+    let report: Value = serde_json::from_str(both.stdout.lines().next().unwrap()).unwrap();
+    let pushed: Vec<&str> = report["pushed"].as_array().unwrap().iter().map(|p| p["path"].as_str().unwrap()).collect();
+    assert_eq!(pushed, ["/img/plain.png"], "{}", both.stdout);
+    assert_eq!(report["failed"].as_array().unwrap().len(), 1, "{}", both.stdout);
+    assert!(report["failed"][0].as_str().unwrap().contains("report.docx"), "{}", both.stdout);
+    assert_eq!(std::fs::read(remote.join("textdb/img/plain.png")).unwrap(), b"\x89PNG untouched");
+
+    // The rewritten bytes never become the asset: no pointer names them, under its own path or
+    // the `beside` name a push falls back to when other bytes hold the path.
+    assert_eq!(run(&mut t(&["stat", "/img/report.docx.tdbasset"]), None).status, 5);
+}
+
+/// rclone clears the destination before a server-side move, so an asset is briefly missing from
+/// its own path while it is replaced. When the move then fails, what was there has to come back:
+/// the one path in the driver where a provider hiccup could lose an asset outright. Real rclone on
+/// a local backend renames atomically and never leaves that gap.
+#[test]
+fn a_move_that_clears_the_destination_and_fails_puts_the_old_bytes_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, vault, remote, config) = fake_rclone_vault(tmp.path(), "textdb");
+    std::fs::write(vault.join("notes.md"), "![[a.png]]\n").unwrap();
+    std::fs::write(vault.join("img/a.png"), b"\x89PNG published").unwrap();
+    let plain = |args: &[&str]| with_fake_rclone(&store, &remote, &config, args);
+    let dir = vault.to_str().unwrap();
+    ok(&mut plain(&["sync", "/", dir]), None);
+    ok(&mut plain(&["assets", "stores", "--add", "drive", "--driver", "rclone", "--root", "fake:textdb"]), None);
+    ok(&mut plain(&["assets", "push", "--dir", dir]), None);
+    let stored = remote.join("textdb/img/a.png");
+    assert_eq!(std::fs::read(&stored).unwrap(), b"\x89PNG published");
+
+    // A new version of the asset, pushed while every server-side move fails after clearing the
+    // destination.
+    std::fs::write(vault.join("img/a.png"), b"\x89PNG the next version").unwrap();
+    let mut gap = with_fake_rclone(&store, &remote, &config, &["assets", "push", "--dir", dir]);
+    let failed = run(gap.env("TEXTDB_FAKE_RCLONE_MOVE_GAP", "1"), None);
+    assert_eq!(failed.status, 1, "{}{}", failed.stdout, failed.stderr);
+
+    // The published bytes are back where the asset belongs: not missing, and not the half-written
+    // new version.
+    assert_eq!(std::fs::read(&stored).unwrap(), b"\x89PNG published", "the asset must not be left missing or replaced");
+    // And the store still describes what is actually there.
+    assert_eq!(ok(&mut plain(&["--json", "assets", "verify", "--dir", dir]), None).json()["problems"], 0);
+
+    // Once the provider behaves, the same push goes through.
+    ok(&mut plain(&["assets", "push", "--dir", dir]), None);
+    assert_eq!(std::fs::read(&stored).unwrap(), b"\x89PNG the next version");
+}
+
+/// The lock protocol rests on the provider listing what was just written ("of two pushes that
+/// wrote at once, the one that lists later sees the other's file"). Google Drive promises no such
+/// thing. A push must still finish when its own lock file takes several listings to appear, rather
+/// than wedging or giving up.
+#[test]
+fn a_push_finishes_when_the_provider_lists_its_lock_file_late() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, vault, remote, config) = fake_rclone_vault(tmp.path(), "textdb");
+    std::fs::write(vault.join("notes.md"), "![[a.png]]\n").unwrap();
+    std::fs::write(vault.join("img/a.png"), b"\x89PNG late listing").unwrap();
+    let t = |args: &[&str]| {
+        let mut c = with_fake_rclone(&store, &remote, &config, args);
+        // Every lock file stays unlisted for its first few listings.
+        c.env("TEXTDB_FAKE_RCLONE_LIST_LAG", "6");
+        c
+    };
+    let dir = vault.to_str().unwrap();
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "stores", "--add", "drive", "--driver", "rclone", "--root", "fake:textdb"]), None);
+
+    let started = std::time::Instant::now();
+    ok(&mut t(&["assets", "push", "--dir", dir]), None);
+    // It has to converge, not wait out the ten-minute lock budget.
+    assert!(started.elapsed() < std::time::Duration::from_secs(60), "the push took {:?}", started.elapsed());
+    assert_eq!(std::fs::read(remote.join("textdb/img/a.png")).unwrap(), b"\x89PNG late listing");
+    assert_eq!(ok(&mut t(&["--json", "assets", "status", "--dir", dir]), None).json()["counts"], serde_json::json!({ "ok": 1 }));
+
+    // No lock file is left behind for the next push to wait on.
+    let locks = remote.join("textdb/.textdb-trash/locks");
+    let left: Vec<_> = std::fs::read_dir(&locks).into_iter().flatten().flatten().map(|e| e.file_name()).collect();
+    assert!(left.is_empty(), "locks left behind: {left:?}");
 }
