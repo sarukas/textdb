@@ -922,6 +922,45 @@ fn textdbignore_leaves_obsidian_code_out_both_ways_and_stays_the_directorys_own(
 }
 
 #[test]
+fn defaults_are_added_unless_the_rules_say_otherwise_and_binary_notes_are_never_merged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let vault = tmp.path().join("vault");
+    std::fs::create_dir_all(vault.join(".obsidian")).unwrap();
+    let lines: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+    std::fs::write(vault.join("note.txt"), &lines).unwrap();
+    std::fs::write(vault.join(".textdbignore"), "# .obsidian/themes are shared\n.obsidian/plugins/*/data.json\n").unwrap();
+    let dir = vault.to_str().unwrap();
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.args(args);
+        c
+    };
+
+    // A comment or a pattern for some files in a folder is no say on the folder: its default goes in.
+    ok(&mut t(&["sync", "/", dir]), None);
+    let rules = std::fs::read_to_string(vault.join(".textdbignore")).unwrap();
+    assert!(rules.contains("**/.obsidian/plugins\n") && rules.contains("**/.obsidian/themes\n"), "{rules}");
+
+    // A note that turned binary on disk is not merged with a change in the store.
+    let mut bytes = lines.clone().into_bytes();
+    bytes[5] = 0;
+    std::fs::write(vault.join("note.txt"), &bytes).unwrap();
+    run(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["write", "/note.txt"]), Some(&lines.replace("line 18\n", "line 18 (store)\n")));
+    let synced = run(&mut t(&["sync", "/", dir]), None);
+    assert!(synced.stdout.contains("a binary file"), "{}", synced.stdout);
+    assert_eq!(std::fs::read(vault.join("note.txt")).unwrap(), bytes, "the binary on disk changed: {}", synced.stdout);
+    assert_eq!(ok(&mut t(&["--json", "stat", "/note.txt"]), None).json()["version"], 2, "{}", synced.stdout);
+
+    // Rules that are not UTF-8 stop the sync.
+    std::fs::write(vault.join(".textdbignore"), [0xff, 0xfe, b'*', 0]).unwrap();
+    let stopped = run(&mut t(&["sync", "/", dir]), None);
+    assert_ne!(stopped.status, 0, "{}", stopped.stdout);
+    assert!(format!("{}{}", stopped.stdout, stopped.stderr).contains("UTF-8"), "{}", stopped.stderr);
+}
+
+#[test]
 fn binary_files_are_not_taken_in_and_sync_says_what_to_do() {
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("kb.db");
