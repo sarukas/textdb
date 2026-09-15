@@ -184,6 +184,37 @@ the sidecar is part of the small-document create regression and not all of it. T
 feed, path events and folder totals are the untested remainder — the next step is a probe
 that switches each off in turn, which `textdb-probe writepath` is the right place for.
 
+## Link rewriting on a move is within 1.45x of its floor (2026-09-15)
+
+`link_updates = rewrite` keeps the corpus correct when a file moves: every document that
+pointed at it is rewritten to point at the new path, one commit each, in the same
+transaction as the move. It handles all four link kinds and keeps each one's syntax and
+alias — `[x](./target.md)` -> `[x](./renamed.md)`, `[[target]]` -> `[[renamed]]`,
+`![[target]]`, `![alt](./target.md)`.
+
+It is the most expensive thing in the MD family, so it is worth saying what the cost *is*
+rather than only that it is large. Measured on this host, one file moved with N documents
+pointing at it:
+
+| fan-in | total | per rewritten document |
+|---|---|---|
+| 50 | 39 ms | 780 us |
+| 200 | 124 ms | 620 us |
+| 500 | 334 ms | 668 us |
+
+Linear in fan-in, flat per document — no quadratic blow-up from re-resolving the graph.
+
+The floor is "one ordinary edit per affected document", because a versioned store cannot
+change 500 documents without committing 500 versions. Measured on the same store, 500
+ordinary `textdb_edit` calls in one transaction cost **230 ms, 460 us each**. So the link
+rewrite runs at 668 us against a 460 us floor: **1.45x**, with about 208 us per document of
+genuinely link-specific work (finding what points here, rewriting the target text,
+re-resolving).
+
+The consequence for tuning is the useful part: two thirds of this is ordinary commit cost,
+so the lever is the per-commit fixed cost recorded above, not the link logic. Rewriting the
+link code could at best recover the 208 us.
+
 ## Sync rewrote its whole base on every run, including a no-op (2026-09-15)
 
 SY-01 put a number on sync for the first time, and the no-op case — the one a save hook or
