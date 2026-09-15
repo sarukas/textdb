@@ -65,6 +65,12 @@ pub struct Rules {
     pub skip_dirs: Vec<String>,
     /// Git blob id of `.textdbignore`, when the directory has one.
     pub ignore_file: Option<String>,
+    /// The text of `.textdbignore`, so the next sync can tell what loosening it lets through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_text: Option<String>,
+    /// Whether sync has put its default lines in `.textdbignore`, which it does once per directory.
+    #[serde(default)]
+    pub ignore_seeded: bool,
     /// One id for the `.gitattributes` files, which say which files are assets (`""` when there
     /// are none); `None` for a base an older build saved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -218,13 +224,49 @@ pub const SKIP_DIRS: &[&str] = &[".git", ".textdb", ".trash", "node_modules"];
 /// The directory's own rules for what sync leaves out, in `.gitignore` syntax.
 const IGNORE_FILE: &str = ".textdbignore";
 
-/// What an Obsidian vault that never had a `.textdbignore` gets: its settings sync, but not the code
-/// and styles Obsidian loads, which anyone who can write to the store could otherwise put there.
-const DEFAULT_IGNORE: &str = "# What sync leaves out, in .gitignore syntax: not taken in, and never written, moved or deleted.\n\
-# Obsidian's plugins, snippets and themes are code and styles it loads: delete these lines to sync them.\n\
-**/.obsidian/plugins/\n\
-**/.obsidian/snippets/\n\
-**/.obsidian/themes/\n";
+/// The lines sync puts in a directory's `.textdbignore` once: Obsidian's settings sync, but not the
+/// code and styles it loads (at any depth, and a file of that name too), which anyone who can write
+/// to the store could otherwise put there.
+const DEFAULT_IGNORE_LINES: &[&str] = &["**/.obsidian/plugins", "**/.obsidian/snippets", "**/.obsidian/themes"];
+
+const DEFAULT_IGNORE_HEADER: &str = "# What sync leaves out, in .gitignore syntax: not taken in, and never written, moved or deleted.\n\
+# Obsidian's plugins, snippets and themes are code and styles it loads: delete these lines to sync them.\n";
+
+/// What sync adds to a `.textdbignore` holding `text` the first time: the default lines for the
+/// folders it does not mention yet (a line naming one at all, `!` included, is the user's say).
+fn default_ignore_additions(text: &str) -> Option<String> {
+    let missing: Vec<&str> = DEFAULT_IGNORE_LINES
+        .iter()
+        .copied()
+        .filter(|line| {
+            let folder = line.trim_start_matches("**/");
+            !text.lines().any(|l| l.to_ascii_lowercase().contains(folder))
+        })
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let mut add = String::from(DEFAULT_IGNORE_HEADER);
+    for line in missing {
+        add.push_str(line);
+        add.push('\n');
+    }
+    Some(add)
+}
+
+/// Whether `.textdbignore`'s rules leave `rel` out. As in git, a file inside a folder they leave out
+/// stays out, whatever a later `!` line says about the file.
+fn ignored_by(gi: &ignore::gitignore::Gitignore, rel: &str) -> bool {
+    let mut end = 0;
+    while let Some(i) = rel[end..].find('/') {
+        end += i;
+        if gi.matched(&rel[..end], true).is_ignore() {
+            return true;
+        }
+        end += 1;
+    }
+    gi.matched(rel, false).is_ignore()
+}
 
 /// Whether `rel` is, or is inside, a folder sync never writes a store file into: version control,
 /// textdb's own folder, trash, dependencies and system folders (the folders assets are never in,
@@ -238,8 +280,9 @@ fn protected_rel(rel: &str) -> bool {
     let segs: Vec<&str> = rel.split('/').collect();
     segs.iter().any(|s| names_dir(s, &dirs))
         // The rules that keep files out are the directory's own: anyone who can write to the store
-        // could otherwise take away the lines that keep Obsidian's plugins out.
-        || (segs.len() == 1 && names_dir(segs[0], &[IGNORE_FILE]))
+        // could otherwise take away the lines that keep Obsidian's plugins out, or put a folder in
+        // their place.
+        || names_dir(segs[0], &[IGNORE_FILE])
 }
 
 /// The rules of a `.textdbignore` (in any letter case where the file system ignores it), and a
@@ -1147,34 +1190,49 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         }
     };
     // `.textdbignore` in the directory, in .gitignore syntax: what it matches is not synced either
-    // way. An Obsidian vault that never had one gets the defaults, which leave its plugins out.
+    // way. Rules that are there but cannot be read stop the sync: nothing they keep out is written.
     let ignore_path = o.dir.join(IGNORE_FILE);
-    let mut ignore_bytes = std::fs::read(&ignore_path).ok();
-    let had_ignore_file = stored
+    let mut ignore_text = match std::fs::read(&ignore_path) {
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(StoreError::invalid(format!("sync stopped before writing anything: {} could not be read ({e})", ignore_path.display()))),
+    };
+    // Once per directory the default lines go in: a new file, or the ones a file does not mention
+    // yet. Lines deleted after that stay deleted.
+    let mut ignore_seeded = stored
         .as_ref()
         .and_then(|b| b.rules.as_deref())
         .and_then(|r| serde_json::from_str::<Rules>(r).ok())
-        .is_some_and(|r| r.ignore_file.is_some());
-    if std::fs::symlink_metadata(&ignore_path).is_err() && !had_ignore_file && o.dir.join(".obsidian").is_dir() {
-        if !o.dry_run {
-            let written = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&ignore_path)
-                .and_then(|mut f| std::io::Write::write_all(&mut f, DEFAULT_IGNORE.as_bytes()));
-            match written {
-                Ok(()) => report.to_disk.new.push(IGNORE_FILE.to_string()),
-                Err(e) => report.skipped.push(note(IGNORE_FILE, format!("the defaults could not be written ({e}): used for this sync"))),
+        .is_some_and(|r| r.ignore_seeded);
+    if !ignore_seeded {
+        ignore_seeded = true;
+        if let Some(add) = default_ignore_additions(ignore_text.as_deref().unwrap_or("")) {
+            let mut text = ignore_text.clone().unwrap_or_default();
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
             }
+            text.push_str(&add);
+            let written = if o.dry_run { Ok(()) } else { std::fs::create_dir_all(&o.dir).and_then(|()| std::fs::write(&ignore_path, &text)) };
+            match written {
+                Ok(()) if ignore_text.is_some() => report.to_disk.changed.push(IGNORE_FILE.to_string()),
+                Ok(()) => report.to_disk.new.push(IGNORE_FILE.to_string()),
+                Err(e) => {
+                    report.skipped.push(note(IGNORE_FILE, format!("the default lines could not be written ({e}): used for this sync, and tried again next time")));
+                    ignore_seeded = false;
+                }
+            }
+            ignore_text = Some(text);
         }
-        ignore_bytes = Some(DEFAULT_IGNORE.as_bytes().to_vec());
     }
-    let (ignore, ignore_notes) = match &ignore_bytes {
-        Some(bytes) => ignore_rules(&o.dir, &String::from_utf8_lossy(bytes)),
+    let (ignore, ignore_notes) = match &ignore_text {
+        Some(text) => ignore_rules(&o.dir, text),
         None => (None, Vec::new()),
     };
+    if ignore_text.is_some() && ignore.is_none() {
+        return Err(StoreError::invalid(format!("sync stopped before writing anything: {} could not be read ({})", ignore_path.display(), ignore_notes.join("; "))));
+    }
     report.skipped.extend(ignore_notes.into_iter().map(|e| note(IGNORE_FILE, format!("not read: {e}"))));
-    let ignored = |rel: &str| ignore.as_ref().is_some_and(|gi| gi.matched_path_or_any_parents(rel, false).is_ignore());
+    let ignored = |rel: &str| ignore.as_ref().is_some_and(|gi| ignored_by(gi, rel));
 
     let mut plan = Plan::default();
     let all: BTreeSet<String> = base.keys().chain(heads.keys()).chain(walked.files.keys()).cloned().collect();
@@ -1189,6 +1247,10 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         // textdb, a plugin taken in from disk).
         let protected = protected_rel(&rel);
         if protected || ignored(&rel) {
+            // Gone from both sides: the last sync's record of it goes too.
+            if !heads.contains_key(&rel) && !walked.files.contains_key(&rel) {
+                continue;
+            }
             if heads.contains_key(&rel) || base.contains_key(&rel) {
                 let why = if protected { "inside a folder sync never writes into (.git, .textdb, node_modules, …): not synced" } else { "left out by .textdbignore: not synced" };
                 report.skipped.push(note(&rel, why));
@@ -1342,7 +1404,9 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         Rules {
             exts,
             skip_dirs: SKIP_DIRS.iter().map(|s| s.to_string()).collect(),
-            ignore_file: ignore_bytes.as_deref().map(blob_id),
+            ignore_file: ignore_text.as_deref().map(|t| blob_id(t.as_bytes())),
+            ignore_text: ignore_text.clone(),
+            ignore_seeded,
             gitattributes: Some(gitattributes_id(&o.dir, &walked)),
         }
     };
@@ -1368,6 +1432,21 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     for rel in std::mem::take(&mut plan.candidates) {
         if !moved_to.contains(&rel) {
             plan.to_textdb.push((rel, None));
+        }
+    }
+    // A binary file (a NUL byte in its first 8000 bytes, as git tells) is not text for the store:
+    // it stays on disk, and the store keeps what it had, with a word on what to do about it.
+    let mut binary = Vec::new();
+    for (rel, _) in &plan.to_textdb {
+        if sides.disk(rel)?.iter().take(8000).any(|&c| c == 0) {
+            binary.push(rel.clone());
+        }
+    }
+    if !binary.is_empty() {
+        plan.to_textdb.retain(|(rel, _)| !binary.contains(rel));
+        for rel in binary {
+            report.skipped.push(note(&rel, "a binary file: not taken in (list it in .textdbignore, or make it an asset with a textdb=asset line in .gitattributes)"));
+            plan.hold.push(rel);
         }
     }
 
@@ -1426,6 +1505,10 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     let mut pairs = pair_assets(&mut sides, &o.dir, &plan, &walked, &base, &heads, &untracked, &carry, &mut report)?;
     carry.extend(std::mem::take(&mut pairs.carry));
     carry.extend(case_renames);
+    // Nothing is trashed, renamed or set aside in what `.textdbignore` leaves out.
+    pairs.trash.retain(|(file, pointer)| !ignored(file) && !ignored(pointer));
+    pairs.renames.retain(|(from, to)| !ignored(from) && !ignored(to));
+    pairs.copies.retain(|(from, to)| !ignored(from) && !ignored(to));
     // Folders whose tracked files all leave disk but that keep untracked ones.
     let carried: HashSet<&str> = carry.iter().map(|(from, _)| from.as_str()).chain(pairs.trash.iter().map(|(file, _)| file.as_str())).collect();
     let mut emptied: BTreeSet<String> = BTreeSet::new();
@@ -1562,11 +1645,14 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     if let Some(stored) = &stored {
         let before: Option<Rules> = stored.rules.as_deref().and_then(|r| serde_json::from_str(r).ok());
         if !before.as_ref().is_some_and(|b| b.same(&rules)) {
+            // What the last sync's `.textdbignore` left out, taken in or written now, counts too.
+            let before_ignore = before.as_ref().and_then(|b| b.ignore_text.as_deref()).and_then(|t| ignore_rules(&o.dir, t).0);
+            let was_ignored = |rel: &str| before_ignore.as_ref().is_some_and(|gi| ignored_by(gi, rel));
             let left_out = |rel: &str| {
                 let dirs: Vec<&str> = rel.split('/').rev().skip(1).collect();
                 match &before {
                     None => dirs.iter().any(|s| s.starts_with('.') || *s == "node_modules"),
-                    Some(b) => dirs.iter().any(|s| b.skip_dirs.iter().any(|d| d == s)) || !eligible(rel, &b.exts),
+                    Some(b) => dirs.iter().any(|s| b.skip_dirs.iter().any(|d| d == s)) || !eligible(rel, &b.exts) || was_ignored(rel),
                 }
             };
             let newly_included: Vec<String> = plan
@@ -1574,6 +1660,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
                 .iter()
                 .filter(|(rel, v)| v.is_none() && !heads.contains_key(rel) && !base.contains_key(rel) && left_out(rel))
                 .map(|(rel, _)| rel.clone())
+                .chain(plan.to_disk.iter().filter(|rel| was_ignored(rel)).cloned())
                 .collect();
             report.stopped_by_rules = !newly_included.is_empty() && !o.accept_rules;
             report.rules = Some(RulesChange { before, now: rules.clone(), newly_included });
@@ -2298,14 +2385,21 @@ mod tests {
     #[test]
     fn the_default_textdbignore_leaves_out_obsidian_code_at_any_depth() {
         let tmp = tempfile::tempdir().unwrap();
-        let (gi, notes) = ignore_rules(tmp.path(), DEFAULT_IGNORE);
+        let defaults = default_ignore_additions("").unwrap();
+        let (gi, notes) = ignore_rules(tmp.path(), &format!("{defaults}!*.css\n"));
         assert!(notes.is_empty(), "{notes:?}");
         let gi = gi.unwrap();
-        let ignored = |rel: &str| gi.matched_path_or_any_parents(rel, false).is_ignore();
-        assert!(ignored(".obsidian/plugins/p/main.js") && ignored("sub/vault/.obsidian/themes/t/theme.css") && ignored(".obsidian/snippets/s.css"));
-        assert!(!ignored(".obsidian/app.json") && !ignored("plugins/p/main.js") && !ignored("notes/a.md"));
+        let ignored = |rel: &str| ignored_by(&gi, rel);
+        assert!(ignored(".obsidian/plugins/p/main.js") && ignored("sub/vault/.obsidian/themes/t/theme.css") && ignored(".obsidian/plugins"));
+        assert!(ignored(".obsidian/snippets/s.css"), "a ! line does not bring back a file inside a folder left out");
+        assert!(!ignored(".obsidian/app.json") && !ignored("plugins/p/main.js") && !ignored("notes/a.md") && !ignored("a.css"));
         if CASE_INSENSITIVE {
             assert!(ignored(".Obsidian/Plugins/p/main.js"));
         }
+        // Added once, only for the folders a file does not mention.
+        let added = default_ignore_additions("*.tmp\n!**/.obsidian/plugins/\n").unwrap();
+        assert!(!added.contains("plugins\n") && added.contains("**/.obsidian/snippets\n") && added.contains("**/.obsidian/themes\n"), "{added}");
+        assert!(default_ignore_additions(&defaults).is_none());
+        assert!(protected_rel(".textdbignore/readme.md"));
     }
 }

@@ -876,6 +876,7 @@ fn textdbignore_leaves_obsidian_code_out_both_ways_and_stays_the_directorys_own(
     std::fs::create_dir_all(vault.join(".obsidian/plugins/local")).unwrap();
     std::fs::write(vault.join(".obsidian/plugins/local/main.md"), "local plugin").unwrap();
     std::fs::write(vault.join("a.md"), "a").unwrap();
+    std::fs::write(vault.join(".textdbignore"), "*.tmp\n").unwrap();
     let dir = vault.to_str().unwrap();
     let t = |args: &[&str]| {
         let mut c = textdb(&store);
@@ -883,25 +884,34 @@ fn textdbignore_leaves_obsidian_code_out_both_ways_and_stays_the_directorys_own(
         c
     };
 
-    // An Obsidian vault's first sync writes the defaults, and leaves out what they match.
+    // The first sync adds the default lines to the rules the directory has, and leaves out what they match.
     ok(&mut t(&["sync", "/", dir]), None);
     let rules = std::fs::read_to_string(vault.join(".textdbignore")).unwrap();
-    assert!(rules.contains("**/.obsidian/plugins/"), "{rules}");
+    assert!(rules.starts_with("*.tmp\n") && rules.contains("**/.obsidian/plugins\n"), "{rules}");
     assert_eq!(run(&mut t(&["stat", "/.obsidian/plugins/local/main.md"]), None).status, 5, "a plugin was taken in");
     assert_eq!(run(&mut t(&["stat", "/.textdbignore"]), None).status, 5, "the rules were taken in");
 
-    // Nor is a plugin written from the store, at any depth, nor are the rules changed from there.
-    for rel in ["/.obsidian/plugins/evil/main.js", "/sub/.obsidian/themes/t/theme.css", "/.textdbignore"] {
+    // Nor is a plugin written from the store, at any depth, nor a file a `!` line names inside a
+    // folder left out, nor anything under the rules' name.
+    let rules = format!("{rules}!*.css\n");
+    std::fs::write(vault.join(".textdbignore"), &rules).unwrap();
+    ok(&mut t(&["sync", "/", dir]), None);
+    for rel in ["/.obsidian/plugins/evil/main.js", "/sub/.obsidian/themes/t/theme.css", "/.obsidian/snippets/evil.css", "/.textdbignore/readme.md"] {
         ok(&mut t(&["write", rel]), Some("from the store\n"));
     }
     let synced = run(&mut t(&["sync", "/", dir]), None);
-    assert!(!vault.join(".obsidian/plugins/evil").exists() && !vault.join("sub/.obsidian/themes").exists(), "{}", synced.stdout);
+    for rel in [".obsidian/plugins/evil", "sub/.obsidian/themes", ".obsidian/snippets/evil.css"] {
+        assert!(!vault.join(rel).exists(), "{rel} written: {}", synced.stdout);
+    }
     assert_eq!(std::fs::read_to_string(vault.join(".textdbignore")).unwrap(), rules, "the store changed the rules");
     assert!(synced.stdout.contains("left out by .textdbignore"), "{}", synced.stdout);
 
-    // The directory's own rules decide: without those lines plugins sync, and the defaults are not
-    // written again.
+    // Loosening the rules stops the sync until accepted. The directory's own rules decide: without
+    // those lines plugins sync, and the defaults are not added again.
     std::fs::write(vault.join(".textdbignore"), "").unwrap();
+    let stopped = run(&mut t(&["sync", "/", dir]), None);
+    assert_eq!(stopped.status, 6, "{}", stopped.stdout);
+    assert!(!vault.join(".obsidian/plugins/evil").exists(), "{}", stopped.stdout);
     let synced = run(&mut t(&["sync", "/", dir, "--accept-rules"]), None);
     assert!(vault.join(".obsidian/plugins/evil/main.js").exists() && vault.join("sub/.obsidian/themes/t/theme.css").exists(), "{}", synced.stdout);
     assert_eq!(run(&mut t(&["stat", "/.obsidian/plugins/local/main.md"]), None).status, 0, "{}", synced.stdout);
@@ -909,6 +919,68 @@ fn textdbignore_leaves_obsidian_code_out_both_ways_and_stays_the_directorys_own(
     std::fs::remove_file(vault.join(".textdbignore")).unwrap();
     run(&mut t(&["sync", "/", dir]), None);
     assert!(!vault.join(".textdbignore").exists(), "the defaults came back after the file was deleted");
+}
+
+#[test]
+fn binary_files_are_not_taken_in_and_sync_says_what_to_do() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let vault = tmp.path().join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(vault.join("a.md"), "a").unwrap();
+    std::fs::write(vault.join("blob.md"), [b'x', 0, b'y']).unwrap();
+    std::fs::write(vault.join("data.txt"), "text").unwrap();
+    let dir = vault.to_str().unwrap();
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.args(args);
+        c
+    };
+    let synced = run(&mut t(&["sync", "/", dir]), None);
+    assert_eq!(synced.status, 0, "{}", synced.stdout);
+    assert_eq!(run(&mut t(&["stat", "/a.md"]), None).status, 0);
+    assert_eq!(run(&mut t(&["stat", "/blob.md"]), None).status, 5, "a binary file was taken in");
+    assert!(synced.stdout.contains("blob.md") && synced.stdout.contains(".textdbignore"), "{}", synced.stdout);
+
+    // A text file that turns binary is not taken in either: the store keeps its text.
+    std::fs::write(vault.join("data.txt"), [b't', 0]).unwrap();
+    let synced = run(&mut t(&["--json", "sync", "/", dir]), None);
+    assert!(synced.stdout.contains("data.txt") && synced.stdout.contains("a binary file"), "{}", synced.stdout);
+    let stat = ok(&mut t(&["--json", "stat", "/data.txt"]), None).json();
+    assert_eq!(stat["nbytes"], 4, "{stat}");
+}
+
+#[test]
+fn a_first_sync_into_a_new_folder_writes_no_obsidian_code_and_unreadable_rules_stop_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.args(args);
+        c
+    };
+    for (rel, text) in [
+        ("/notes/a.md", "a"),
+        ("/notes/.obsidian/app.json", "{}"),
+        ("/notes/.obsidian/plugins/evil/main.js", "run()"),
+        ("/notes/vault/.obsidian/themes/t/theme.css", "x"),
+    ] {
+        ok(&mut t(&["write", rel]), Some(text));
+    }
+
+    // A directory that does not exist yet gets the default rules before anything is written.
+    let fresh = tmp.path().join("fresh");
+    let synced = run(&mut t(&["sync", "/notes", fresh.to_str().unwrap()]), None);
+    assert!(fresh.join("a.md").exists() && fresh.join(".obsidian/app.json").exists(), "{}", synced.stdout);
+    assert!(!fresh.join(".obsidian/plugins").exists() && !fresh.join("vault/.obsidian/themes").exists(), "{}", synced.stdout);
+    assert!(fresh.join(".textdbignore").is_file());
+
+    // Rules that are there but cannot be read stop the sync before anything is written.
+    let other = tmp.path().join("other");
+    std::fs::create_dir_all(other.join(".textdbignore")).unwrap();
+    let stopped = run(&mut t(&["sync", "/notes", other.to_str().unwrap()]), None);
+    assert_ne!(stopped.status, 0, "{}", stopped.stdout);
+    assert!(!other.join("a.md").exists() && !other.join(".obsidian").exists(), "{}", stopped.stdout);
 }
 
 /// Make `link` a link to the folder `target`: a junction on Windows (which needs no privilege), a
@@ -1451,6 +1523,7 @@ fn assets_migrate_from_git_moves_tracked_binaries_out_of_git() {
     std::fs::write(v.join("a.md"), "![[x.png]]\n").unwrap();
     std::fs::write(v.join("img/x.png"), b"\x89PNG x").unwrap();
     std::fs::write(v.join("img/y.pdf"), b"%PDF-1.4 y").unwrap();
+    std::fs::write(v.join(".textdbignore"), SEEDED_RULES).unwrap();
     git(&v, &["add", "-A"]);
     git(&v, &["commit", "-q", "-m", "start"]);
     ok(&mut t(&["sync", "/", d]), None);
@@ -1702,6 +1775,10 @@ fn sync_reconciles_both_sides_merges_and_marks_conflicts() {
     assert_eq!(std::fs::read(dir.join("logo.png")).unwrap(), [0u8, 1, 2]);
 }
 
+/// A `.textdbignore` that already has the lines sync puts in one, as a checkout that synced before
+/// keeps it: sync leaves it as it is.
+const SEEDED_RULES: &str = "**/.obsidian/plugins\n**/.obsidian/snippets\n**/.obsidian/themes\n";
+
 #[test]
 fn sync_in_a_git_checkout_credits_git_authors_and_commits_with_trailers() {
     if !has_git() {
@@ -1721,6 +1798,7 @@ fn sync_in_a_git_checkout_credits_git_authors_and_commits_with_trailers() {
         std::fs::write(docs.join(name), text).unwrap();
     }
     std::fs::write(repo.join("README.md"), "outside the synced folder\n").unwrap();
+    std::fs::write(docs.join(".textdbignore"), SEEDED_RULES).unwrap();
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "initial"]);
     let initial = git(&repo, &["rev-parse", "HEAD"]);

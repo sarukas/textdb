@@ -240,11 +240,12 @@ only names. For the same reason sync never writes, moves or deletes a store file
 `.textdb`, `node_modules`, `.trash`, `.textdb-trash`, `__pycache__` or the system folders textdb
 leaves out, nor anything `.textdbignore` leaves out: nothing there is synced either way — a file
 textdb or the last sync has there is reported as skipped, a file only on disk there is not taken
-in, and none is written, moved or deleted. An Obsidian vault that never had a `.textdbignore` gets
-one at its next sync leaving out `.obsidian/plugins/`, `snippets/` and `themes/`, the code and
-styles Obsidian loads (its other settings sync); delete those lines to sync them. `.textdbignore`
-is the directory's own: sync never writes it from textdb, so the store cannot take those lines
-away. These checks take a name as Windows would resolve it, so `.GIT`, `.git.`,
+in, and none is written, moved or deleted. The first sync of a directory puts `**/.obsidian/plugins`,
+`snippets` and `themes` lines in its `.textdbignore` (creating it, or adding the ones it does not
+mention yet), so the code and styles Obsidian loads are never written from textdb (its other
+settings sync); delete those lines to sync them, and sync does not add them again. `.textdbignore`
+is the directory's own: sync never writes anything under that name from textdb, so the store cannot
+take those lines away, and it stops if the file is there but cannot be read. These checks take a name as Windows would resolve it, so `.GIT`, `.git.`,
 `.git::$INDEX_ALLOCATION` and the 8.3 short names Windows may give those folders (`GIT~1`,
 `NODE_M~1`, or the hashed `GI3F2A~1`) are those folders, while other names that only look like
 short names (`photos~1`, `report~1.pdf`) are not. Neither sync nor pull writes, moves or deletes

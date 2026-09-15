@@ -1570,6 +1570,11 @@ fn import(
     let interactive = std::io::stderr().is_terminal() && !json;
     let started = Instant::now();
     let mut contents = files.into_iter().filter_map(|(rel, local)| match std::fs::read(&local) {
+        // A binary file (a NUL byte in its first 8000 bytes, as git tells) is not text for the store.
+        Ok(body) if body.iter().take(8000).any(|&c| c == 0) => {
+            eprintln!("skipped {}: a binary file, not imported (narrow --ext, or keep it in an asset store)", local.display());
+            None
+        }
         Ok(body) => Some((format!("{base}/{rel}"), body)),
         Err(e) => {
             eprintln!("skipped {}: {e}", local.display());
