@@ -204,6 +204,19 @@ fn heads_by_rel(st: &mut dyn Store, prefix: &str) -> Result<BTreeMap<String, Fil
 /// are read like any other.
 pub const SKIP_DIRS: &[&str] = &[".git", ".textdb", ".trash", "node_modules"];
 
+/// Whether `rel` is a `.git` directory or inside one (in any letter case): sync never writes
+/// there, so a file anyone put in the store cannot become a git hook or configuration.
+fn in_git_dir(rel: &str) -> bool {
+    rel.split('/').any(|s| s.eq_ignore_ascii_case(".git"))
+}
+
+fn refuse_git(rel: &str) -> std::io::Result<()> {
+    if in_git_dir(rel) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("{rel} is inside .git, where sync never writes")));
+    }
+    Ok(())
+}
+
 /// Whether a file found only on disk is taken in: one of `exts`, and not inside one of
 /// [`SKIP_DIRS`] (the same files `import` reads).
 fn eligible(rel: &str, exts: &[String]) -> bool {
@@ -287,6 +300,7 @@ fn walk(root: &Path, tracked_dirs: &HashSet<String>) -> Result<Walk> {
 }
 
 fn write_disk(root: &Path, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
+    refuse_git(rel)?;
     let target = root.join(rel);
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
@@ -329,6 +343,7 @@ fn remove_empty_dir(dir: &Path) -> bool {
 /// Move a file on disk from `from` to `to`, creating the folders it needs and removing the ones
 /// it leaves empty.
 fn move_disk(root: &Path, from: &str, to: &str) -> std::io::Result<()> {
+    refuse_git(to)?;
     let target = root.join(to);
     let case_only = from != to && from.to_lowercase() == to.to_lowercase();
     if target.exists() && !(case_only && CASE_INSENSITIVE) {
@@ -1001,6 +1016,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         let d = walked.files.get(&rel).copied();
         let Some(b) = base.get(&rel) else {
             match (t, d) {
+                (Some(_), None) if in_git_dir(&rel) => report.skipped.push(note(&rel, "inside .git, where sync never writes: kept in textdb only")),
                 (Some(_), None) => plan.to_disk.push(rel),
                 (None, Some(_)) => {
                     if eligible(&rel, &o.exts) {
@@ -2081,6 +2097,8 @@ mod tests {
         assert!(eligible(".claude/instructions/rules.md", &exts) && eligible("docs/.drafts/a.md", &exts));
         assert!(!eligible("logo.png", &exts) && !eligible("x/node_modules/a.md", &exts));
         assert!(!eligible(".git/a.md", &exts) && !eligible(".trash/a.md", &exts) && !eligible(".textdb/app/a.md", &exts));
+        assert!(in_git_dir(".git/hooks/post-checkout") && in_git_dir("sub/.GIT/config") && in_git_dir("vendor/lib/.git"));
+        assert!(!in_git_dir(".gitignore") && !in_git_dir("a/.github/workflows/ci.yml") && !in_git_dir("notes/git/a.md"));
         assert!(eligible("logo.png", &parse_exts("*")));
         assert!(has_markers(b"a\n<<<<<<< textdb\nb\n=======\nc\n>>>>>>> disk\n"));
         assert!(!has_markers(b"<<<<<<< only an opening line\n"));

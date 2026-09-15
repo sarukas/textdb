@@ -701,6 +701,51 @@ fn assets_push_pull_verify_links_and_gitignore() {
     assert_eq!((stores[0]["reachable"].as_bool(), stores[0]["bound_to"].as_str()), (Some(true), bucket.to_str()), "{stores}");
 }
 
+#[test]
+fn asset_pointers_never_reach_into_git_or_tell_of_other_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let (vault, bucket, config) = (tmp.path().join("vault"), tmp.path().join("bucket"), tmp.path().join("config"));
+    std::fs::create_dir_all(vault.join("img")).unwrap();
+    std::fs::create_dir_all(vault.join(".git").join("hooks")).unwrap();
+    std::fs::create_dir_all(&bucket).unwrap();
+    std::fs::write(vault.join("img/evil.dat"), b"#!/bin/sh\necho pwned\n\0").unwrap();
+    std::fs::write(vault.join(".env"), "SECRET=hunter2\n").unwrap();
+    let dir = vault.to_str().unwrap();
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.env("TEXTDB_CONFIG_DIR", &config).args(args);
+        c
+    };
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", bucket.to_str().unwrap()]), None);
+    ok(&mut t(&["assets", "push"]), None);
+    let pointer = std::fs::read_to_string(vault.join("img/evil.dat.tdbasset")).unwrap();
+
+    // Pointers anyone could write to the store: one inside .git, one naming a file that is no asset.
+    ok(&mut t(&["write", "/.git/hooks/post-checkout.tdbasset"]), Some(&pointer));
+    ok(&mut t(&["write", "/.env.tdbasset"]), Some(&pointer));
+    let s = ok(&mut t(&["--json", "assets", "status", "--dir", dir]), None).json();
+    let find = |p: &str| s["assets"].as_array().unwrap().iter().find(|a| a["path"] == p).cloned().unwrap_or_else(|| panic!("{p} not in {s}"));
+    let hook = find("/.git/hooks/post-checkout");
+    assert_eq!(hook["state"], "invalid-path", "{hook}");
+    let env = find("/.env");
+    assert_eq!(env["state"], "conflict", "{env}");
+    assert!(env.get("size").is_none() && env.get("file").is_none(), "nothing of the file is told: {env}");
+
+    // Neither is pulled.
+    run(&mut t(&["assets", "pull", "--dir", dir]), None);
+    assert!(!vault.join(".git/hooks/post-checkout").exists());
+    assert_eq!(std::fs::read_to_string(vault.join(".env")).unwrap(), "SECRET=hunter2\n");
+
+    // Nor does a sync write a document from the store into .git (in any letter case).
+    ok(&mut t(&["write", "/.git/hooks/notes.md"]), Some("#!/bin/sh\necho pwned\n"));
+    ok(&mut t(&["write", "/sub/.GIT/config.md"]), Some("[core]\n"));
+    let synced = run(&mut t(&["--json", "sync", "/", dir]), None);
+    assert!(!vault.join(".git/hooks/notes.md").exists() && !vault.join("sub/.GIT/config.md").exists(), "{}", synced.stdout);
+    assert!(synced.stdout.contains("where sync never writes"), "{}", synced.stdout);
+}
+
 /// rclone for tests: `TEXTDB_RCLONE`, else `rclone` on the PATH. Without one the test is skipped,
 /// unless `TEXTDB_REQUIRE_RCLONE` is set (as in CI).
 fn test_rclone() -> Option<std::path::PathBuf> {

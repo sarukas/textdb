@@ -30,7 +30,11 @@ export interface AppOptions {
   sync?: SyncService | null;
   /** The assets of those folders; null when none are set up. */
   assets?: AssetService | null;
+  /** The interface the server listens on; on loopback, requests must name a loopback host. */
+  host?: string;
 }
+
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 
 function syncService(sync: SyncService | null | undefined): SyncService {
   if (!sync) throw new NotFound('no folders are set up for sync: set TEXTDB_SYNC on the server');
@@ -51,6 +55,16 @@ const LOCAL_ORIGIN =/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
 export function createApp(corpus: Corpus, hub: ChangeHub, options: AppOptions): Hono {
   const app = new Hono();
   app.onError((error, c) => errorResponse(c, error));
+  // Listening on loopback, a request naming any other host reached it through a name that was
+  // pointed at this computer (DNS rebinding): another site's page, which CORS would take for the
+  // same origin.
+  if (!options.host || ['127.0.0.1', 'localhost', '::1'].includes(options.host)) {
+    app.use('/api/*', async (c, next) => {
+      const host = (c.req.header('host') ?? '').toLowerCase().replace(/:\d+$/, '');
+      if (!LOOPBACK_HOSTS.has(host)) throw badRequest(`this server answers requests for localhost only, not ${JSON.stringify(host)}`);
+      await next();
+    });
+  }
   app.use(
     '/api/*',
     cors({

@@ -35,7 +35,7 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
   const hub = new ChangeHub(corpus, { intervalMs: options.watchIntervalMs });
   const sync = options.sync?.length ? new SyncService(corpus, options.sync, findCli(options.cli)) : null;
   const assets = sync ? new AssetService(sync, corpus.db) : null;
-  const app = createApp(corpus, hub, { webDist: options.webDist, pingMs: options.pingMs ?? 15_000, sync, assets });
+  const app = createApp(corpus, hub, { webDist: options.webDist, pingMs: options.pingMs ?? 15_000, sync, assets, host: options.host ?? '127.0.0.1' });
 
   const host = options.host ?? '127.0.0.1';
   let server: ServerType;

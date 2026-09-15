@@ -47,6 +47,11 @@ export function AssetPane({ pointer, link, hub, author, onAction, onOpenFolder, 
   const loads = useRef(0);
   const pathChangeRef = useRef(onPathChange);
   pathChangeRef.current = onPathChange;
+  // Where the pointer is now, ahead of the next render: a second move may follow the first at once.
+  const pointerRef = useRef(pointer);
+  pointerRef.current = pointer;
+  // This pane followed its pointer to where it moved in textdb; the file moves at the next sync.
+  const [followed, setFollowed] = useState(false);
 
   const load = useCallback(() => {
     const seq = ++loads.current;
@@ -73,6 +78,13 @@ export function AssetPane({ pointer, link, hub, author, onAction, onOpenFolder, 
     );
     return () => ctl.abort();
   }, [link.prefix, asset, pointer]);
+  // What was shown of the pointer's old path goes when the path changes.
+  useEffect(() => {
+    setItem(null);
+    setMissing(false);
+    setError(null);
+    setHistory([]);
+  }, [pointer]);
   useEffect(() => {
     setGone(false);
     return load();
@@ -81,12 +93,16 @@ export function AssetPane({ pointer, link, hub, author, onAction, onOpenFolder, 
   useEffect(
     () =>
       hub.events.on((e) => {
-        const next = afterChange(pointer, e);
+        const at = pointerRef.current;
+        const next = afterChange(at, e);
         if (next === null) setGone(true);
-        else if (next !== undefined) pathChangeRef.current(next);
-        else if (e.path === pointer) setRev((n) => n + 1);
+        else if (next !== undefined) {
+          pointerRef.current = next;
+          setFollowed(true);
+          pathChangeRef.current(next);
+        } else if (e.path === at) setRev((n) => n + 1);
       }),
-    [hub, pointer],
+    [hub],
   );
 
   const run = async (op: "pull" | "push") => {
@@ -113,7 +129,10 @@ export function AssetPane({ pointer, link, hub, author, onAction, onOpenFolder, 
   };
 
   const label = item ? stateLabel(item.state) : null;
-  const action = item ? actionFor(item) : null;
+  // Not pulled at the path it moved to: its file is still at the old path until a sync moves it, and
+  // pulling would leave a second copy there.
+  const awaitingSync = followed && item?.state === "not-pulled";
+  const action = item && !gone && !awaitingSync ? actionFor(item) : null;
   const kind = item ? previewKind(item.type) : "download";
   const src = `${assetFileUrl(link.prefix, asset)}&rev=${rev}`;
 
@@ -136,6 +155,14 @@ export function AssetPane({ pointer, link, hub, author, onAction, onOpenFolder, 
       );
     }
     if (!item) return <div className="empty muted">Loading {name}…</div>;
+    if (!item.file && awaitingSync) {
+      return (
+        <div className="empty">
+          <p>{name} moved in textdb; its file is still at the old path on the server's disk.</p>
+          <p className="muted">Sync the folder to move the file here.</p>
+        </div>
+      );
+    }
     if (!item.file) {
       return (
         <div className="empty">

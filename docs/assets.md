@@ -231,7 +231,12 @@ pointer changed in the store during the push, exits 3 when something was left fo
 keeps an asset's id when its bytes change, and records the pointers it wrote in the directory's
 sync base, as sync would. One asset failing does not stop the others. `pull` fetches `not-pulled`
 and `outdated` assets, leaves `modified` and `conflict` files alone, and never puts bytes whose
-hash differs from the pointer in place. `verify` counts an asset store it cannot reach as a
+hash differs from the pointer in place. A pointer is never pulled into `.git`, `.textdb`,
+`node_modules` or another place the rules leave out (it is `invalid-path`), and a pointer that only
+names a file that is no asset (a document, a file the rules leave out) is a `conflict` whose file is
+never hashed or described: anyone who can write to the store must not be able to plant a git hook
+or learn about other files through a pointer. For the same reason sync never writes a store file
+inside a `.git` folder, in any letter case (it is reported as skipped). `verify` counts an asset store it cannot reach as a
 problem. `status --json` gives `{ prefix, dir, assets, counts }`, each asset with `path`, `state`,
 `type` (the pointer's media type, or one from the name), and where known `size`, `store`,
 `sha256` (the pointer's), `version` (the pointer's in the store), `file` (its name on disk,

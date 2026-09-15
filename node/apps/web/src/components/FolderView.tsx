@@ -223,6 +223,8 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
 
   // The state of the assets below this folder, by asset path, when it is in a synced folder.
   const assetPrefix = assetLink?.prefix ?? null;
+  // A sync of the folder (the first one included) changes what its assets' states can be.
+  const assetSyncSeq = assetLink?.last?.seq ?? null;
   const [assetRev, setAssetRev] = useState(0);
   const [assets, setAssets] = useState<ReadonlyMap<string, AssetItem>>(() => new Map());
   useEffect(() => {
@@ -238,7 +240,7 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
       },
     );
     return () => ctl.abort();
-  }, [assetPrefix, path, nonce, assetRev]);
+  }, [assetPrefix, assetSyncSeq, path, nonce, assetRev]);
   const assetOf = (e: LsEntry): AssetItem | undefined => (e.kind === "file" && isPointer(e.path) ? assets.get(assetPath(e.path)) : undefined);
 
   // ---- live changes ---------------------------------------------------------------------------

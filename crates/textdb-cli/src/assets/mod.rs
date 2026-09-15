@@ -595,6 +595,14 @@ fn items(v: &Vault, scan: &Scan, cache: &mut VaultCache, scope: &[String]) -> Re
             out.push(item);
             continue;
         }
+        // Never pulled into .git, .textdb, node_modules and the like, nor onto a name the rules
+        // leave out: a pointer anyone wrote to the store must not put bytes there (a git hook, say).
+        if scan.classifier.rule_class(rel) == Class::Ignore {
+            item.state = "invalid-path";
+            item.note = Some("a place textdb never writes assets to (.git, .textdb, node_modules, a name the rules leave out): move the pointer in the store".into());
+            out.push(item);
+            continue;
+        }
         let pointer = match (scan.store_pointers.get(rel), scan.disk_pointers.get(rel)) {
             (Some((_, Err(e))), _) | (None, Some(Err(e))) => {
                 item.state = "invalid-pointer";
@@ -623,6 +631,21 @@ fn items(v: &Vault, scan: &Scan, cache: &mut VaultCache, scope: &[String]) -> Re
         match file_of.get(rel) {
             Some(&f) => {
                 let (size, mtime) = scan.disk[f];
+                let name = f.rsplit('/').next().unwrap_or(f);
+                let asset_file = match scan.classifier.rule_class(f) {
+                    Class::Asset => true,
+                    Class::Other => !name.starts_with(".git") && cache.binary(&v.dir, f, size, mtime),
+                    _ => false,
+                };
+                if !asset_file {
+                    // A pointer only names this file: nothing of it is read or told (not its size,
+                    // not whether its bytes are the pointer's), since anyone can write a pointer.
+                    item.state = "conflict";
+                    item.note = Some("the file here is not an asset (a document, or a file the rules leave out): rename the file or move the pointer".into());
+                    item.pointer = Some(pointer);
+                    out.push(item);
+                    continue;
+                }
                 item.size = Some(size);
                 item.file = Some(f.clone());
                 if f != rel {
