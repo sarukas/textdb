@@ -59,14 +59,47 @@ SELECT sum(length(c.bytes)) FROM kb.chunk c
 SELECT length(content) FROM kb.file WHERE path = '/s14000.md';      -- 17.5 ms
 ```
 
-So about 15 ms of a 17.5 ms read is per-query overhead rather than reaching the data. Two
-changes, in order of expected return:
+So about 15 ms of a 17.5 ms read is per-query overhead rather than reaching the data.
 
-1. **Batch the chunk fetch.** Walk the tree to collect the leaf hashes, then fetch them with
-   one `WHERE hash = ANY($1)` and assemble in order. One SPI call instead of N.
-2. **Prepare once.** Where a per-row query has to stay, `Spi::prepare` a plan and reuse it,
-   rather than re-planning per call. This is the same fix that took `textdb-sqlite`'s
-   scalar functions from 29.5 us to 9.9 us, one layer down.
+### Done: batched, ordered chunk fetch (2.6x on a 983 KB read)
+
+`materialize_all` now walks the tree a level at a time and fetches the leaves with
+`unnest($1::bytea[]) WITH ORDINALITY`, which returns the rows **in the order they were
+asked for**, so the bytes are appended as they arrive and each chunk is copied once. Server
+side, a 983 KB / 596-leaf read went 13.8 ms -> 5.27 ms. Across the matrix `read` is a median
+0.86x with a best of 0.35x and `replace` a median 0.73x with a best of 0.38x; the 10 MiB XL
+cells are all about 0.37x. `create`, `search` and `history` are unchanged, as they should
+be. 120 byte-exact oracle checks pass and the 8 Postgres CLI tests pass.
+
+Three things only showed up by measuring, and are why the final shape is not the obvious
+one:
+
+- **A cache plus a walk still handles every chunk twice.** Batching into a `HashMap` and
+  then walking the tree to copy back out gave only 2.0x and left ~10 us a leaf. Ordering the
+  fetch so the second pass is unnecessary is what took the rest.
+- **Batching makes small documents worse.** The first cut sped 10 MiB reads 2.6x while
+  making 512 B reads 1.76x *slower*: `unnest ... WITH ORDINALITY` joined against `kb.chunk`
+  costs more to plan than `WHERE hash = $1`, and on a one-leaf document that planning is the
+  whole read. Small documents are also what the RT, CR and SR families issue most. Hence
+  `BATCH_FLOOR`: under 8 leaves, stay on the single-row path.
+- **Dropping the node cache cost a query.** Nodes are asked for twice per read — once to
+  decide whether batching is worth it, once by the walk that assembles — so without a cache
+  a one-leaf document paid three queries where it had paid two. A node-only cache (never
+  chunks, which are asked for once each) restored it and helped large reads too, since the
+  assembling walk reuses what the level scan read. Small-document reads ended at 30 us
+  against 41 us without it.
+
+The fast path declines rather than guesses: unflushed pending writes, a tree it cannot walk,
+or a short result all fall back to the ordinary walk.
+
+**Now the limit:** at ~10 us a leaf what remains is pgrx turning each `bytea` datum into a
+`Vec<u8>`, not query overhead. That is inherent to reading bytes into Rust, so going further
+needs a different approach — assembling in Postgres, or avoiding the copy — not more
+batching.
+
+**Still to do — prepare once.** Where a per-row query has to stay, `Spi::prepare` a plan and
+reuse it rather than re-planning per call. Same fix that took `textdb-sqlite`'s scalar
+functions from 29.5 us to 9.9 us, one layer down.
 
 The client round trip is *not* the problem and should not be optimised first: this Postgres
 answers a trivial statement in 82-117 us, which bounds how much of a 648 us small-document
