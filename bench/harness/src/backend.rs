@@ -83,6 +83,30 @@ pub struct Hit {
     pub line: u64,
 }
 
+/// One recorded link, as the store resolved it.
+///
+/// `status` is the store's own verdict (`ok`, `ambiguous`, `anchor-missing`, `broken`,
+/// `not-in-store`, `external`), not something the harness recomputes — the suite's oracle
+/// compares it against the link graph the generator wrote, so a backend that resolves
+/// wrongly fails the check rather than merely looking fast.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkRow {
+    pub path: String,
+    pub target: String,
+    pub line: u64,
+    pub status: String,
+    pub resolved: Option<String>,
+}
+
+/// One heading and the line range it covers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SectionRow {
+    pub heading: String,
+    pub level: u64,
+    pub line_from: u64,
+    pub line_to: u64,
+}
+
 #[derive(Clone, Debug)]
 pub enum WriteOutcome {
     /// `direct` is true when no other writer committed between the caller's base and this write.
@@ -142,6 +166,48 @@ pub trait Backend: Send + Sync {
     /// phrase; `foo*` is a prefix. Hits report the first matching line per document.
     fn search(&self, query: &str, prefix: &str) -> R<Vec<Hit>>;
     fn history(&self, path: &str) -> R<Vec<Version>>;
+
+    // structure sidecar (textdb only; every other backend records N/A)
+    //
+    // These have no baseline equivalent, so the default is `NotSupported` and the MD family
+    // reports N/A for `fs` and the `sql-text-*` stores. That is the point of the family:
+    // it establishes what these operations cost, not who wins.
+
+    /// Links recorded for every document at or below `prefix`.
+    fn links(&self, _prefix: &str) -> R<Vec<LinkRow>> {
+        Err(BackendError::NotSupported("no link index"))
+    }
+    /// Links in any document that resolve to `path`.
+    fn backlinks(&self, _path: &str) -> R<Vec<LinkRow>> {
+        Err(BackendError::NotSupported("no link index"))
+    }
+    /// Front matter of `path` as JSON text, `None` when the document has none.
+    fn frontmatter(&self, _path: &str) -> R<Option<String>> {
+        Err(BackendError::NotSupported("no front-matter index"))
+    }
+    /// Set one top-level front-matter key, leaving the rest of the document untouched.
+    fn set_meta(&self, _path: &str, _key: &str, _value: &str) -> R<Version> {
+        Err(BackendError::NotSupported("no front-matter editing"))
+    }
+    /// Headings of `path` with the line range each covers.
+    fn sections(&self, _path: &str) -> R<Vec<SectionRow>> {
+        Err(BackendError::NotSupported("no section index"))
+    }
+    /// The body of one section, addressed by its heading path.
+    fn section(&self, _path: &str, _heading: &str) -> R<Option<Vec<u8>>> {
+        Err(BackendError::NotSupported("no section index"))
+    }
+    /// Select what a move does to links that pointed at what moved: `off`, `report` or
+    /// `rewrite`. A store setting rather than an argument, so the suite sets it outside the
+    /// timed span and then times an ordinary `rename` — which is what isolates each mode's
+    /// cost on the same operation.
+    fn set_link_mode(&self, _mode: &str) -> R<()> {
+        Err(BackendError::NotSupported("no link rewriting"))
+    }
+    /// Change-feed rows after `seq`, as `(highest seq seen, rows read)`.
+    fn changes_since(&self, _seq: u64) -> R<(u64, u64)> {
+        Err(BackendError::NotSupported("no change feed"))
+    }
 
     // measurement hooks
     fn storage_bytes(&self) -> R<u64>;

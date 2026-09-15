@@ -1270,6 +1270,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "textdb-core",
+ "textdb-md",
  "textdb-sqlite",
  "toml",
 ]

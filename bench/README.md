@@ -105,7 +105,7 @@ than shrinking them.
 
 ## The test matrix
 
-Ten families, defined as data in `harness/tests/*.toml`. `reps` repetitions per cell; the
+Eleven families, defined as data in `harness/tests/*.toml`. `reps` repetitions per cell; the
 report takes the median.
 
 ### RT — round-trip accuracy
@@ -196,6 +196,40 @@ Ground truth is the reference tokenizer (word boundary, case-insensitive), equiv
 | NS-03 | Rename a folder with {1k, 10k, 50k} descendants: latency; all paths updated, contents unchanged, versions preserved |
 | NS-04 | Delete a folder with 10k descendants, then read a deleted file's last version |
 | NS-05 | Path characters: spaces, dots, Unicode, 255-byte name, 4 KiB path, `%` and `_` |
+
+### MD — the structure sidecar
+
+Markdown links, front matter, sections and the change feed: the operations textdb has and
+no baseline does. `fs` keeps no index of what a document links to, and the `sql-text-*`
+stores keep text and nothing derived from it, so **every cell here is `N/A` for them**,
+recorded with its reason. The family is not asking who is faster; it establishes what these
+operations cost, and — in MD-01 — what maintaining them costs the write path that every
+other family measures.
+
+| Test | What it measures |
+|---|---|
+| MD-01 | The same bytes written as `.md` (the extractor runs) and `.txt` (it does not), at 0/8/64 links per document: `create_overhead_pct` and `replace_overhead_pct` are what the sidecar costs a write |
+| MD-02 | A known link graph with planted dangling targets: outbound links per document, the whole subtree in one query, backlinks, and broken-link validation |
+| MD-03 | Rename a file that N others link to, under `link_updates` = off / report / rewrite: latency and documents rewritten per move |
+| MD-04 | Front matter: reading the parsed block per document, and setting one key with the rest of the document byte-identical |
+| MD-05 | Documents with 32 headings: listing sections, and fetching one section's body by heading |
+| MD-06 | Change feed: a watcher polling after every write, and one catching up from zero |
+
+Every case is generated with a **known** link graph, front matter and heading tree, so the
+oracle is what the generator wrote rather than whatever the backend returns. A backend that
+indexes nothing and answers instantly fails the check and publishes no timings. Links are
+written as relative `[text](./f00042.md)`, not wiki links, because a wiki link resolves by
+name across the whole store and its expected status would depend on what else the corpus
+happens to hold.
+
+Two things MD-01 controls for, because both would swamp the effect it measures:
+
+- The `.md` and `.txt` writes are **interleaved, alternating which goes first**. Writing all
+  of one kind and then all of the other hands the second a warmed page cache and a larger
+  store.
+- `links0` is not "no structure": those documents still have front matter and eight
+  headings, so its overhead is the cost of parsing and recording those. The *link* cost is
+  the difference between `links0` and the denser cases.
 
 ### DU — durability
 

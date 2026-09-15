@@ -20,6 +20,15 @@ pub const LIST: &str = "list";
 pub const SEARCH: &str = "search";
 pub const HISTORY: &str = "history";
 pub const MAINTENANCE: &str = "maintenance";
+// Structure sidecar: textdb-only, so these rows are present for the textdb bindings and
+// absent for the baselines rather than being compared across them.
+pub const LINKS: &str = "links";
+pub const BACKLINKS: &str = "backlinks";
+pub const FRONTMATTER: &str = "frontmatter";
+pub const SET_META: &str = "set_meta";
+pub const SECTIONS: &str = "sections";
+pub const SECTION: &str = "section";
+pub const CHANGES_SINCE: &str = "changes_since";
 
 /// Every operation name, in the order the report should present them.
 pub const ALL: &[&str] = &[
@@ -37,6 +46,13 @@ pub const ALL: &[&str] = &[
     SEARCH,
     HISTORY,
     MAINTENANCE,
+    LINKS,
+    BACKLINKS,
+    FRONTMATTER,
+    SET_META,
+    SECTIONS,
+    SECTION,
+    CHANGES_SINCE,
 ];
 
 /// True when `name` is part of the vocabulary. Used by the report to separate genuine

@@ -19,6 +19,10 @@ impl Latencies {
     pub fn extend(&mut self, other: &Latencies) {
         self.samples.extend_from_slice(&other.samples);
     }
+    /// Median, for suites that form a ratio between two sets of samples.
+    pub fn p50(&self) -> Option<f64> {
+        self.pct(0.5)
+    }
     fn pct(&self, p: f64) -> Option<f64> {
         if self.samples.is_empty() {
             return None;

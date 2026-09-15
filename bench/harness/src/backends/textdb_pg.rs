@@ -282,6 +282,97 @@ impl Backend for TextdbPg {
             Ok(rows.iter().map(|r| r.get::<_, i64>(0) as u64).collect())
         })
     }
+    // structure sidecar -------------------------------------------------------------
+    // The same sidecar tables as the SQLite binding, in the `kb` schema. `kb._subtree_like`
+    // escapes `%` and `_` in the prefix, so a folder named `100%_done` selects itself and
+    // not `100XXXdone`.
+
+    fn links(&self, prefix: &str) -> R<Vec<LinkRow>> {
+        self.with(|c| {
+            let rows = c.query(
+                "SELECT n.path, l.target_path, l.line, l.status, r.path
+                   FROM kb.link l
+                   JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL
+                   LEFT JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL
+                  WHERE n.path = $1 OR n.path LIKE kb._subtree_like($1) ESCAPE '\'
+                  ORDER BY n.path, l.line",
+                &[&prefix],
+            )?;
+            Ok(rows.iter().map(pg_link_row).collect())
+        })
+    }
+    fn backlinks(&self, path: &str) -> R<Vec<LinkRow>> {
+        self.with(|c| {
+            let rows = c.query(
+                "SELECT n.path, l.target_path, l.line, l.status, r.path
+                   FROM kb.link l
+                   JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL AND r.path = $1
+                   JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL
+                  ORDER BY n.path, l.line",
+                &[&path],
+            )?;
+            Ok(rows.iter().map(pg_link_row).collect())
+        })
+    }
+    fn frontmatter(&self, path: &str) -> R<Option<String>> {
+        self.with(|c| {
+            let rows = c.query(
+                // `data` is jsonb here and TEXT in the SQLite binding; ::text gives both
+                // bindings the same shape for the suite to check.
+                "SELECT f.data::text FROM kb.frontmatter f
+                   JOIN kb.node n ON n.id = f.file_id AND n.deleted_at IS NULL AND n.path = $1",
+                &[&path],
+            )?;
+            Ok(rows.first().and_then(|r| r.get::<_, Option<String>>(0)))
+        })
+    }
+    fn set_meta(&self, path: &str, key: &str, value: &str) -> R<Version> {
+        let (body, _) = self.read_versioned(path)?;
+        let next = super::textdb_sqlite::set_frontmatter_key(&body, key, value);
+        self.overwrite(path, &next)
+    }
+    fn sections(&self, path: &str) -> R<Vec<SectionRow>> {
+        self.with(|c| {
+            let rows = c.query(
+                "SELECT s.heading_path, s.level, s.line_from, s.line_to
+                   FROM kb.section s
+                   JOIN kb.node n ON n.id = s.file_id AND n.deleted_at IS NULL AND n.path = $1
+                  ORDER BY s.line_from",
+                &[&path],
+            )?;
+            Ok(rows
+                .iter()
+                .map(|r| SectionRow {
+                    heading: r.get(0),
+                    level: r.get::<_, i32>(1) as u64,
+                    line_from: r.get::<_, i64>(2) as u64,
+                    line_to: r.get::<_, i64>(3) as u64,
+                })
+                .collect())
+        })
+    }
+    fn section(&self, path: &str, heading: &str) -> R<Option<Vec<u8>>> {
+        self.with(|c| {
+            let rows = c.query("SELECT kb.section($1, $2)", &[&path, &heading])?;
+            Ok(rows.first().and_then(|r| r.get::<_, Option<String>>(0)).map(|s| s.into_bytes()))
+        })
+    }
+    fn set_link_mode(&self, mode: &str) -> R<()> {
+        self.with(|c| {
+            c.execute("SELECT kb.set_setting('link_updates', $1)", &[&mode])?;
+            Ok(())
+        })
+    }
+    fn changes_since(&self, seq: u64) -> R<(u64, u64)> {
+        self.with(|c| {
+            let rows = c.query("SELECT seq FROM kb.feed($1)", &[&(seq as i64)])?;
+            let mut last = seq;
+            for r in &rows {
+                last = last.max(r.get::<_, i64>(0) as u64);
+            }
+            Ok((last, rows.len() as u64))
+        })
+    }
     fn storage_bytes(&self) -> R<u64> {
         self.with(|c| {
             let row = c.query_one(
@@ -347,5 +438,15 @@ impl Backend for TextdbPg {
             }
             Ok(v)
         })
+    }
+}
+
+fn pg_link_row(r: &postgres::Row) -> LinkRow {
+    LinkRow {
+        path: r.get(0),
+        target: r.get(1),
+        line: r.get::<_, i64>(2) as u64,
+        status: r.get::<_, Option<String>>(3).unwrap_or_default(),
+        resolved: r.get(4),
     }
 }

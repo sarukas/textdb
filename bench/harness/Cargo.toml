@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 textdb-core = { path = "../../crates/textdb-core" }
 textdb-sqlite = { path = "../../crates/textdb-sqlite" }
+textdb-md = { path = "../../crates/textdb-md" }
 rusqlite = { workspace = true }
 postgres = "0.19"
 serde = { workspace = true }

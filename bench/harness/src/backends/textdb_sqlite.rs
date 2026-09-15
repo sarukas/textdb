@@ -276,7 +276,14 @@ impl Backend for TextdbSqlite {
                 }),
                 Err(e) => {
                     if e.to_string().contains("TX004") {
-                        let cur = self.read(path)?;
+                        // On the connection already borrowed here, not through `self.read`:
+                        // that re-enters `with`, and the thread-local `RefCell` is held for
+                        // the whole closure, so the recovery path panicked instead of
+                        // reporting the conflict it exists to report.
+                        let cur: Vec<u8> = c
+                            .query_row("SELECT content FROM kb WHERE path = ?1", params![path], |r| col_bytes(r, 0))
+                            .optional()?
+                            .unwrap_or_default();
                         return Ok(WriteOutcome::Conflict { current_region: cur });
                     }
                     Self::map_write_err(e)
@@ -310,6 +317,112 @@ impl Backend for TextdbSqlite {
             let mut st = c.prepare_cached("SELECT version FROM textdb_history(?1)")?;
             let v = st.query_map(params![path], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(v.into_iter().map(|x| x as u64).collect())
+        })
+    }
+    // structure sidecar -------------------------------------------------------------
+    //
+    // Read through the sidecar tables the write path maintains (`kb_link`, `kb_section`,
+    // `kb_frontmatter`), joined to `kb_node` for paths, which is what the CLI's `links`,
+    // `sections` and `frontmatter` views do. Rows are kept for HEAD only (ADR 0007), so
+    // every query is at the document's current version.
+
+    fn links(&self, prefix: &str) -> R<Vec<LinkRow>> {
+        self.with(|c| {
+            let (lo, hi) = subtree_range(prefix);
+            let mut st = c.prepare_cached(
+                "SELECT n.path, l.target_path, l.line, l.status, r.path
+                   FROM kb_link l
+                   JOIN kb_node n ON n.id = l.file_id AND n.deleted_at IS NULL
+                   LEFT JOIN kb_node r ON r.id = l.resolved_id AND r.deleted_at IS NULL
+                  WHERE n.path = ?3 OR (n.path >= ?1 AND n.path < ?2)
+                  ORDER BY n.path, l.line",
+            )?;
+            let rows = st.query_map(params![lo, hi, prefix], link_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+    fn backlinks(&self, path: &str) -> R<Vec<LinkRow>> {
+        self.with(|c| {
+            let mut st = c.prepare_cached(
+                "SELECT n.path, l.target_path, l.line, l.status, r.path
+                   FROM kb_link l
+                   JOIN kb_node r ON r.id = l.resolved_id AND r.deleted_at IS NULL AND r.path = ?1
+                   JOIN kb_node n ON n.id = l.file_id AND n.deleted_at IS NULL
+                  ORDER BY n.path, l.line",
+            )?;
+            let rows = st.query_map(params![path], link_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+    fn frontmatter(&self, path: &str) -> R<Option<String>> {
+        self.with(|c| {
+            let v: Option<Option<String>> = c
+                .prepare_cached(
+                    "SELECT f.data FROM kb_frontmatter f
+                       JOIN kb_node n ON n.id = f.file_id AND n.deleted_at IS NULL AND n.path = ?1",
+                )?
+                .query_row(params![path], |r| r.get(0))
+                .optional()?;
+            Ok(v.flatten())
+        })
+    }
+    fn set_meta(&self, path: &str, key: &str, value: &str) -> R<Version> {
+        // The store has no "set one key" primitive: front matter is part of the document,
+        // so this reads, edits the YAML block and writes back. That is what the CLI's
+        // `meta set` does, and the cost the suite reports is that whole round trip.
+        let (body, _) = self.read_versioned(path)?;
+        let next = set_frontmatter_key(&body, key, value);
+        self.overwrite(path, &next)
+    }
+    fn sections(&self, path: &str) -> R<Vec<SectionRow>> {
+        self.with(|c| {
+            let mut st = c.prepare_cached(
+                "SELECT s.heading_path, s.level, s.line_from, s.line_to
+                   FROM kb_section s
+                   JOIN kb_node n ON n.id = s.file_id AND n.deleted_at IS NULL AND n.path = ?1
+                  ORDER BY s.line_from",
+            )?;
+            let rows = st
+                .query_map(params![path], |r| {
+                    Ok(SectionRow {
+                        heading: r.get(0)?,
+                        level: r.get::<_, i64>(1)? as u64,
+                        line_from: r.get::<_, i64>(2)? as u64,
+                        line_to: r.get::<_, i64>(3)? as u64,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+    fn section(&self, path: &str, heading: &str) -> R<Option<Vec<u8>>> {
+        self.with(|c| {
+            let v: Option<Vec<u8>> = c
+                .prepare_cached("SELECT textdb_section(?1, ?2)")?
+                .query_row(params![path, heading], |r| col_bytes(r, 0))
+                .optional()?;
+            // `textdb_section` returns NULL for a heading the document does not have, which
+            // `col_bytes` flattens to empty: an empty answer is "no such section" here.
+            Ok(v.filter(|b| !b.is_empty()))
+        })
+    }
+    fn set_link_mode(&self, mode: &str) -> R<()> {
+        self.with(|c| {
+            c.prepare_cached("SELECT textdb_setting('link_updates', ?1)")?
+                .query_row(params![mode], |_| Ok(()))?;
+            Ok(())
+        })
+    }
+    fn changes_since(&self, seq: u64) -> R<(u64, u64)> {
+        self.with(|c| {
+            let mut st = c.prepare_cached("SELECT seq FROM textdb_feed(?1)")?;
+            let mut last = seq;
+            let mut n = 0u64;
+            for row in st.query_map(params![seq as i64], |r| r.get::<_, i64>(0))? {
+                last = last.max(row? as u64);
+                n += 1;
+            }
+            Ok((last, n))
         })
     }
     fn storage_bytes(&self) -> R<u64> {
@@ -378,4 +491,70 @@ pub fn leaf_hashes(b: &TextdbSqlite, path: &str) -> R<Vec<textdb_core::Hash>> {
             .map(|l| l.hash)
             .collect())
     })
+}
+
+/// `[lo, hi)` over `kb_node.path` covering a subtree, as an index range rather than a
+/// `substr` predicate (the same trick the vtab uses: "0" is the byte after "/").
+///
+/// The range covers what is *below* the path, so callers pair it with an equality on the
+/// path itself: `links("/a/b.md")` means that document, `links("/a")` means the folder.
+fn subtree_range(prefix: &str) -> (String, String) {
+    if prefix == "/" || prefix.is_empty() {
+        ("/".to_string(), "0".to_string())
+    } else {
+        let p = prefix.trim_end_matches('/');
+        (format!("{}/", p), format!("{}0", p))
+    }
+}
+
+fn link_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LinkRow> {
+    Ok(LinkRow {
+        path: r.get(0)?,
+        target: r.get(1)?,
+        line: r.get::<_, i64>(2)? as u64,
+        status: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        resolved: r.get(4)?,
+    })
+}
+
+/// Set one top-level key in a document's YAML front matter, leaving every other line
+/// exactly as it was, and creating the block when the document has none.
+///
+/// Deliberately the same shape as the CLI's `meta set`: a line-wise edit of the block, not
+/// a YAML round trip, because re-serialising would rewrite lines the user did not touch and
+/// the suite's oracle checks that the body comes back byte for byte.
+pub fn set_frontmatter_key(body: &[u8], key: &str, value: &str) -> Vec<u8> {
+    let line = format!("{}: {}\n", key, value);
+    let Some((fm, end)) = textdb_md::split_frontmatter(body) else {
+        let mut out = format!("---\n{}---\n", line).into_bytes();
+        out.extend_from_slice(body);
+        return out;
+    };
+    let mut out = Vec::with_capacity(body.len() + line.len());
+    out.extend_from_slice(b"---\n");
+    let mut replaced = false;
+    for l in fm.split(|&b| b == b'\n') {
+        if l.is_empty() {
+            continue;
+        }
+        let is_key = l
+            .iter()
+            .position(|&b| b == b':')
+            .is_some_and(|i| std::str::from_utf8(&l[..i]).is_ok_and(|k| k.trim() == key));
+        if is_key {
+            if !replaced {
+                out.extend_from_slice(line.as_bytes());
+                replaced = true;
+            }
+        } else {
+            out.extend_from_slice(l);
+            out.push(b'\n');
+        }
+    }
+    if !replaced {
+        out.extend_from_slice(line.as_bytes());
+    }
+    out.extend_from_slice(b"---\n");
+    out.extend_from_slice(&body[end..]);
+    out
 }

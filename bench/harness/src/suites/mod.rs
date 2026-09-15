@@ -7,6 +7,7 @@ pub mod cw;
 pub mod du;
 pub mod fp;
 pub mod ll;
+pub mod md;
 pub mod me;
 pub mod ns;
 pub mod rt;
@@ -28,6 +29,7 @@ pub fn dispatch(kind: &str, ctx: &Ctx) -> anyhow::Result<()> {
         "concurrent_reads" => cr::concurrent_reads(ctx),
         "search" => sr::search(ctx),
         "namespace" => ns::namespace(ctx),
+        "markdown" => md::markdown(ctx),
         "footprint" => fp::footprint(ctx),
         "durability" => du::durability(ctx),
         other => anyhow::bail!("unknown test kind {}", other),
