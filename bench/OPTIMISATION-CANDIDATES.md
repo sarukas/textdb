@@ -184,6 +184,41 @@ the sidecar is part of the small-document create regression and not all of it. T
 feed, path events and folder totals are the untested remainder — the next step is a probe
 that switches each off in turn, which `textdb-probe writepath` is the right place for.
 
+## Sync rewrote its whole base on every run, including a no-op (2026-09-15)
+
+SY-01 put a number on sync for the first time, and the no-op case — the one a save hook or
+a watcher runs constantly — cost 6.4 % of a full import.
+
+The change detection itself is already right: `t_changed` compares versions and `d_changed`
+compares size and mtime (with git's racy-clean window handled), so an unchanged file is
+never read. What cost the time was downstream. `save_sync_base` ended every run with
+`DELETE FROM sync_file WHERE sync_id = ?` followed by an `INSERT` per file, so a sync whose
+answer was "nothing to do" still wrote the entire base back — hundreds of statements and
+their WAL records.
+
+It now reads the stored rows and skips the rewrite when they already say the same thing: one
+indexed scan against two statements per file. Measured directly on 300 files:
+
+| corpus | before | after |
+|---|---|---|
+| 300 files, 1 MB total | 15 ms (52 us/file) | 13 ms (45 us/file) |
+| 300 files, 16 MB total | 25 ms (84 us/file) | 13 ms (46 us/file) |
+
+The interesting part is the second row. A no-op sync used to get slower as the *content*
+grew, which looked like it was re-reading documents; it was not — the bigger store simply
+made the pointless rewrite more expensive. The cost is now flat in content size, which is
+what a no-op should be. Both store backends got the fix; 131 workspace tests, 36 CLI tests
+and 8 Postgres CLI tests pass.
+
+**The SY family at `--size s` does not show this**, and that is worth knowing before reading
+its numbers: 120 files of about 1.2 KB is too small a corpus for the rewrite to dominate, so
+the cell moves 0.97x, inside the noise. The effect needs either more files or more bytes
+than the POC parameters use.
+
+Left alone: ~45 us per file per no-op sync, which is a `metadata` syscall, a store row
+lookup and the map work. For a 10,000-file vault that is about half a second to establish
+that nothing changed.
+
 ## Why the matrix alone was misleading
 
 Three things the published `2026-09-12` entry concluded do not survive decomposition.

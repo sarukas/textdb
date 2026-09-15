@@ -1021,6 +1021,12 @@ impl Store for PgStore {
             )
             .map_err(pg)?
             .get(0);
+        // As in the SQLite store: a sync that changed nothing still arrives with the whole
+        // base, and rewriting it cost a DELETE and an INSERT of every row for a run whose
+        // answer was "nothing to do". One indexed read to find that out instead.
+        if same_sync_files(&mut tx, id, &base.files)? {
+            return tx.commit().map_err(pg);
+        }
         tx.execute("DELETE FROM kb.sync_file WHERE sync_id = $1", &[&id]).map_err(pg)?;
         let rels: Vec<&str> = base.files.iter().map(|f| f.rel.as_str()).collect();
         let versions: Vec<Option<i64>> = base.files.iter().map(|f| f.version).collect();
@@ -1185,4 +1191,25 @@ mod tests {
         assert_eq!(rewrite("SELECT 'unterminated :author"), ("SELECT 'unterminated :author".into(), 0));
         assert_eq!(rewrite("SELECT $10 FROM t$1"), ("SELECT $10 FROM t$1".into(), 10));
     }
+}
+
+/// Do the stored `kb.sync_file` rows for `id` already say exactly what `want` says?
+fn same_sync_files(tx: &mut postgres::Transaction<'_>, id: i64, want: &[BaseFile]) -> Result<bool> {
+    type Row = (Option<i64>, String, Option<i64>, Option<i64>, bool);
+    let rows = tx
+        .query(
+            "SELECT rel, version, blob, disk_size, disk_mtime, conflict FROM kb.sync_file WHERE sync_id = $1",
+            &[&id],
+        )
+        .map_err(pg)?;
+    if rows.len() != want.len() {
+        return Ok(false);
+    }
+    let have: std::collections::HashMap<String, Row> = rows
+        .iter()
+        .map(|r| (r.get(0), (r.get(1), r.get(2), r.get(3), r.get(4), r.get(5))))
+        .collect();
+    Ok(want
+        .iter()
+        .all(|f| have.get(&f.rel) == Some(&(f.version, f.blob.clone(), f.disk_size, f.disk_mtime, f.conflict))))
 }

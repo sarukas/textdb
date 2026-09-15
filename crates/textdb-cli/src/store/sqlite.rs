@@ -752,6 +752,13 @@ impl Store for SqliteStore {
                 |r| r.get(0),
             )
             .map_err(sql)?;
+        // A sync that changed nothing still arrives here with the whole base, and rewriting it
+        // meant a DELETE and an INSERT per file — hundreds of statements and their WAL records
+        // for a run whose answer was "nothing to do". Read the rows first and skip the rewrite
+        // when they already say this; one indexed scan against two statements per file.
+        if same_sync_files(&tx, p, id, &base.files)? {
+            return tx.commit().map_err(sql);
+        }
         tx.execute(&format!("DELETE FROM {p}sync_file WHERE sync_id = ?1"), [id]).map_err(sql)?;
         {
             let mut insert = tx
@@ -938,4 +945,38 @@ fn sync_row(r: &rusqlite::Row) -> rusqlite::Result<(i64, SyncBase)> {
             files: Vec::new(),
         },
     ))
+}
+
+/// Do the stored `sync_file` rows for `id` already say exactly what `want` says?
+///
+/// Compared as a map rather than in order: the rewrite this avoids did not preserve any
+/// order either, and `rel` is unique per sync, so the map is the meaning of the table.
+fn same_sync_files(tx: &rusqlite::Transaction<'_>, p: &str, id: i64, want: &[BaseFile]) -> Result<bool> {
+    type Row = (Option<i64>, String, Option<i64>, Option<i64>, bool);
+    let mut have: std::collections::HashMap<String, Row> = std::collections::HashMap::with_capacity(want.len());
+    {
+        let mut st = tx
+            .prepare_cached(&format!(
+                "SELECT rel, version, blob, disk_size, disk_mtime, conflict FROM {p}sync_file WHERE sync_id = ?1"
+            ))
+            .map_err(sql)?;
+        let rows = st
+            .query_map([id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? != 0),
+                ))
+            })
+            .map_err(sql)?;
+        for row in rows {
+            let (rel, rest) = row.map_err(sql)?;
+            have.insert(rel, rest);
+        }
+    }
+    if have.len() != want.len() {
+        return Ok(false);
+    }
+    Ok(want
+        .iter()
+        .all(|f| have.get(&f.rel) == Some(&(f.version, f.blob.clone(), f.disk_size, f.disk_mtime, f.conflict))))
 }
