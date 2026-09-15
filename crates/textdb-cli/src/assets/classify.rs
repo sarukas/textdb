@@ -56,6 +56,28 @@ pub const IGNORED_DIRS: &[&str] = &[
     ".spotlight-v100", ".fseventsd", ".trashes",
 ];
 
+/// A path segment as Windows resolves it: without an NTFS stream (`name:stream`) and the trailing
+/// dots and spaces it drops, in lower case.
+fn resolved(seg: &str) -> String {
+    seg.split(':').next().unwrap_or(seg).trim_end_matches(['.', ' ']).to_lowercase()
+}
+
+/// An 8.3 short name such as `GIT~1` or `NODE_M~1`: on Windows, another name of whatever folder
+/// has it (`.git` included).
+fn short_name(seg: &str) -> bool {
+    let Some((stem, rest)) = seg.split_once('~') else { return false };
+    let (num, ext) = rest.split_once('.').unwrap_or((rest, ""));
+    (1..=6).contains(&stem.chars().count()) && !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) && ext.chars().count() <= 3 && !ext.contains('.')
+}
+
+/// Whether the path segment `seg` names, or on Windows may name, one of `dirs`: in any letter
+/// case, with trailing dots or spaces or a stream, or, for a `folder` on the way to a file, as an
+/// 8.3 short name.
+pub fn names_dir(seg: &str, dirs: &[&str], folder: bool) -> bool {
+    let name = resolved(seg);
+    dirs.iter().any(|d| d.eq_ignore_ascii_case(&name)) || (folder && short_name(seg))
+}
+
 /// Files that are never assets: a store's database and its copies, system clutter, lock files,
 /// downloads and copies in progress.
 fn ignored_name(name: &str) -> bool {
@@ -234,7 +256,7 @@ impl Classifier {
     pub fn rule_class(&self, rel: &str) -> Class {
         let mut segs: Vec<&str> = rel.split('/').collect();
         let name = segs.pop().unwrap_or("");
-        if segs.iter().any(|s| IGNORED_DIRS.iter().any(|d| d.eq_ignore_ascii_case(s))) || ignored_name(name) {
+        if segs.iter().any(|s| names_dir(s, IGNORED_DIRS, true)) || names_dir(name, IGNORED_DIRS, false) || ignored_name(name) {
             return Class::Ignore;
         }
         if is_asset_pointer(name) {
@@ -348,6 +370,12 @@ mod tests {
         for junk in [".git/objects/ab", "docs/~$report.docx", "docs/.DS_Store", "img/._photo.jpg", "kb.db.bak", "dl/big.zip.crdownload", "~WRL0001.tmp", ".obsidian/plugins/p/main.wasm", "$RECYCLE.BIN/x.png"] {
             assert_eq!(c.rule_class(junk), Class::Ignore, "{junk}");
         }
+        // Other names Windows gives those folders: 8.3 short names, trailing dots and spaces, streams.
+        for alias in ["GIT~1/hooks/post-checkout", ".git./hooks/x", ".GIT /config", ".git::$INDEX_ALLOCATION/hooks/x", "NODE_M~1/x.png", "sub/.git"] {
+            assert_eq!(c.rule_class(alias), Class::Ignore, "{alias}");
+        }
+        assert!(names_dir("GIT~1", IGNORED_DIRS, true) && !names_dir("report~1.pdf", IGNORED_DIRS, false) && !names_dir("a~b", IGNORED_DIRS, true));
+        assert_eq!(c.rule_class("scans/report~1.pdf"), Class::Asset, "a file may be named like a short name");
         assert_eq!(c.rule_class(".png"), Class::Other);
         assert_eq!(c.rule_class("certs/server.key"), Class::Other);
 

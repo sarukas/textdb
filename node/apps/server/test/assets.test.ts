@@ -109,6 +109,10 @@ describe('assets of a synced folder', { skip: cli ? false : 'the textdb CLI is n
     assert.equal((await status(`&path=${encodeURIComponent(`/notes/a${NUL}.png`)}`)).status, 400);
     assert.equal((await status(`&path=${encodeURIComponent('/notes\\..\\x.png')}`)).status, 400);
     assert.equal((await status(`&path=${encodeURIComponent('/notes/.GIT/hooks/post-checkout')}`)).status, 400);
+    // Nor through the other names Windows gives .git: an 8.3 short name, trailing dots, a stream.
+    for (const alias of ['/notes/GIT~1/hooks/post-checkout', '/notes/.git./hooks/x', '/notes/.git::$INDEX_ALLOCATION/hooks/x']) {
+      assert.equal((await status(`&path=${encodeURIComponent(alias)}`)).status, 400, alias);
+    }
     assert.equal((await call('POST', '/api/assets/push', { prefix: '/notes', paths: ['/x.png'] })).status, 400);
     assert.equal((await call('POST', '/api/assets/pull', { prefix: '/notes', author: `a${NUL}b` })).status, 400);
 

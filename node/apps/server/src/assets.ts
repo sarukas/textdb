@@ -85,10 +85,22 @@ const MAX_RUNS = 4;
 
 const CONTROL = /[\x00-\x1f\x7f]/;
 
-/** A store path at or below `prefix`: no `.` or `..` part, backslash, control character or ignored folder. */
+/** An 8.3 short name such as GIT~1: on Windows another name of whatever folder has it, .git included. */
+const SHORT_NAME = /^[^~]{1,6}~\d+(\.[^.]{0,3})?$/;
+
+/**
+ * A store path at or below `prefix` that an asset can be at: no `.` or `..` part, backslash, colon
+ * (an NTFS stream) or control character, and no part naming an ignored folder the way Windows
+ * resolves names (any letter case, trailing dots and spaces dropped, or an 8.3 short name).
+ */
 function under(prefix: string, p: string): boolean {
-  if (!p.startsWith('/') || p.includes('\\') || CONTROL.test(p)) return false;
-  if (p.split('/').some((s) => s === '.' || s === '..' || IGNORED_DIRS.has(s.toLowerCase()))) return false;
+  if (!p.startsWith('/') || p.includes('\\') || p.includes(':') || CONTROL.test(p)) return false;
+  const segs = p.split('/');
+  for (const [i, s] of segs.entries()) {
+    if (s === '.' || s === '..') return false;
+    if (IGNORED_DIRS.has(s.replace(/[. ]+$/, '').toLowerCase())) return false;
+    if (i > 0 && i < segs.length - 1 && SHORT_NAME.test(s)) return false;
+  }
   return prefix === '/' || p === prefix || p.startsWith(`${prefix}/`);
 }
 

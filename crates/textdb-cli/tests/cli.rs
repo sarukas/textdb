@@ -743,7 +743,24 @@ fn asset_pointers_never_reach_into_git_or_tell_of_other_files() {
     ok(&mut t(&["write", "/sub/.GIT/config.md"]), Some("[core]\n"));
     let synced = run(&mut t(&["--json", "sync", "/", dir]), None);
     assert!(!vault.join(".git/hooks/notes.md").exists() && !vault.join("sub/.GIT/config.md").exists(), "{}", synced.stdout);
-    assert!(synced.stdout.contains("where sync never writes"), "{}", synced.stdout);
+    assert!(synced.stdout.contains("sync never writes into"), "{}", synced.stdout);
+
+    // Nor into textdb's own folder, dependencies or trash, nor into .git by another name Windows
+    // gives it (the store may refuse some of these names, which is as good).
+    for rel in ["/.textdb/bin/evil.md", "/node_modules/evil.md", "/.trash/evil.md"] {
+        ok(&mut t(&["write", rel]), Some("#!/bin/sh\necho pwned\n"));
+    }
+    for rel in ["/GIT~1/hooks/short.md", "/.git./hooks/dotted.md"] {
+        run(&mut t(&["write", rel]), Some("#!/bin/sh\necho pwned\n"));
+    }
+    let synced = run(&mut t(&["--json", "sync", "/", dir]), None);
+    for rel in [".textdb/bin/evil.md", "node_modules/evil.md", ".trash/evil.md", ".git/hooks/short.md", "GIT~1/hooks/short.md", ".git/hooks/dotted.md"] {
+        assert!(!vault.join(rel).exists(), "{rel} was written: {}", synced.stdout);
+    }
+
+    // push --force never sends a file a pointer only names to the asset store.
+    run(&mut t(&["assets", "push", "--force", "--dir", dir]), None);
+    assert!(!bucket.join(".env").exists(), "the .env went to the asset store");
 }
 
 /// rclone for tests: `TEXTDB_RCLONE`, else `rclone` on the PATH. Without one the test is skipped,

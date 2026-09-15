@@ -204,15 +204,24 @@ fn heads_by_rel(st: &mut dyn Store, prefix: &str) -> Result<BTreeMap<String, Fil
 /// are read like any other.
 pub const SKIP_DIRS: &[&str] = &[".git", ".textdb", ".trash", "node_modules"];
 
-/// Whether `rel` is a `.git` directory or inside one (in any letter case): sync never writes
-/// there, so a file anyone put in the store cannot become a git hook or configuration.
-fn in_git_dir(rel: &str) -> bool {
-    rel.split('/').any(|s| s.eq_ignore_ascii_case(".git"))
+/// Whether `rel` is, or is inside, a folder sync never writes a store file into: version control,
+/// textdb's own folder, trash, dependencies and system folders (the folders assets are never in,
+/// `.obsidian` excepted: its settings sync on purpose). Names are taken as Windows resolves them,
+/// so `.GIT`, `.git.`, `.git::$INDEX_ALLOCATION` and `GIT~1` are `.git`. A file anyone put in the
+/// store must not become a git hook, a script textdb's wrappers run, or a dependency.
+fn protected_rel(rel: &str) -> bool {
+    use crate::assets::classify::{names_dir, IGNORED_DIRS};
+    let dirs: Vec<&str> = IGNORED_DIRS.iter().copied().filter(|d| *d != ".obsidian").collect();
+    let segs: Vec<&str> = rel.split('/').collect();
+    segs.iter().enumerate().any(|(i, s)| names_dir(s, &dirs, i + 1 < segs.len()))
 }
 
-fn refuse_git(rel: &str) -> std::io::Result<()> {
-    if in_git_dir(rel) {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("{rel} is inside .git, where sync never writes")));
+fn refuse_protected(rel: &str) -> std::io::Result<()> {
+    if protected_rel(rel) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{rel} is inside a folder sync never writes into (.git, .textdb, node_modules, …)"),
+        ));
     }
     Ok(())
 }
@@ -300,7 +309,7 @@ fn walk(root: &Path, tracked_dirs: &HashSet<String>) -> Result<Walk> {
 }
 
 fn write_disk(root: &Path, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
-    refuse_git(rel)?;
+    refuse_protected(rel)?;
     let target = root.join(rel);
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
@@ -343,7 +352,9 @@ fn remove_empty_dir(dir: &Path) -> bool {
 /// Move a file on disk from `from` to `to`, creating the folders it needs and removing the ones
 /// it leaves empty.
 fn move_disk(root: &Path, from: &str, to: &str) -> std::io::Result<()> {
-    refuse_git(to)?;
+    // textdb's own trash (`.textdb/trash/<time>/<file>`) is the one such folder files move into;
+    // the file's own path is checked all the same.
+    refuse_protected(to.strip_prefix(".textdb/trash/").and_then(|rest| rest.split_once('/')).map_or(to, |(_, file)| file))?;
     let target = root.join(to);
     let case_only = from != to && from.to_lowercase() == to.to_lowercase();
     if target.exists() && !(case_only && CASE_INSENSITIVE) {
@@ -1016,7 +1027,9 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         let d = walked.files.get(&rel).copied();
         let Some(b) = base.get(&rel) else {
             match (t, d) {
-                (Some(_), None) if in_git_dir(&rel) => report.skipped.push(note(&rel, "inside .git, where sync never writes: kept in textdb only")),
+                (Some(_), None) if protected_rel(&rel) => {
+                    report.skipped.push(note(&rel, "inside a folder sync never writes into (.git, .textdb, node_modules, …): kept in textdb only"))
+                }
                 (Some(_), None) => plan.to_disk.push(rel),
                 (None, Some(_)) => {
                     if eligible(&rel, &o.exts) {
@@ -2097,8 +2110,11 @@ mod tests {
         assert!(eligible(".claude/instructions/rules.md", &exts) && eligible("docs/.drafts/a.md", &exts));
         assert!(!eligible("logo.png", &exts) && !eligible("x/node_modules/a.md", &exts));
         assert!(!eligible(".git/a.md", &exts) && !eligible(".trash/a.md", &exts) && !eligible(".textdb/app/a.md", &exts));
-        assert!(in_git_dir(".git/hooks/post-checkout") && in_git_dir("sub/.GIT/config") && in_git_dir("vendor/lib/.git"));
-        assert!(!in_git_dir(".gitignore") && !in_git_dir("a/.github/workflows/ci.yml") && !in_git_dir("notes/git/a.md"));
+        assert!(protected_rel(".git/hooks/post-checkout") && protected_rel("sub/.GIT/config") && protected_rel("vendor/lib/.git"));
+        assert!(protected_rel(".textdb/bin/textdb.cmd") && protected_rel("web/node_modules/x.js") && protected_rel(".trash/a.md"));
+        assert!(protected_rel("GIT~1/hooks/x") && protected_rel(".git./hooks/x") && protected_rel(".git::$INDEX_ALLOCATION/hooks/x"));
+        assert!(!protected_rel(".gitignore") && !protected_rel("a/.github/workflows/ci.yml") && !protected_rel("notes/git/a.md"));
+        assert!(!protected_rel(".obsidian/app.json") && !protected_rel("scans/report~1.pdf"), "settings sync; a file may look like a short name");
         assert!(eligible("logo.png", &parse_exts("*")));
         assert!(has_markers(b"a\n<<<<<<< textdb\nb\n=======\nc\n>>>>>>> disk\n"));
         assert!(!has_markers(b"<<<<<<< only an opening line\n"));

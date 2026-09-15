@@ -1171,7 +1171,9 @@ pub(crate) fn push_run(st: &mut dyn Store, v: &Vault, scope: &[String], o: &Push
         }
         match item.state {
             "new" | "modified" => todo.push(item),
-            "conflict" if o.force && item.case_of.is_none() => todo.push(item),
+            // Only a conflict with an asset file here: a pointer that only names another file (a
+            // .env, say) never sends it to the asset store.
+            "conflict" if o.force && item.case_of.is_none() && item.file.is_some() => todo.push(item),
             "orphan" if o.force => todo.push(item),
             "conflict" => conflicts.push(format!("{}: {}", item.path, item.note.as_deref().unwrap_or("conflict"))),
             _ => {}

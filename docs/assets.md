@@ -235,8 +235,12 @@ hash differs from the pointer in place. A pointer is never pulled into `.git`, `
 `node_modules` or another place the rules leave out (it is `invalid-path`), and a pointer that only
 names a file that is no asset (a document, a file the rules leave out) is a `conflict` whose file is
 never hashed or described: anyone who can write to the store must not be able to plant a git hook
-or learn about other files through a pointer. For the same reason sync never writes a store file
-inside a `.git` folder, in any letter case (it is reported as skipped). `verify` counts an asset store it cannot reach as a
+or learn about other files through a pointer, and `push --force` never uploads a file a pointer
+only names. For the same reason sync never writes a store file inside `.git`, `.textdb`,
+`node_modules`, `.trash`, `.textdb-trash`, `__pycache__` or the system folders textdb leaves out
+(`.obsidian` excepted: its settings sync on purpose), whatever the name's letter case, trailing
+dots or spaces, stream, or 8.3 short name (`GIT~1`) — such a file is reported as skipped. These
+checks take a name as Windows would resolve it, so `.git.` and `GIT~1` are `.git`. `verify` counts an asset store it cannot reach as a
 problem. `status --json` gives `{ prefix, dir, assets, counts }`, each asset with `path`, `state`,
 `type` (the pointer's media type, or one from the name), and where known `size`, `store`,
 `sha256` (the pointer's), `version` (the pointer's in the store), `file` (its name on disk,
