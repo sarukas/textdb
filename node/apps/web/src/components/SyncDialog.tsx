@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, ApiError, type SyncLink, type SyncReport } from "../api";
+import { api, ApiError, type SyncAssetsReport, type SyncLink, type SyncReport } from "../api";
 import { effectiveAuthor } from "../state/useAuthor";
 
 interface Props {
@@ -353,6 +353,7 @@ function Details({ report: r, onOpen }: { report: SyncReport; onOpen: (rel: stri
         onOpen={onOpen}
       />
       <ChangeList title="Merged on both sides" items={tagged("merged", r.merged)} onOpen={onOpen} />
+      {r.assets && <AssetChanges assets={r.assets} />}
       {r.dry_run && (
         <ChangeList title="Conflicts: markers will be written to these files on disk" items={tagged("conflict", r.conflicts)} />
       )}
@@ -364,6 +365,45 @@ function Details({ report: r, onOpen }: { report: SyncReport; onOpen: (rel: stri
               <li key={`${tag}:${n.path}`} title={`${n.path}: ${n.reason}`}>
                 <span className={`export-change export-${tag}`}>{tag}</span> <span className="mono">{n.path}</span>{" "}
                 <span className="muted">— {n.reason}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </>
+  );
+}
+
+/**
+ * What the sync did with assets: bytes pushed and pulled, pointers renamed after their files, files
+ * trashed or set aside for a conflict; and what stopped it.
+ */
+function AssetChanges({ assets: a }: { assets: SyncAssetsReport }) {
+  const serious = a.failed.length + a.conflicts.length;
+  const notes = [
+    ...a.conflicts.map((text) => ["conflict", text] as const),
+    ...a.failed.map((text) => ["failed", text] as const),
+    ...a.notes.map((text) => ["note", text] as const),
+  ];
+  return (
+    <>
+      <ChangeList
+        title={a.mode === "off" ? "Assets (asset_sync is off: nothing pushed or pulled)" : `Assets (${a.mode})`}
+        items={[
+          ...a.pushed.map((p): Tagged => ["pushed", p]),
+          ...a.pulled.map((p): Tagged => ["pulled", p]),
+          ...a.renamed.map((m): Tagged => ["renamed", `${m.from} → ${m.to}`]),
+          ...a.trashed.map((p): Tagged => ["trashed", p]),
+          ...a.conflict_copies.map((m): Tagged => ["set aside", `${m.from} → ${m.to}`]),
+        ]}
+      />
+      {notes.length > 0 && (
+        <details className="failures" open={serious > 0}>
+          <summary className={serious > 0 ? "error-text" : undefined}>Asset notes ({notes.length})</summary>
+          <ul>
+            {notes.map(([tag, text], i) => (
+              <li key={i}>
+                <span className={`export-change export-${tag}`}>{tag}</span> <span className="muted">{text}</span>
               </li>
             ))}
           </ul>

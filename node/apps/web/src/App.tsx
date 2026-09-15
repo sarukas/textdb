@@ -10,7 +10,9 @@ import {
   type SyncLinks,
 } from "./api";
 import { ActivityFeed } from "./components/ActivityFeed";
+import { AssetPane } from "./components/AssetPane";
 import { DocumentPane, type Mode, type OpenDoc } from "./components/DocumentPane";
+import { isPointer, syncLinkFor } from "./assets/model";
 import { ExportDialog } from "./components/ExportDialog";
 import { SyncDialog } from "./components/SyncDialog";
 import { FolderView } from "./components/FolderView";
@@ -35,6 +37,11 @@ import { bulkSummary, purgeSummary, type BulkAction, type PathAction, type Trash
 import { FeedHub } from "./state/hub";
 import { OwnWrites } from "./state/ownWrites";
 import { useAuthor } from "./state/useAuthor";
+
+/** A pointer document opens as its asset when the server syncs a folder it is in with a directory. */
+function assetLinkOf(path: string, links: SyncLinks | null): SyncLinks["links"][number] | null {
+  return isPointer(path) ? syncLinkFor(path, links?.links ?? []) : null;
+}
 
 const FEED_CAP = 500;
 let openSeq = 0;
@@ -385,6 +392,16 @@ export function App() {
               onPurge={(entry) => setTrashAction({ op: "purge", entry })}
               onClose={closeTrash}
             />
+          ) : open && assetLinkOf(open.path, syncLinks) ? (
+            <AssetPane
+              key={open.id}
+              pointer={open.path}
+              link={assetLinkOf(open.path, syncLinks)!}
+              hub={hub}
+              author={author}
+              onAction={onPathAction}
+              onOpenFolder={openFolder}
+            />
           ) : open ? (
             <DocumentPane
               key={open.id}
@@ -408,6 +425,7 @@ export function App() {
               onAction={onPathAction}
               onBulk={setBulkAction}
               syncLink={syncLinks?.links.find((l) => l.prefix === (folder ?? "/")) ?? null}
+              assetLink={syncLinkFor(folder ?? "/", syncLinks?.links ?? [])}
               onSync={setSyncing}
             />
           )}

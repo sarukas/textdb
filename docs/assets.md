@@ -369,9 +369,22 @@ drive. These need real Google Drive and SharePoint accounts to build and test ag
 
 ### Stage 4 — Web app
 
-Assets in the folder view (real name, type, state), image and PDF previews and downloads served by
-the server from the vault or through the driver, pull and push actions, asset history from pointer
-versions; docs and skills.
+For the folders the web server syncs (`TEXTDB_SYNC`), through the CLI as for sync:
+
+- The folder view lists a pointer `NAME.tdbasset` as `NAME`, with its type, the asset's size and a
+  state badge (ok, new, changed, outdated, conflict, not pulled, …), refreshed when a pointer
+  changes. Opening it shows the asset: its state, type, size and asset store; a preview of an image,
+  PDF, audio or video file; a download of anything else; Pull or Push when its state calls for
+  one; Rename and Delete (of the pointer; the next sync moves or trashes the file); and the
+  pointer's versions with their authors and messages.
+- The sync dialog lists what a sync did with assets: pushed, pulled, renamed, trashed, set aside,
+  and its conflicts, failures and notes.
+- Server: `GET /api/assets?prefix=&path=` (the CLI's status), `POST /api/assets/pull` and
+  `POST /api/assets/push` (`{ prefix, paths?, message?, author? }`, taking the folder's turn with
+  its syncs), `GET /api/assets/file?prefix=&path=[&download=1]`: the asset's file from inside the
+  folder's directory only, `nosniff`, sandboxed unless a PDF, and only images, PDF, audio and video
+  inline (SVG and anything else as a download). An asset not pulled is pulled before it can be
+  seen: the server never reads the asset store for a preview.
 
 ## Out of scope for now
 

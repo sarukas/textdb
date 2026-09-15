@@ -8,7 +8,8 @@ import {
   type KeyboardEvent,
   type MouseEvent,
 } from "react";
-import { api, ApiError, type AuthorCount, type LsEntry, type SearchHit, type SyncLink } from "../api";
+import { api, ApiError, type AssetItem, type AuthorCount, type LsEntry, type SearchHit, type SyncLink } from "../api";
+import { assetPath, isPointer, stateLabel } from "../assets/model";
 import {
   COLUMNS,
   PAGE,
@@ -54,6 +55,8 @@ interface Props {
   onBulk: (action: BulkAction) => void;
   /** The server syncs this folder with a directory. */
   syncLink?: SyncLink | null;
+  /** The synced folder this folder is in (itself or one above it): the state of its assets is shown. */
+  assetLink?: SyncLink | null;
   onSync?: (prefix: string) => void;
 }
 
@@ -109,7 +112,7 @@ function readSort(raw: string | null): Sort {
  * scrolls. Changes from anyone update rows in place; rows that appear or would reorder wait
  * behind a "Refresh" so the list does not jump under the pointer.
  */
-export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBulk, syncLink, onSync }: Props) {
+export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBulk, syncLink, assetLink, onSync }: Props) {
   const now = useNow(30_000);
   const label = path === "/" ? "all files" : baseName(path);
   const [sort, setSort] = useState<Sort>(() => stored("textdb.folderSort", readSort));
@@ -218,6 +221,26 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
   }, [path]);
   useEffect(loadSummary, [loadSummary]);
 
+  // The state of the assets below this folder, by asset path, when it is in a synced folder.
+  const assetPrefix = assetLink?.prefix ?? null;
+  const [assetRev, setAssetRev] = useState(0);
+  const [assets, setAssets] = useState<ReadonlyMap<string, AssetItem>>(() => new Map());
+  useEffect(() => {
+    if (assetPrefix === null) {
+      setAssets(new Map());
+      return;
+    }
+    const ctl = new AbortController();
+    api.assets(assetPrefix, path, ctl.signal).then(
+      (s) => setAssets(new Map(s.assets.map((a) => [a.path, a]))),
+      () => {
+        if (!ctl.signal.aborted) setAssets(new Map());
+      },
+    );
+    return () => ctl.abort();
+  }, [assetPrefix, path, nonce, assetRev]);
+  const assetOf = (e: LsEntry): AssetItem | undefined => (e.kind === "file" && isPointer(e.path) ? assets.get(assetPath(e.path)) : undefined);
+
   // ---- live changes ---------------------------------------------------------------------------
 
   const refreshRows = useCallback((paths: string[]) => {
@@ -249,14 +272,24 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null;
     const toRefresh = new Set<string>();
+    // A pointer changed: the assets' state is looked at again, once per burst.
+    let pointers = false;
     const flush = () => {
       timer = null;
+      if (pointers) {
+        pointers = false;
+        setAssetRev((r) => r + 1);
+      }
       loadSummary();
       refreshRows([...toRefresh]);
       toRefresh.clear();
       setFlashRev((r) => r + 1);
     };
     const off = hub.events.on((e) => {
+      if (isPointer(e.path) || isPointer(e.old_path ?? "")) {
+        pointers = true;
+        timer ??= setTimeout(flush, 300);
+      }
       const { recursive: rec, sortKey, onOpenFolder: follow } = liveRef.current;
       const plan = planChange(path, rec, e);
       if (plan.folder) {
@@ -513,6 +546,8 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
     switch (id) {
       case "name": {
         const within = recursive ? parentOf(e.path).slice(path === "/" ? 1 : path.length + 1) : "";
+        const asset = assetOf(e);
+        const label = asset ? stateLabel(asset.state) : null;
         return (
           <>
             <span className={e.kind === "folder" ? "icon icon-folder" : "icon icon-file"} aria-hidden="true" />
@@ -528,16 +563,22 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
                 if (!isRemoved(e.path)) open(e);
               }}
             >
-              {e.name}
+              {e.kind === "file" && isPointer(e.name) ? assetPath(e.name) : e.name}
             </a>
+            {label && (
+              <span className={`badge asset-${label.tone} fasset`} title={asset?.note ?? label.hint}>
+                {label.label}
+              </span>
+            )}
             {within && <span className="fwithin">{within}</span>}
           </>
         );
       }
       case "type":
-        return e.kind === "folder" ? "Folder" : extensionOf(e.name, e.kind).toUpperCase() || "File";
+        return e.kind === "folder" ? "Folder" : extensionOf(isPointer(e.name) ? assetPath(e.name) : e.name, e.kind).toUpperCase() || "File";
       case "size":
-        return formatBytes(e.nbytes ?? 0);
+        // An asset's own size, where its state is known; its pointer's otherwise.
+        return formatBytes(assetOf(e)?.size ?? e.nbytes ?? 0);
       case "lines":
         return num(e.nlines);
       case "words":
