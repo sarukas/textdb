@@ -189,8 +189,10 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
   The local and rclone drivers' locks do not see each other: one team should reach a store
   through one driver. Google Drive remotes work as below; SharePoint's rewriting of Office files
   on upload is still to come (see stage 3 below).
-- **Google Drive** (an rclone remote of type `drive`, as `rclone listremotes --long` shows; a
-  shared drive in a team). Planned; what Drive does was tried against a test shared drive:
+- **Google Drive** (an rclone remote of type `drive`, as `rclone listremotes --long` shows, or a
+  `:drive` connection string; a shared drive in a team). Built in sprints (stage 3 below): file ids
+  as items, the listing with its id guard, and pulls by id are in; the rest is planned, from what
+  Drive was seen to do on a test shared drive:
   - *Item* = the Drive file id, recorded in the pointer's `item`. An id stays with a file through
     renames, moves and in-place overwrites; a pointer an earlier build wrote (item = path) gets its
     id at its next push.
@@ -425,7 +427,9 @@ First part (done): the `rclone` driver: push, pull and verify through any rclone
 the local driver's layout, trash, partial copies and names beside, provider SHA-256 where there is
 one (else read back), locks by lock files and listing, rclone found through `TEXTDB_RCLONE`, next
 to `textdb` (a vault's `.textdb/bin`) or the PATH, and CI running the tests against rclone's local
-backend.
+backend. Tests use rclone only when `TEXTDB_RCLONE` names it, never one on the PATH: their quick
+rewrites and renames of files can look like ransomware to security software on a person's own
+computer.
 
 Second part, Google Drive (as described under asset stores): Drive file ids as items, one
 store listing per command with the id guard, pushes overwriting in place after a checked trash

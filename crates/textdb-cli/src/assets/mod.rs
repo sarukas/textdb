@@ -829,11 +829,12 @@ impl InUse {
 
     /// Where the upload of `item` goes, and the bytes it may replace there: the asset's own where
     /// they are kept (its path, or the item its pointer names), unless another pointer names them
-    /// too; otherwise the asset's path, next to anything already there.
-    fn target<'p>(&self, store: &str, item: &'p Item) -> (String, Option<&'p str>) {
+    /// too or the asset store no longer has them (`gone`); otherwise the asset's path, next to
+    /// anything already there.
+    fn target<'p>(&self, store: &str, item: &'p Item, gone: bool) -> (String, Option<&'p str>) {
         item.pointer
             .as_ref()
-            .filter(|p| p.store == store)
+            .filter(|p| p.store == store && !gone)
             .map(|p| (p.item.clone().unwrap_or_else(|| item.path.clone()), p.sha256.as_str()))
             .filter(|(location, _)| !self.shared(store, location, &item.path))
             .map_or_else(|| (item.path.clone(), None), |(location, sha)| (location, Some(sha)))
@@ -883,6 +884,13 @@ fn push_one(
         Err(e) => return Outcome::Failed(format!("{}: {e}", item.path)),
     };
     let old = item.pointer.as_ref();
+    // A provider's file id its pointer names that the asset store no longer has (a Drive file
+    // purged from Drive's trash, say): the upload goes to the asset's path.
+    let gone = old
+        .filter(|p| p.store == store)
+        .and_then(|p| p.item.as_deref())
+        .filter(|i| !i.starts_with('/'))
+        .is_some_and(|i| matches!(d.size(&item.path, Some(i)), Ok(None)));
     // The target's lock is held until the pointer is committed, and which pointers name the
     // target is read again once it is held: a push that reuses bytes already there commits its
     // pointer before another push may decide to replace them.
@@ -891,7 +899,7 @@ fn push_one(
         if let Err(e) = in_use.refresh(st) {
             return Outcome::Failed(format!("{}: {}", item.path, e.message));
         }
-        let (target, _) = in_use.target(&store, item);
+        let (target, _) = in_use.target(&store, item, gone);
         let held = match d.lock(&target) {
             Ok(h) => h,
             Err(e) => return Outcome::Failed(format!("{}: {}", item.path, e.message)),
@@ -902,7 +910,7 @@ fn push_one(
         if let Err(e) = in_use.refresh(st) {
             return Outcome::Failed(format!("{}: {}", item.path, e.message));
         }
-        let (again, replaces) = in_use.target(&store, item);
+        let (again, replaces) = in_use.target(&store, item, gone);
         if again == target {
             decided = Some((target, replaces, held));
             break;

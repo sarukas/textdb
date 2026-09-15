@@ -1095,13 +1095,92 @@ fn link_dir(target: &Path, link: &Path) -> bool {
 
 /// rclone for tests: `TEXTDB_RCLONE`, else `rclone` on the PATH. Without one the test is skipped,
 /// unless `TEXTDB_REQUIRE_RCLONE` is set (as in CI).
+/// rclone for tests: `TEXTDB_RCLONE` only, as CI sets it, never one found on the PATH. These tests
+/// rewrite and rename files quickly, which security software on a person's own computer may take
+/// for ransomware. Without it the test is skipped, unless `TEXTDB_REQUIRE_RCLONE` is set.
 fn test_rclone() -> Option<std::path::PathBuf> {
-    let exe = std::env::var_os("TEXTDB_RCLONE").filter(|e| !e.is_empty()).map_or_else(|| "rclone".into(), std::path::PathBuf::from);
-    let runs = Command::new(&exe).arg("version").output().is_ok_and(|o| o.status.success());
+    let exe = std::env::var_os("TEXTDB_RCLONE").filter(|e| !e.is_empty()).map(std::path::PathBuf::from);
+    let runs = exe.as_ref().is_some_and(|exe| Command::new(exe).arg("version").output().is_ok_and(|o| o.status.success()));
     if !runs && std::env::var_os("TEXTDB_REQUIRE_RCLONE").is_some() {
-        panic!("TEXTDB_REQUIRE_RCLONE is set, but {} does not run", exe.display());
+        panic!("TEXTDB_REQUIRE_RCLONE is set, but TEXTDB_RCLONE does not name an rclone that runs");
     }
-    runs.then_some(exe)
+    exe.filter(|_| runs)
+}
+
+/// A Google Drive folder called `textdb-test` to test against (`TEXTDB_TEST_GDRIVE`, such as
+/// `gdrive:textdb-test`), and rclone; the test is skipped without one.
+fn test_gdrive() -> Option<(std::path::PathBuf, String)> {
+    let base = std::env::var("TEXTDB_TEST_GDRIVE").ok().filter(|b| !b.is_empty())?;
+    let base = base.trim_end_matches('/').to_string();
+    assert_eq!(base.rsplit(['/', ':']).next(), Some("textdb-test"), "TEXTDB_TEST_GDRIVE must name a folder called textdb-test, not {base}");
+    Some((test_rclone().expect("TEXTDB_TEST_GDRIVE is set, but rclone does not run"), base))
+}
+
+#[test]
+fn assets_on_google_drive_are_pulled_by_file_id_and_never_from_outside_the_store() {
+    let Some((rclone, base)) = test_gdrive() else { return };
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
+    let run_dir = format!("{base}/cli-{}-{nanos}", std::process::id());
+    let root = format!("{run_dir}/store");
+    let rc = |args: &[&str]| {
+        let out = Command::new(&rclone).args(args).output().unwrap();
+        assert!(out.status.success(), "rclone {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    struct Purge(std::path::PathBuf, String);
+    impl Drop for Purge {
+        fn drop(&mut self) {
+            let _ = Command::new(&self.0).args(["purge", "--drive-use-trash=false", &self.1]).output();
+        }
+    }
+    rc(&["mkdir", &root]);
+    let _purge = Purge(rclone.clone(), run_dir.clone());
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let (vault, config) = (tmp.path().join("vault"), tmp.path().join("config"));
+    std::fs::create_dir_all(vault.join("img")).unwrap();
+    std::fs::write(vault.join("notes.md"), "![[a.png]]\n").unwrap();
+    let bytes = [137u8, 80, 78, 71, 0, 1, 2];
+    std::fs::write(vault.join("img/a.png"), bytes).unwrap();
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.env("TEXTDB_CONFIG_DIR", &config).env("TEXTDB_RCLONE", &rclone).args(args);
+        c
+    };
+    let dir = vault.to_str().unwrap();
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "stores", "--add", "drive", "--driver", "rclone", "--root", &root]), None);
+    ok(&mut t(&["assets", "push", "--dir", dir]), None);
+    let pointer = std::fs::read_to_string(vault.join("img/a.png.tdbasset")).unwrap();
+    let id = pointer.lines().find_map(|l| l.strip_prefix("item: ")).unwrap().to_string();
+    assert!(!id.starts_with('/'), "the item is the Drive file id: {pointer}");
+
+    // Renamed in the drive and then trashed there: pulled all the same, by its id.
+    rc(&["moveto", &format!("{root}/img/a.png"), &format!("{root}/elsewhere/renamed.png")]);
+    rc(&["deletefile", &format!("{root}/elsewhere/renamed.png")]);
+    std::fs::remove_file(vault.join("img/a.png")).unwrap();
+    ok(&mut t(&["assets", "pull", "--dir", dir]), None);
+    assert_eq!(std::fs::read(vault.join("img/a.png")).unwrap(), bytes);
+
+    // A pointer naming a file outside the store is never pulled, whatever that file is.
+    rc(&["copyto", vault.join("notes.md").to_str().unwrap(), &format!("{run_dir}/outside/notes.md")]);
+    let outside: serde_json::Value = serde_json::from_str(&rc(&["lsjson", "--stat", &format!("{run_dir}/outside/notes.md")])).unwrap();
+    let outside_id = outside["ID"].as_str().unwrap();
+    let planted = pointer
+        .lines()
+        .map(|l| match l {
+            l if l.starts_with("item: ") => format!("item: {outside_id}"),
+            l if l.starts_with("id: ") => "id: 01a0a37c-6564-709a-9f90-00000000000c".to_string(),
+            l => l.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    ok(&mut t(&["write", "/img/c.png.tdbasset"]), Some(&planted));
+    run(&mut t(&["sync", "/", dir]), None);
+    let pulled = run(&mut t(&["assets", "pull", "--dir", dir]), None);
+    assert!(format!("{}{}", pulled.stdout, pulled.stderr).contains("names no file of the asset store"), "{} {}", pulled.stdout, pulled.stderr);
+    assert!(!vault.join("img/c.png").exists());
 }
 
 #[test]
