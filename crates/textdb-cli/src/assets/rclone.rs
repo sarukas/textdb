@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -90,17 +90,16 @@ fn join(root: &str, rel: &str) -> String {
     format!("{root}{sep}{rel}")
 }
 
-/// The process id in the lock file name `KEY-MILLIS-HOST-PID-NANOS.lock`, when that process is of
-/// this computer and not running any more.
+/// The process id in the lock file name `KEY-MILLIS-HOST-PID-N.lock`, when that process is of this
+/// computer (its name compared without case) and not running any more.
 fn abandoned(name: &str, key: &str) -> Option<u32> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let rest = name.strip_prefix(&format!("{key}-"))?.strip_suffix(".lock")?;
     let (millis, rest) = rest.split_once('-')?;
-    if millis.is_empty() || !millis.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let rest = rest.strip_prefix(&format!("{}-", host_word()))?;
-    let (pid, nanos) = rest.split_once('-')?;
-    if nanos.is_empty() || !nanos.bytes().all(|b| b.is_ascii_digit()) {
+    let host = host_word();
+    let rest = rest.get(host.len()..).filter(|_| digits(millis) && rest.get(..host.len()).is_some_and(|h| h.eq_ignore_ascii_case(&host)))?;
+    let (pid, n) = rest.strip_prefix('-')?.split_once('-')?;
+    if !digits(n) {
         return None;
     }
     let pid: u32 = pid.parse().ok()?;
@@ -290,32 +289,46 @@ impl RcloneDriver {
     /// The lock files of the path whose [`lock_name`] is `key`.
     fn lock_files(&self, folder: &str, key: &str) -> Result<Vec<String>> {
         let start = format!("{key}-");
-        Ok(self.names_in(folder)?.into_iter().filter(|n| n.starts_with(&start) && n.ends_with(".lock")).collect())
+        let mut files: Vec<String> = self.names_in(folder)?.into_iter().filter(|n| n.starts_with(&start) && n.ends_with(".lock")).collect();
+        // A provider that keeps two files of one name (Google Drive) lists it twice.
+        files.sort();
+        files.dedup();
+        Ok(files)
     }
 
     /// Hold the lock of `path` (its case ignored). rclone cannot create a file only when none is
     /// there, so a push lists the lock folder first and writes a lock file of its own
-    /// (`KEY-MILLIS-HOST-PID-NANOS.lock`) only when no other push's file of that path is listed; it
-    /// holds the lock when two listings a moment apart show its file and no other. Where several
-    /// wrote at once, the file whose name sorts first (the push that started first) stays and the
-    /// others are removed; while another file is listed a push waits, longer each time. Of two
-    /// pushes that wrote at once, the one that lists later sees the other's file, as long as the
-    /// provider lists what was written, so both never hold the lock.
+    /// (`KEY-MILLIS-HOST-PID-N.lock`, N counting this process's locks) only when no other push's
+    /// file of that path is listed; it holds the lock when two listings a moment apart show its
+    /// file and no other. Where several wrote at once, the file whose name sorts first (the push
+    /// that started first) stays and the others are removed; while another file is listed a push
+    /// waits, longer each time. Of two pushes that wrote at once, the one that lists later sees the
+    /// other's file, as long as the provider lists what was written, so both never hold the lock.
     fn lock_remote(&self, path: &str) -> Result<RemoteLock> {
+        static N: AtomicU64 = AtomicU64::new(0);
         let folder = format!("/{TRASH}/locks");
         let key = lock_name(path);
         let now = SystemTime::now();
         let since = now.duration_since(UNIX_EPOCH).unwrap_or_default();
-        let mine = format!("{key}-{:020}-{}-{}-{:09}.lock", since.as_millis(), host_word(), std::process::id(), since.subsec_nanos());
+        let mine = format!("{key}-{:020}-{}-{}-{}.lock", since.as_millis(), host_word(), std::process::id(), N.fetch_add(1, Ordering::Relaxed));
         let mine_path = format!("{folder}/{mine}");
         let body = format!("{path}\nheld by process {} on {} since {}\n", std::process::id(), host_word(), stamp(now));
         let started = Instant::now();
-        let (mut told, mut checked, mut wait) = (false, None::<Instant>, Duration::from_millis(200));
+        let (mut told, mut checked, mut wait, mut unlisted) = (false, None::<Instant>, Duration::from_millis(200), 0);
+        let own = || RemoteLock { driver: RcloneDriver::new(self.exe.clone(), self.root.clone()), path: mine_path.clone() };
         // This push's lock file, once written; removed when dropped.
         let mut written: Option<RemoteLock> = None;
         loop {
             let files = self.lock_files(&folder, &key)?;
             let others: Vec<String> = files.iter().filter(|f| **f != mine).cloned().collect();
+            if files.contains(&mine) {
+                unlisted = 0;
+                // Its own file, still there after a removal that failed: taken back, for the
+                // rules below to keep or remove.
+                if written.is_none() {
+                    written = Some(own());
+                }
+            }
             if started.elapsed() > LOCK_WAIT {
                 return Err(StoreError::other(format!(
                     "{path} is locked ({}) and was not released in {} minutes; if that push is not running any more, remove its file from {}",
@@ -325,22 +338,26 @@ impl RcloneDriver {
                 )));
             }
             if others.is_empty() {
-                match &written {
-                    None => {
-                        self.write_small(&mine_path, &body).inspect_err(|_| drop(self.delete(&mine_path)))?;
-                        written = Some(RemoteLock { driver: RcloneDriver::new(self.exe.clone(), self.root.clone()), path: mine_path.clone() });
-                    }
-                    Some(_) if files.len() == 1 => {
-                        std::thread::sleep(Duration::from_millis(300));
-                        let again = self.lock_files(&folder, &key)?;
-                        if again.len() == 1 && again[0] == mine {
-                            if let Some(lock) = written.take() {
-                                return Ok(lock);
-                            }
+                if written.is_none() {
+                    self.write_small(&mine_path, &body).inspect_err(|_| drop(self.delete(&mine_path)))?;
+                    written = Some(own());
+                } else if files.len() == 1 {
+                    std::thread::sleep(Duration::from_millis(300));
+                    let again = self.lock_files(&folder, &key)?;
+                    if again.len() == 1 && again[0] == mine {
+                        if let Some(lock) = written.take() {
+                            return Ok(lock);
                         }
                     }
-                    // Written, not listed yet.
-                    Some(_) => std::thread::sleep(Duration::from_millis(200)),
+                } else {
+                    // Written and not listed: not yet, or gone (removed by hand, say), when it is
+                    // written again.
+                    unlisted += 1;
+                    if unlisted >= 3 {
+                        (written, unlisted) = (None, 0);
+                    } else {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
                 }
                 continue;
             }
@@ -366,7 +383,7 @@ impl RcloneDriver {
             // Apart from one another, so pushes that keep meeting stop doing so.
             let spread = u64::from(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()) ^ std::process::id().wrapping_mul(2_654_435_761));
             std::thread::sleep(wait + Duration::from_millis(spread % (wait.as_millis() as u64 + 1)));
-            wait = (wait * 3 / 2).min(Duration::from_secs(4));
+            wait = (wait * 3 / 2).min(Duration::from_secs(2));
         }
     }
 
@@ -415,7 +432,7 @@ impl RcloneDriver {
                 // A copy in the trash first, checked to be what this push replaces (not bytes put
                 // there some other way).
                 let copy = self.trash_for(path);
-                let copied = self.ok(&format!("copying {dest} to the trash"), &["copyto", "--ignore-times", "--inplace", "--", &dest, &self.remote(&copy)?]).and_then(|_| self.hash(&copy, None));
+                let copied = self.ok(&format!("copying {dest} to the trash"), &["copyto", "--ignore-times", "--", &dest, &self.remote(&copy)?]).and_then(|_| self.hash(&copy, None));
                 match copied {
                     Ok(Some((sha, _))) if sha == expected => trashed = Some(copy),
                     Ok(_) => {

@@ -178,7 +178,7 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
   Every copy and move passes `--ignore-times`: rclone otherwise skips a copy onto a file of the
   same size and time, and a move then deletes the new bytes and keeps the old. A pull refuses a
   folder where the asset's file should be. rclone cannot create a file only when none is there, so
-  pushes take turns through lock files (`<hash of the path>-MILLIS-HOST-PID-NANOS.lock`) in
+  pushes take turns through lock files (`<hash of the path>-MILLIS-HOST-PID-N.lock`) in
   `.textdb-trash/locks/`: a push writes its own only when a listing shows no other of that path,
   and holds the lock when two listings a moment apart show its file alone; where several wrote at
   once, the push that started first keeps its file and the others remove theirs, and a push waits,
