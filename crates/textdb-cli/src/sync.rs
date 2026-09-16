@@ -58,7 +58,9 @@ pub struct Options {
     /// What to do with assets besides listing them: `push`, `pull` or `both`; `None` for what the
     /// store's `asset_sync` setting says.
     pub assets: Option<String>,
-    /// How long to wait for another sync of the same directory. Zero is `--no-wait`.
+    /// How long to wait for another sync of the same directory. Zero — the default — fails at
+    /// once, so two syncs at once are one success and one visible failure rather than two
+    /// successes where the second silently found nothing left to do.
     pub lock_wait: Duration,
     /// Print the summary line and what went wrong, nothing else. What a hook wants.
     pub quiet: bool,

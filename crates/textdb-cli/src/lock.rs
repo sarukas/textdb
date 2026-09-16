@@ -74,8 +74,10 @@ impl Drop for Lock {
 
 /// Take the lock for `dir`, waiting up to `timeout` for whoever holds it.
 ///
-/// Waiting rather than failing outright is what a hook needs: two agents whose turns overlap
-/// should queue, not error. `timeout` of zero fails at once, which is `--no-wait`.
+/// A `timeout` of zero — the default — fails at once. Two syncs of one directory are a
+/// collision, and one of them failing visibly (exit 4, meaning retry shortly) is better than
+/// both reporting success because the second found the first had already done the work.
+/// `--lock-timeout` queues instead, for a caller that would rather wait than retry.
 pub fn acquire(dir: &Path, timeout: Duration) -> Result<Lock> {
     let path = lock_path(dir);
     crate::sync::textdb_dir(dir).map_err(|e| StoreError::other(format!("{}: {e}", dir.join(".textdb").display())))?;
@@ -104,7 +106,7 @@ pub fn acquire(dir: &Path, timeout: Duration) -> Result<Lock> {
         if Instant::now() >= deadline {
             let holder = read_holder(&path);
             return Err(StoreError::contention(format!(
-                "{} is being synced by another process ({}); retry when it finishes, or raise --lock-timeout",
+                "{} is already being synced by another process ({}); wait for it to finish and run again, or pass --lock-timeout to queue behind it",
                 dir.display(),
                 holder.describe()
             )));

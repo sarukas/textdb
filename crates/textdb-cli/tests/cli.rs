@@ -2604,25 +2604,31 @@ fn tree_counts_folders_and_prints_a_file_plainly() {
     assert!(one.contains("one.md"), "{one}");
 }
 
-/// Two syncs of one directory at once, which a turn-end hook in one agent and a turn-start hook
-/// in another produce. Without the directory lock each computed both sides from the same base and
-/// committed, so one appended line landed twice on disk and three times in the store, and both
-/// runs reported success.
+/// Two syncs of one directory at once: exactly one runs, and the other fails saying so.
+///
+/// Without the directory lock both went ahead, each computing both sides from the same base, and
+/// one line appended on disk landed twice on disk and three times in the store — with both runs
+/// reporting success. Failing the second is the point: a collision a caller can see beats two
+/// exit-zero runs where the second quietly found the work already done.
 #[test]
-fn concurrent_syncs_do_not_duplicate_an_edit() {
+fn two_syncs_at_once_are_one_success_and_one_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("kb.db");
     let dir = tmp.path().join("vault");
     std::fs::create_dir_all(&dir).unwrap();
-    for i in 1..=20 {
-        std::fs::write(dir.join(format!("note-{i}.md")), format!("# Note {i}\n\nbody line\n")).unwrap();
+    // Enough files that the first run is still going when the second starts.
+    for i in 0..600 {
+        std::fs::write(dir.join(format!("n{i}.md")), format!("# N {i}\n\nbody line\n")).unwrap();
     }
     ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
 
-    // One line appended on disk, then both syncs started as close together as possible.
-    let note = dir.join("note-5.md");
-    std::fs::write(&note, "# Note 5\n\nbody line\n- appended\n").unwrap();
-    let mut both: Vec<_> = (0..2)
+    let note = dir.join("n5.md");
+    std::fs::write(&note, "# N 5\n\nbody line\n- appended\n").unwrap();
+    for i in 600..1400 {
+        std::fs::write(dir.join(format!("n{i}.md")), format!("# N {i}\n\nbody line\n")).unwrap();
+    }
+
+    let both: Vec<_> = (0..2)
         .map(|_| {
             textdb(&db)
                 .args(["sync", "/"])
@@ -2633,20 +2639,78 @@ fn concurrent_syncs_do_not_duplicate_an_edit() {
                 .expect("spawn sync")
         })
         .collect();
-    let outs: Vec<i32> = both.iter_mut().map(|c| c.wait().unwrap().code().unwrap_or(-1)).collect();
-    // Either both queue and succeed, or the loser reports contention (exit 4). Never a silent
-    // success that wrote twice, and never a conflict (3) from a race with itself.
-    assert!(outs.iter().all(|c| matches!(c, 0 | 4)), "{outs:?}");
+    let outs: Vec<Output> = both
+        .into_iter()
+        .map(|c| {
+            let o = c.wait_with_output().unwrap();
+            Output {
+                status: o.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+            }
+        })
+        .collect();
 
+    let codes: Vec<i32> = outs.iter().map(|o| o.status).collect();
+    assert_eq!(codes.iter().filter(|c| **c == 0).count(), 1, "exactly one should run: {codes:?}");
+    assert_eq!(codes.iter().filter(|c| **c == 4).count(), 1, "exactly one should fail: {codes:?}");
+    let refused = outs.iter().find(|o| o.status == 4).unwrap();
+    assert!(refused.stderr.contains("already being synced by another process"), "{}", refused.stderr);
+    assert!(refused.stderr.contains("--lock-timeout"), "the message should say how to queue: {}", refused.stderr);
+
+    // The one that ran did the whole job, and nothing was doubled.
     let on_disk = std::fs::read_to_string(&note).unwrap();
-    let in_store = ok(textdb(&db).args(["cat", "/note-5.md"]), None).stdout;
-    assert_eq!(on_disk, "# Note 5\n\nbody line\n- appended\n", "disk");
+    let in_store = ok(textdb(&db).args(["cat", "/n5.md"]), None).stdout;
+    assert_eq!(on_disk, "# N 5\n\nbody line\n- appended\n", "disk");
     assert_eq!(in_store, on_disk, "the store and disk agree");
     assert!(!on_disk.contains("<<<<<<<") && !on_disk.contains(">>>>>>>"), "no markers: {on_disk}");
+    let history = ok(textdb(&db).args(["--json", "history", "/n5.md", "--versions-only"]), None).json();
+    assert_eq!(history.as_array().unwrap().len(), 2, "one disk edit is one new version: {history}");
+    let files = ok(textdb(&db).args(["--json", "sql", "SELECT count(*) AS n FROM files"]), None).json();
+    assert_eq!(files["rows"][0]["n"], 1400, "{files}");
 
-    // One disk edit is one new version, whatever the two syncs did.
-    let history = ok(textdb(&db).args(["--json", "history", "/note-5.md", "--versions-only"]), None).json();
-    assert_eq!(history.as_array().unwrap().len(), 2, "{history}");
+    // The failure is not a dead end: run it again and the rest goes through.
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+}
+
+/// `--lock-timeout` is the other half: a caller that would rather queue than retry.
+#[test]
+fn lock_timeout_queues_behind_a_running_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..600 {
+        std::fs::write(dir.join(format!("n{i}.md")), format!("# N {i}\n\nbody\n")).unwrap();
+    }
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+    for i in 600..1400 {
+        std::fs::write(dir.join(format!("n{i}.md")), format!("# N {i}\n\nbody\n")).unwrap();
+    }
+
+    // Both queue, so it does not matter which reaches the lock first: neither fails, where the
+    // default would have failed whichever came second.
+    let both: Vec<_> = (0..2)
+        .map(|_| {
+            textdb(&db)
+                .args(["sync", "/"])
+                .arg(&dir)
+                .args(["--lock-timeout", "60"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn sync")
+        })
+        .collect();
+    let outs: Vec<_> = both.into_iter().map(|c| c.wait_with_output().unwrap()).collect();
+    for o in &outs {
+        assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    // One did the work and the other found it done, in whichever order they got the lock.
+    let said: Vec<String> = outs.iter().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).collect();
+    assert_eq!(said.iter().filter(|s| s.contains("1400 unchanged")).count(), 1, "{said:?}");
+    let files = ok(textdb(&db).args(["--json", "sql", "SELECT count(*) AS n FROM files"]), None).json();
+    assert_eq!(files["rows"][0]["n"], 1400, "{files}");
 }
 
 /// A sync will not start while another holds the directory, and says so rather than proceeding.
@@ -2668,7 +2732,7 @@ fn a_second_sync_waits_or_reports_the_holder() {
         assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
     }
 
-    let refused = run(textdb(&db).args(["sync", "/"]).arg(&dir).arg("--no-wait"), None);
+    let refused = run(textdb(&db).args(["sync", "/"]).arg(&dir), None);
     assert_eq!(refused.status, 4, "stdout: {}\nstderr: {}", refused.stdout, refused.stderr);
     assert!(refused.stderr.contains("being synced by another process"), "{}", refused.stderr);
 
@@ -2699,7 +2763,7 @@ fn a_dry_run_does_not_queue_behind_a_sync() {
         use std::os::unix::io::AsRawFd;
         assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
     }
-    ok(textdb(&db).args(["sync", "/"]).arg(&dir).args(["--dry-run", "--no-wait"]), None);
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir).arg("--dry-run"), None);
 }
 
 /// `.textdb` keeps a checkout clean on its own, so nothing textdb writes beside a directory shows

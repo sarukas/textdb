@@ -161,14 +161,11 @@ enum Cmd {
         /// asset_pull setting is `all`.
         #[arg(long)]
         pull: bool,
-        /// Seconds to wait for another sync of the same directory to finish. Two syncs at once
-        /// would each compute both sides from the same base and land one edit twice, so the
-        /// second waits. On timeout it exits 4 naming the holder.
-        #[arg(long, value_name = "SECONDS", default_value_t = 10)]
+        /// Seconds to wait for another sync of the same directory instead of failing. One sync
+        /// of a directory runs at a time; by default a second exits 4 at once, so a collision is
+        /// visible rather than absorbed. Pass this to queue behind the first instead.
+        #[arg(long, value_name = "SECONDS", default_value_t = 0)]
         lock_timeout: u64,
-        /// Do not wait for another sync of the same directory: exit 4 at once if one is running.
-        #[arg(long, conflicts_with = "lock_timeout")]
-        no_wait: bool,
         /// Print the summary line and what went wrong, not the file-by-file list. For hooks.
         #[arg(long, short = 'q')]
         quiet: bool,
@@ -615,7 +612,6 @@ fn run(mut cli: Cli, matches: &ArgMatches) -> Result<()> {
             push,
             pull,
             lock_timeout,
-            no_wait,
             quiet,
         } => sync::sync(
             st,
@@ -632,7 +628,7 @@ fn run(mut cli: Cli, matches: &ArgMatches) -> Result<()> {
                 store_file: cli.store.clone(),
                 accept_rules,
                 prune_empty_dirs,
-                lock_wait: if no_wait { Duration::ZERO } else { Duration::from_secs(lock_timeout) },
+                lock_wait: Duration::from_secs(lock_timeout),
                 quiet,
                 assets: match (push, pull) {
                     (true, true) => Some("both".to_string()),
