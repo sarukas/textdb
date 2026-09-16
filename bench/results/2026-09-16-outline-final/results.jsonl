@@ -66,3 +66,15 @@
 {"test":"SR-01/02","family":"SR","backend":"textdb-pg","mode":"fast","cache":"warm","rep":1,"case":"","metric":"import_s","value":15.387641037,"note":"ok"}
 {"test":"SR-01/02","family":"SR","backend":"textdb-pg","mode":"fast","cache":"warm","rep":1,"case":"","metric":"footprint_after_import","value":61906944.0,"note":"ok"}
 {"test":"SR-01/02","family":"SR","backend":"textdb-pg","mode":"fast","cache":"warm","rep":1,"case":"","metric":"footprint_over_raw","value":5.038075439931718,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-pg","mode":"fast","cache":"warm","rep":1,"case":"single","metric":"recall","value":0.9976399958596418,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-pg","mode":"fast","cache":"warm","rep":1,"case":"single","metric":"precision","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-pg","mode":"fast","cache":"warm","rep":1,"case":"single","metric":"snippet_coverage","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-pg","mode":"fast","cache":"warm","rep":1,"case":"single","metric":"snippet_shows_the_term","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-pg","mode":"fast","cache":"warm","rep":1,"case":"and2","metric":"recall","value":0.9946276861569215,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-pg","mode":"fast","cache":"warm","rep":1,"case":"and2","metric":"precision","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-pg","mode":"fast","cache":"warm","rep":1,"case":"and2","metric":"snippet_coverage","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-pg","mode":"fast","cache":"warm","rep":1,"case":"and2","metric":"snippet_shows_the_term","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-pg","mode":"fast","cache":"warm","rep":1,"case":"phrase","metric":"recall","value":0.9675667742882301,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-pg","mode":"fast","cache":"warm","rep":1,"case":"phrase","metric":"precision","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-pg","mode":"fast","cache":"warm","rep":1,"case":"phrase","metric":"snippet_coverage","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-pg","mode":"fast","cache":"warm","rep":1,"case":"phrase","metric":"snippet_shows_the_term","value":1.0,"note":"ok"}

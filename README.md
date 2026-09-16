@@ -125,4 +125,5 @@ against a reference model. A cell that fails one publishes no timings at all, so
 backend cannot post a fast number. See [`bench/README.md`](bench/README.md) for the knobs,
 the ten test families and what each measures.
 
-Front-matter property search is documented in [`docs/properties.md`](docs/properties.md).
+Front-matter property search is documented in [`docs/properties.md`](docs/properties.md), and
+markdown heading outlines in [`docs/outlines.md`](docs/outlines.md).
