@@ -51,7 +51,7 @@ SELECT kb.diff('/clients/acme/notes.md', 1, 3);                -- unified diff b
 SELECT version, author, ts FROM kb.file_version WHERE path = '/clients/acme/notes.md' ORDER BY version;
 
 -- search: terms are ANDed per document, "quoted phrase", prefix*
-SELECT path, line, snippet FROM kb.search('pricing acme', '/clients');
+SELECT path, version, line, text FROM kb.search('pricing acme', '/clients');
 SELECT path, line FROM kb.search('"SOW signed"');
 SELECT path FROM kb.search('kick*', '/');
 
@@ -81,6 +81,8 @@ These mirror the SQLite binding's `textdb_feed`, `textdb_hunks`, … (see
 | `kb.revert_batch(batch text, author text DEFAULT NULL, skip_changed boolean DEFAULT false)` | `jsonb` `{restored: [{path, version}], removed, moved_back: [{from, to}], recreated, skipped}` — files go back to their content before the batch, files it created are deleted, moves undone, deletes recreated. Anything changed since is skipped, and unless `skip_changed` that is `TX004` with nothing changed; an unknown batch is `TX003` |
 | `kb.hunks(path text, v1 bigint DEFAULT NULL, v2 bigint DEFAULT NULL)` | `TABLE(old_from, old_count, new_from, new_count, old_text, new_text)` — line hunks turning `v1` into `v2`, 1-based lines, a zero count is an insertion/deletion in front of that line. Defaults: `v2` = HEAD, `v1` = `v2 - 1`. Version 0 is the empty document |
 | `kb.chunks(path text, version bigint DEFAULT NULL)` | `TABLE(ord, hash, byte_from, nbytes, line_from, nlines)` — the document's chunks in order (`ord` from 0, `line_from` 1-based, `hash` hex); unchanged content keeps its hash across versions |
+| `kb.links(path text DEFAULT '/', status text DEFAULT '', lim bigint DEFAULT 10000)` | `TABLE(path, version, line, kind, target, anchor, alias, status, resolved, asset)` — the links written in a document or in everything below a folder. `status` keeps one kind (`ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store`, `external`); anything else is an error, not an empty result. A link to an asset reports the asset, not its `.tdbasset` pointer |
+| `kb.backlinks(path text DEFAULT '/', status text DEFAULT '', lim bigint DEFAULT 10000)` | The same row for the links pointing *at* `path`. An asset is found by its own path |
 | `kb.feed(since bigint DEFAULT 0, lim bigint DEFAULT 10000)` | `TABLE(seq, ts, op, path, old_path, node_kind, version, base_version, commit_kind, author, message)` for every change with `seq > since`, ordered by `seq`. `op` ∈ `create, commit, mkdir, move, delete`; `node_kind` ∈ `file, folder` |
 | `kb.last_seq()` | newest `seq`, 0 when the feed is empty |
 | `kb.move(from_path text, to_path text, author text DEFAULT NULL, message text DEFAULT NULL)` | `void` — `_rename` with the move attributed in the feed. Links that pointed at what moved are rewritten when the store's `link_updates` setting is `rewrite` |
@@ -172,7 +174,7 @@ SELECT textdb_entry('/notes');                             -- one folder's total
 -- functions of the column, so they cost a full scan of the store. `'0'` is the byte after
 -- `'/'`, which makes `prefix || '0'` the exclusive end of the subtree.
 SELECT path, kind, nbytes FROM kb WHERE path >= '/notes/' AND path < '/notes0' ORDER BY path;
-SELECT path, line, snippet FROM textdb_search('beta', '/', 50);
+SELECT path, version, line, text FROM textdb_search('beta', '/', 50);
 SELECT * FROM textdb_export('/');
 UPDATE kb SET path = '/archive/a.md' WHERE path = '/a.md';  -- also works for folders (subtree move)
 DELETE FROM kb WHERE path = '/archive';

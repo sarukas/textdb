@@ -414,3 +414,43 @@ describe('event stream', () => {
     await waitFor(() => (server.hub.subscriberCount === 0 ? true : undefined));
   });
 });
+
+describe('links', () => {
+  test('both directions return the canonical row, and an unknown status is rejected', async () => {
+    await api('PUT', '/api/file', {
+      path: '/lk/index.md',
+      content: '# Guide\n\nSee [the limits page](limits.md) and [[Missing]].\n',
+    });
+    await api('PUT', '/api/file', { path: '/lk/limits.md', content: '# Limits\n' });
+
+    let res = await api('GET', '/api/links?path=/lk');
+    assert.deepEqual(Object.keys(res.body[0]), [
+      'path',
+      'version',
+      'line',
+      'kind',
+      'target',
+      'anchor',
+      'alias',
+      'status',
+      'resolved',
+      'asset',
+    ]);
+    assert.deepEqual(
+      res.body.map((l: { target: string; alias: string | null; status: string }) => [l.target, l.alias, l.status]),
+      [
+        ['limits.md', 'the limits page', 'ok'],
+        ['Missing', null, 'broken'],
+      ],
+    );
+
+    res = await api('GET', '/api/links?path=/lk&status=broken');
+    assert.deepEqual(res.body.map((l: { target: string }) => l.target), ['Missing']);
+
+    res = await api('GET', '/api/backlinks?path=/lk/limits.md');
+    assert.deepEqual(res.body.map((l: { path: string; line: number }) => [l.path, l.line]), [['/lk/index.md', 3]]);
+
+    res = await api('GET', '/api/links?path=/lk&status=nope');
+    assert.deepEqual([res.status, res.body.code], [400, 'TX004']);
+  });
+});

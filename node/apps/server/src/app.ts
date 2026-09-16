@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
-import { type Corpus, NotFound, SORT_KEYS, type SortKey } from '@textdb/node';
+import { type Corpus, LINK_STATUSES, type LinkStatus, NotFound, SORT_KEYS, type SortKey } from '@textdb/node';
+import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { ZipFile } from 'yazl';
 import { cors } from 'hono/cors';
@@ -120,6 +121,18 @@ export function createApp(corpus: Corpus, hub: ChangeHub, options: AppOptions): 
       }),
     ),
   );
+
+  // Links: the ones a document (or a folder) writes, and the ones pointing at it. Both return
+  // the canonical ten-key row, so a client can treat the two directions alike.
+  const linkOptions = (c: Context) => {
+    const status = c.req.query('status');
+    if (status && !LINK_STATUSES.includes(status as LinkStatus)) {
+      throw badRequest(`status must be one of ${LINK_STATUSES.join(', ')}`);
+    }
+    return { status: (status as LinkStatus) || undefined, limit: queryInt(c, 'limit') ?? 10000 };
+  };
+  app.get('/api/links', (c) => c.json(corpus.links(c.req.query('path') || '/', linkOptions(c))));
+  app.get('/api/backlinks', (c) => c.json(corpus.backlinks(c.req.query('path') || '/', linkOptions(c))));
 
   // Markdown headings: one document's outline, a folder's, or the whole store's. `names` is
   // the autosuggest call and answers from an index range.

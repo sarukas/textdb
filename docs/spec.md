@@ -208,7 +208,9 @@ Trait `StructureExtractor { fn extract(&self, bytes) -> Structure }` producing s
   `textdb_search(query, prefix, limit, per_file)` returning one row per matching line as
   `path, version, line, text, section, score, more`; `textdb_history(path)`, `textdb_lines(path, from, to)`,
   `textdb_section(path, heading)`, `textdb_outline(path, heading, match, level, limit)`,
-  `textdb_headings(path, starts, limit)`, `textdb_prop_keys/values/find`, `textdb_diff(path, v1, v2)`,
+  `textdb_headings(path, starts, limit)`, `textdb_links(path, status, limit)` and
+  `textdb_backlinks(path, status, limit)` returning `path, version, line, kind, target, anchor,
+  alias, status, resolved, asset`, `textdb_prop_keys/values/find`, `textdb_diff(path, v1, v2)`,
   `textdb_content(path, version)`.
 - Single writer per connection is accepted; this stage validates algorithms, not concurrency.
 
@@ -250,6 +252,11 @@ kb.outline(prefix, heading, mode, max_level, lim) → TABLE(path, heading, headi
        line_from, line_to, nwords, nwords_total, nbytes, nlines, file_nwords, version,
        updated_at, updated_by)         -- as SQLite's textdb_outline
 kb.headings(prefix, starts, lim) → TABLE(heading, sections, docs)
+kb.links(path, status, lim) → TABLE(path, version, line, kind, target, anchor, alias,
+       status, resolved, asset)            -- links written under path; kb.backlinks is the
+                                        -- same row for the links pointing at it. As SQLite's
+                                        -- textdb_links / textdb_backlinks
+kb.backlinks(path, status, lim) → the same
 kb.analyze_store() → void               -- refresh planner statistics after a bulk load
 kb.rebuild_headings() → bigint          -- backfill section headings for stores written before them
 kb.history(path) → TABLE(version, author, ts, message, kind, base_version, nbytes, nlines, nwords)

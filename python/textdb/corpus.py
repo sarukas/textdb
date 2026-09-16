@@ -152,6 +152,31 @@ class PropertyHit:
 
 
 @dataclass
+class Link:
+    """One link, the same ten keys as `textdb links`, `textdb_links` and `kb.links`.
+
+    ``version`` is the file's, and it is here for the same reason it is on a :class:`Hit`: a
+    line number belongs to a version, and a caller that reads a link and then edits by line
+    needs one to pass as ``base_version``.
+    """
+    #: The file the link is written in.
+    path: str
+    version: int
+    line: int
+    #: ``wiki``, ``embed``, ``md`` or ``image``.
+    kind: str
+    target: str
+    anchor: Optional[str]
+    alias: Optional[str]
+    #: ``ok``, ``ambiguous``, ``anchor-missing``, ``broken``, ``not-in-store`` or ``external``.
+    status: Optional[str]
+    #: The file it points to; for an asset, the asset rather than its ``.tdbasset`` pointer.
+    resolved: Optional[str]
+    #: It resolves to an asset.
+    asset: bool
+
+
+@dataclass
 class Commit:
     """One version of a file: the same nine fields, in the same order, as the ``commits`` view
     and ``textdb_history`` on either engine.
@@ -332,6 +357,21 @@ class Corpus:
         """Text of a markdown section by heading (exact 'A / B' path or last component)."""
         v = self.backend.section(normalize(path), heading)
         return None if v is None else to_text(v)
+
+    def links(self, path: str = "/", *, status: Optional[str] = None, limit: int = 10000) -> List[Link]:
+        """Links written in a document, or in everything below a folder.
+
+        ``status`` keeps only one kind — ``broken`` is the one worth asking for. Rows come back
+        in document order within a document and in path order across them.
+        """
+        return [Link(**r) for r in self.backend.links(normalize(path), status or "", limit, False)]
+
+    def backlinks(self, path: str = "/", *, status: Optional[str] = None, limit: int = 10000) -> List[Link]:
+        """The links pointing at a document, as :meth:`links` gives the ones leaving it.
+
+        An asset is found by its own path, not by its ``.tdbasset`` pointer.
+        """
+        return [Link(**r) for r in self.backend.links(normalize(path), status or "", limit, True)]
 
     # ---------------------------------------------------------------------- write
     def write(self, path: str, content: Bytes, *, author: Optional[str] = None) -> int:

@@ -132,6 +132,42 @@ export interface HistoryEntry {
   nwords: number | null;
 }
 
+/** One link: the canonical row of `docs/shapes.md`, the same ten keys on every surface. */
+export interface Link {
+  /** The file the link is written in. */
+  path: string;
+  /** The version the line number belongs to; pass it as `baseVersion` when editing by line. */
+  version: number;
+  line: number;
+  kind: 'wiki' | 'embed' | 'md' | 'image';
+  target: string;
+  anchor: string | null;
+  alias: string | null;
+  status: 'ok' | 'ambiguous' | 'anchor-missing' | 'broken' | 'not-in-store' | 'external' | null;
+  /** The file it points to; for an asset, the asset rather than its `.tdbasset` pointer. */
+  resolved: string | null;
+  asset: boolean;
+}
+
+/** Which links a `links` call returns: those a status names, or all of them. */
+export type LinkStatus = NonNullable<Link['status']>;
+
+export const LINK_STATUSES: readonly LinkStatus[] = [
+  'ok',
+  'ambiguous',
+  'anchor-missing',
+  'broken',
+  'not-in-store',
+  'external',
+];
+
+export interface LinkOptions {
+  /** Keep only links with this status; `broken` is the one worth asking for. */
+  status?: LinkStatus;
+  /** Default 10000. */
+  limit?: number;
+}
+
 export interface Hunk {
   old_from: number;
   old_count: number;

@@ -380,3 +380,25 @@ def test_ls_sorts_and_limits_like_the_cli(kb):
         kb.ls(root, sort="nope")
     with pytest.raises(InvalidEdit):
         kb.ls(root, sort="size", order="sideways")
+
+
+def test_links_and_backlinks_carry_the_version_their_line_belongs_to(kb):
+    root = P(kb, "/lk")
+    kb.write(f"{root}/index.md", "# Guide\n\nSee [the limits page](limits.md) and [[Missing]].\n")
+    kb.write(f"{root}/limits.md", "# Limits\n")
+
+    rows = kb.links(root)
+    assert [(l.line, l.kind, l.target, l.alias, l.status) for l in rows] == [
+        (3, "md", "limits.md", "the limits page", "ok"),
+        (3, "wiki", "Missing", None, "broken"),
+    ]
+    # Every row that carries a line carries the version it belongs to.
+    assert all(l.path == f"{root}/index.md" and l.version == 1 and l.asset is False for l in rows)
+    assert rows[0].resolved == f"{root}/limits.md"
+
+    assert [l.target for l in kb.links(root, status="broken")] == ["Missing"]
+    # The other direction: who points here.
+    back = kb.backlinks(f"{root}/limits.md")
+    assert [(l.path, l.line, l.target) for l in back] == [(f"{root}/index.md", 3, "limits.md")]
+    assert kb.backlinks(f"{root}/index.md") == []
+    assert len(kb.links(root, limit=1)) == 1

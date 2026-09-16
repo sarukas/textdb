@@ -812,3 +812,68 @@ fn a_heading_dense_document_stays_under_the_parameter_limit() {
         .unwrap();
     assert_eq!(n, 5000);
 }
+
+/// `textdb_links` and `textdb_backlinks` answer with the one canonical row, in both directions.
+#[test]
+fn links_and_backlinks_are_table_valued_functions() {
+    let conn = setup();
+    let put = |path: &str, body: &str| {
+        conn.execute("INSERT INTO kb(path, content) VALUES (?1, ?2)", params![path, body]).unwrap();
+    };
+    put("/g/index.md", "# Guide\n\nSee [the limits page](limits.md) and [[Missing]].\n");
+    put("/g/limits.md", "# Limits\n");
+
+    let cols: Vec<String> = conn
+        .prepare("SELECT * FROM textdb_links('/g')")
+        .unwrap()
+        .column_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(cols, ["path", "version", "line", "kind", "target", "anchor", "alias", "status", "resolved", "asset"]);
+
+    let rows: Vec<(String, i64, i64, String, String, Option<String>, Option<String>)> = conn
+        .prepare("SELECT path, version, line, kind, target, alias, status FROM textdb_links('/g')")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("/g/index.md".into(), 1, 3, "md".into(), "limits.md".into(), Some("the limits page".into()), Some("ok".into())),
+            ("/g/index.md".into(), 1, 3, "wiki".into(), "Missing".into(), None, Some("broken".into())),
+        ]
+    );
+
+    let broken: Vec<String> = conn
+        .prepare("SELECT target FROM textdb_links('/g', 'broken')")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(broken, ["Missing"]);
+
+    let back: Vec<(String, i64)> = conn
+        .prepare("SELECT path, line FROM textdb_backlinks('/g/limits.md')")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(back, [("/g/index.md".to_string(), 3)]);
+
+    // A status the store never writes is a mistake, not an empty result. The vtab filters on
+    // the first row, so the error arrives when the rows are drawn rather than at prepare time.
+    let bad = conn
+        .prepare("SELECT * FROM textdb_links('/g', 'nope')")
+        .unwrap()
+        .query_map([], |_| Ok(()))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>();
+    assert!(bad.is_err(), "{bad:?}");
+}

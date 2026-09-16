@@ -176,6 +176,14 @@ class SqliteBackend(Backend):
         return [dict(version=r[0], author=r[1], ts=r[2], message=r[3], kind=r[4], base_version=r[5], nbytes=r[6], nlines=r[7], nwords=r[8]) for r in rows]
 
     @_wrap
+    def links(self, path: str, status: str, limit: int, incoming: bool):
+        fn = "textdb_backlinks" if incoming else "textdb_links"
+        rows = self.conn.execute(
+            f"SELECT path, version, line, kind, target, anchor, alias, status, resolved, asset FROM {fn}(?, ?, ?)", (path, status, limit)
+        ).fetchall()
+        return [dict(path=r[0], version=r[1], line=r[2], kind=r[3], target=r[4], anchor=r[5], alias=r[6], status=r[7], resolved=r[8], asset=bool(r[9])) for r in rows]
+
+    @_wrap
     def diff(self, path: str, v1: int, v2: int) -> str:
         return self._one("SELECT textdb_diff(?, ?, ?)", (path, v1, v2)) or ""
 

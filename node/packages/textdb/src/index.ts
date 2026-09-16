@@ -26,5 +26,5 @@ export {
   toTextdbError,
 } from './errors.ts';
 export type * from './types.ts';
-export { SORT_KEYS } from './types.ts';
+export { LINK_STATUSES, SORT_KEYS } from './types.ts';
 export { type WatchOptions, Watcher } from './watch.ts';

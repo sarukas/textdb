@@ -90,6 +90,20 @@ the line. Every surface now reads the matching documents and lists the lines tha
 the terms, which is what makes `line` a fact rather than a hint, and drops a document whose
 words only ever appear apart.
 
+## Link rows
+
+`textdb links` and `backlinks`, the `links` SQL view, `textdb_links` / `textdb_backlinks`,
+`kb.links` / `kb.backlinks`, Python `Link`, Node `Link` and `/api/links` / `/api/backlinks` all
+return the same ten keys in this order:
+
+`path, version, line, kind, target, anchor, alias, status, resolved, asset`
+
+`path` is the file the link is written in and `version` the one its `line` belongs to, for the
+same reason a search hit carries one. `resolved` names the file it reaches; a link to an asset
+reports the asset itself, not the `.tdbasset` pointer beside it, because the asset is what the
+writer wrote. `status` is one of `ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store`
+or `external`, and asking for any other one is an error rather than an empty result.
+
 ## History
 
 One order on both engines and in every SDK, matching the `commits` view:
@@ -108,4 +122,5 @@ One order on both engines and in every SDK, matching the `commits` view:
 | a key omitted when absent | `null` |
 | `search` limit 100 (SQL), 50 (Node, HTTP), 200 (UI), 50 documents (CLI) | 200 rows everywhere |
 | `kb.folder.n_children`, `nbytes_total` | `files + folders`, `nbytes` |
+| `links` only in the CLI and `textdb sql`; the view had no `version` | `links`/`backlinks` on both engines, in Python, Node and HTTP, with `version` |
 | `tree` folder rows `(N files, SIZE)`; `tree FILE` headed `(0 files, 0 B)` | `(N files, M folders, SIZE)`; `tree FILE` prints the one entry |

@@ -2292,6 +2292,129 @@ mod kb {
         TableIterator::new(rows)
     }
 
+    /// The canonical link row. `#[pg_extern]` reads a signature literally, so the two
+    /// functions spell the tuple out and this alias types what they share underneath.
+    type LinkRow = (
+        name!(path, String),
+        name!(version, i64),
+        name!(line, i64),
+        name!(kind, String),
+        name!(target, String),
+        name!(anchor, Option<String>),
+        name!(alias, Option<String>),
+        name!(status, Option<String>),
+        name!(resolved, Option<String>),
+        name!(asset, bool),
+    );
+
+    /// Both directions in one query: `links` scopes on the file the link is written in,
+    /// `backlinks` on the file it resolves to.
+    fn link_rows(path: &str, status: &str, lim: i64, incoming: bool) -> Vec<LinkRow> {
+        let path = ok(normalize_path(path));
+        let mut args: Vec<String> = Vec::new();
+        let mut where_sql = if incoming {
+            // An asset is linked by its own name; the node that exists is the pointer beside it.
+            let (lo, hi) = subtree_bounds(&path);
+            let sql = format!(
+                "l.target_path <> '' AND l.resolved_id IN (SELECT id FROM kb.node WHERE kind = 1 \
+                 AND deleted_at IS NULL AND (path = $1 OR path = $1 || '.tdbasset' \
+                 OR (path >= $2 AND path < $3)))"
+            );
+            args.push(path.clone());
+            args.push(lo);
+            args.push(hi);
+            sql
+        } else {
+            Scope::of(&path).sql(&mut args)
+        };
+        if !status.is_empty() {
+            const KNOWN: [&str; 6] = ["ok", "ambiguous", "anchor-missing", "broken", "not-in-store", "external"];
+            if !KNOWN.contains(&status) {
+                fail(TextdbError::InvalidEdit(format!("unknown link status: {status}")));
+            }
+            where_sql.push_str(&format!(" AND l.status = ${}", args.len() + 1));
+            args.push(status.to_string());
+        }
+        let sql = format!(
+            "SELECT n.path, n.version, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status,
+                    CASE WHEN lower(r.path) LIKE '%.tdbasset' THEN left(r.path, -9) ELSE r.path END,
+                    coalesce(lower(r.path) LIKE '%.tdbasset', false)
+               FROM kb.link l JOIN kb.node n ON n.id = l.file_id
+               LEFT JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL
+              WHERE n.deleted_at IS NULL AND {where_sql}
+              ORDER BY n.path, l.line, l.id LIMIT {lim}",
+            lim = lim.max(1)
+        );
+        Spi::connect(|client| {
+            let args: Vec<pgrx::datum::DatumWithOid> = args.iter().map(|a| a.as_str().into()).collect();
+            let r = client.select(&sql, None, &args).unwrap_or_else(|e| spi_err(e));
+            let mut out = Vec::new();
+            for row in r {
+                out.push((
+                    row.get::<String>(1).unwrap_or_default().unwrap_or_default(),
+                    row.get::<i64>(2).unwrap_or_default().unwrap_or(0),
+                    row.get::<i64>(3).unwrap_or_default().unwrap_or(0),
+                    row.get::<String>(4).unwrap_or_default().unwrap_or_default(),
+                    row.get::<String>(5).unwrap_or_default().unwrap_or_default(),
+                    row.get::<String>(6).unwrap_or_default(),
+                    row.get::<String>(7).unwrap_or_default(),
+                    row.get::<String>(8).unwrap_or_default(),
+                    row.get::<String>(9).unwrap_or_default(),
+                    row.get::<bool>(10).unwrap_or_default().unwrap_or(false),
+                ));
+            }
+            out
+        })
+    }
+
+    /// Links written under `path` — one document or a whole folder — or, with `backlinks`,
+    /// the links that point at it.
+    ///
+    /// The same canonical row on both engines and in every SDK, `version` included: a line
+    /// number belongs to a version, and a caller that reads a link and then edits by line
+    /// needs one to pass as `base_version`. A link to an asset is reported as the asset,
+    /// not as its `.tdbasset` pointer, which is what the writer wrote.
+    #[pg_extern(stable)]
+    fn links(
+        path: default!(&str, "'/'"),
+        status: default!(&str, "''"),
+        lim: default!(i64, 10000),
+    ) -> TableIterator<'static, (
+            name!(path, String),
+            name!(version, i64),
+            name!(line, i64),
+            name!(kind, String),
+            name!(target, String),
+            name!(anchor, Option<String>),
+            name!(alias, Option<String>),
+            name!(status, Option<String>),
+            name!(resolved, Option<String>),
+            name!(asset, bool),
+        )> {
+        TableIterator::new(link_rows(path, status, lim, false))
+    }
+
+    /// The links pointing at `path`, as `links` returns the ones leaving it.
+    #[pg_extern(stable)]
+    fn backlinks(
+        path: default!(&str, "'/'"),
+        status: default!(&str, "''"),
+        lim: default!(i64, 10000),
+    ) -> TableIterator<'static, (
+            name!(path, String),
+            name!(version, i64),
+            name!(line, i64),
+            name!(kind, String),
+            name!(target, String),
+            name!(anchor, Option<String>),
+            name!(alias, Option<String>),
+            name!(status, Option<String>),
+            name!(resolved, Option<String>),
+            name!(asset, bool),
+        )> {
+        TableIterator::new(link_rows(path, status, lim, true))
+    }
+
     /// Distinct headings under `prefix`, most-used first. The autosuggest call for outlines,
     /// so it reads the folded index range rather than grouping raw heading text.
     #[pg_extern(stable)]

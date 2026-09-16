@@ -934,7 +934,7 @@ fn sql_views(p: &str) -> String {
                   n.nbytes, n.nlines, n.nwords AS file_nwords, n.version, n.updated_at, n.updated_by
            FROM {p}section s JOIN {p}node n ON n.id = s.file_id AND n.deleted_at IS NULL;
          CREATE TEMP VIEW IF NOT EXISTS links AS
-           SELECT n.path, l.target_path AS target, l.line, l.kind, l.anchor, l.alias, l.status,
+           SELECT n.path, n.version, l.line, coalesce(l.kind, '') AS kind, l.target_path AS target, l.anchor, l.alias, l.status,
                   CASE WHEN r.path LIKE '%.tdbasset' THEN substr(r.path, 1, length(r.path) - 9) ELSE r.path END AS resolved,
                   r.path LIKE '%.tdbasset' AS asset
            FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL

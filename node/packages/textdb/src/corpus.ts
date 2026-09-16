@@ -20,6 +20,8 @@ import {
   type PropertyKey,
   type PropertyValue,
   SORT_KEYS,
+  type Link,
+  type LinkOptions,
   type SearchHit,
   type SortKey,
   type WriteResult,
@@ -486,6 +488,37 @@ export class Corpus {
       options.starts ?? '',
       options.limit ?? 100,
     );
+  }
+
+  /**
+   * Links written in a document, or in everything below a folder.
+   *
+   * `status` keeps only one kind — `broken` is the one worth asking for. Rows come back in
+   * document order within a document and in path order across them.
+   */
+  links(path = '/', options: LinkOptions = {}): Link[] {
+    return this.linkRows('textdb_links', path, options);
+  }
+
+  /**
+   * The links pointing at a document, as `links` gives the ones leaving it.
+   *
+   * An asset is found by its own path, not by the `.tdbasset` pointer beside it.
+   */
+  backlinks(path = '/', options: LinkOptions = {}): Link[] {
+    return this.linkRows('textdb_backlinks', path, options);
+  }
+
+  /** Both directions read the same ten columns, so neither can drift from the other. */
+  private linkRows(fn: 'textdb_links' | 'textdb_backlinks', path: string, options: LinkOptions): Link[] {
+    return this.sql
+      .all<Omit<Link, 'asset'> & { asset: number }>(
+        `SELECT path, version, line, kind, target, anchor, alias, status, resolved, asset FROM ${fn}(?, ?, ?)`,
+        path,
+        options.status ?? '',
+        options.limit ?? 10000,
+      )
+      .map((r) => ({ ...r, asset: r.asset !== 0 }));
   }
 
   /** The values one property takes, most-used first; `prefix` narrows them as above. */

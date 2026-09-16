@@ -37,8 +37,8 @@ psycopg, JDBC, …). Python: `pip install -e python/` from the repo gives `textd
 | `head -20 notes.md` / `tail -20 notes.md` | `SELECT kb.lines(p, 1, 20)` / `SELECT kb.lines(p, nlines - 19, nlines) FROM kb.file WHERE path = p` |
 | `wc -l notes.md` / `wc -c` | `SELECT nlines, nbytes FROM kb.file WHERE path = '/clients/acme/notes.md';` |
 | `awk '/^## Open questions/,/^## /' notes.md` (a section) | `SELECT kb.section('/clients/acme/notes.md', 'Open questions');` |
-| `grep -rn -w pricing /clients` | `SELECT path, line, snippet FROM kb.search('pricing', '/clients');` |
-| `grep -rl pricing /clients \| xargs grep -l renewal` (both words in a file) | `SELECT path FROM kb.search('pricing renewal', '/clients');` |
+| `grep -rn -w pricing /clients` | `SELECT path, line, text FROM kb.search('pricing', '/clients');` |
+| `grep -rl pricing /clients \| xargs grep -l renewal` (both words in a file) | `SELECT DISTINCT path FROM kb.search('pricing renewal', '/clients');` |
 | `grep -rn '"quarterly review"'` | `SELECT path, line FROM kb.search('"quarterly review"');` |
 | `grep -rn 'renew' --include='*'` (prefix) | `SELECT path, line FROM kb.search('renew*');` |
 | `sed -i 's/pending/signed/' notes.md` (one unique occurrence) | `SELECT kb.edit('/clients/acme/notes.md', 'pending', 'signed', 'me');` |
@@ -62,18 +62,21 @@ psycopg, JDBC, …). Python: `pip install -e python/` from the repo gives `textd
 
 Differences to remember: `sed -i`/`echo >>` on files are last-writer-wins and unversioned;
 the SQL forms are transactional, versioned, and (with `kb.edit`/`base_version`) rebased over
-concurrent writes. `grep` is line-based; `kb.search` is document-based for AND and reports
-the first matching line.
+concurrent writes. `kb.search` is line-based too: one row per line that really holds the
+terms, with the `version` that line number belongs to.
 
 ## Find and read
 
 ```sql
 SELECT * FROM kb.ls('/clients');
 SELECT path, nbytes, updated_at FROM kb.file WHERE path LIKE '/clients/acme/%' ORDER BY path;
-SELECT path, line, snippet FROM kb.search('pricing renewal', '/clients');   -- AND of terms per document
+SELECT path, version, line, text FROM kb.search('pricing renewal', '/clients');  -- one row per matching line
 SELECT content, version FROM kb.file WHERE path = '/clients/acme/notes.md';  -- remember version
 SELECT kb.lines('/clients/acme/notes.md', 40, 60);                           -- 1-based inclusive
 SELECT kb.section('/clients/acme/notes.md', 'Open questions');               -- heading path "A / B" or last component
+SELECT * FROM kb.links('/clients/acme/notes.md');                            -- what it points at
+SELECT * FROM kb.links('/clients', 'broken');                                -- what does not resolve
+SELECT path, line FROM kb.backlinks('/clients/acme/notes.md');               -- what points at it
 ```
 
 `kb.lines` and `kb.section` cost O(fragment); `content` costs the whole document.

@@ -35,7 +35,7 @@ CREATE OR REPLACE TEMP VIEW sections AS
          n.nbytes, n.nlines, n.nwords AS file_nwords, n.version, n.updated_at, n.updated_by
   FROM kb.section s JOIN kb.node n ON n.id = s.file_id AND n.deleted_at IS NULL;
 CREATE OR REPLACE TEMP VIEW links AS
-  SELECT n.path, l.target_path AS target, l.line, l.kind, l.anchor, l.alias, l.status,
+  SELECT n.path, n.version, l.line, coalesce(l.kind, '') AS kind, l.target_path AS target, l.anchor, l.alias, l.status,
          CASE WHEN lower(r.path) LIKE '%.tdbasset' THEN left(r.path, -9) ELSE r.path END AS resolved,
          coalesce(lower(r.path) LIKE '%.tdbasset', false) AS asset
   FROM kb.link l JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL

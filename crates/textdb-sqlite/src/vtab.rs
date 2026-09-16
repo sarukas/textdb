@@ -522,6 +522,8 @@ pub enum FnKind {
     Outline,
     Headings,
     Entry,
+    Links,
+    Backlinks,
 }
 
 pub struct FnSpec {
@@ -546,6 +548,9 @@ impl FnKind {
             FnKind::Headings => c"CREATE TABLE x(heading TEXT, sections INTEGER, docs INTEGER, prefix TEXT HIDDEN, starts TEXT HIDDEN, lim INTEGER HIDDEN)",
             FnKind::Entry => c"CREATE TABLE x(path TEXT, name TEXT, kind TEXT, version INTEGER, nbytes INTEGER, nlines INTEGER, updated_at TEXT, updated_by TEXT, id INTEGER, dir TEXT, depth INTEGER, ext TEXT, title TEXT, nwords INTEGER, nsections INTEGER, nprops INTEGER, nlinks INTEGER, nlinks_broken INTEGER, versions INTEGER, created_at TEXT, files INTEGER, folders INTEGER, nauthors INTEGER, authors TEXT, path_arg TEXT HIDDEN)",
             FnKind::PathHistory => c"CREATE TABLE x(id INTEGER, ts TEXT, op TEXT, old_path TEXT, new_path TEXT, via TEXT, version INTEGER, author TEXT, path TEXT HIDDEN, node_id INTEGER HIDDEN)",
+            // One shape for both directions: `backlinks` answers "who points here" with the
+            // same row `links` answers "where does this point" with.
+            FnKind::Links | FnKind::Backlinks => c"CREATE TABLE x(path TEXT, version INTEGER, line INTEGER, kind TEXT, target TEXT, anchor TEXT, alias TEXT, status TEXT, resolved TEXT, asset INTEGER, path_arg TEXT HIDDEN, status_arg TEXT HIDDEN, lim INTEGER HIDDEN)",
         }
     }
     /// Number of visible columns; hidden argument columns follow.
@@ -565,6 +570,7 @@ impl FnKind {
             FnKind::Outline => 14,
             FnKind::Headings => 3,
             FnKind::Entry => 24,
+            FnKind::Links | FnKind::Backlinks => 10,
         }
     }
     fn n_hidden(self) -> c_int {
@@ -583,6 +589,7 @@ impl FnKind {
             FnKind::Outline => 5,
             FnKind::Headings => 3,
             FnKind::Entry => 1,
+            FnKind::Links | FnKind::Backlinks => 3,
         }
     }
 }
@@ -809,6 +816,36 @@ unsafe impl VTabCursor for FnCursor<'_> {
                             Value::Integer(r.file_version),
                             Value::Text(r.updated_at),
                             r.updated_by.map_or(Value::Null, Value::Text),
+                        ]
+                    })
+                    .collect()
+            }
+            FnKind::Links | FnKind::Backlinks => {
+                use crate::links::Direction;
+                let path = s(&hidden[0]).unwrap_or_else(|| "/".into());
+                let path = crate::db::normalize_path(&path).map_err(map_err)?;
+                // One status per call, which is what `--broken` and the SDKs ask for; the rest
+                // of the set is a `WHERE status IN (...)` away for a caller writing SQL.
+                let status = s(&hidden[1]).unwrap_or_default();
+                let only: Vec<&str> = if status.is_empty() { Vec::new() } else { vec![status.as_str()] };
+                let lim = hidden_i64(&hidden[2]).map_or(10_000, |i| i.max(0) as usize);
+                let dir = if self.tab.kind == FnKind::Links { Direction::Out } else { Direction::In };
+                crate::links::rows(self.tab.conn(), &self.tab.prefix, &path, dir, &only, lim)
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(|r| {
+                        let text = |v: Option<String>| v.map_or(Value::Null, Value::Text);
+                        vec![
+                            Value::Text(r.path),
+                            Value::Integer(r.version),
+                            Value::Integer(r.line),
+                            Value::Text(r.kind),
+                            Value::Text(r.target),
+                            text(r.anchor),
+                            text(r.alias),
+                            text(r.status),
+                            text(r.resolved),
+                            Value::Integer(r.asset as i64),
                         ]
                     })
                     .collect()

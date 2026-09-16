@@ -38,7 +38,7 @@ Postgres extension: absolute `/` paths, folders on demand, tombstone deletes, fu
 | `head -20` / `tail -20` | `SELECT textdb_lines(p, 1, 20)` / `SELECT textdb_lines(path, nlines - 19, nlines) FROM kb WHERE path = p` |
 | `wc -l` / `wc -c` | `SELECT nlines, nbytes FROM kb WHERE path = '/clients/acme/notes.md';` |
 | `awk '/^## Open questions/,/^## /'` (a section) | `SELECT textdb_section('/clients/acme/notes.md', 'Open questions');` |
-| `grep -rn -w pricing /clients` | `SELECT path, line, snippet FROM textdb_search('pricing', '/clients');` |
+| `grep -rn -w pricing /clients` | `SELECT path, line, text FROM textdb_search('pricing', '/clients');` |
 | `grep -rl pricing \| xargs grep -l renewal` | `SELECT path FROM textdb_search('pricing renewal', '/clients');` |
 | `grep -rn '"quarterly review"'` | `SELECT path, line FROM textdb_search('"quarterly review"', '/');` |
 | `grep -rn 'renew'` (prefix) | `SELECT path, line FROM textdb_search('renew*', '/');` |
@@ -66,7 +66,10 @@ SELECT id, path, kind, version, nbytes, nlines FROM kb WHERE path >= '/clients/'
 SELECT content, version FROM kb WHERE path = '/clients/acme/notes.md';
 SELECT textdb_lines('/clients/acme/notes.md', 40, 60);
 SELECT textdb_section('/clients/acme/notes.md', 'Open questions');
-SELECT path, line, snippet FROM textdb_search('pricing renewal', '/clients', 50);
+SELECT path, version, line, text FROM textdb_search('pricing renewal', '/clients', 50);
+SELECT * FROM textdb_links('/clients/acme/notes.md');                        -- what it points at
+SELECT * FROM textdb_links('/clients', 'broken');                            -- what does not resolve
+SELECT path, line FROM textdb_backlinks('/clients/acme/notes.md');           -- what points at it
 ```
 
 ## Change

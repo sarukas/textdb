@@ -98,7 +98,8 @@ textdb --json sql 'SELECT path, nwords FROM files ORDER BY nwords DESC LIMIT 10'
 Also `textdb_search(query, prefix, limit, per_file)` → `path, version, line, text, section, score, more`
 (one row per matching line), `textdb_ls(dir, recursive)` and `textdb_entry(path)` → the full record above,
 `textdb_outline(path, heading, match, level, limit)`, `textdb_headings(path, starts, limit)`,
-`textdb_content(path)`. Do not
+`textdb_links(path, status, limit)` and `textdb_backlinks(path, status, limit)` → `path, version,
+line, kind, target, anchor, alias, status, resolved, asset`, `textdb_content(path)`. Do not
 select `content` from `kb` across many files: it reads every document in full.
 
 - **Output for scripts:** `--format lines` prints one value per line (one column), `--format tsv`
@@ -109,10 +110,11 @@ select `content` from `kb` across many files: it reads every document in full.
 - **Patterns:** in `LIKE`, `_` and `%` are wildcards (`'/work_files/%'` matches `/workXfiles/`; add
   `ESCAPE '\'` and write `\_`); `[0-9]`-style classes work only with `GLOB`, which is case-sensitive.
   A wrong "0 rows" is often this.
-- **`textdb_search`** gives one row per document holding every term (hyphenated terms such as
-  `teo-group` need no quotes). Its `line`/`snippet` come from one chunk and may hold only some of the
-  terms: check with `textdb_lines(path, line, line)`, or use the `search` command, which lists each
-  matching line.
+- **`textdb_search`** gives one row per matching *line* — `path, version, line, text, section,
+  score, more` — the same rows the `search` command prints (hyphenated terms such as `teo-group`
+  need no quotes). The index works on chunks, so the function reads the matching documents and
+  lists the lines that really hold the terms: `line` is a fact, and a document whose words only
+  ever appear apart is not returned. `SELECT DISTINCT path` for the documents.
 
 Statements are read-only unless you pass `--write`. Then change documents only through the textdb
 functions, passing `:author` (bound to your author name) so the edits are attributed:

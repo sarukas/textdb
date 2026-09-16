@@ -148,7 +148,7 @@ by path, deleted files left out:
 | `frontmatter` | `path, data` — a document's YAML front matter as JSON (text in SQLite: `json_extract`, `json_each`; `jsonb` in Postgres) |
 | `properties` | `path, key` (dotted: `project.name`), `value, number` (the value as a number when it is one), `ord` (position in a list). One row per value, so a list is one row per element |
 | `sections` | `path, heading` (`Title / Section / Subsection`), `level, line_from, line_to, title` (the last component alone), `nwords` (the section's own lines), `nwords_total` (plus everything nested under it), and the document's `nbytes, nlines, file_nwords, version, updated_at, updated_by` |
-| `links` | `path, target` (without `#anchor` or `\|alias`; markdown links decoded), `line, kind` (`wiki`, `embed`, `md`, `image`), `anchor, alias, status` (`ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store`, `external`), `resolved` (the path it points to), `asset` (it resolves to an asset's pointer). Both backends |
+| `links` | `path, version, line, kind` (`wiki`, `embed`, `md`, `image`), `target` (without `#anchor` or `\|alias`; markdown links decoded), `anchor, alias, status` (`ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store`, `external`), `resolved` (the path it points to), `asset` (it resolves to an asset). The same ten columns as `textdb_links` / `kb.links`. Both backends |
 | `commits` | `path, version, author, ts, message, kind, base_version, nbytes, nlines, nwords, batch` (`batch` in SQLite: the `sql --write` run that made it) |
 | `authors` | `path, author, commits, first_ts, last_ts` |
 
@@ -182,13 +182,14 @@ textdb sql --format lines "SELECT path FROM files WHERE dir = '/accounts/acme' A
 textdb sql "SELECT substr(dir, 11) AS account, count(*) FROM files WHERE depth = 3 AND path GLOB '/accounts/*' GROUP BY account"
 ```
 
-**Full-text search in SQL.** `textdb_search(query, prefix)` returns one row per document that holds
-every term (terms are ANDed per document; `"a phrase"`, `prefix*`; a term with punctuation such as
-`teo-group` or `2026-02` is matched as the phrase of its words, no quoting needed). `line` and
-`snippet` come from one chunk of the document, the best-ranked one for the first term: the line in
-that chunk holding the most terms. The document holds all the terms, but that line may hold only some
-of them, so confirm with `textdb_lines(path, line, line)` before relying on it. The `search` command
-instead checks every line and lists each one that holds a term.
+**Full-text search in SQL.** `textdb_search(query, prefix, limit, per_file)` returns one row per
+matching *line* — `path, version, line, text, section, score, more` — the same rows the `search`
+command prints (terms are ANDed; `"a phrase"`, `prefix*`; a term with punctuation such as
+`teo-group` or `2026-02` is matched as the phrase of its words, no quoting needed). The index works
+on chunks, so the function reads the matching documents and lists the lines that really hold the
+terms: `line` is a fact rather than a guess, and a document whose words only ever appear apart is
+dropped. `SELECT DISTINCT path` gives the documents, and `more` says how many lines `per_file` held
+back.
 
 **Changing documents.** Statements are read-only unless `--write`. With it, change the store
 through `kb` (`INSERT`, `UPDATE`, `DELETE`) and the functions `textdb_write`, `textdb_edit`,

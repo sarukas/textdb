@@ -417,3 +417,101 @@ pub fn backfill(conn: &Connection, p: &str) -> Result<()> {
     }
     db.relink_where("1", Vec::new())
 }
+
+/// One link as every surface returns it — the canonical row of `docs/shapes.md`.
+///
+/// `version` is the file's, and it is here for the same reason it is on a search hit: a line
+/// number belongs to a version, and an agent that reads a link and then edits by line needs
+/// one to pass as `base_version`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkRow {
+    /// The file the link is written in.
+    pub path: String,
+    pub version: i64,
+    pub line: i64,
+    /// `wiki`, `embed`, `md` or `image`.
+    pub kind: String,
+    pub target: String,
+    pub anchor: Option<String>,
+    pub alias: Option<String>,
+    /// `ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store` or `external`.
+    pub status: Option<String>,
+    /// The file it points to; for an asset, the asset itself rather than its `.tdbasset` pointer.
+    pub resolved: Option<String>,
+    /// It resolves to an asset.
+    pub asset: bool,
+}
+
+/// Which way to follow a link: the ones written under `path`, or the ones pointing at it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Out,
+    In,
+}
+
+/// Links under `path` (a file or a whole folder), or the links pointing at it.
+///
+/// `statuses` filters on `status` and empty means all of them. A link to an asset's pointer is
+/// reported as the asset, which is what the user wrote and what `backlinks` on an asset finds.
+pub fn rows(
+    conn: &Connection,
+    p: &str,
+    path: &str,
+    dir: Direction,
+    statuses: &[&str],
+    lim: usize,
+) -> Result<Vec<LinkRow>> {
+    let (lo, hi) = subtree_bounds(path).unwrap_or_else(|| ("/".into(), "0".into()));
+    // `status` is a closed set the caller does not choose freely, so the list is built into the
+    // statement text: it keeps the statement cacheable and the values can only be our own.
+    let only = if statuses.is_empty() {
+        String::new()
+    } else {
+        let known = ["ok", "ambiguous", "anchor-missing", "broken", "not-in-store", "external"];
+        let mut names: Vec<String> = Vec::new();
+        for s in statuses {
+            if !known.contains(s) {
+                return Err(TextdbError::InvalidEdit(format!("unknown link status: {s}")));
+            }
+            names.push(format!("'{s}'"));
+        }
+        format!(" AND l.status IN ({})", names.join(","))
+    };
+    let cond = match dir {
+        Direction::Out => format!("(n.path = ?1 OR (n.path >= ?2 AND n.path < ?3)){only}"),
+        // An asset is linked by its own name; the node that exists is the `.tdbasset` pointer.
+        Direction::In => format!(
+            "l.target_path <> '' AND l.resolved_id IN (SELECT id FROM {p}node WHERE kind = 1 AND deleted_at IS NULL \
+             AND (path = ?1 OR path = ?1 || '.tdbasset' OR (path >= ?2 AND path < ?3))){only}"
+        ),
+    };
+    let mut stmt = conn
+        .prepare_cached(&format!(
+            "SELECT n.path, n.version, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status, \
+             CASE WHEN r.path LIKE '%.tdbasset' THEN substr(r.path, 1, length(r.path) - 9) ELSE r.path END, \
+             coalesce(r.path LIKE '%.tdbasset', 0) \
+             FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL \
+             LEFT JOIN {p}node r ON r.id = l.resolved_id AND r.deleted_at IS NULL \
+             WHERE {cond} ORDER BY n.path, l.line, l.rowid LIMIT ?4"
+        ))
+        .map_err(sql_err)?;
+    let out = stmt
+        .query_map(params![path, lo, hi, lim as i64], |r| {
+            Ok(LinkRow {
+                path: r.get(0)?,
+                version: r.get(1)?,
+                line: r.get(2)?,
+                kind: r.get(3)?,
+                target: r.get(4)?,
+                anchor: r.get(5)?,
+                alias: r.get(6)?,
+                status: r.get(7)?,
+                resolved: r.get(8)?,
+                asset: r.get::<_, i64>(9)? != 0,
+            })
+        })
+        .map_err(sql_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_err)?;
+    Ok(out)
+}

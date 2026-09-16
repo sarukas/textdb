@@ -91,7 +91,7 @@ Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./
 | `GET /api/history?path=…` | | `[{ version, author, ts, message, kind, base_version, nbytes, nlines, nwords }]` oldest first |
 | `GET /api/hunks?path=…&from=v1&to=v2` | | `[{ old_from, old_count, new_from, new_count, old_text, new_text }]` |
 | `GET /api/diff?path=…&from=v1&to=v2` | | `{ diff }` unified text |
-| `GET /api/search?q=…[&prefix=/][&limit=50]` | | `[{ path, line, snippet, rank }]` |
+| `GET /api/search?q=…[&prefix=/][&limit=200][&per_file=10]` | | `[{ path, version, line, text, section, score, more }]`, one row per matching line |
 | `PUT /api/file` | `{ path, content, base_version?, author?, message? }` | `{ version, kind }` — rebased over concurrent commits; 409 with `conflict` when the same lines changed |
 | `POST /api/replace-lines` | `{ path, from, to, text, base_version?, author? }` | `{ version, kind }` |
 | `GET /api/stat?path=…`, `GET /api/entry?path=…` | | one full listing record (`docs/shapes.md`); `stat` is an alias of `entry`. A folder's figures are totals over everything below it |

@@ -9,7 +9,7 @@
         print(hit.path, hit.line, hit.snippet)
 """
 
-from .corpus import SORT_KEYS, HeadingName, OutlineEntry, PropertyHit, PropertyKey, PropertyValue, Corpus, Entry, Hit, Commit
+from .corpus import SORT_KEYS, HeadingName, OutlineEntry, PropertyHit, PropertyKey, PropertyValue, Corpus, Entry, Hit, Commit, Link
 from .errors import TextdbError, Conflict, Contention, NotFound, InvalidEdit
 
 __all__ = [
@@ -19,7 +19,7 @@ __all__ = [
     "HeadingName",
     "OutlineEntry",
     "PropertyHit",
-    "Corpus", "Entry", "Hit", "Commit",
+    "Corpus", "Entry", "Hit", "Commit", "Link",
     "TextdbError", "Conflict", "Contention", "NotFound", "InvalidEdit",
 ]
 __version__ = "0.1.0"
