@@ -1535,19 +1535,13 @@ fn ls_text(entries: &[Entry], long: bool, recursive: bool) -> String {
     s
 }
 
+/// A byte count for a human to read.
+///
+/// One formatter for the whole CLI. There were two, and they disagreed above a gigabyte: this
+/// one stopped at `GB` and the assets one went to `TB`, so the same number printed differently
+/// depending on which command showed it.
 fn human_bytes(n: i64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut v = n as f64;
-    let mut unit = 0;
-    while v >= 1024.0 && unit < UNITS.len() - 1 {
-        v /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{n} B")
-    } else {
-        format!("{v:.1} {}", UNITS[unit])
-    }
+    assets::size_text(n.max(0) as u64)
 }
 
 fn change_line(c: &Change) -> String {
