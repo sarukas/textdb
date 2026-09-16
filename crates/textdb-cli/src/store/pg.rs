@@ -689,7 +689,10 @@ impl Store for PgStore {
         let rows = self
             .client
             .query(
-                "SELECT version, author, ts::text, message, kind, base_version, nbytes, nlines, nwords FROM kb.history($1)",
+                &format!(
+                    "SELECT version, author, {ts}, message, nbytes, kind, base_version, nlines, nwords FROM kb.history($1)",
+                    ts = utc("ts")
+                ),
                 &[&path],
             )
             .map_err(pg)?;
@@ -700,11 +703,11 @@ impl Store for PgStore {
                 author: r.get(1),
                 ts: r.get(2),
                 message: r.get(3),
-                nbytes: r.get(6),
+                nbytes: r.get(4),
                 nlines: r.get(7),
                 nwords: r.get(8),
-                kind: r.get(4),
-                base_version: r.get(5),
+                kind: r.get(5),
+                base_version: r.get(6),
             })
             .collect())
     }

@@ -266,7 +266,7 @@ impl Backend for TextdbPg {
     }
     fn search(&self, query: &str, prefix: &str) -> R<Vec<Hit>> {
         self.with(|c| {
-            let rows = c.query("SELECT path, line, snippet FROM kb.search($1, $2, $3)", &[&query, &prefix, &100_000i64])?;
+            let rows = c.query("SELECT path, line, text FROM kb.search($1, $2, $3, 1000000)", &[&query, &prefix, &100_000i64])?;
             Ok(rows
                 .iter()
                 .map(|r| Hit {

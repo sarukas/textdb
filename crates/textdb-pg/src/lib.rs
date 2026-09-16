@@ -1738,13 +1738,16 @@ mod kb {
     ) -> TableIterator<
         'static,
         (
+            // The same order as SQLite's `textdb_history` and the `commits` view. The two
+            // engines used to return the same seven names in a different order, so `SELECT *`
+            // consumed positionally silently swapped `nbytes` and `kind`.
             name!(version, i64),
             name!(author, Option<String>),
             name!(ts, pgrx::datum::TimestampWithTimeZone),
             name!(message, Option<String>),
+            name!(nbytes, Option<i64>),
             name!(kind, Option<String>),
             name!(base_version, Option<i64>),
-            name!(nbytes, Option<i64>),
             name!(nlines, Option<i64>),
             name!(nwords, Option<i64>),
         ),
@@ -1754,7 +1757,7 @@ mod kb {
         let rows: Vec<_> = Spi::connect(|client| {
             let t = client
                 .select(
-                    "SELECT version, author, ts, message, kind, base_version, nbytes, nlines, nwords FROM kb.commit WHERE file_id = $1 ORDER BY version",
+                    "SELECT version, author, ts, message, nbytes, kind, base_version, nlines, nwords FROM kb.commit WHERE file_id = $1 ORDER BY version",
                     None,
                     &[n.id.into()],
                 )
@@ -1766,8 +1769,8 @@ mod kb {
                     r.get::<String>(2).unwrap_or_else(|e| spi_err(e)),
                     r.get::<pgrx::datum::TimestampWithTimeZone>(3).unwrap_or_else(|e| spi_err(e)).expect("ts"),
                     r.get::<String>(4).unwrap_or_else(|e| spi_err(e)),
-                    r.get::<String>(5).unwrap_or_else(|e| spi_err(e)),
-                    r.get::<i64>(6).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<i64>(5).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<String>(6).unwrap_or_else(|e| spi_err(e)),
                     r.get::<i64>(7).unwrap_or_else(|e| spi_err(e)),
                     r.get::<i64>(8).unwrap_or_else(|e| spi_err(e)),
                     r.get::<i64>(9).unwrap_or_else(|e| spi_err(e)),

@@ -300,7 +300,7 @@ impl Backend for TextdbSqlite {
     }
     fn search(&self, query: &str, prefix: &str) -> R<Vec<Hit>> {
         self.with(|c| {
-            let mut st = c.prepare_cached("SELECT path, line, snippet FROM textdb_search(?1, ?2, 100000)")?;
+            let mut st = c.prepare_cached("SELECT path, line, text FROM textdb_search(?1, ?2, 100000, 1000000)")?;
             let rows = st
                 .query_map(params![query, prefix], |r| {
                     Ok(Hit {

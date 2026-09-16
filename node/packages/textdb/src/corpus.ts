@@ -185,8 +185,10 @@ export function openCorpus(options: OpenOptions): Corpus {
   return new Corpus(sql, db, extension, options.author ?? null);
 }
 
+/** The canonical `Entry` columns, in order. One list, so `ls`, `list` and `entry` agree. */
 const ENTRY_COLS =
-  'id, name, path, kind, nbytes, nlines, nwords, versions, updated_at, updated_by, created_at, files, folders, nauthors, authors';
+  'path, name, kind, version, nbytes, nlines, updated_at, updated_by, id, dir, depth, ext, title, ' +
+  'nwords, nsections, nprops, nlinks, nlinks_broken, versions, created_at, files, folders, nauthors, authors';
 
 type EntryRow = Omit<Entry, 'authors'> & { authors: string };
 
@@ -289,7 +291,7 @@ export class Corpus {
       offset,
     );
     const total = rows[0]?.total ?? Number(this.sql.value(`SELECT count(*) FROM textdb_ls(?, ?) ${filter}`, ...params));
-    return { path: dir, total, offset, entries: rows.map(toEntry) };
+    return { path: dir, total, offset, limit, entries: rows.map(toEntry) };
   }
 
   read(filePath: string, version?: number): FileView {
@@ -378,13 +380,27 @@ export class Corpus {
     return asText(this.sql.value('SELECT textdb_diff(?, ?, ?)', filePath, from, to));
   }
 
-  search(query: string, options: { prefix?: string; limit?: number } = {}): SearchHit[] {
+  /**
+   * Matching lines. One row per line, `limit` counting rows and `perFile` capping how many
+   * come from any one document — the same meanings the CLI gives those words.
+   */
+  search(query: string, options: { prefix?: string; limit?: number; perFile?: number } = {}): SearchHit[] {
     return this.sql.all<SearchHit>(
-      'SELECT path, line, snippet, rank FROM textdb_search(?, ?, ?)',
+      'SELECT path, version, line, text, section, score, more FROM textdb_search(?, ?, ?, ?)',
       query,
       options.prefix ?? '/',
-      options.limit ?? 50,
+      // One default for the whole project: 200 rows. It used to be 100 in SQL, 50 here and
+      // in HTTP, and 200 in the UI, for the same function.
+      options.limit ?? 200,
+      options.perFile ?? 10,
     );
+  }
+
+  /** One path's listing row — the record `textdb stat` prints. */
+  entry(target: string): Entry {
+    const row = this.sql.get<EntryRow>(`SELECT ${ENTRY_COLS} FROM textdb_entry(?)`, target);
+    if (!row) throw new NotFound(`not found: ${target}`);
+    return toEntry(row);
   }
 
   /**
@@ -400,7 +416,7 @@ export class Corpus {
         options.prefix ?? '',
         options.limit ?? 200,
       )
-      .map((r) => ({ key: r.key, docs: r.docs, valuesN: r.values_n, kind: r.kind }));
+      .map((r) => ({ key: r.key, docs: r.docs, values_n: r.values_n, kind: r.kind }));
   }
 
   /**
@@ -453,7 +469,7 @@ export class Corpus {
         nlines: r.nlines,
         fileNwords: r.file_nwords,
         version: r.version,
-        updatedAt: r.updated_at,
+        updated_at: r.updated_at,
         updatedBy: r.updated_by,
       }));
   }
@@ -499,7 +515,7 @@ export class Corpus {
       .map((r) => ({
         path: r.path,
         nbytes: r.nbytes,
-        updatedAt: r.updated_at,
+        updated_at: r.updated_at,
         // Parsed here so every caller does not: the column is the JSON the store keeps, and a
         // document whose front matter failed to parse is reported as having none rather than
         // failing the whole query.
@@ -557,11 +573,6 @@ export class Corpus {
   /** Deletes a file, or a folder with everything below it. History stays in the store. */
   remove(target: string, options: AuthorOptions = {}): void {
     this.sql.value('SELECT textdb_delete(?, ?)', target, this.authorOf(options));
-  }
-
-  /** One file or folder as a listing shows it; the root too. */
-  entry(target: string): Entry {
-    return JSON.parse(String(this.sql.value('SELECT textdb_entry(?)', target))) as Entry;
   }
 
   /** Every live file below the folder `dir`, by path, with its size and last change: what an export writes. */

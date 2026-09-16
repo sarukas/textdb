@@ -75,6 +75,8 @@ export function createApp(corpus: Corpus, hub: ChangeHub, options: AppOptions): 
   );
 
   app.get('/api/info', (c) => c.json(corpus.info()));
+  // Both listing endpoints return the same `Entry[]`; `/api/list` wraps it in a page. `/api/ls`
+  // used to be a bare unbounded array and `/api/list` a page without its own `limit` echoed.
   app.get('/api/ls', (c) => c.json(corpus.ls(c.req.query('path') || '/')));
   app.get('/api/list', (c) => {
     const sort = c.req.query('sort') || 'name';
@@ -111,7 +113,10 @@ export function createApp(corpus: Corpus, hub: ChangeHub, options: AppOptions): 
     c.json(
       corpus.search(queryString(c, 'q'), {
         prefix: c.req.query('prefix') || '/',
-        limit: queryInt(c, 'limit') ?? 50,
+        // One default across the project rather than four: SQL said 100, this said 50, the UI
+        // passed 200 and the CLI counted documents instead of rows.
+        limit: queryInt(c, 'limit') ?? 200,
+        perFile: queryInt(c, 'per_file') ?? 10,
       }),
     ),
   );
@@ -185,7 +190,8 @@ export function createApp(corpus: Corpus, hub: ChangeHub, options: AppOptions): 
     return c.json(result);
   });
 
-  app.get('/api/stat', (c) => c.json(corpus.stat(queryString(c, 'path'))));
+  // `stat` is an alias: it returned a different, smaller record than `entry` for one path.
+  app.get('/api/stat', (c) => c.json(corpus.entry(queryString(c, 'path'))));
   app.get('/api/entry', (c) => c.json(corpus.entry(queryString(c, 'path'))));
 
   // Sync with directories on this machine, configured by the operator (TEXTDB_SYNC).

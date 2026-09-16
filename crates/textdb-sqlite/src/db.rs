@@ -817,9 +817,12 @@ impl<'c> TextDb<'c> {
                 .execute(params![file_id])
                 .map_err(sql_err)?;
         }
-        // SQLite's default parameter limit is 32766, so a document with a very large number
-        // of headings is written in several batches rather than one statement.
-        const MAX_ROWS_PER_BATCH: usize = 4000;
+        // SQLite's default parameter limit is 32766, so a document with a very large number of
+        // headings is written in several batches. The bound is *parameters*, not rows, so it
+        // is derived from the column count: a fixed 4000 rows was under the limit at six
+        // columns and over it at ten, which a heading-dense document found the hard way.
+        const COLS: usize = 10;
+        const MAX_ROWS_PER_BATCH: usize = 32_000 / COLS;
         for batch in s.sections.chunks(MAX_ROWS_PER_BATCH) {
             let mut sql = format!(
                 "INSERT INTO {}section(file_id, version, heading_path, level, line_from, line_to, \
@@ -890,7 +893,8 @@ impl TextDb<'_> {
     /// `line_from` keys the update because a heading owns its line: two sections of one
     /// document can never start on the same one.
     fn update_section_counts(&self, file_id: i64, sections: &[textdb_core::structure::Section]) -> Result<()> {
-        const MAX_ROWS_PER_BATCH: usize = 4000;
+        // Three placeholders per row plus the file id; same parameter bound as the insert.
+        const MAX_ROWS_PER_BATCH: usize = 32_000 / 3;
         for batch in sections.chunks(MAX_ROWS_PER_BATCH) {
             let mut sql = format!(
                 "UPDATE {}section AS s SET nwords = v.column2, nwords_total = v.column3 FROM (VALUES ",

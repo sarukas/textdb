@@ -13,18 +13,25 @@ use crate::{emit_json, out, Result};
 pub const BROKEN: &[&str] = &["broken", "anchor-missing", "not-in-store"];
 
 /// How a link is written, from its parts.
-fn shape(kind: &str, target: &str, anchor: Option<&str>) -> String {
+///
+/// The alias is the text a reader clicks, and dropping it rendered every markdown link as
+/// `[](target)` — the same four characters for every link in a document, which told a reader
+/// nothing about which one they were looking at.
+fn shape(kind: &str, target: &str, anchor: Option<&str>, alias: Option<&str>) -> String {
     let anchor = anchor.map(|a| format!("#{a}")).unwrap_or_default();
+    let text = alias.unwrap_or("");
     match kind {
-        "wiki" => format!("[[{target}{anchor}]]"),
-        "embed" => format!("![[{target}{anchor}]]"),
-        "image" => format!("![]({target}{anchor})"),
-        _ => format!("[]({target}{anchor})"),
+        "wiki" if text.is_empty() => format!("[[{target}{anchor}]]"),
+        "wiki" => format!("[[{target}{anchor}|{text}]]"),
+        "embed" if text.is_empty() => format!("![[{target}{anchor}]]"),
+        "embed" => format!("![[{target}{anchor}|{text}]]"),
+        "image" => format!("![{text}]({target}{anchor})"),
+        _ => format!("[{text}]({target}{anchor})"),
     }
 }
 
 pub fn written(l: &LinkRow) -> String {
-    shape(&l.kind, &l.target, l.anchor.as_deref())
+    shape(&l.kind, &l.target, l.anchor.as_deref(), l.alias.as_deref())
 }
 
 /// What `mv` says about the links that pointed at what moved.
@@ -42,7 +49,7 @@ pub fn moved_text(from: &str, links: &[MovedLink]) -> String {
             files(&left)
         ));
         for l in left {
-            s.push_str(&format!("  {}:{}: {} (now {})\n", l.path, l.line, shape(&l.kind, &l.target, None), l.now_at));
+            s.push_str(&format!("  {}:{}: {} (now {})\n", l.path, l.line, shape(&l.kind, &l.target, None, None), l.now_at));
         }
     }
     s

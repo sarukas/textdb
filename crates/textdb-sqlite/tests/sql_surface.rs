@@ -787,3 +787,28 @@ fn a_snippet_shows_the_match_however_the_query_was_written() {
     let (_, snippet) = hit("head");
     assert_eq!(snippet, "# Head");
 }
+
+#[test]
+fn a_heading_dense_document_stays_under_the_parameter_limit() {
+    // SQLite allows 32,766 bound parameters per statement. The section insert batches rows,
+    // and the bound is on *parameters*: 4,000 rows fitted at six columns per row and did not
+    // at ten, so the batch size is derived from the column count rather than written down.
+    let conn = setup();
+    let mut body = String::from("---\ntitle: Big\n---\n");
+    for i in 0..5000 {
+        body.push_str(&format!("# Heading {i}\n\nbody line {i}\n\n"));
+    }
+    conn.execute("INSERT INTO kb(path, content) VALUES ('/big.md', ?1)", params![body]).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT nsections FROM textdb_entry('/big.md')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 5000);
+    // And an edit that leaves the heading tree alone takes the counts-only path, whose batch
+    // has the same bound.
+    conn.execute("UPDATE kb SET content = replace(content, 'body line 0', 'body line zero') WHERE path = '/big.md'", [])
+        .unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM textdb_outline('/big.md', NULL, 'exact', NULL, 100000)", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 5000);
+}

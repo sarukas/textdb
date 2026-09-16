@@ -10,28 +10,50 @@ export interface Info {
 }
 
 /** A file or folder in a listing. A folder's size, lines, words and versions are totals over every file below it. */
+/**
+ * One listing row: the same twenty-four keys as every other surface, in this order.
+ *
+ * Every key is always present; one that does not apply is `null`.
+ */
 export interface Entry {
-  id: number;
-  name: string;
+  // The minimal tier: what every surface carries.
   path: string;
+  name: string;
   kind: NodeKind;
-  nbytes: number | null;
-  nlines: number | null;
-  /** Words, as `wc -w` counts them. */
-  nwords: number | null;
-  /** A file's version; a folder's total of versions below it. */
-  versions: number;
-  /** A file's last commit or move; a folder's latest change, to it or anywhere below. */
+  /** A file's current version — what `cat -n` shows and `base_version` takes; null for a folder. */
+  version: number | null;
+  /** A file's own size; a folder's total over the live files below it. */
+  nbytes: number;
+  nlines: number;
+  /** ISO-8601 UTC with milliseconds and `Z`, on both backends. */
   updated_at: string;
   updated_by: string | null;
+
+  // The rest of the full tier.
+  id: number;
+  /** The parent folder; null for the root. */
+  dir: string | null;
+  depth: number;
+  /** Lower case, no dot; null for a folder or a name without one. */
+  ext: string | null;
+  /** Front matter `title`, else the first level-1 heading, else null. */
+  title: string | null;
+  /** Words, as `wc -w` counts them. */
+  nwords: number;
+  /** Headings, top-level front-matter keys, links, and links that reach nothing. */
+  nsections: number;
+  nprops: number;
+  nlinks: number;
+  nlinks_broken: number;
+  /** A file's version count; a folder's sum of the versions below it. */
+  versions: number;
   created_at: string;
   /** Folder: live files anywhere below it; null for a file. */
   files: number | null;
   /** Folder: live folders anywhere below it; null for a file. */
   folders: number | null;
-  /** File: distinct commit authors; null for a folder. */
-  nauthors: number | null;
-  /** File: who committed to it, most commits first; empty for a folder. */
+  nauthors: number;
+  /** Who committed to it, most commits first; empty for a folder. */
   authors: AuthorCount[];
 }
 
@@ -71,6 +93,8 @@ export interface ListPage {
   /** Entries matching the filters, across all pages. */
   total: number;
   offset: number;
+  /** The page size actually applied, which the caller's request may have been clamped to. */
+  limit: number;
   entries: Entry[];
 }
 
@@ -114,11 +138,24 @@ export interface Hunk {
   new_text: string;
 }
 
+/**
+ * One matching line — the same seven keys as the CLI and the SQL functions.
+ *
+ * One row per matching *line*, not per document with a guessed line.
+ */
 export interface SearchHit {
   path: string;
+  /** The version the line number belongs to; pass it as `base_version` when editing. */
+  version: number;
   line: number;
-  snippet: string;
-  rank: number;
+  /** The matching line, windowed around the match when longer than the cut. */
+  text: string;
+  /** The heading path the line sits under; null outside any heading. */
+  section: string | null;
+  /** Relevance, higher is better, scaled to (0, 1]; null when nothing ranked. */
+  score: number | null;
+  /** Matching lines in this file not returned because of `perFile`. */
+  more: number;
 }
 
 /** A front-matter property name in use across the store. */
@@ -126,8 +163,13 @@ export interface PropertyKey {
   key: string;
   /** Documents carrying it — a note with three tags counts once. */
   docs: number;
-  /** Distinct values it takes. */
-  valuesN: number;
+  /**
+   * Distinct values it takes.
+   *
+   * `values_n` and not `values` on every surface: `values` is reserved in SQL, so a column
+   * named that would need quoting in every query that touched it.
+   */
+  values_n: number;
   /** `number`, `text` or `mixed`; a UI offers `>` and `<` only where they mean something. */
   kind: 'number' | 'text' | 'mixed';
 }
@@ -142,7 +184,7 @@ export interface PropertyValue {
 export interface PropertyHit {
   path: string;
   nbytes: number;
-  updatedAt: string;
+  updated_at: string;
   /** The whole front matter, so a result table can show any column without a query per row. */
   frontmatter: Record<string, unknown> | null;
 }
@@ -167,7 +209,7 @@ export interface OutlineEntry {
   nlines: number | null;
   fileNwords: number | null;
   version: number;
-  updatedAt: string;
+  updated_at: string;
   updatedBy: string | null;
 }
 

@@ -647,13 +647,20 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             reverse,
             recursive,
         } => {
-            let mut entries = st.ls(&path, recursive)?;
+            // `ls FILE` lists that one file, as Unix does; it used to print nothing at all.
+            let mut entries = match st.stat(&path) {
+                Ok(e) if e.kind == "file" => vec![e],
+                _ => st.ls(&path, recursive)?,
+            };
             sort_entries(&mut entries, sort, reverse, recursive);
             if json {
                 return emit_json(&entries);
             }
             if paths {
-                return out(entries.iter().map(|e| format!("{}\n", e.path)).collect::<String>().as_bytes());
+                // The trailing `/` marks a folder here too: without it a script could not tell
+                // `/guides` the folder from `/guides` a file with no extension.
+                let mark = |e: &Entry| if e.kind == "folder" { format!("{}/\n", e.path) } else { format!("{}\n", e.path) };
+                return out(entries.iter().map(mark).collect::<String>().as_bytes());
             }
             out(ls_text(&entries, long, recursive).as_bytes())
         }
@@ -904,7 +911,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             };
             let diff = st.diff(&path, v1, v2)?;
             if json {
-                emit_json(&json!({ "path": path, "from": v1, "to": v2, "diff": diff }))
+                emit_json(&json!({ "path": normalize_path(&path)?, "from": v1, "to": v2, "diff": diff }))
             } else {
                 out(diff.as_bytes())
             }
@@ -918,7 +925,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             let v1 = v1.unwrap_or(v2 - 1).max(0);
             let hunks = st.hunks(&path, v1, v2)?;
             if json {
-                return emit_json(&json!({ "path": path, "from": v1, "to": v2, "hunks": hunks }));
+                return emit_json(&json!({ "path": normalize_path(&path)?, "from": v1, "to": v2, "hunks": hunks }));
             }
             let mut s = String::new();
             for h in &hunks {
@@ -1156,7 +1163,7 @@ fn emit_json<T: Serialize + ?Sized>(v: &T) -> Result<()> {
 
 fn emit_written(path: &str, w: &Written, json: bool) -> Result<()> {
     if json {
-        emit_json(&json!({ "path": path, "version": w.version, "kind": w.kind }))
+        emit_json(&json!({ "path": normalize_path(path)?, "version": w.version, "kind": w.kind }))
     } else if w.kind == "noop" {
         line(format!("{path}: unchanged, still v{}", w.version))
     } else {
@@ -1654,6 +1661,10 @@ fn cat(
     let from = from.max(1);
     let to = to.min(total);
     let selected: &[&[u8]] = if from <= to { &all[(from - 1) as usize..to as usize] } else { &[] };
+    // Echo the path the store knows, not the one the user typed: `cat guides/x.md` used to
+    // answer `"path":"guides/x.md"` while every listing said `/guides/x.md`, so a caller
+    // keying on `path` saw two spellings of one file.
+    let path = &normalize_path(path)?;
     if json {
         return emit_json(&json!({
             "path": path,

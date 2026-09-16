@@ -30,7 +30,7 @@ describe('front-matter properties', () => {
     const byKey = new Map(kb.propertyKeys().map((k) => [k.key, k]));
     // Three documents carry `tags`; five rows of them, because a list is a row per element.
     assert.equal(byKey.get('tags')?.docs, 3);
-    assert.equal(byKey.get('status')?.valuesN, 2);
+    assert.equal(byKey.get('status')?.values_n, 2);
     // A UI offers `>` only where it means something.
     assert.equal(byKey.get('priority')?.kind, 'number');
     assert.equal(byKey.get('status')?.kind, 'text');
