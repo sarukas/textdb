@@ -580,6 +580,58 @@ misreading.
 
 ---
 
+## Coverage gaps found by reading the surfaces, not the numbers (2026-09-16)
+
+Neither of these is a regression. Both are places where the suite measures a narrower thing
+than the feature offers, so a cost we already pay has never been attributed.
+
+### Search snippets are timed but never isolated, and never checked
+
+`textdb_search(query, prefix, limit)` returns `path, line, snippet, rank`. The harness's SQL
+selects `path, line` only, and its `Hit` is `{ path: String, line: u64 }` — the `snippet`
+column is dropped on the floor. Two consequences:
+
+- Snippet extraction runs server-side inside every SR timing, so it is *inside* `op_search`
+  (699 us on `textdb-sqlite`, 8225 us on `textdb-pg`) without ever being separable from hit
+  lookup. We cannot say what share of the largest remaining gap is snippet rendering.
+- Snippet *content* has no oracle at all. Nothing asserts a snippet contains the matched
+  term, is centred on it, or is bounded in length. The web app highlights terms client-side
+  and would look wrong if the snippet were, but that is not a test.
+
+To close: carry `snippet` on the harness `Hit`, assert it contains the matched term, and time
+a snippet-less variant of the same query so the two costs separate. Cheap, and it feeds
+directly into gap 1 above.
+
+### Section listing exists only as a SQL view, and only per-file is measured
+
+Extraction and storage are complete — `textdb-md::extract` emits one row per H1-H6 with
+`heading_path` (the `Parent / Child` breadcrumb), `level`, `line_from`, `line_to`, and both
+engines keep them at HEAD. What is thin is everything above one document:
+
+- **No listing surface but raw SQL.** There is no `textdb outline` verb, no
+  `textdb_sections()` / `kb.sections()` table-valued function, no `Corpus.sections()` in
+  Python, and nothing whatever in the Node SDK — not even the single-section `section()` the
+  other surfaces have. Properties got three verbs, three functions, both SDKs and a UI;
+  sections got a view.
+- **The view carries no file metadata.** `sections` is `path, heading, level, line_from,
+  line_to`. A heading list is most useful next to `nbytes`, `updated_at`, `updated_by` and
+  the document's own front matter, and every caller has to join `files` itself to get them.
+- **A vault-wide heading query is a full scan.** The only index is
+  `section_file (file_id, version)`. `WHERE heading LIKE '%/ Next steps'` scans every section
+  row — roughly 32 per note in a heading-rich vault — and is case-sensitive unless wrapped in
+  `lower()`, which would defeat an index if one existed. The property work already settled
+  the shape for this: a stored folded column plus an index on it.
+- **No notion of a title.** An H1 is just `level = 1`; front-matter `title` is a property row.
+  Nothing reconciles them, so "list every document's title" means choosing a convention in
+  SQL each time.
+
+Benchmark coverage is MD-05 and it is strictly per-file: `sections_list` 16 us p50 on SQLite
+and 201 us on Postgres, `section_body` 25 us and 399 us, both oracles passing. Folder-scoped
+listing, vault-wide listing, any heading-text predicate, filtering by level, and the
+`sections` view itself (MD-05 queries the base table directly, so the join with `node` has
+never been timed) are all unmeasured. MD-01 does cover what maintaining the sidecar costs the
+write path, so the indexing side is fine; it is the reading side above one file that is not.
+
 ## Tried and rejected — do not pay for these twice
 
 - **Batching search hit resolution through `json_each`** (previous pass): worse. The
