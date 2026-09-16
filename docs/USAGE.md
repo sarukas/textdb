@@ -214,3 +214,63 @@ load/ls/cat/search/edit/append/history/diff/mv/rm/export.
 5. **Search** with `kb.search(query, prefix)` restricted to the folder you work in; results
    are `(path, line)` so a follow-up `kb.lines(path, line-5, line+5)` gives context cheaply.
 6. **History** is free: `kb.history`, `kb.content(path, version)`, `kb.diff(path, v1, v2)`.
+
+## Delegated access: accounts, tokens and shares
+
+One store can hold every vault and still hand each person or agent only the folders they need.
+An **account** is given whole folders — a share is a folder and everything below it — and sees
+each one at its own root under an **alias** that belongs to the grant.
+
+```sql
+-- Postgres, as the owner.
+SELECT kb.account_create('accounts-agent', 'agent');
+SELECT * FROM kb.access_grant('accounts-agent', '/legal/contracts', 'rw', 'contracts');
+SELECT * FROM kb.access_grant('accounts-agent', '/products', 'ro');
+SELECT * FROM kb.token_create('accounts-agent', 'claude session');   -- the bearer, once
+```
+
+```sql
+-- As the account, on the connection it works over.
+SET textdb.token = 'tdb_…';        -- or SELECT kb.auth('tdb_…')
+SELECT path FROM kb.ls('/');       -- contracts/  products/
+SELECT kb.content('/contracts/acme.md');
+```
+
+SQLite is the same model through `textdb_auth`:
+
+```sql
+SELECT textdb_auth('tdb_…');       -- the account name, or an error
+SELECT path FROM textdb_ls('/');
+SELECT textdb_content('/contracts/acme.md');
+```
+
+Everything after that point speaks the account's paths — listings, `stat`, search, grep,
+history, the change feed, links, `export` and `sync` — and shows nothing outside its shares.
+
+What is worth knowing before you build on it:
+
+- **A store that delegates nothing is unchanged.** With no token the connection is the owner and
+  sees store paths, which is what opening the SQLite file or connecting to the database already
+  means. The filter and the translation cost nothing on that path by construction: Postgres
+  resolves the account once per statement as an InitPlan, and SQLite skips its session lookup on
+  an atomic that is never set until something authenticates.
+- **`forbidden` (`TX005`, exit 7) is not `not found` (`TX003`, exit 5).** A path under a share
+  you hold but may not use — read-only, revoked, or its folder in the trash — is forbidden; a
+  path under no share of yours is not found and is indistinguishable from one that never existed.
+  `sync` deletes from disk what the store no longer has and leaves alone what it may not touch,
+  so the difference is what stops a permission change emptying somebody's checkout.
+- **Paths are per view; ids are not.** The same document is `/contracts/acme.md` to one account
+  and `/legal/contracts/acme.md` to the owner. Every listing row carries the store's `id`, and
+  every path-taking command accepts `id:1234` — that is the reference to pass between agents.
+- **Links are rewritten at the boundary.** The store holds one canonical text whose root-absolute
+  links use store paths; each reader sees its own. A link to a document the reader cannot see
+  becomes `textdb:<id>`, which is not a path, cannot collide with one, and renders as an
+  unresolved link. Relative links and name-only wiki links are byte-identical everywhere. Line
+  numbers are the same in every view, so `cat -n`, `replace-lines` and search line numbers mean
+  one thing.
+- **Writes are checked before anything commits**, the author of a write is the account, and
+  `--author` naming someone else is refused.
+
+On SQLite anyone who can open the file can read the raw `kb_*` tables or skip `textdb_auth`; on
+Postgres a superuser can. Both mean "you own the store", which is the trust boundary either way.
+The model is real where a server holds the store and clients hold tokens.

@@ -285,6 +285,34 @@ Isolation: READ COMMITTED is sufficient; correctness rests on `cas_root` (`UPDAT
 
 Independent of core except the chunker. Schema `chunks(file_id, ordinal_key varchar, hash, text)` with fractional ordinal keys. Each simulated agent works on its own branch and merges to main. Measures conflicts detected by Dolt's cell-level merge for the same workload used in §9.3. Purpose: external evidence for claim 2 before the Postgres binding exists.
 
+### 7.4 Delegated access (both bindings) — after the POC
+
+Added by issue #12, after this spec was written, and shaped so the rest of it is unchanged: a
+store with no accounts behaves exactly as §7.1 and §7.2 describe.
+
+Three tables in each binding — `account`, `token`, `grant` — and one question per connection:
+who is this? SQLite answers it with `textdb_auth('<bearer>')`, Postgres with
+`SET textdb.token` (or `kb.auth`), and from then on every surface filters to that account's
+shares and speaks its paths. A **share** is one folder with everything below it; the account
+sees it at its own root under an **alias** fixed when the grant is made, so its paths never move
+when another share is added or taken away.
+
+Both bindings call the same code — `textdb_core::access` — for what a grant means, which path a
+caller's path is, and how links are rewritten across the boundary. Two hand-written
+implementations would agree on the day they were written; one algorithm with two persistences
+cannot drift.
+
+Two rules carry more weight than the rest:
+
+- **`TX005 forbidden` is distinct from `TX003 not found`,** because `sync` deletes from disk what
+  the store no longer has and leaves alone what it may not touch. Conflating them empties a
+  checkout when a share is revoked, which is why a revoked grant keeps its row rather than being
+  deleted.
+- **The store holds exactly one canonical text per version.** Root-absolute links are projected
+  into each reader's paths at the boundary and un-projected on save, and a link to a document the
+  reader cannot see reads as `textdb:<id>`. Only the byte spans the extractor already recorded
+  are rewritten, so nothing re-parses free text and line numbers are identical in every view.
+
 ## 8. Concurrency model (normative)
 
 1. The only mutable state per file is `(root, version)`.
