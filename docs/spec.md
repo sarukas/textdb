@@ -241,8 +241,18 @@ kb.ls(path, recursive boolean DEFAULT false) → SETOF kb.entry
                                         -- textdb_ls. A folder's figures total everything below it.
 kb.compact_folder_totals() → bigint     -- fold kb.folder_delta into the folder rows (maintenance)
 kb.rebuild_folder_totals() → void       -- recompute every folder's totals from its files
-kb.search(tsquery text, prefix text) → TABLE(path, line, snippet, rank)
-kb.history(path) → TABLE(version, author, ts, message)
+kb.search(query text, prefix text DEFAULT '/', lim bigint DEFAULT 200,
+       per_file bigint DEFAULT 10) → TABLE(path, version, line, text, section, score, more)
+                                        -- one row per matching line, the same columns in the same
+                                        -- order as SQLite's textdb_search; score is higher-is-better
+                                        -- on both engines, and `more` is the lines per_file held back
+kb.outline(prefix, heading, mode, max_level, lim) → TABLE(path, heading, heading_path, level,
+       line_from, line_to, nwords, nwords_total, nbytes, nlines, file_nwords, version,
+       updated_at, updated_by)         -- as SQLite's textdb_outline
+kb.headings(prefix, starts, lim) → TABLE(heading, sections, docs)
+kb.analyze_store() → void               -- refresh planner statistics after a bulk load
+kb.rebuild_headings() → bigint          -- backfill section headings for stores written before them
+kb.history(path) → TABLE(version, author, ts, message, kind, base_version, nbytes, nlines, nwords)
 kb.content(path, version) → text
 kb.export(prefix) → TABLE(path, content)
 ```

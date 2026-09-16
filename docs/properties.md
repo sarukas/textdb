@@ -81,6 +81,14 @@ SELECT * FROM kb.prop_values('status', '', 50);
 SELECT * FROM kb.prop_find('status:draft', '/', 500);
 ```
 
+The three return the same columns on both engines:
+
+| Function | Columns |
+|---|---|
+| `prop_keys(starts, lim)` | `key, docs, values_n, kind` — `kind` is `number` when every value parses as one, else `text` |
+| `prop_values(key, starts, lim)` | `value, docs`, most documents first |
+| `prop_find(query, folder, lim)` | `path, nbytes, updated_at, frontmatter` — `updated_at` is ISO-8601 UTC and `frontmatter` the whole parsed block as JSON |
+
 **Python**
 
 ```python

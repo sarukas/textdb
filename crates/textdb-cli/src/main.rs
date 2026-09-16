@@ -1503,8 +1503,7 @@ fn ls_text(entries: &[Entry], long: bool, recursive: bool) -> String {
     ));
     for e in entries {
         let who = if e.kind == "folder" {
-            let n = |v: i64, w: &str| if v == 1 { format!("1 {w}") } else { format!("{v} {w}s") };
-            format!("{}, {}", n(e.files.unwrap_or(0), "file"), n(e.folders.unwrap_or(0), "folder"))
+            format!("{}, {}", plural(e.files.unwrap_or(0) as usize, "file"), plural(e.folders.unwrap_or(0) as usize, "folder"))
         } else {
             let mut names: Vec<String> =
                 e.authors.iter().take(2).map(|a| format!("{} ({})", a.author.as_deref().unwrap_or("-"), a.commits)).collect();
@@ -2122,6 +2121,7 @@ struct TreeNode {
     entry: Option<Entry>,
     children: BTreeMap<String, TreeNode>,
     files: usize,
+    folders: usize,
     bytes: i64,
 }
 
@@ -2134,7 +2134,14 @@ impl TreeNode {
 fn tree(st: &mut dyn Store, path: &str, depth: Option<usize>, dirs_only: bool, json: bool) -> Result<()> {
     let root = normalize_path(path)?;
     let base_len = if root == "/" { 0 } else { root.len() };
-    let mut entries = st.nodes(&root)?;
+    // `tree FILE` shows the one entry, as `ls FILE` does. `nodes()` answers about a subtree and
+    // gives nothing for a file, which used to leave a header reading `(0 files, 0 B)` and no rows.
+    let one = st.stat(&root).ok().filter(|e| e.kind == "file");
+    let file = one.is_some();
+    let mut entries = match one {
+        Some(e) => vec![e],
+        None => st.nodes(&root)?,
+    };
     if json {
         entries.retain(|e| {
             let rel = e.path[base_len.min(e.path.len())..].trim_start_matches('/');
@@ -2154,25 +2161,34 @@ fn tree(st: &mut dyn Store, path: &str, depth: Option<usize>, dirs_only: bool, j
             top.children.insert(e.name.clone(), TreeNode { entry: Some(e), ..Default::default() });
             continue;
         }
-        let size = if e.kind == "file" { e.nbytes } else { 0 };
         let is_file = e.kind == "file";
+        let size = if is_file { e.nbytes } else { 0 };
         let mut node = &mut top;
+        // Each step counts the entry against the folder it is *in*, so every ancestor of a
+        // node holds the totals for its whole subtree and the node itself does not count itself.
         for seg in rel.split('/') {
             if is_file {
                 node.files += 1;
                 node.bytes += size;
+            } else {
+                node.folders += 1;
             }
             node = node.children.entry(seg.to_string()).or_default();
         }
         node.entry = Some(e);
     }
-    let mut s = format!("{root}  ({}, {})\n", count_files(top.files), human_bytes(top.bytes));
+    let mut s = if file { String::new() } else { format!("{root}  ({})\n", contains(top.files, top.folders, top.bytes)) };
     render_tree(&top, "", depth, dirs_only, &mut s);
     out(s.as_bytes())
 }
 
-fn count_files(n: usize) -> String {
-    if n == 1 { "1 file".to_string() } else { format!("{n} files") }
+/// What a folder holds, all the way down: `2 files, 1 folder, 394 B`.
+fn contains(files: usize, folders: usize, bytes: i64) -> String {
+    format!("{}, {}, {}", plural(files, "file"), plural(folders, "folder"), human_bytes(bytes))
+}
+
+fn plural(n: usize, what: &str) -> String {
+    if n == 1 { format!("1 {what}") } else { format!("{n} {what}s") }
 }
 
 /// Draw `node`'s children, and their children down to `depth` more levels (all when `None`).
@@ -2186,7 +2202,7 @@ fn render_tree(node: &TreeNode, indent: &str, depth: Option<usize>, dirs_only: b
         let last = i + 1 == kids.len();
         let branch = if last { "└── " } else { "├── " };
         if kid.is_folder() {
-            s.push_str(&format!("{indent}{branch}{name}/  ({}, {})\n", count_files(kid.files), human_bytes(kid.bytes)));
+            s.push_str(&format!("{indent}{branch}{name}/  ({})\n", contains(kid.files, kid.folders, kid.bytes)));
             let indent = format!("{indent}{}", if last { "    " } else { "│   " });
             render_tree(kid, &indent, depth.map(|d| d - 1), dirs_only, s);
         } else {

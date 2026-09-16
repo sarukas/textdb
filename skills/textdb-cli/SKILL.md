@@ -32,7 +32,7 @@ output.
 ## Find your way around
 
 ```sh
-textdb tree -L 2                         # top of the tree with file counts
+textdb tree -L 2                         # top of the tree; folders say what they hold
 textdb tree guides -d                    # folders only under /guides
 textdb ls guides/api
 textdb ls -l guides                      # + words, versions, last update, authors; folders show totals below them

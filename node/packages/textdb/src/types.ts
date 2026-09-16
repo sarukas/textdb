@@ -123,10 +123,13 @@ export interface HistoryEntry {
   author: string | null;
   ts: string;
   message: string | null;
-  nbytes: number;
   /** Null for commits recorded by a build that predates commit kinds. */
   kind: CommitKind | null;
   base_version: number | null;
+  nbytes: number;
+  /** The file's size in lines and words as of this version. */
+  nlines: number | null;
+  nwords: number | null;
 }
 
 export interface Hunk {

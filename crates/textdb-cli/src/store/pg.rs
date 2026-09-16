@@ -41,7 +41,7 @@ CREATE OR REPLACE TEMP VIEW links AS
   FROM kb.link l JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL
   LEFT JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL;
 CREATE OR REPLACE TEMP VIEW commits AS
-  SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines, c.batch
+  SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines, c.nwords, c.batch
   FROM kb.commit c JOIN kb.node n ON n.id = c.file_id AND n.deleted_at IS NULL;
 CREATE OR REPLACE TEMP VIEW authors AS
   SELECT n.path, nullif(a.author, '') AS author, a.commits, a.first_ts, a.last_ts
@@ -684,7 +684,7 @@ impl Store for PgStore {
             .client
             .query(
                 &format!(
-                    "SELECT version, author, {ts}, message, nbytes, kind, base_version, nlines, nwords FROM kb.history($1)",
+                    "SELECT version, author, {ts}, message, kind, base_version, nbytes, nlines, nwords FROM kb.history($1)",
                     ts = utc("ts")
                 ),
                 &[&path],
@@ -697,11 +697,11 @@ impl Store for PgStore {
                 author: r.get(1),
                 ts: r.get(2),
                 message: r.get(3),
-                nbytes: r.get(4),
+                kind: r.get(4),
+                base_version: r.get(5),
+                nbytes: r.get(6),
                 nlines: r.get(7),
                 nwords: r.get(8),
-                kind: r.get(5),
-                base_version: r.get(6),
             })
             .collect())
     }

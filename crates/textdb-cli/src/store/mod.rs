@@ -135,18 +135,23 @@ pub struct Author {
 
 
 #[derive(Debug, Serialize)]
+/// One version of a file, in the order the `commits` view and `textdb_history` use — one
+/// order on both engines and in every SDK. `SELECT *` consumed positionally used to swap
+/// `nbytes` and `kind` between them.
 pub struct Commit {
     pub version: i64,
     pub author: Option<String>,
     pub ts: String,
     pub message: Option<String>,
+    /// How the commit landed: `direct`, `rebased` or `merged`.
+    pub kind: Option<String>,
+    /// The version the writer started from; `None` for a file's first version.
+    pub base_version: Option<i64>,
     pub nbytes: Option<i64>,
     /// Lines and words as of this version. `nwords` is absent on commits written before the
     /// column existed.
     pub nlines: Option<i64>,
     pub nwords: Option<i64>,
-    pub kind: Option<String>,
-    pub base_version: Option<i64>,
 }
 
 /// A rename, move or delete as it touched one file or folder.

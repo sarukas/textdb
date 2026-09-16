@@ -334,7 +334,7 @@ export class Corpus {
   /** Oldest first. */
   history(filePath: string): HistoryEntry[] {
     return this.sql.all<HistoryEntry>(
-      'SELECT version, author, ts, message, nbytes, kind, base_version FROM textdb_history(?)',
+      'SELECT version, author, ts, message, kind, base_version, nbytes, nlines, nwords FROM textdb_history(?)',
       filePath,
     );
   }

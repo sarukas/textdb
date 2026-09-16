@@ -394,9 +394,11 @@ pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
                     "author": c.author,
                     "ts": c.ts,
                     "message": c.message,
-                    "nbytes": c.nbytes,
                     "kind": c.kind,
                     "base_version": c.base_version,
+                    "nbytes": c.nbytes,
+                    "nlines": c.nlines,
+                    "nwords": c.nwords,
                 })
             })
             .collect();

@@ -15,7 +15,7 @@ use rusqlite::vtab::{
 use rusqlite::{Connection, Error, Result};
 use textdb_core::TextdbError;
 
-use crate::db::{normalize_path, parent_of, TextDb, DEFAULT_PREFIX};
+use crate::db::{normalize_path, TextDb, DEFAULT_PREFIX};
 
 pub fn map_err(e: TextdbError) -> Error {
     match &e {
@@ -534,7 +534,7 @@ impl FnKind {
         match self {
             FnKind::Ls => c"CREATE TABLE x(path TEXT, name TEXT, kind TEXT, version INTEGER, nbytes INTEGER, nlines INTEGER, updated_at TEXT, updated_by TEXT, id INTEGER, dir TEXT, depth INTEGER, ext TEXT, title TEXT, nwords INTEGER, nsections INTEGER, nprops INTEGER, nlinks INTEGER, nlinks_broken INTEGER, versions INTEGER, created_at TEXT, files INTEGER, folders INTEGER, nauthors INTEGER, authors TEXT, dir_arg TEXT HIDDEN, recursive INTEGER HIDDEN)",
             FnKind::Search => c"CREATE TABLE x(path TEXT, version INTEGER, line INTEGER, text TEXT, section TEXT, score REAL, more INTEGER, query TEXT HIDDEN, prefix TEXT HIDDEN, lim INTEGER HIDDEN, per_file INTEGER HIDDEN)",
-            FnKind::History => c"CREATE TABLE x(version INTEGER, author TEXT, ts TEXT, message TEXT, nbytes INTEGER, kind TEXT, base_version INTEGER, nlines INTEGER, nwords INTEGER, path TEXT HIDDEN)",
+            FnKind::History => c"CREATE TABLE x(version INTEGER, author TEXT, ts TEXT, message TEXT, kind TEXT, base_version INTEGER, nbytes INTEGER, nlines INTEGER, nwords INTEGER, path TEXT HIDDEN)",
             FnKind::Export => c"CREATE TABLE x(path TEXT, content TEXT, prefix TEXT HIDDEN)",
             FnKind::Feed => c"CREATE TABLE x(seq INTEGER, ts TEXT, op TEXT, path TEXT, old_path TEXT, node_kind TEXT, version INTEGER, base_version INTEGER, commit_kind TEXT, author TEXT, message TEXT, since INTEGER HIDDEN, lim INTEGER HIDDEN)",
             FnKind::Hunks => c"CREATE TABLE x(old_from INTEGER, old_count INTEGER, new_from INTEGER, new_count INTEGER, old_text TEXT, new_text TEXT, path TEXT HIDDEN, v1 INTEGER HIDDEN, v2 INTEGER HIDDEN)",
@@ -877,9 +877,9 @@ unsafe impl VTabCursor for FnCursor<'_> {
                             c.author.map_or(Value::Null, Value::Text),
                             Value::Text(c.ts),
                             c.message.map_or(Value::Null, Value::Text),
-                            c.nbytes.map_or(Value::Null, Value::Integer),
                             c.kind.map_or(Value::Null, Value::Text),
                             c.base_version.map_or(Value::Null, Value::Integer),
+                            c.nbytes.map_or(Value::Null, Value::Integer),
                             c.nlines.map_or(Value::Null, Value::Integer),
                             c.nwords.map_or(Value::Null, Value::Integer),
                         ]

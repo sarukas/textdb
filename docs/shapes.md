@@ -93,7 +93,7 @@ words only ever appear apart.
 ## History
 
 One order on both engines and in every SDK, matching the `commits` view:
-`version, author, ts, message, nbytes, kind, base_version, nlines, nwords`.
+`version, author, ts, message, kind, base_version, nbytes, nlines, nwords`.
 
 ## What this replaced
 
@@ -108,3 +108,4 @@ One order on both engines and in every SDK, matching the `commits` view:
 | a key omitted when absent | `null` |
 | `search` limit 100 (SQL), 50 (Node, HTTP), 200 (UI), 50 documents (CLI) | 200 rows everywhere |
 | `kb.folder.n_children`, `nbytes_total` | `files + folders`, `nbytes` |
+| `tree` folder rows `(N files, SIZE)`; `tree FILE` headed `(0 files, 0 B)` | `(N files, M folders, SIZE)`; `tree FILE` prints the one entry |

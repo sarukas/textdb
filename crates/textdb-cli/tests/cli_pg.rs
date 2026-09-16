@@ -97,6 +97,13 @@ fn write_read_move_and_history() {
     let listed = ok(textdb(&db).args(["--json", "ls", "/archive"]), None).json();
     assert_eq!(listed[0]["name"], "a.md", "{listed}");
     let history = ok(textdb(&db).args(["--json", "history", "--versions-only", "/archive/a.md"]), None).json();
+    // The same nine keys in the same order as SQLite, behind the `type` tag the flag keeps.
+    let keys: Vec<String> = history[0].as_object().unwrap().keys().cloned().collect();
+    assert_eq!(
+        keys,
+        ["type", "version", "author", "ts", "message", "kind", "base_version", "nbytes", "nlines", "nwords"],
+        "{history}"
+    );
     let messages: Vec<&str> = history.as_array().unwrap().iter().map(|c| c["message"].as_str().unwrap_or("")).collect();
     assert_eq!(messages, ["first", "second"]);
     assert_eq!(history[1]["nbytes"], 9, "{history}");

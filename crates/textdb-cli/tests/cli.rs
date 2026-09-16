@@ -698,7 +698,7 @@ fn assets_push_pull_verify_links_and_gitignore() {
     std::fs::remove_file(vault.join("docs/deck.pdf")).unwrap();
     assert_eq!(status(&[])["counts"], serde_json::json!({ "not-pulled": 1, "ok": 2 }));
     let broken = ok(&mut t(&["links", "--broken", "--dir", dir]), None).stdout;
-    assert!(broken.contains("[](../docs/deck.pdf) -> /docs/deck.pdf (not-pulled)"), "{broken}");
+    assert!(broken.contains("[deck](../docs/deck.pdf) -> /docs/deck.pdf (not-pulled)"), "{broken}");
     let pulled = ok(&mut t(&["--json", "assets", "pull", "--linked-from", "/notes"]), None).json();
     assert_eq!(pulled["pulled"].as_array().unwrap().len(), 1, "{pulled}");
     assert_eq!(std::fs::read(vault.join("docs/deck.pdf")).unwrap(), b"%PDF-1.4 one");
@@ -2540,4 +2540,60 @@ fn paths_come_back_normalized() {
         let v = ok(textdb(&db).args(&args), None).json();
         assert_eq!(v["path"], "/n/a.md", "{args:?}");
     }
+}
+
+/// The history row's nine keys, in the order the `commits` view and `textdb_history` use.
+/// They used to come back in a third order here, so `SELECT *` consumed positionally swapped
+/// `nbytes` and `kind` between the CLI and either engine.
+#[test]
+fn history_rows_are_in_the_commits_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kb.db");
+    ok(textdb(&db).args(["write", "/h/a.md"]), Some("one\n"));
+    ok(textdb(&db).args(["write", "/h/a.md"]), Some("one\ntwo\n"));
+
+    const ORDER: [&str; 9] =
+        ["version", "author", "ts", "message", "kind", "base_version", "nbytes", "nlines", "nwords"];
+    let keys_of = |v: &Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
+
+    let plain = ok(textdb(&db).args(["--json", "history", "/h/a.md"]), None).json();
+    // `--json history` tags each row; a flag filters rows, it never changes the row type.
+    let tagged: Vec<String> = std::iter::once("type".to_string()).chain(ORDER.map(str::to_string)).collect();
+    assert_eq!(keys_of(&plain[0]), tagged, "history");
+
+    let only = ok(textdb(&db).args(["--json", "history", "/h/a.md", "--versions-only"]), None).json();
+    assert_eq!(keys_of(&only[0]), tagged, "history --versions-only");
+
+    let sql = ok(
+        textdb(&db).args(["--json", "sql", "SELECT * FROM textdb_history('/h/a.md') LIMIT 1"]),
+        None,
+    )
+    .json();
+    let cols: Vec<&str> = sql["columns"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+    assert_eq!(cols, ORDER, "textdb_history");
+
+    // The `commits` view carries the same nine after `path`, then the batch that wrote it.
+    let view = ok(textdb(&db).args(["--json", "sql", "SELECT * FROM commits LIMIT 1"]), None).json();
+    let cols: Vec<&str> = view["columns"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+    let want: Vec<&str> = ["path"].into_iter().chain(ORDER).chain(["batch"]).collect();
+    assert_eq!(cols, want, "commits view");
+}
+
+/// `tree` says what each folder holds all the way down, and `tree FILE` shows the one entry
+/// rather than a header claiming the file's folder holds nothing.
+#[test]
+fn tree_counts_folders_and_prints_a_file_plainly() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kb.db");
+    ok(textdb(&db).args(["write", "/t/api/one.md"]), Some("a\n"));
+    ok(textdb(&db).args(["write", "/t/api/deep/two.md"]), Some("bb\n"));
+
+    let all = ok(textdb(&db).args(["tree", "/t"]), None).stdout;
+    assert!(all.starts_with("/t  (2 files, 2 folders, "), "{all}");
+    assert!(all.contains("api/  (2 files, 1 folder, "), "{all}");
+    assert!(all.contains("deep/  (1 file, 0 folders, "), "{all}");
+
+    let one = ok(textdb(&db).args(["tree", "/t/api/one.md"]), None).stdout;
+    assert!(!one.contains("0 files"), "{one}");
+    assert!(one.contains("one.md"), "{one}");
 }

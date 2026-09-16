@@ -254,14 +254,17 @@ export interface Chunk {
 
 export type CommitKind = "direct" | "rebased" | "merged";
 
+/** One version of a file: the canonical history row from `docs/shapes.md`. */
 export interface HistoryEntry {
   version: number;
   author: string | null;
   ts: string;
   message: string | null;
-  nbytes: number;
   kind: CommitKind | null;
   base_version: number | null;
+  nbytes: number;
+  nlines: number | null;
+  nwords: number | null;
 }
 
 /** One matching line: the canonical hit row from `docs/shapes.md`. */

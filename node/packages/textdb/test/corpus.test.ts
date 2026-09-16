@@ -46,6 +46,18 @@ describe('corpus', () => {
         [2, 'human', null, 'direct', 1],
       ],
     );
+    // The nine keys of the history row, in the order the `commits` view uses on both engines.
+    assert.deepEqual(Object.keys(history[0]), [
+      'version',
+      'author',
+      'ts',
+      'message',
+      'kind',
+      'base_version',
+      'nbytes',
+      'nlines',
+      'nwords',
+    ]);
     assert.deepEqual(kb.hunks('/docs/a.md'), [
       { old_from: 2, old_count: 1, new_from: 2, new_count: 1, old_text: 'two\n', new_text: 'TWO\n' },
     ]);

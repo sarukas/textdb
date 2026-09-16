@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, OptionalExtension};
 use textdb_core::CommitKind;
 use textdb_sqlite::db::subtree_bounds;
-use textdb_sqlite::{normalize_path, NodeRow, TextDb, DEFAULT_PREFIX};
+use textdb_sqlite::{normalize_path, TextDb, DEFAULT_PREFIX};
 
 use super::{
     Author, BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, MovedBack, PathEvent,
@@ -943,7 +943,7 @@ fn sql_views(p: &str) -> String {
            SELECT n.path, r.key, r.val_txt AS value, r.val_num AS number, r.ord
            FROM {p}property r JOIN {p}node n ON n.id = r.file_id AND n.deleted_at IS NULL;
          CREATE TEMP VIEW IF NOT EXISTS commits AS
-           SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines, c.batch
+           SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines, c.nwords, c.batch
            FROM {p}commit c JOIN {p}node n ON n.id = c.file_id AND n.deleted_at IS NULL;
          CREATE TEMP VIEW IF NOT EXISTS authors AS
            SELECT n.path, nullif(a.author, '') AS author, a.commits, a.first_ts, a.last_ts

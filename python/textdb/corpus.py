@@ -161,11 +161,11 @@ class Commit:
     #: ISO-8601 UTC with milliseconds and ``Z``, a ``str`` on both backends.
     ts: str
     message: Optional[str]
-    nbytes: Optional[int]
     #: How the commit landed: ``direct``, ``rebased`` or ``merged``.
     kind: Optional[str]
     #: The version the writer started from; ``None`` for a file's first version.
     base_version: Optional[int]
+    nbytes: Optional[int]
     nlines: Optional[int]
     nwords: Optional[int]
 

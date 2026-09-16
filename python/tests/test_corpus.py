@@ -56,6 +56,13 @@ def test_write_read_edit_history(kb):
     assert kb.append(p, "tail\n") == 3
     assert kb.read_version(p, 1).count("beta") == 1
     assert [c.version for c in kb.history(p)] == [1, 2, 3]
+    # The nine fields of the history row, in the order the `commits` view uses on both engines.
+    assert [f.name for f in dataclasses.fields(kb.history(p)[0])] == [
+        "version", "author", "ts", "message", "kind", "base_version", "nbytes", "nlines", "nwords",
+    ]
+    last = kb.history(p)[-1]
+    assert (last.kind, last.base_version, last.nlines) == ("direct", 2, 6)
+    assert last.ts.endswith("Z") and last.nbytes > 0
     assert "-beta\n+BETA\n" in kb.diff(p, 1, 2)
     assert kb.version(p) == 3
     with pytest.raises(InvalidEdit):

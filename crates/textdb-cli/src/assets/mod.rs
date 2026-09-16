@@ -462,8 +462,8 @@ impl VaultCache {
 pub struct Item {
     /// The asset's path in the store.
     pub path: String,
-    /// `ok`, `new`, `modified`, `outdated`, `conflict`, `not-pulled`, `invalid-pointer` or
-    /// `invalid-path`.
+    /// `ok`, `new`, `modified`, `outdated`, `conflict`, `not-pulled`, `conflict-copy`, `orphan`,
+    /// `invalid-pointer` or `invalid-path`.
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
