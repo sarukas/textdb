@@ -16,6 +16,7 @@ use pgrx::prelude::*;
 mod bulk;
 mod links;
 mod property;
+mod sections;
 mod store;
 
 extension_sql!(
@@ -62,7 +63,7 @@ CREATE TABLE kb.commit (
   base_version bigint,      -- the version the writer started from (NULL for version 1)
   batch text,               -- the batch (session setting textdb.batch) the commit belongs to
   PRIMARY KEY (file_id, version)
-);
+, nwords bigint);
 -- Change feed: one row per create, commit, mkdir, move and delete, written in the same
 -- transaction as the change; each row is also announced with pg_notify('textdb_change', seq).
 CREATE TABLE kb.change (
@@ -87,8 +88,15 @@ CREATE TABLE kb.chunk (
 );
 CREATE TABLE kb.tree_node (hash bytea PRIMARY KEY, children bytea NOT NULL);
 CREATE TABLE kb.chunk_ref (chunk_id bigint NOT NULL, file_id bigint NOT NULL, version bigint NOT NULL, PRIMARY KEY (chunk_id, file_id));
-CREATE TABLE kb.section (file_id bigint NOT NULL, version bigint NOT NULL, heading_path text NOT NULL, level int NOT NULL, line_from bigint NOT NULL, line_to bigint NOT NULL);
+CREATE TABLE kb.section (file_id bigint NOT NULL, version bigint NOT NULL, heading_path text NOT NULL, level int NOT NULL, line_from bigint NOT NULL, line_to bigint NOT NULL,
+  heading text NOT NULL DEFAULT '',            -- the last component of heading_path, as written
+  heading_lc text NOT NULL DEFAULT '',         -- folded, so a match is an index seek
+  -- The section's own lines, and it plus everything nested under it. Words never span a line
+  -- and sections partition by line, so both are exact and the totals compose.
+  nwords bigint, nwords_total bigint);
 CREATE INDEX section_file ON kb.section(file_id, version);
+CREATE INDEX section_heading ON kb.section(heading_lc text_pattern_ops);
+CREATE INDEX section_level ON kb.section(level, heading_lc);
 -- Links as written (target without anchor or alias), and what each resolves to by the rules the
 -- stores share (textdb_md::resolve). target_name (last segment, lower case, without .md) finds
 -- the rows a created, moved or deleted file can change.
@@ -832,7 +840,7 @@ mod kb {
             _ => ok(words_at(&st, &c.root)) as i64,
         };
         Spi::run_with_args(
-            "INSERT INTO kb.commit(file_id, version, root, parent_root, author, message, nbytes, nlines, kind, base_version, batch) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, kb.batch())",
+            "INSERT INTO kb.commit(file_id, version, root, parent_root, author, message, nbytes, nlines, nwords, kind, base_version, batch) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $11, $9, $10, kb.batch())",
             &[
                 file_id.into(),
                 (c.version as i64).into(),
@@ -844,6 +852,7 @@ mod kb {
                 (nlines as i64).into(),
                 c.kind.as_str().into(),
                 base_version.into(),
+                nwords.into(),
             ],
         )
         .unwrap_or_else(|e| spi_err(e));
@@ -897,7 +906,23 @@ mod kb {
     /// headings, links and front matter are what the rows already hold — most edits — only the
     /// rows' version moves: no rows are rewritten and no link is resolved again.
     fn write_structure(file_id: i64, version: i64, s: &textdb_core::structure::Structure) -> Result<(), TextdbError> {
-        if structure_matches(file_id, s)? {
+        let diff = structure_diff(file_id, s)?;
+        if diff != StructureDiff::Different {
+            // Word counts move on nearly every body edit while the heading tree stays put, so
+            // they are refreshed on their own rather than forcing the rewrite below. One
+            // statement for the document, keyed on `line_from`: a heading owns its line.
+            if diff == StructureDiff::CountsOnly {
+                let lines: Vec<i64> = s.sections.iter().map(|x| x.line_from as i64).collect();
+                let own: Vec<i64> = s.sections.iter().map(|x| x.nwords as i64).collect();
+                let tot: Vec<i64> = s.sections.iter().map(|x| x.nwords_total as i64).collect();
+                Spi::run_with_args(
+                    "UPDATE kb.section t SET nwords = v.own, nwords_total = v.tot \
+                       FROM unnest($2::bigint[], $3::bigint[], $4::bigint[]) AS v(ln, own, tot) \
+                      WHERE t.file_id = $1 AND t.line_from = v.ln",
+                    &[file_id.into(), lines.into(), own.into(), tot.into()],
+                )
+                .map_err(storage_err)?;
+            }
             for t in ["kb.section", "kb.link", "kb.frontmatter", "kb.property"] {
                 Spi::run_with_args(&format!("UPDATE {t} SET version = $1 WHERE file_id = $2 AND version <> $1"), &[version.into(), file_id.into()])
                     .map_err(storage_err)?;
@@ -907,16 +932,31 @@ mod kb {
         for t in ["kb.section", "kb.frontmatter"] {
             Spi::run_with_args(&format!("DELETE FROM {} WHERE file_id = $1", t), &[file_id.into()]).map_err(storage_err)?;
         }
-        for sec in &s.sections {
+        // Unnested arrays rather than a statement per heading: a 1 MiB document with 339 of
+        // them would otherwise pay 339 round trips through SPI on every structural change.
+        if !s.sections.is_empty() {
+            let paths: Vec<&str> = s.sections.iter().map(|x| x.heading_path.as_str()).collect();
+            let heads: Vec<&str> = s.sections.iter().map(|x| x.heading.as_str()).collect();
+            let heads_lc: Vec<String> = s.sections.iter().map(|x| x.heading.to_lowercase()).collect();
+            let levels: Vec<i32> = s.sections.iter().map(|x| x.level as i32).collect();
+            let from: Vec<i64> = s.sections.iter().map(|x| x.line_from as i64).collect();
+            let to: Vec<i64> = s.sections.iter().map(|x| x.line_to as i64).collect();
+            let own: Vec<i64> = s.sections.iter().map(|x| x.nwords as i64).collect();
+            let tot: Vec<i64> = s.sections.iter().map(|x| x.nwords_total as i64).collect();
             Spi::run_with_args(
-                "INSERT INTO kb.section(file_id, version, heading_path, level, line_from, line_to) VALUES ($1, $2, $3, $4, $5, $6)",
+                "INSERT INTO kb.section(file_id, version, heading_path, level, line_from, line_to, heading, heading_lc, nwords, nwords_total) \
+                 SELECT $1, $2, * FROM unnest($3::text[], $4::int[], $5::bigint[], $6::bigint[], $7::text[], $8::text[], $9::bigint[], $10::bigint[])",
                 &[
                     file_id.into(),
                     version.into(),
-                    sec.heading_path.as_str().into(),
-                    (sec.level as i32).into(),
-                    (sec.line_from as i64).into(),
-                    (sec.line_to as i64).into(),
+                    paths.into(),
+                    levels.into(),
+                    from.into(),
+                    to.into(),
+                    heads.into(),
+                    heads_lc.into(),
+                    own.into(),
+                    tot.into(),
                 ],
             )
             .map_err(storage_err)?;
@@ -936,19 +976,36 @@ mod kb {
         crate::links::relink_file(file_id)
     }
 
-    /// Do the stored rows for `file_id` already describe `s`, version aside?
-    fn structure_matches(file_id: i64, s: &textdb_core::structure::Structure) -> Result<bool, TextdbError> {
-        let same_sections = Spi::connect(|client| {
+    /// What a commit changed about a document's structure rows.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StructureDiff {
+        /// Nothing; only the `version` column has to move forward.
+        Same,
+        /// The heading tree is intact but word counts under it moved — the common case for a
+        /// body edit, and much cheaper to serve than a rewrite.
+        CountsOnly,
+        /// Headings, links or front matter moved; the rows are rebuilt.
+        Different,
+    }
+
+    /// How the stored rows for `file_id` differ from `s`, version aside.
+    ///
+    /// Three outcomes rather than two because the two kinds of change cost very differently:
+    /// a heading tree that has not moved needs no delete, no re-insert and no relink, even
+    /// when every word count under it has changed.
+    fn structure_diff(file_id: i64, s: &textdb_core::structure::Structure) -> Result<StructureDiff, TextdbError> {
+        let (same_sections, counts_differ) = Spi::connect(|client| {
             let rows = client
                 .select(
-                    "SELECT heading_path, level, line_from, line_to FROM kb.section WHERE file_id = $1 ORDER BY line_from, level",
+                    "SELECT heading_path, level, line_from, line_to, nwords, nwords_total FROM kb.section WHERE file_id = $1 ORDER BY line_from, level",
                     None,
                     &[file_id.into()],
                 )
                 .map_err(storage_err)?;
             if rows.len() != s.sections.len() {
-                return Ok::<_, TextdbError>(false);
+                return Ok::<_, TextdbError>((false, false));
             }
+            let mut counts = false;
             for (r, sec) in rows.zip(&s.sections) {
                 let stored = (
                     r.get::<String>(1).map_err(storage_err)?.unwrap_or_default(),
@@ -957,13 +1014,17 @@ mod kb {
                     r.get::<i64>(4).map_err(storage_err)?.unwrap_or(0),
                 );
                 if stored != (sec.heading_path.clone(), sec.level as i64, sec.line_from as i64, sec.line_to as i64) {
-                    return Ok(false);
+                    return Ok((false, false));
+                }
+                let words = (r.get::<i64>(5).map_err(storage_err)?, r.get::<i64>(6).map_err(storage_err)?);
+                if words != (Some(sec.nwords as i64), Some(sec.nwords_total as i64)) {
+                    counts = true;
                 }
             }
-            Ok(true)
+            Ok((true, counts))
         })?;
         if !same_sections {
-            return Ok(false);
+            return Ok(StructureDiff::Different);
         }
         let same_links = Spi::connect(|client| {
             let rows = client
@@ -992,7 +1053,7 @@ mod kb {
             Ok(true)
         })?;
         if !same_links {
-            return Ok(false);
+            return Ok(StructureDiff::Different);
         }
         // Front matter compared as jsonb, which ignores key order and spacing.
         let want = s.frontmatter.as_ref().map(|fm| fm.to_string());
@@ -1001,11 +1062,15 @@ mod kb {
             &[file_id.into(), want.as_deref().into()],
         )
         .map_err(storage_err)?;
-        Ok(match (stored, want) {
+        let same_fm = match (stored, want) {
             (None, None) => true,
             (Some(same), Some(_)) => same,
             _ => false,
-        })
+        };
+        if !same_fm {
+            return Ok(StructureDiff::Different);
+        }
+        Ok(if counts_differ { StructureDiff::CountsOnly } else { StructureDiff::Same })
     }
 
     /// Create a file (parents created), commit version 1.
@@ -1516,6 +1581,8 @@ mod kb {
             name!(kind, Option<String>),
             name!(base_version, Option<i64>),
             name!(nbytes, Option<i64>),
+            name!(nlines, Option<i64>),
+            name!(nwords, Option<i64>),
         ),
     > {
         let path = ok(normalize_path(path));
@@ -1523,7 +1590,7 @@ mod kb {
         let rows: Vec<_> = Spi::connect(|client| {
             let t = client
                 .select(
-                    "SELECT version, author, ts, message, kind, base_version, nbytes FROM kb.commit WHERE file_id = $1 ORDER BY version",
+                    "SELECT version, author, ts, message, kind, base_version, nbytes, nlines, nwords FROM kb.commit WHERE file_id = $1 ORDER BY version",
                     None,
                     &[n.id.into()],
                 )
@@ -1538,6 +1605,8 @@ mod kb {
                     r.get::<String>(5).unwrap_or_else(|e| spi_err(e)),
                     r.get::<i64>(6).unwrap_or_else(|e| spi_err(e)),
                     r.get::<i64>(7).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<i64>(8).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<i64>(9).unwrap_or_else(|e| spi_err(e)),
                 ));
             }
             v
@@ -1832,12 +1901,37 @@ mod kb {
     /// nothing until this has run — silently, which is worse than slowly, so it is a named
     /// repair rather than something hidden in a read path. Idempotent: it skips documents
     /// that already have rows, so running it twice costs one query.
+    /// Fill `heading` and `heading_lc` for section rows written before those columns existed.
+    ///
+    /// The last component of the stored `heading_path` is exactly what the extractor would
+    /// have written, so no document has to be read. Word counts need the bytes and stay
+    /// `NULL` until each document is next written. Idempotent, and the number it returns is
+    /// how many rows it repaired.
+    #[pg_extern]
+    fn rebuild_headings() -> i64 {
+        ok(crate::sections::backfill())
+    }
+
     #[pg_extern]
     fn rebuild_properties() -> i64 {
         ok(crate::property::backfill());
         Spi::get_one::<i64>("SELECT count(*) FROM kb.property")
             .unwrap_or(Some(0))
             .unwrap_or(0)
+    }
+
+    /// The half-open path range that holds everything under `path`, as `[path/, path0)`.
+    ///
+    /// `/` sorts just below every character a path segment can start with and `0` is its
+    /// successor, so the range is exact: nothing sorts between them. The root has no bound,
+    /// and takes the range that holds every path. Matches `textdb_sqlite::db::subtree_bounds`
+    /// so one prefix means the same thing on either engine, and seeks `node_path` where
+    /// `LIKE` would scan it.
+    fn subtree_bounds(path: &str) -> (String, String) {
+        if path == "/" {
+            return ("/".to_string(), "0".to_string());
+        }
+        (format!("{}/", path), format!("{}0", path))
     }
 
     /// `[lo, hi)` covering everything that starts with `p`, so a prefix match reads an index
@@ -1857,6 +1951,153 @@ mod kb {
 
     /// Front-matter property names in use, most-used first; `prefix` narrows them.
     ///
+    /// Headings under `prefix`, with the file columns a caller would otherwise join for.
+    ///
+    /// `prefix` is a folder or a single document; `/` is the whole vault. `heading` narrows to
+    /// one heading, matched folded so `Next Steps` finds `next steps`, with `mode` choosing
+    /// `exact`, `prefix` or `contains` — the first two seek `section_heading`, the third is the
+    /// one shape that has to scan. Rows come back in document order within a document and in
+    /// path order across them, so an outline pane renders them without sorting.
+    #[pg_extern(stable)]
+    #[allow(clippy::type_complexity)]
+    fn outline(
+        prefix: default!(&str, "'/'"),
+        heading: default!(Option<&str>, "NULL"),
+        mode: default!(&str, "'exact'"),
+        max_level: default!(Option<i64>, "NULL"),
+        lim: default!(i64, 1000),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(path, String),
+            name!(heading, String),
+            name!(heading_path, String),
+            name!(level, i64),
+            name!(line_from, i64),
+            name!(line_to, i64),
+            name!(nwords, Option<i64>),
+            name!(nwords_total, Option<i64>),
+            name!(nbytes, Option<i64>),
+            name!(nlines, Option<i64>),
+            name!(file_nwords, Option<i64>),
+            name!(version, i64),
+            name!(updated_at, pgrx::datum::TimestampWithTimeZone),
+            name!(updated_by, Option<String>),
+        ),
+    > {
+        let prefix = ok(normalize_path(prefix));
+        let (lo, hi) = subtree_bounds(&prefix);
+        let folded = heading.map(|h| h.to_lowercase());
+        // The predicate is chosen before any text is emitted so the placeholder numbers line
+        // up: `prefix` needs two bound values, the others one.
+        let (clause, hlo, hhi) = match (folded.as_deref(), mode) {
+            (None, _) => (String::new(), String::new(), String::new()),
+            (Some(h), "prefix") => {
+                let (a, b) = prefix_range(h);
+                (" AND s.heading_lc >= $6 AND s.heading_lc < $7".to_string(), a, b)
+            }
+            (Some(h), "contains") => (
+                " AND s.heading_lc LIKE $6 ESCAPE '\\'".to_string(),
+                format!("%{}%", h.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")),
+                String::new(),
+            ),
+            (Some(h), _) => (" AND s.heading_lc = $6".to_string(), h.to_string(), String::new()),
+        };
+        let sql = format!(
+            "SELECT n.path, s.heading, s.heading_path, s.level::bigint, s.line_from, s.line_to,
+                    s.nwords, s.nwords_total, n.nbytes, n.nlines, n.nwords, n.version,
+                    n.updated_at, n.updated_by
+               FROM kb.section s JOIN kb.node n ON n.id = s.file_id
+              WHERE n.deleted_at IS NULL AND (n.path = $1 OR (n.path >= $2 AND n.path < $3))
+                AND ($4::bigint IS NULL OR s.level <= $4){clause}
+              ORDER BY n.path, s.line_from LIMIT $5"
+        );
+        let rows = Spi::connect(|client| {
+            let mut args: Vec<pgrx::datum::DatumWithOid> = vec![
+                prefix.as_str().into(),
+                lo.as_str().into(),
+                hi.as_str().into(),
+                max_level.into(),
+                lim.max(1).into(),
+            ];
+            if !clause.is_empty() {
+                args.push(hlo.as_str().into());
+                if !hhi.is_empty() {
+                    args.push(hhi.as_str().into());
+                }
+            }
+            let r = client.select(&sql, None, &args).unwrap_or_else(|e| spi_err(e));
+            let mut out = Vec::new();
+            for row in r {
+                out.push((
+                    row.get::<String>(1).unwrap_or_default().unwrap_or_default(),
+                    row.get::<String>(2).unwrap_or_default().unwrap_or_default(),
+                    row.get::<String>(3).unwrap_or_default().unwrap_or_default(),
+                    row.get::<i64>(4).unwrap_or_default().unwrap_or(0),
+                    row.get::<i64>(5).unwrap_or_default().unwrap_or(0),
+                    row.get::<i64>(6).unwrap_or_default().unwrap_or(0),
+                    row.get::<i64>(7).unwrap_or_default(),
+                    row.get::<i64>(8).unwrap_or_default(),
+                    row.get::<i64>(9).unwrap_or_default(),
+                    row.get::<i64>(10).unwrap_or_default(),
+                    row.get::<i64>(11).unwrap_or_default(),
+                    row.get::<i64>(12).unwrap_or_default().unwrap_or(0),
+                    row.get::<pgrx::datum::TimestampWithTimeZone>(13).unwrap_or_default().expect("updated_at"),
+                    row.get::<String>(14).unwrap_or_default(),
+                ));
+            }
+            out
+        });
+        TableIterator::new(rows)
+    }
+
+    /// Distinct headings under `prefix`, most-used first. The autosuggest call for outlines,
+    /// so it reads the folded index range rather than grouping raw heading text.
+    #[pg_extern(stable)]
+    fn headings(
+        prefix: default!(&str, "'/'"),
+        starts: default!(&str, "''"),
+        lim: default!(i64, 100),
+    ) -> TableIterator<'static, (name!(heading, String), name!(sections, i64), name!(docs, i64))> {
+        let prefix = ok(normalize_path(prefix));
+        let (lo, hi) = subtree_bounds(&prefix);
+        let lower = starts.to_lowercase();
+        let (hlo, hhi) = prefix_range(&lower);
+        let rows = Spi::connect(|client| {
+            let r = client
+                .select(
+                    "SELECT min(s.heading), count(*), count(DISTINCT s.file_id)
+                       FROM kb.section s JOIN kb.node n ON n.id = s.file_id
+                      WHERE n.deleted_at IS NULL AND (n.path = $1 OR (n.path >= $2 AND n.path < $3))
+                        AND ($4 = '' OR (s.heading_lc >= $5 AND s.heading_lc < $6))
+                      GROUP BY s.heading_lc
+                      ORDER BY count(*) DESC, s.heading_lc
+                      LIMIT $7",
+                    None,
+                    &[
+                        prefix.as_str().into(),
+                        lo.as_str().into(),
+                        hi.as_str().into(),
+                        lower.as_str().into(),
+                        hlo.as_str().into(),
+                        hhi.as_str().into(),
+                        lim.max(1).into(),
+                    ],
+                )
+                .unwrap_or_else(|e| spi_err(e));
+            let mut out = Vec::new();
+            for row in r {
+                out.push((
+                    row.get::<String>(1).unwrap_or_default().unwrap_or_default(),
+                    row.get::<i64>(2).unwrap_or_default().unwrap_or(0),
+                    row.get::<i64>(3).unwrap_or_default().unwrap_or(0),
+                ));
+            }
+            out
+        });
+        TableIterator::new(rows)
+    }
+
     /// This is the autosuggest call — it runs on every keystroke — so it reads an index range
     /// over the folded key rather than enumerating `jsonb` keys, which took 1,007 ms over
     /// 50,000 notes.
