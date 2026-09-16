@@ -112,19 +112,19 @@ pub struct PgStore {
 
 /// Keep the extension's `TX00n` SQLSTATEs, and the conflict payload it puts in `DETAIL`.
 fn pg(e: postgres::Error) -> StoreError {
+    let of = |code: String, db: &postgres::error::DbError| StoreError {
+        conflict: (code == "TX001").then(|| db.detail().and_then(|d| serde_json::from_str(d).ok())).flatten(),
+        message: db.message().trim_start_matches(&code).trim_start().to_string(),
+        code,
+    };
     match e.as_db_error() {
-        Some(db) if db.code().code().starts_with("TX") => {
-            let code = db.code().code().to_string();
-            let conflict = if code == "TX001" {
-                db.detail().and_then(|d| serde_json::from_str(d).ok())
-            } else {
-                None
-            };
-            StoreError {
-                code,
-                message: db.message().to_string(),
-                conflict,
-            }
+        Some(db) if db.code().code().starts_with("TX") => of(db.code().code().to_string(), db),
+        // An error the extension raised inside SPI arrives as `XX000`: the re-raise on the way out
+        // of a `#[pg_extern]` keeps the message and drops the SQLSTATE. `raise` puts the code in
+        // front of the message for exactly this case, so a refusal is still a refusal here and not
+        // an internal error (#12 C, H).
+        Some(db) if db.message().len() > 5 && db.message().starts_with("TX") && db.message()[2..5].bytes().all(|c| c.is_ascii_digit()) => {
+            of(db.message()[..5].to_string(), db)
         }
         Some(db) => StoreError::other(format!("{} (SQLSTATE {})", db.message(), db.code().code())),
         None => StoreError::other(e),
@@ -175,7 +175,11 @@ fn entry(r: &Row) -> Entry {
         // the same `entry()` reads rows from queries written before these columns existed.
         share: r.try_get("share").ok().flatten(),
         rights: r.try_get("rights").ok().flatten(),
-        shares: None,
+        shares: r
+            .try_get::<_, Option<String>>("shares")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok()),
         authors: authors.and_then(|a| serde_json::from_str(&a).ok()).unwrap_or_default(),
     }
 }
@@ -192,7 +196,7 @@ fn entry_cols() -> String {
     format!(
         "e.path, e.name, e.kind, e.version, e.nbytes, e.nlines, {upd}, e.updated_by, e.id, e.dir, e.depth, e.ext, \
          e.title, e.nwords, e.nsections, e.nprops, e.nlinks, e.nlinks_broken, e.versions, {cre}, e.files, e.folders, \
-         e.nauthors, e.authors::text",
+         e.nauthors, e.authors::text, e.share, e.rights, e.shares::text",
         upd = utc("e.updated_at"),
         cre = utc("e.created_at"),
     )

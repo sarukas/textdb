@@ -91,9 +91,17 @@ CREATE TABLE kb.change (
   commit_kind  text,                 -- create, commit: direct, rebased, merged
   author       text,
   message      text,
-  batch        text                  -- the batch (session setting textdb.batch) the change belongs to
+  batch        text,                 -- the batch (session setting textdb.batch) the change belongs to
+  -- Whose feed alone carries this row: an event about one account's shares, which nobody else's
+  -- feed shows. A revocation has to be recorded this way — by the time it lands the account can
+  -- no longer see the folder it is about, so a row filtered by visibility would never reach it
+  -- (#12 F7-F9). NULL for an ordinary change, which every account that can see the path gets.
+  -- A plain id, not a foreign key: kb.account is created further down this same script, and an
+  -- account is disabled rather than deleted, so there is nothing for a cascade to do.
+  for_account  bigint
 );
 CREATE INDEX change_node ON kb.change(node_id);
+CREATE INDEX change_for_account ON kb.change(for_account, seq) WHERE for_account IS NOT NULL;
 CREATE INDEX change_batch ON kb.change(batch) WHERE batch IS NOT NULL;
 CREATE TABLE kb.chunk (
   id bigserial PRIMARY KEY, hash bytea NOT NULL UNIQUE, bytes bytea NOT NULL, nlines int NOT NULL
@@ -559,7 +567,9 @@ CREATE VIEW kb.entry AS
          (SELECT g.alias FROM kb.my_grant g
            WHERE NOT g.dormant AND (n.path = g.store_path OR n.path LIKE kb._subtree_like(g.store_path)) LIMIT 1) AS share,
          (SELECT g.rights FROM kb.my_grant g
-           WHERE NOT g.dormant AND (n.path = g.store_path OR n.path LIKE kb._subtree_like(g.store_path)) LIMIT 1) AS rights
+           WHERE NOT g.dormant AND (n.path = g.store_path OR n.path LIKE kb._subtree_like(g.store_path)) LIMIT 1) AS rights,
+         -- Only the root row carries the share list; here so the two views union.
+         NULL::jsonb AS shares
   FROM kb.node n
   CROSS JOIN LATERAL (SELECT CASE WHEN (SELECT kb.current_account()) IS NULL THEN n.path ELSE kb.to_view(n.path) END AS p) v
   LEFT JOIN LATERAL (
@@ -590,7 +600,11 @@ CREATE VIEW kb.root_entry AS
          coalesce(sum(e.nlinks_broken), 0)::bigint AS nlinks_broken,
          coalesce(sum(e.versions), 0)::bigint AS versions, min(e.created_at) AS created_at,
          coalesce(sum(e.files), 0)::bigint AS files, coalesce(sum(e.folders) + count(*), 0)::bigint AS folders,
-         0::bigint AS nauthors, '[]'::jsonb AS authors, NULL::text AS share, NULL::text AS rights
+         0::bigint AS nauthors, '[]'::jsonb AS authors, NULL::text AS share, NULL::text AS rights,
+         -- What the root is made of. The root is not a node, so this is the only place a caller
+         -- can read its shares; in path order, as the rows above are (#12 A8).
+         (SELECT coalesce(jsonb_agg(jsonb_build_object('alias', g.alias, 'rights', g.rights) ORDER BY g.store_path), '[]'::jsonb)
+            FROM kb.my_grant g WHERE NOT g.dormant) AS shares
     FROM kb.entry e
    WHERE (SELECT kb.current_account()) IS NOT NULL
      AND NOT EXISTS (SELECT 1 FROM kb.my_grant WHERE alias = '')
@@ -801,12 +815,35 @@ mod kb {
     /// through SPI, which is a change to the extension's whole error path rather than to one
     /// function, so it is recorded here rather than bolted onto a caller.
     fn fail(e: TextdbError) -> ! {
+        let e = to_view_err(e);
         match &e {
             TextdbError::Conflict(c) => raise("TX001", &e.to_string(), &serde_json::to_string(c).unwrap_or_default()),
             TextdbError::Contention => raise("TX002", &e.to_string(), ""),
             TextdbError::NotFound(_) => raise("TX003", &e.to_string(), ""),
             TextdbError::InvalidEdit(_) => raise("TX004", &e.to_string(), ""),
+            TextdbError::Forbidden(_) => raise("TX005", &e.to_string(), ""),
             _ => raise("TX000", &e.to_string(), ""),
+        }
+    }
+
+    /// Put the caller's own paths back into an error on its way out.
+    ///
+    /// Errors carry paths too — a conflict payload names the file it is about, and a not-found
+    /// names what was not found. Translating rows but not errors is how a store path leaks to an
+    /// account that must not learn the layout, and it leaks precisely when something went wrong,
+    /// which is when people paste the message somewhere (#12 C16).
+    fn to_view_err(e: TextdbError) -> TextdbError {
+        if account_id_now().is_none() {
+            return e;
+        }
+        let seen = |p: &str| to_view(p).unwrap_or_else(|| OUTSIDE.to_string());
+        match e {
+            TextdbError::NotFound(p) if p.starts_with('/') => TextdbError::NotFound(seen(&p)),
+            TextdbError::Conflict(mut c) => {
+                c.path = seen(&c.path);
+                TextdbError::Conflict(c)
+            }
+            other => other,
         }
     }
 
@@ -1037,6 +1074,123 @@ mod kb {
         }
     }
 
+    /// What a path outside the caller's shares is called where one has to be named: a history
+    /// row's `old_path`, an error's subject. The same words on both engines.
+    const OUTSIDE: &str = "(outside your shares)";
+
+    /// A store path as this connection sees it; `None` when it sees nothing there. The owner's
+    /// paths are the store's own, so this answers without touching the database for them.
+    fn to_view(store_path: &str) -> Option<String> {
+        if account_id_now().is_none() {
+            return Some(store_path.to_string());
+        }
+        Spi::get_one_with_args::<String>("SELECT kb.to_view($1)", &[store_path.into()]).ok().flatten()
+    }
+
+    /// This connection's view of the store, or `None` for the owner, who has no translation to do.
+    ///
+    /// The same `View` the SQLite binding builds, from the same three tables, so link projection
+    /// is one algorithm over two persistences rather than two implementations that have to be
+    /// kept agreeing (#12 part 2).
+    pub(crate) fn current_view() -> Option<textdb_core::access::View> {
+        use textdb_core::access::{Namespace, View};
+        let id = account_id_now()?;
+        let row: Option<(String, Option<i64>)> = Spi::connect(|client| {
+            let t = client
+                .select("SELECT name, root_node_id FROM kb.account WHERE id = $1", None, &[id.into()])
+                .ok()?;
+            t.into_iter().next().map(|r| {
+                (
+                    r.get::<String>(1).ok().flatten().unwrap_or_default(),
+                    r.get::<i64>(2).ok().flatten(),
+                )
+            })
+        });
+        let (name, root) = row?;
+        let ns = if root.is_some() { Namespace::SingleRoot } else { Namespace::Aliased };
+        Some(View::account(&name, ns, grants_of(id)))
+    }
+
+    /// The link targets written in some text, each resolved to the document it names, as the
+    /// projector needs them.
+    ///
+    /// Scanned from the text rather than read from `kb.link`: the rows hold the current version's
+    /// links and an older version's offsets would not line up, and this way the projection needs
+    /// no columns of its own on either engine.
+    fn scan_target_spans(text: &[u8]) -> Vec<textdb_core::access::TargetSpan> {
+        use textdb_md::MarkdownExtractor;
+        use textdb_core::StructureExtractor;
+        MarkdownExtractor
+            .extract(text)
+            .links
+            .into_iter()
+            .filter(|l| !l.external)
+            .filter_map(|l| {
+                let (from, to) = l.span?;
+                let store = format!("/{}", l.target_path.trim_start_matches('/'));
+                let mut span = textdb_core::access::TargetSpan {
+                    target: l.target_path,
+                    from: from as usize,
+                    to: to as usize,
+                    kind: l.kind,
+                    resolved: None,
+                    resolved_id: None,
+                    alias: l.alias,
+                };
+                for candidate in [store.clone(), format!("{store}.md")] {
+                    if let Some(n) = node_by_path(&candidate) {
+                        span.resolved = Some(n.path);
+                        span.resolved_id = Some(n.id);
+                        break;
+                    }
+                }
+                Some(span)
+            })
+            .collect()
+    }
+
+    /// A document as this caller reads it: root-absolute links in its own paths, and the ones it
+    /// cannot see as `textdb:<id>`. The owner's text is the store's own, untouched.
+    fn project_text(text: &[u8]) -> Vec<u8> {
+        let Some(view) = current_view() else { return text.to_vec() };
+        let spans = scan_target_spans(text);
+        if spans.is_empty() {
+            return text.to_vec();
+        }
+        textdb_core::access::project(&view, text, &spans).0
+    }
+
+    /// The inverse, for text arriving from a caller.
+    fn unproject_text(text: &[u8]) -> Vec<u8> {
+        let Some(view) = current_view() else { return text.to_vec() };
+        let spans = scan_target_spans(text);
+        if spans.is_empty() {
+            return text.to_vec();
+        }
+        let by_id = |id: i64| {
+            Spi::get_one_with_args::<String>("SELECT path FROM kb.node WHERE id = $1 AND deleted_at IS NULL", &[id.into()])
+                .ok()
+                .flatten()
+        };
+        textdb_core::access::unproject(&view, text, &spans, by_id)
+    }
+
+    /// [`project_text`] over a string, for the surfaces that speak `String`.
+    fn project_str(text: String) -> String {
+        if account_id_now().is_none() {
+            return text;
+        }
+        String::from_utf8_lossy(&project_text(text.as_bytes())).into_owned()
+    }
+
+    /// [`unproject_text`] over a string.
+    fn unproject_str(text: &str) -> String {
+        if account_id_now().is_none() {
+            return text.to_string();
+        }
+        String::from_utf8_lossy(&unproject_text(text.as_bytes())).into_owned()
+    }
+
     /// A caller's path as a store path, raising TX003 or TX005 as `kb.resolve` decides. Returns
     /// the path unchanged for the owner without touching the database.
     fn resolve(path: &str, need_write: bool) -> String {
@@ -1087,6 +1241,18 @@ mod kb {
         Spi::get_one::<i64>("SELECT currval(pg_get_serial_sequence('kb.change', 'seq'))")
             .unwrap_or_else(|e| spi_err(e))
             .unwrap_or(0)
+    }
+
+    /// One row in an account's own feed: an event about its shares, which nobody else's feed
+    /// carries. Its paths are already the account's — the alias has no store path to translate
+    /// from — so the feed hands them out as they are (#12 F7-F9).
+    fn record_share_event(account_id: i64, op: &str, node_id: i64, path: &str, old_path: Option<&str>, message: &str) {
+        Spi::run_with_args(
+            "WITH c AS (INSERT INTO kb.change(op, node_id, node_kind, path, old_path, message, for_account, batch) \
+             VALUES ($1, $2, 0, $3, $4, $5, $6, kb.batch()) RETURNING seq) SELECT pg_notify('textdb_change', seq::text) FROM c",
+            &[op.into(), node_id.into(), path.into(), old_path.into(), message.into(), account_id.into()],
+        )
+        .unwrap_or_else(|e| spi_err(e));
     }
 
     fn path_history_enabled() -> Result<bool, TextdbError> {
@@ -1510,6 +1676,16 @@ mod kb {
     pub(crate) fn create_impl(path: &str, content: &str, author: Option<&str>, message: Option<&str>) -> Result<i64, TextdbError> {
         let path = normalize_path(path)?;
         let path = resolve(&path, true);
+        create_at(&path, &unproject_str(content), author, message)
+    }
+
+    // The internal `*_at` forms take a path that is **already** a store path and text that is
+    // already in the store's namespace, so one operation translates exactly once. Without the
+    // split, `write` resolved and then called `create`, which resolved the result again — and an
+    // account's own `/legal/contracts/x.md`, fed back in, names an alias it does not have.
+    // Entry points translate; `*_at` never does.
+    fn create_at(path: &str, content: &str, author: Option<&str>, message: Option<&str>) -> Result<i64, TextdbError> {
+        let path = path.to_string();
         if node_by_path(&path).is_some() {
             return Err(TextdbError::InvalidEdit(format!("{} already exists", path)));
         }
@@ -1552,9 +1728,13 @@ mod kb {
     fn write_impl(path: &str, content: &str, base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
         let path = normalize_path(path)?;
         let path = resolve(&path, true);
+        // Text arriving from a caller is in the caller's namespace: its root-absolute links
+        // become the store's before anything is committed, so the store holds one canonical
+        // spelling whoever wrote it (#12 E9).
+        let content = &unproject_str(content);
         match node_by_path(&path) {
-            None => Ok((create_impl(&path, content, author, message)?, CommitKind::Direct)),
-            Some(_) => update_content_impl(&path, content, base_version, author, message),
+            None => Ok((create_at(&path, content, author, message)?, CommitKind::Direct)),
+            Some(_) => update_content_at(&path, content, base_version, author, message),
         }
     }
 
@@ -1610,6 +1790,10 @@ mod kb {
     ) -> Result<(i64, CommitKind), TextdbError> {
         let path = normalize_path(path)?;
         let path = resolve(&path, true);
+        // Each piece of replacement text is the caller's, so each goes back to the store's
+        // namespace; the line numbers are the same in both, because a rewrite never adds one.
+        let in_store: Vec<(u64, u64, Vec<u8>)> = ranges.iter().map(|(a, b, t)| (*a, *b, unproject_text(t))).collect();
+        let ranges: &[(u64, u64, Vec<u8>)] = &in_store;
         let mut sorted: Vec<&(u64, u64, Vec<u8>)> = ranges.iter().collect();
         sorted.sort_by_key(|r| r.0);
         if sorted.is_empty() {
@@ -1680,11 +1864,22 @@ mod kb {
         if replacements.is_empty() {
             return Err(TextdbError::InvalidEdit("no replacements given".into()));
         }
+        // Both halves of each replacement are anchored on the text the caller read, so both go
+        // back to the store's namespace before they are matched against what the store holds.
+        let in_store: Vec<crate::bulk::Replacement> = replacements
+            .iter()
+            .map(|r| crate::bulk::Replacement {
+                old: unproject_text(&r.old),
+                new: unproject_text(&r.new),
+                expected: r.expected,
+            })
+            .collect();
         let n = file_by_path_r(&path)?;
         let root = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
-        let text = crate::bulk::apply_replacements(&path, materialize_all(&SpiStorage::new(), &root)?, replacements)?;
+        let text = crate::bulk::apply_replacements(&path, materialize_all(&SpiStorage::new(), &root)?, &in_store)?;
         let text = String::from_utf8(text).map_err(|_| TextdbError::InvalidEdit(format!("{path}: the replaced content is not valid UTF-8")))?;
-        update_content_impl(&path, &text, Some(n.version), author, message.or(Some("replace")))
+        // `path` is a store path already and `text` is in the store's namespace.
+        update_content_at(&path, &text, Some(n.version), author, message.or(Some("replace")))
     }
 
     /// Commit a byte-range edit set expressed against `base_version` (or HEAD).
@@ -1713,6 +1908,13 @@ mod kb {
     pub(crate) fn update_content_impl(path: &str, content: &str, base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
         let path = normalize_path(path)?;
         let path = resolve(&path, true);
+        // In the store's namespace before it is diffed: the caller wrote its own paths, and the
+        // diff has to be against what the store holds or every projected link reads as a change.
+        update_content_at(&path, &unproject_str(content), base_version, author, message)
+    }
+
+    fn update_content_at(path: &str, content: &str, base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
+        let path = path.to_string();
         let n = file_by_path_r(&path)?;
         let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let base = match base_version {
@@ -1754,6 +1956,10 @@ mod kb {
     fn edit_impl(path: &str, old: &str, new: &str, author: Option<&str>, message: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
         let path = normalize_path(path)?;
         let path = resolve(&path, true);
+        // Both sides are anchored on the text the caller read, so both go back to the store's
+        // namespace: matching against un-projected text is what makes the edit one version
+        // rather than an edit and a link rewrite (#12 E16).
+        let (old, new) = (&unproject_str(old), &unproject_str(new));
         let n = file_by_path_r(&path)?;
         let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let mut st = SpiStorage::new();
@@ -1796,6 +2002,7 @@ mod kb {
     fn append_impl(path: &str, tail: &str, author: Option<&str>, message: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
         let path = normalize_path(path)?;
         let path = resolve(&path, true);
+        let tail = &unproject_str(tail);
         let n = file_by_path_r(&path)?;
         let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let mut st = SpiStorage::new();
@@ -1960,7 +2167,9 @@ mod kb {
                 ok(materialize_all(&st, &root_of_version(n.id, v as u64)))
             }
         };
-        String::from_utf8_lossy(&bytes).into_owned()
+        // A document is text the caller reads, so its links are in the caller's paths and the
+        // ones it cannot see are id references (#12 part 2).
+        String::from_utf8_lossy(&project_text(&bytes)).into_owned()
     }
 
     /// Lines `[l_from, l_to]`, 1-based inclusive.
@@ -1975,7 +2184,9 @@ mod kb {
         let st = SpiStorage::new();
         let root = n.root.unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
         let bytes = ok(textdb_core::lines(&st, &root, (l_from - 1) as u64, (l_to - 1) as u64));
-        String::from_utf8_lossy(&bytes).into_owned()
+        // Projected like any other text the caller reads. Rewriting never changes a line count,
+        // so the numbers mean the same thing in either namespace.
+        String::from_utf8_lossy(&project_text(&bytes)).into_owned()
     }
 
     /// Text of the section whose heading matches (exact heading path, then last component).
@@ -2007,7 +2218,10 @@ mod kb {
         if body.is_empty() {
             return String::new();
         }
-        format!("--- {p}@{v1}\n+++ {p}@{v2}\n{body}", p = path, v1 = v1, v2 = v2, body = body)
+        let body = project_str(body);
+        // The caller's own path in the header too.
+        let p = to_view(&path).unwrap_or_else(|| OUTSIDE.to_string());
+        format!("--- {p}@{v1}\n+++ {p}@{v2}\n{body}", p = p, v1 = v1, v2 = v2, body = body)
     }
 
     #[pg_extern(stable)]
@@ -2092,14 +2306,18 @@ mod kb {
                 )
                 .unwrap_or_else(|e| spi_err(e));
             let mut v = Vec::new();
+            // A path this caller cannot see is named as nothing at all. The history of a file
+            // moved in from outside is the file's, so it is complete; where it came from is not
+            // this account's business and must not be spelled out (#12 B16).
+            let seen = |p: Option<String>| p.map(|p| to_view(&p).unwrap_or_else(|| OUTSIDE.to_string()));
             for r in t {
                 v.push((
                     r.get::<i64>(1).unwrap_or_else(|e| spi_err(e)).unwrap_or(0),
                     r.get::<pgrx::datum::TimestampWithTimeZone>(2).unwrap_or_else(|e| spi_err(e)).expect("ts"),
                     r.get::<String>(3).unwrap_or_else(|e| spi_err(e)).unwrap_or_default(),
-                    r.get::<String>(4).unwrap_or_else(|e| spi_err(e)).unwrap_or_default(),
-                    r.get::<String>(5).unwrap_or_else(|e| spi_err(e)),
-                    r.get::<String>(6).unwrap_or_else(|e| spi_err(e)),
+                    seen(r.get::<String>(4).unwrap_or_else(|e| spi_err(e))).unwrap_or_default(),
+                    seen(r.get::<String>(5).unwrap_or_else(|e| spi_err(e))),
+                    seen(r.get::<String>(6).unwrap_or_else(|e| spi_err(e))),
                     r.get::<i64>(7).unwrap_or_else(|e| spi_err(e)),
                     r.get::<String>(8).unwrap_or_else(|e| spi_err(e)),
                 ));
@@ -2145,8 +2363,10 @@ mod kb {
                     h.old_count as i64,
                     h.new_from as i64 + 1,
                     h.new_count as i64,
-                    String::from_utf8_lossy(&h.old_text).into_owned(),
-                    String::from_utf8_lossy(&h.new_text).into_owned(),
+                    // A diff is text the caller reads, each side projected against its own
+                    // version's links (#12 E16).
+                    String::from_utf8_lossy(&project_text(&h.old_text)).into_owned(),
+                    String::from_utf8_lossy(&project_text(&h.new_text)).into_owned(),
                 )
             })
             .collect();
@@ -2251,13 +2471,63 @@ mod kb {
             name!(message, Option<String>),
         ),
     > {
+        // The owner's feed is the table, one query and no projection: a store that delegates
+        // nothing runs what it ran before this feature existed. An account's is the same rows
+        // scoped and translated — and a move across the edge of its view is not a move at all
+        // from inside, so the projection below turns it into what it is (#12 F4-F6).
+        const OWNER: &str = "SELECT seq, ts, op, path, old_path, node_kind, version, base_version, commit_kind, author, message \
+                             FROM kb.change WHERE seq > $1 ORDER BY seq LIMIT $2";
+        // `x` is the whole of the projection: one branch per shape a stored row can take here.
+        // A folder moves as a single row, so a subtree crossing the edge is expanded to its files
+        // — a sync told only "the folder is gone" has nothing to match its own files against.
+        const ACCOUNT: &str = "\
+            WITH c AS (
+              SELECT ch.seq, ch.ts, ch.op, ch.node_id, ch.node_kind, ch.path, ch.old_path, ch.version,
+                     ch.base_version, ch.commit_kind, ch.author, ch.message, ch.for_account,
+                     kb.to_view(ch.path) AS v_new,
+                     CASE WHEN ch.old_path IS NULL THEN NULL ELSE kb.to_view(ch.old_path) END AS v_old,
+                     -- The share root itself moving changes none of this account's paths, so its
+                     -- feed says nothing about it.
+                     EXISTS (SELECT 1 FROM kb.my_grant g WHERE g.node_id = ch.node_id) AS is_root
+                FROM kb.change ch
+               WHERE ch.seq > $1
+                 AND ((ch.for_account IS NULL
+                       AND (kb.visible(ch.path) OR (ch.old_path IS NOT NULL AND kb.visible(ch.old_path))))
+                      OR ch.for_account = (SELECT kb.current_account()))
+            )
+            SELECT c.seq, c.ts, x.op, x.path, x.old_path, c.node_kind, c.version, c.base_version,
+                   c.commit_kind, c.author, c.message
+              FROM c
+              CROSS JOIN LATERAL (
+                    SELECT c.op AS op, c.path AS path, c.old_path AS old_path
+                      WHERE c.for_account IS NOT NULL
+                 UNION ALL
+                    SELECT c.op, c.v_new, c.v_old
+                      WHERE c.for_account IS NULL AND c.v_new IS NOT NULL AND NOT c.is_root
+                        AND (c.op <> 'move' OR c.old_path IS NULL OR c.v_old IS NOT NULL)
+                 UNION ALL
+                    SELECT 'create', kb.to_view(n.path), NULL
+                      FROM kb.node n
+                     WHERE c.for_account IS NULL AND c.op = 'move' AND c.old_path IS NOT NULL AND NOT c.is_root
+                       AND c.v_new IS NOT NULL AND c.v_old IS NULL
+                       AND n.kind = 1 AND n.deleted_at IS NULL
+                       AND (n.path = c.path OR n.path LIKE kb._subtree_like(c.path))
+                       AND kb.to_view(n.path) IS NOT NULL
+                 UNION ALL
+                    SELECT 'delete', kb.to_view(c.old_path || substr(n.path, length(c.path) + 1)), NULL
+                      FROM kb.node n
+                     WHERE c.for_account IS NULL AND c.op = 'move' AND c.old_path IS NOT NULL AND NOT c.is_root
+                       AND c.v_new IS NULL AND c.v_old IS NOT NULL
+                       AND n.kind = 1 AND n.deleted_at IS NULL
+                       AND (n.path = c.path OR n.path LIKE kb._subtree_like(c.path))
+                       AND kb.to_view(c.old_path || substr(n.path, length(c.path) + 1)) IS NOT NULL
+              ) x
+             ORDER BY c.seq
+             LIMIT $2";
+        let sql = if account_id_now().is_none() { OWNER } else { ACCOUNT };
         let rows: Vec<_> = Spi::connect(|client| {
             let t = client
-                .select(
-                    "SELECT seq, ts, op, path, old_path, node_kind, version, base_version, commit_kind, author, message FROM kb.change WHERE seq > $1 ORDER BY seq LIMIT $2",
-                    None,
-                    &[since.into(), lim.max(0).into()],
-                )
+                .select(sql, None, &[since.into(), lim.max(0).into()])
                 .unwrap_or_else(|e| spi_err(e));
             let mut v = Vec::new();
             for r in t {
@@ -2622,13 +2892,16 @@ mod kb {
             where_sql.push_str(&format!(" AND l.status = ${}", args.len() + 1));
             args.push(status.to_string());
         }
+        // The *linking* file must be one this caller can see. Its target may not be, and that is
+        // not a reason to drop the row: it is the id-reference case, handled below, so a hidden
+        // target is reported as hidden rather than as absent (#12 E5, E7).
         let sql = format!(
             "SELECT n.path, n.version, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status,
                     CASE WHEN lower(r.path) LIKE '%.tdbasset' THEN left(r.path, -9) ELSE r.path END,
-                    coalesce(lower(r.path) LIKE '%.tdbasset', false)
+                    coalesce(lower(r.path) LIKE '%.tdbasset', false), r.id
                FROM kb.link l JOIN kb.node n ON n.id = l.file_id
                LEFT JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL
-              WHERE n.deleted_at IS NULL AND {where_sql}
+              WHERE n.deleted_at IS NULL AND kb.visible(n.path) AND {where_sql}
               ORDER BY n.path, l.line, l.id LIMIT {lim}",
             lim = lim.max(1)
         );
@@ -2637,16 +2910,38 @@ mod kb {
             let r = client.select(&sql, None, &args).unwrap_or_else(|e| spi_err(e));
             let mut out = Vec::new();
             for row in r {
+                let file: String = row.get::<String>(1).unwrap_or_default().unwrap_or_default();
+                // Filtered above, so `None` here means the node went in the meantime.
+                let Some(file) = to_view(&file) else { continue };
+                let mut target: String = row.get::<String>(5).unwrap_or_default().unwrap_or_default();
+                let mut status: Option<String> = row.get::<String>(8).unwrap_or_default();
+                let resolved: Option<String> = row.get::<String>(9).unwrap_or_default();
+                // Both paths in the caller's namespace. A target outside its shares keeps its
+                // row and names no path: the reader is told there is a document and nothing
+                // about where it is, exactly as the text reads.
+                let resolved = match resolved {
+                    Some(t) => match to_view(&t) {
+                        Some(v) => Some(v),
+                        None => {
+                            status = Some("hidden".to_string());
+                            if let Some(id) = row.get::<i64>(11).unwrap_or_default() {
+                                target = format!("textdb:{id}");
+                            }
+                            None
+                        }
+                    },
+                    None => None,
+                };
                 out.push((
-                    row.get::<String>(1).unwrap_or_default().unwrap_or_default(),
+                    file,
                     row.get::<i64>(2).unwrap_or_default().unwrap_or(0),
                     row.get::<i64>(3).unwrap_or_default().unwrap_or(0),
                     row.get::<String>(4).unwrap_or_default().unwrap_or_default(),
-                    row.get::<String>(5).unwrap_or_default().unwrap_or_default(),
+                    target,
                     row.get::<String>(6).unwrap_or_default(),
                     row.get::<String>(7).unwrap_or_default(),
-                    row.get::<String>(8).unwrap_or_default(),
-                    row.get::<String>(9).unwrap_or_default(),
+                    status,
+                    resolved,
                     row.get::<bool>(10).unwrap_or_default().unwrap_or(false),
                 ));
             }
@@ -2958,7 +3253,7 @@ mod kb {
             let files: std::collections::HashMap<i64, (i64, f32)> = Spi::connect(|client| {
                 let t = client
                     .select(
-                        "SELECT r.file_id, c.id, ts_rank(c.tsv, q) FROM kb.chunk c JOIN kb.chunk_ref r ON r.chunk_id = c.id JOIN kb.node n ON n.id = r.file_id, to_tsquery('simple', $1) q WHERE c.tsv @@ q AND n.deleted_at IS NULL AND n.kind = 1 AND ($2 = '/' OR n.path LIKE kb._subtree_like($2)) ORDER BY 3 DESC LIMIT $3",
+                        "SELECT r.file_id, c.id, ts_rank(c.tsv, q) FROM kb.chunk c JOIN kb.chunk_ref r ON r.chunk_id = c.id JOIN kb.node n ON n.id = r.file_id, to_tsquery('simple', $1) q WHERE c.tsv @@ q AND n.deleted_at IS NULL AND n.kind = 1 AND ($2 = '/' OR n.path LIKE kb._subtree_like($2)) AND kb.visible(n.path) ORDER BY 3 DESC LIMIT $3",
                         None,
                         &[tsq.as_str().into(), prefix.as_str().into(), ((limit.saturating_mul(50)).min(500_000) as i64).into()],
                     )
@@ -3018,6 +3313,9 @@ mod kb {
                 Ok(Some(x)) => x,
                 _ => continue,
             };
+            // The caller's own path. A row it cannot see is filtered out above, so `None` here
+            // means the node went away between the two queries.
+            let Some(path) = to_view(&path) else { continue };
             let body = ok(materialize_all(&st, &ok(to_hash(&root))));
             let body = String::from_utf8_lossy(&body);
             let Some(lines) = textdb_core::terms::matching_lines(&parsed, &body) else {
@@ -3403,6 +3701,8 @@ mod kb {
             &[id.into(), g.node_id.into(), g.alias.as_str().into(), g.rights.as_str().into()],
         )
         .unwrap_or_else(|e| spi_err(e));
+        let local = if g.alias.is_empty() { "/".to_string() } else { format!("/{}", g.alias) };
+        record_share_event(id, "mkdir", g.node_id, &local, None, &format!("share granted ({})", g.rights.as_str()));
         TableIterator::once((g.alias.clone(), g.rights.as_str().to_string(), g.store_path.clone(), g.node_id))
     }
 
@@ -3424,6 +3724,8 @@ mod kb {
         if n == 0 {
             fail(TextdbError::NotFound(format!("'{account}' has no share called '{from}'")));
         }
+        let node_id = grants.by_alias(to).map(|g| g.node_id).unwrap_or(0);
+        record_share_event(id, "move", node_id, &format!("/{to}"), Some(&format!("/{from}")), "share renamed");
         true
     }
 
@@ -3442,6 +3744,12 @@ mod kb {
         if n == 0 {
             fail(TextdbError::NotFound(format!("'{account}' has no share called '{alias}'")));
         }
+        let node_id: i64 = Spi::get_one_with_args("SELECT node_id FROM kb.grant WHERE account_id = $1 AND alias = $2", &[id.into(), alias.into()])
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let local = if alias.is_empty() { "/".to_string() } else { format!("/{alias}") };
+        record_share_event(id, "delete", node_id, &local, None, "share revoked");
         true
     }
 

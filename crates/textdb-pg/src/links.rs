@@ -30,6 +30,32 @@ fn id_paths(sql: &str, arg: &str) -> Result<Vec<(i64, String)>> {
     })
 }
 
+/// Is this a root path written in the account's own namespace that names no share it holds?
+///
+/// Such a link is nonsense: the account meant a folder it does not have. Its bytes are kept as
+/// written (#12 §3.4) — the text is the author's — but it must not then be resolved against the
+/// store's root, which would let `[[hr/salaries]]` reach a document the account cannot see and
+/// put a link into it in everyone else's backlinks. It is broken, for everyone, which is what it
+/// means. A target that *did* un-project is a store path by the time it is indexed, so the
+/// account can see it and this says no.
+fn names_no_share(kind: &str, target: &str) -> bool {
+    use textdb_core::access::Resolved;
+    let Some(view) = crate::kb::current_view() else { return false };
+    if target.is_empty() {
+        return false;
+    }
+    let md = kind == "md" || kind == "image";
+    let looks_root = if md { target.starts_with('/') } else { target.contains('/') };
+    if !looks_root {
+        return false;
+    }
+    let local = format!("/{}", target.trim_start_matches('/'));
+    if view.to_view(&local).is_some() {
+        return false;
+    }
+    !matches!(view.to_store(&local), Resolved::In { .. } | Resolved::Root)
+}
+
 /// The store's answers for [`resolve`].
 pub struct PgLookup;
 
@@ -126,7 +152,10 @@ fn relink_where(cond: &str, arg: Option<&str>) -> Result<()> {
     // touched are collected and their totals refreshed once at the end.
     let mut touched: std::collections::BTreeMap<i64, String> = Default::default();
     for (id, file_id, path, kind, target, anchor, external) in rows {
-        let (to, status) = resolve(&PgLookup, file_id, &path, &kind, &target, anchor.as_deref(), external)?;
+        let (to, status) = match !external && names_no_share(&kind, &target) {
+            true => (None, "broken"),
+            false => resolve(&PgLookup, file_id, &path, &kind, &target, anchor.as_deref(), external)?,
+        };
         // Only rows whose outcome changed are written: a commit then locks no other file's rows
         // it leaves as they were, so writers to files that link to each other do not deadlock.
         let changed = Spi::get_one_with_args::<i64>(

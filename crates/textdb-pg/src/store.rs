@@ -9,10 +9,19 @@ pub fn spi_err(e: pgrx::spi::Error) -> ! {
 }
 
 /// Raise a Postgres error with a custom SQLSTATE through the PL/pgSQL helper.
+///
+/// The code is also put in front of the message. An error raised inside SPI and re-raised on the
+/// way out of a `#[pg_extern]` keeps its message and loses its SQLSTATE — it arrives as `XX000` —
+/// so a caller that only read the SQLSTATE saw every refusal from Rust as an internal error:
+/// exit 1 where the catalogue asks for 6, or 7. The prefix is what the client reads back when the
+/// SQLSTATE did not survive, and the same trick the SQLite binding uses for an error raised
+/// through a virtual table. Where the SQLSTATE *does* survive — `kb._raise` called from SQL — the
+/// client prefers it and the prefix is stripped.
 pub fn raise(code: &str, msg: &str, detail: &str) -> ! {
+    let tagged = format!("{code} {msg}");
     // The SPI call itself raises; if it somehow returns, fall back to a plain error.
-    let _ = Spi::run_with_args("SELECT kb._raise($1, $2, $3)", &[code.into(), msg.into(), detail.into()]);
-    pgrx::error!("{} {}", code, msg);
+    let _ = Spi::run_with_args("SELECT kb._raise($1, $2, $3)", &[code.into(), tagged.as_str().into(), detail.into()]);
+    pgrx::error!("{}", tagged);
 }
 
 pub fn to_hash(v: &[u8]) -> Result<Hash> {
