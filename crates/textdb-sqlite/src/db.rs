@@ -2023,6 +2023,17 @@ impl TextDb<'_> {
             .collect()
     }
 
+    /// May this connection write at this *store* path?
+    ///
+    /// Takes a store path, not a caller's, because its callers are inside the binding and already
+    /// hold one — `store_path_rw` is the entry-point form.
+    pub(crate) fn can_write_store_path(&self, store_path: &str) -> bool {
+        if self.view.is_admin() {
+            return true;
+        }
+        self.view.grant_for(store_path).is_some_and(|g| g.live() && g.rights.can_write())
+    }
+
     /// `(predicate, params)` restricting `col` to this connection's visible set, numbered from
     /// `offset + 1`. `("1", [])` for the owner, so the SQL is what it was before #12.
     pub(crate) fn visible_for(&self, col: &str, offset: usize) -> (String, Vec<rusqlite::types::Value>) {

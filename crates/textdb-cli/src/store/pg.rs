@@ -1011,6 +1011,7 @@ impl Store for PgStore {
                         target: l["target"].as_str().unwrap_or_default().to_string(),
                         now_at: l["now_at"].as_str().unwrap_or_default().to_string(),
                         version: l["version"].as_i64(),
+                        outside: l["outside"].as_bool().unwrap_or(false),
                     })
                     .collect()
             })

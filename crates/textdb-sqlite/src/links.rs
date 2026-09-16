@@ -45,6 +45,12 @@ pub struct LinkChange {
     pub now_at: String,
     /// The version of `path` the link was rewritten in; `None` when it was only reported.
     pub version: Option<u64>,
+    /// The linking file is outside the caller's shares, so it was left alone and `path` is empty.
+    ///
+    /// A move rewrites links store-wide, and an account may not write every file that points into
+    /// what it moved. Those are counted and reported as a number — never as paths, which would
+    /// hand out the layout the alias exists to hide (#12 D14).
+    pub outside: bool,
 }
 
 /// A resolved link captured before a move.
@@ -335,6 +341,21 @@ impl<'c> TextDb<'c> {
             let Some((source, root)) = self.live_path(file_id)? else {
                 continue;
             };
+            // A linking file the caller may not write is left exactly as it is. It is still a
+            // fact about the move — the link now points somewhere else — so it is reported, as a
+            // count with no path: naming it would disclose a layout the account cannot see.
+            if !self.view.is_admin() && !self.can_write_store_path(&source) {
+                changes.push(LinkChange {
+                    path: String::new(),
+                    line: 0,
+                    kind: String::new(),
+                    target: String::new(),
+                    now_at: String::new(),
+                    version: None,
+                    outside: true,
+                });
+                continue;
+            }
             let mut rewritten = HashSet::new();
             let mut version = None;
             if mode == LinkUpdates::Rewrite {
@@ -364,18 +385,29 @@ impl<'c> TextDb<'c> {
                     }
                 }
                 if !edits.is_empty() {
-                    version = Some(self.commit_edits(&source, &edits, None, author, Some(&message))?.version);
+                    version = Some(self.commit_edits_at(&source, &edits, None, author, Some(&message))?.version);
                 }
             }
             for p in &links {
                 let now_at = self.live_path(p.resolved_id)?.map(|(path, _)| path).unwrap_or_default();
+                // Both paths in the caller's namespace; the file is one it can write, so it has
+                // one, and the target may not be — then it is named as nothing rather than as a
+                // store path.
+                let (path, now_at) = match self.view.is_admin() {
+                    true => (source.clone(), now_at),
+                    false => (
+                        self.view_path(&source).unwrap_or_default(),
+                        self.view_path(&now_at).unwrap_or_default(),
+                    ),
+                };
                 changes.push(LinkChange {
-                    path: source.clone(),
+                    path,
                     line: p.line,
                     kind: p.kind.clone(),
                     target: p.target.clone(),
                     now_at,
                     version: if rewritten.contains(&p.rowid) { version } else { None },
+                    outside: false,
                 });
             }
         }

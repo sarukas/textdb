@@ -2166,6 +2166,11 @@ fn import(
     let files = collect_files(dir, &exts)?;
     let total = files.len();
     let prefix = normalize_path(prefix)?;
+    // Asked of the store before a single file is read: importing into somewhere the caller may
+    // not write is one refusal about the destination, not a failure per file. The account root
+    // is the case that reads worst otherwise — "0 created, 47 failed" for something that was
+    // never going to work.
+    st.mkdir(&prefix)?;
     let base = if prefix == "/" { "" } else { prefix.as_str() };
     let interactive = std::io::stderr().is_terminal() && !json;
     let started = Instant::now();

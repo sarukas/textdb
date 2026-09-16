@@ -832,6 +832,7 @@ impl Store for SqliteStore {
                 target: c.target,
                 now_at: c.now_at,
                 version: c.version.map(|v| v as i64),
+                outside: c.outside,
             })
             .collect())
     }

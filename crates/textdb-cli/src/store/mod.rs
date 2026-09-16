@@ -252,6 +252,10 @@ pub struct MovedLink {
     pub now_at: String,
     /// The version the link was rewritten in; absent when only reported.
     pub version: Option<i64>,
+    /// The linking file is outside the caller's shares, so it was left alone and `path` is empty.
+    /// Counted, never named: the path would be the layout an alias exists to hide (#12 D14).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outside: bool,
 }
 
 /// A link as `links` and `backlinks` list it.

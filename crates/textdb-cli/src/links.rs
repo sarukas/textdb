@@ -37,8 +37,19 @@ pub fn written(l: &LinkRow) -> String {
 /// What `mv` says about the links that pointed at what moved.
 pub fn moved_text(from: &str, links: &[MovedLink]) -> String {
     let files = |ls: &[&MovedLink]| ls.iter().map(|l| l.path.as_str()).collect::<HashSet<_>>().len();
-    let (done, left): (Vec<&MovedLink>, Vec<&MovedLink>) = links.iter().partition(|l| l.version.is_some());
+    // Files the caller may not write carry no path and are only counted: saying which they are
+    // would hand out the layout an account's aliases exist to hide.
+    let (outside, links): (Vec<&MovedLink>, Vec<&MovedLink>) = links.iter().partition(|l| l.outside);
+    let (done, left): (Vec<&MovedLink>, Vec<&MovedLink>) = links.into_iter().partition(|l| l.version.is_some());
     let mut s = String::new();
+    if !outside.is_empty() {
+        s.push_str(&format!(
+            "{} {} outside your shares also pointed at what moved and were left alone
+",
+            outside.len(),
+            if outside.len() == 1 { "file" } else { "files" }
+        ));
+    }
     if !done.is_empty() {
         s.push_str(&format!("rewrote {} links in {} files\n", done.len(), files(&done)));
     }
