@@ -7,6 +7,10 @@
 //! scenario cannot quietly go missing.
 //!
 //! These are written before the feature exists. Until it does they fail, which is the point.
+//!
+//! Section M at the end is not from the issue. The catalogue is organised by permission rule, one
+//! command against one view; M is the working loop the feature exists for — a central vault, two
+//! partial checkouts, edits and syncs going round until they converge.
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -312,8 +316,11 @@ fn zz_scenario_coverage_is_complete() {
     let excused: BTreeSet<&str> = NOT_COVERED.iter().map(|(s, _)| *s).collect();
     let missing: Vec<&str> = CATALOGUE.iter().copied().filter(|s| !covered.contains(s) && !excused.contains(s)).collect();
     assert!(missing.is_empty(), "catalogue rows with no test: {missing:?}");
-    let unknown: Vec<&str> = covered.iter().copied().filter(|s| !CATALOGUE.contains(s)).collect();
-    assert!(unknown.is_empty(), "tests claim rows the catalogue does not have: {unknown:?}");
+    let extra_missing: Vec<&str> = EXTRA.iter().copied().filter(|s| !covered.contains(s)).collect();
+    assert!(extra_missing.is_empty(), "working-loop rows with no test: {extra_missing:?}");
+    let unknown: Vec<&str> =
+        covered.iter().copied().filter(|s| !CATALOGUE.contains(s) && !EXTRA.contains(s)).collect();
+    assert!(unknown.is_empty(), "tests claim rows neither list has: {unknown:?}");
 }
 
 // ============================================================================ A. Roots and listing
@@ -2023,4 +2030,367 @@ fn l_the_catalogue_runs_on_both_engines() {
         engines.contains(&Engine::Postgres),
         "L5: set TEXTDB_TEST_PG so the catalogue runs on Postgres too; it is a requirement, not an option"
     );
+}
+
+// ======================================================= M. The distributed working loop
+//
+// Beyond the catalogue. The issue numbers scenarios by the permission rule each one pins down, so
+// nearly every row is one command against one view. That leaves the thing the feature is *for*
+// barely touched: a central vault, two people holding partial checkouts of it, both editing on
+// disk and syncing over days. G14 is the only row with two checkouts at once and it is a single
+// hop — A edits, B sees it, stop. No return hop, no two edits in flight, no rename, no delete.
+//
+// These rows are not from the issue and the coverage test keeps them apart from it. They are the
+// loop itself: does work go round, does it converge, and does a checkout stay a vault while it
+// happens.
+
+/// The working-loop rows, kept separate from `CATALOGUE` so neither list pretends to be the other.
+const EXTRA: &[&str] = &["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10"];
+
+/// Two checkouts of one `rw` share, one per account: accounts-agent sees it at `contracts/`,
+/// contracts-agent is single-root and sees it at `/`. The pair every M row works with.
+fn two_checkouts(f: &Fixture, tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let (a, b) = (tmp.join("a"), tmp.join("b"));
+    ok(f.as_("accounts-agent").args(["sync", "/"]).arg(&a), None);
+    ok(f.as_("contracts-agent").args(["sync", "/"]).arg(&b), None);
+    (a, b)
+}
+
+/// Sync a checkout as its account, from inside it, the way a person or a hook does.
+fn sync(f: &Fixture, account: &str, dir: &std::path::Path) -> Output {
+    run(f.as_(account).args(["sync"]).current_dir(dir), None)
+}
+
+fn sync_ok(f: &Fixture, account: &str, dir: &std::path::Path) -> String {
+    let o = sync(f, account, dir);
+    assert_eq!(o.status, 0, "sync as {account} failed\nstdout: {}\nstderr: {}", o.stdout, o.stderr);
+    o.stdout
+}
+
+/// M1: work goes round and comes back. A edits, B receives it, B edits, A receives that, and the
+/// centre agrees with both — the loop G14 stops halfway through.
+#[test]
+fn m_a_round_trip_between_two_checkouts_converges() {
+    scenarios!("M1");
+    on_each_engine(|f| {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = two_checkouts(f, tmp.path());
+
+        // A writes, on disk, and pushes.
+        std::fs::write(a.join("contracts/acme.md"), "# Acme\n\nfrom A\n").unwrap();
+        sync_ok(f, "accounts-agent", &a);
+
+        // B pulls it, writes on top, and pushes back.
+        sync_ok(f, "contracts-agent", &b);
+        assert_eq!(std::fs::read_to_string(b.join("acme.md")).unwrap(), "# Acme\n\nfrom A\n", "M1: A's work did not reach B");
+        std::fs::write(b.join("acme.md"), "# Acme\n\nfrom A\nfrom B\n").unwrap();
+        sync_ok(f, "contracts-agent", &b);
+
+        // A pulls B's reply. All three now hold the same bytes, in three namespaces.
+        sync_ok(f, "accounts-agent", &a);
+        let want = "# Acme\n\nfrom A\nfrom B\n";
+        assert_eq!(std::fs::read_to_string(a.join("contracts/acme.md")).unwrap(), want, "M1: B's work did not come back to A");
+        assert_eq!(std::fs::read_to_string(b.join("acme.md")).unwrap(), want, "M1");
+        assert_eq!(ok(f.as_("admin").args(["cat", "/legal/contracts/acme.md"]), None).stdout, want, "M1: the centre disagrees");
+
+        // And the history names who did which, in the centre's own paths.
+        let hist = ok(f.as_("admin").args(["--json", "history", "/legal/contracts/acme.md"]), None).json();
+        let authors: Vec<String> =
+            hist.as_array().unwrap().iter().filter_map(|r| r["author"].as_str().map(str::to_string)).collect();
+        assert!(authors.contains(&"accounts-agent".to_string()), "M1: {authors:?}");
+        assert!(authors.contains(&"contracts-agent".to_string()), "M1: {authors:?}");
+    });
+}
+
+/// M2: two checkouts edit different parts of one file between syncs. Both edits survive — a
+/// checkout is not a lock on the file.
+#[test]
+fn m_concurrent_edits_to_different_lines_merge() {
+    scenarios!("M2");
+    on_each_engine(|f| {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "# Loop\n\nalpha\nbeta\ngamma\ndelta\nepsilon\n";
+        ok(f.as_("admin").args(["write", "--create", "/legal/contracts/loop.md"]), Some(body));
+        let (a, b) = two_checkouts(f, tmp.path());
+
+        // Both start from the same base and edit opposite ends without seeing each other.
+        std::fs::write(a.join("contracts/loop.md"), body.replace("alpha", "alpha, by A")).unwrap();
+        std::fs::write(b.join("loop.md"), body.replace("epsilon", "epsilon, by B")).unwrap();
+
+        sync_ok(f, "accounts-agent", &a);
+        let out = sync_ok(f, "contracts-agent", &b);
+        assert!(out.contains("merged") && out.contains("loop.md"), "M2: B's sync did not merge: {out}");
+        assert!(out.contains("0 conflicts"), "M2: separate lines are not a conflict: {out}");
+
+        // Both edits are in the centre, and neither was overwritten.
+        let central = ok(f.as_("admin").args(["cat", "/legal/contracts/loop.md"]), None).stdout;
+        assert!(central.contains("alpha, by A"), "M2: A's line was lost: {central}");
+        assert!(central.contains("epsilon, by B"), "M2: B's line was lost: {central}");
+
+        // And A gets B's half on its next sync, without having to ask for it.
+        sync_ok(f, "accounts-agent", &a);
+        assert_eq!(std::fs::read_to_string(a.join("contracts/loop.md")).unwrap(), central, "M2: A and the centre disagree");
+        assert_eq!(std::fs::read_to_string(b.join("loop.md")).unwrap(), central, "M2: B and the centre disagree");
+    });
+}
+
+/// M3: two checkouts edit the same line. The second one is told, on its own disk, in its own
+/// paths — and resolving it locally is enough to converge.
+#[test]
+fn m_concurrent_edits_to_one_line_conflict_on_the_second_disk() {
+    scenarios!("M3");
+    on_each_engine(|f| {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "# Loop\n\nalpha\nbeta\ngamma\n";
+        ok(f.as_("admin").args(["write", "--create", "/legal/contracts/loop.md"]), Some(body));
+        let (a, b) = two_checkouts(f, tmp.path());
+
+        std::fs::write(a.join("contracts/loop.md"), body.replace("beta", "beta, A's wording")).unwrap();
+        std::fs::write(b.join("loop.md"), body.replace("beta", "beta, B's wording")).unwrap();
+
+        sync_ok(f, "accounts-agent", &a);
+        let out = sync(f, "contracts-agent", &b);
+        assert_eq!(out.status, CONFLICT, "M3: the second sync must report a conflict\n{}\n{}", out.stdout, out.stderr);
+        assert!(out.stdout.contains("conflict") && out.stdout.contains("loop.md"), "M3: {}", out.stdout);
+
+        // The markers are on B's disk; the centre keeps A's version until B resolves it.
+        let on_disk = std::fs::read_to_string(b.join("loop.md")).unwrap();
+        assert!(on_disk.contains("<<<<<<< textdb") && on_disk.contains(">>>>>>> disk"), "M3: {on_disk}");
+        assert!(on_disk.contains("beta, A's wording") && on_disk.contains("beta, B's wording"), "M3: {on_disk}");
+        let central = ok(f.as_("admin").args(["cat", "/legal/contracts/loop.md"]), None).stdout;
+        assert!(central.contains("beta, A's wording") && !central.contains("<<<<<<<"), "M3: markers reached the centre: {central}");
+
+        // B resolves the file by hand and syncs again. That is the whole recovery.
+        std::fs::write(b.join("loop.md"), body.replace("beta", "beta, agreed")).unwrap();
+        sync_ok(f, "contracts-agent", &b);
+        sync_ok(f, "accounts-agent", &a);
+        let want = body.replace("beta", "beta, agreed");
+        assert_eq!(ok(f.as_("admin").args(["cat", "/legal/contracts/loop.md"]), None).stdout, want, "M3");
+        assert_eq!(std::fs::read_to_string(a.join("contracts/loop.md")).unwrap(), want, "M3");
+    });
+}
+
+/// M4: a file renamed on disk in one checkout is a move in the centre and a rename in the other —
+/// not a delete and a new file, so the document keeps its history and its id.
+#[test]
+fn m_a_rename_on_disk_travels_as_a_move() {
+    scenarios!("M4");
+    on_each_engine(|f| {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = two_checkouts(f, tmp.path());
+        let before = f.id("/legal/contracts/acme.md");
+
+        // B renames it the way a person does: in the file manager.
+        std::fs::rename(b.join("acme.md"), b.join("acme-2026.md")).unwrap();
+        let out = sync_ok(f, "contracts-agent", &b);
+        assert!(out.contains("textdb moved") && out.contains("acme-2026.md"), "M4: not carried as a move: {out}");
+
+        // The centre moved the same document rather than making another one.
+        assert_eq!(f.id("/legal/contracts/acme-2026.md"), before, "M4: the id changed, so it was not a move");
+        refused(&run(f.as_("admin").args(["stat", "/legal/contracts/acme.md"]), None), NOT_FOUND, "TX003");
+        let hist = ok(f.as_("admin").args(["--json", "history", "/legal/contracts/acme-2026.md"]), None).json();
+        assert!(hist.as_array().unwrap().len() >= 3, "M4: the three versions from before the move are gone: {hist}");
+
+        // And A sees a rename on its own disk, under its own prefix.
+        let out = sync_ok(f, "accounts-agent", &a);
+        assert!(out.contains("acme-2026.md"), "M4: {out}");
+        assert!(a.join("contracts/acme-2026.md").is_file(), "M4");
+        assert!(!a.join("contracts/acme.md").exists(), "M4: the old path stayed behind");
+    });
+}
+
+/// M5: a file deleted on disk in one checkout is deleted in the centre and removed from the
+/// other. The counterpart of G8, where a *revocation* must leave the disk alone.
+#[test]
+fn m_a_delete_on_disk_travels_to_the_other_checkout() {
+    scenarios!("M5");
+    on_each_engine(|f| {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = two_checkouts(f, tmp.path());
+
+        std::fs::remove_file(a.join("contracts/2026/q3.md")).unwrap();
+        let out = sync_ok(f, "accounts-agent", &a);
+        assert!(out.contains("textdb deleted") && out.contains("2026/q3.md"), "M5: {out}");
+        refused(&run(f.as_("admin").args(["cat", "/legal/contracts/2026/q3.md"]), None), NOT_FOUND, "TX003");
+
+        let out = sync_ok(f, "contracts-agent", &b);
+        assert!(out.contains("disk deleted"), "M5: {out}");
+        assert!(!b.join("2026/q3.md").exists(), "M5");
+    });
+}
+
+/// M6: a file created on disk in an `rw` share lands centrally under that share's store path,
+/// authored by the account, and reaches the other checkout. The everyday case — a person makes a
+/// note in their vault.
+#[test]
+fn m_a_new_file_on_disk_lands_centrally_and_reaches_the_other_checkout() {
+    scenarios!("M6");
+    on_each_engine(|f| {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = two_checkouts(f, tmp.path());
+
+        std::fs::create_dir_all(a.join("contracts/2027")).unwrap();
+        std::fs::write(a.join("contracts/2027/plan.md"), "# Plan\n\ndrafted in the vault\n").unwrap();
+        let out = sync_ok(f, "accounts-agent", &a);
+        assert!(out.contains("textdb new") && out.contains("2027/plan.md"), "M6: {out}");
+
+        // Centrally it is under the share's store path, not the account's, and the account owns it.
+        let stat = ok(f.as_("admin").args(["--json", "stat", "/legal/contracts/2027/plan.md"]), None).json();
+        assert_eq!(stat["updated_by"], "accounts-agent", "M6");
+
+        sync_ok(f, "contracts-agent", &b);
+        assert_eq!(std::fs::read_to_string(b.join("2027/plan.md")).unwrap(), "# Plan\n\ndrafted in the vault\n", "M6");
+    });
+}
+
+/// M7: a checkout is a working vault. Every link an account can resolve names a path that is on
+/// its own disk, at that path — otherwise a note opened in an editor has dead links. Links to
+/// what the account cannot see are id references and name no path at all, which is E5's rule seen
+/// from the vault's side.
+#[test]
+fn m_a_checkout_is_a_working_vault() {
+    scenarios!("M7");
+    on_each_engine(|f| {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = two_checkouts(f, tmp.path());
+
+        for (account, dir) in [("accounts-agent", &a), ("contracts-agent", &b)] {
+            // Every document in the view, as the view names it.
+            let files = ok(f.as_(account).args(["--json", "ls", "-R", "/"]), None).json();
+            let paths: Vec<String> = files
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["kind"] == "file")
+                .filter_map(|e| e["path"].as_str().map(str::to_string))
+                .collect();
+            assert!(!paths.is_empty(), "M7: {account} sees nothing");
+            for path in &paths {
+                // The document itself is on disk where the view says it is.
+                let on_disk = dir.join(path.trim_start_matches('/'));
+                assert!(on_disk.is_file(), "M7: {account} lists {path} but {} is not on disk", on_disk.display());
+
+                for link in ok(f.as_(account).args(["--json", "links", path]), None).json().as_array().unwrap() {
+                    match link["status"].as_str().unwrap_or_default() {
+                        "ok" => {
+                            let target = link["resolved"].as_str().unwrap_or_else(|| panic!("M7: ok with no path: {link}"));
+                            let t = dir.join(target.trim_start_matches('/'));
+                            assert!(t.is_file(), "M7: {account}: {path} links to {target}, which is not on disk at {}", t.display());
+                        }
+                        "hidden" => {
+                            assert!(link["resolved"].is_null(), "M7: a hidden target named a path: {link}");
+                            let target = link["target"].as_str().unwrap_or_default();
+                            assert!(target.starts_with("textdb:"), "M7: a hidden link must read as an id: {link}");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// M8: once everyone has converged, syncing again changes nothing on either side, for anyone.
+/// Churn here is what turns an hourly hook into a version per hour per file forever.
+#[test]
+fn m_a_converged_loop_is_quiet() {
+    scenarios!("M8");
+    on_each_engine(|f| {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = two_checkouts(f, tmp.path());
+        let audit = tmp.path().join("audit");
+        ok(f.as_("auditor").args(["sync", "/"]).arg(&audit), None);
+
+        // Some work, then everyone catches up twice so the loop is quiet by construction.
+        std::fs::write(a.join("contracts/acme.md"), "# Acme\n\nsettled\n").unwrap();
+        for _ in 0..2 {
+            for (account, dir) in [("accounts-agent", &a), ("contracts-agent", &b), ("auditor", &audit)] {
+                sync_ok(f, account, dir);
+            }
+        }
+
+        let version = ok(f.as_("admin").args(["--json", "stat", "/legal/contracts/acme.md"]), None).json()["version"].clone();
+        for (account, dir) in [("accounts-agent", &a), ("contracts-agent", &b), ("auditor", &audit)] {
+            let out = sync_ok(f, account, dir);
+            assert!(
+                out.contains("disk 0 new, 0 changed, 0 deleted; textdb 0 new, 0 changed, 0 deleted, 0 moved; 0 merged, 0 conflicts"),
+                "M8: {account} churned: {out}"
+            );
+        }
+        assert_eq!(
+            ok(f.as_("admin").args(["--json", "stat", "/legal/contracts/acme.md"]), None).json()["version"],
+            version,
+            "M8: a quiet sync made a new version"
+        );
+    });
+}
+
+/// M9: one checkout holding both an `rw` and a `ro` share. Editing in both and syncing once must
+/// push one and keep the other — the mixed vault is where a rule that is right per-share goes
+/// wrong per-directory.
+#[test]
+fn m_a_mixed_checkout_pushes_what_it_may_and_keeps_the_rest() {
+    scenarios!("M9");
+    on_each_engine(|f| {
+        let tmp = tempfile::tempdir().unwrap();
+        let mine = tmp.path().join("mine");
+        ok(f.as_("accounts-agent").args(["sync", "/"]).arg(&mine), None);
+        let theirs = tmp.path().join("theirs");
+        ok(f.as_("product-agent").args(["sync", "/"]).arg(&theirs), None);
+
+        // One edit under the rw share, one under the ro share, in the same directory.
+        std::fs::write(mine.join("contracts/acme.md"), "# Acme\n\nmine to change\n").unwrap();
+        std::fs::write(mine.join("products/roadmap.md"), "# Roadmap\n\nnot mine to change\n").unwrap();
+        let out = sync_ok(f, "accounts-agent", &mine);
+        assert!(out.contains("textdb changed") && out.contains("contracts/acme.md"), "M9: the rw edit did not go: {out}");
+        assert!(out.contains("kept") && out.contains("products/roadmap.md"), "M9: the ro edit was not kept: {out}");
+
+        // The centre took one and not the other, and the edit is still on disk.
+        assert!(ok(f.as_("admin").args(["cat", "/legal/contracts/acme.md"]), None).stdout.contains("mine to change"), "M9");
+        assert!(!ok(f.as_("admin").args(["cat", "/products/roadmap.md"]), None).stdout.contains("not mine"), "M9");
+        assert!(std::fs::read_to_string(mine.join("products/roadmap.md")).unwrap().contains("not mine to change"), "M9");
+
+        // product-agent, who does own /products, is unaffected by the reader's local copy — and
+        // its own edit still reaches the centre, so the ro share is not simply frozen.
+        sync_ok(f, "product-agent", &theirs);
+        assert!(!std::fs::read_to_string(theirs.join("products/roadmap.md")).unwrap().contains("not mine"), "M9");
+        std::fs::write(theirs.join("products/roadmap.md"), "# Roadmap\n\nby the owner\n").unwrap();
+        sync_ok(f, "product-agent", &theirs);
+        assert!(ok(f.as_("admin").args(["cat", "/products/roadmap.md"]), None).stdout.contains("by the owner"), "M9");
+
+        // The reader gets the owner's version merged with, not silently replacing, its own line.
+        let out = sync_ok(f, "accounts-agent", &mine);
+        assert!(!out.contains("0 conflicts") || std::fs::read_to_string(mine.join("products/roadmap.md")).unwrap().contains("not mine"),
+            "M9: the reader's local work was dropped: {out}");
+    });
+}
+
+/// M10: the centre moves a file while a checkout is holding an unsynced edit to it. The edit must
+/// follow the file to its new path rather than resurrect the old one or be dropped.
+#[test]
+fn m_a_local_edit_follows_a_move_made_centrally() {
+    scenarios!("M10");
+    on_each_engine(|f| {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, _b) = two_checkouts(f, tmp.path());
+        let id = f.id("/legal/contracts/acme.md");
+
+        // A edits on disk but has not synced yet.
+        std::fs::write(a.join("contracts/acme.md"), "# Acme\n\nedited before the move\n").unwrap();
+        // Meanwhile the owner reorganises.
+        ok(f.as_("admin").args(["mv", "/legal/contracts/acme.md", "/legal/contracts/2026/acme.md"]), None);
+
+        let out = sync_ok(f, "accounts-agent", &a);
+        assert!(out.contains("2026/acme.md"), "M10: {out}");
+        assert!(!a.join("contracts/acme.md").exists(), "M10: the old path was left behind");
+        assert!(
+            std::fs::read_to_string(a.join("contracts/2026/acme.md")).unwrap().contains("edited before the move"),
+            "M10: the local edit did not follow the move"
+        );
+        assert_eq!(f.id("/legal/contracts/2026/acme.md"), id, "M10: still the same document");
+        assert!(
+            ok(f.as_("admin").args(["cat", "/legal/contracts/2026/acme.md"]), None).stdout.contains("edited before the move"),
+            "M10: the centre did not get the edit"
+        );
+    });
 }
