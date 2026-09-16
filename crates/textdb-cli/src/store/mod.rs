@@ -46,6 +46,13 @@ impl StoreError {
         Self::new("TX001", message)
     }
 
+    /// It is in your view and you may not do this (#12). Distinct from `not_found` on purpose:
+    /// `sync` deletes what is absent from the store and leaves alone what it is merely forbidden,
+    /// so conflating the two is what would empty a checkout when a share is revoked.
+    pub fn forbidden(message: impl std::fmt::Display) -> Self {
+        Self::new("TX005", message)
+    }
+
     /// Someone else holds what this needs right now, and retrying shortly is the answer.
     /// Exit 4, which a hook can branch on without parsing the message.
     pub fn contention(message: impl std::fmt::Display) -> Self {
@@ -59,6 +66,7 @@ impl StoreError {
             "TX002" => 4,
             "TX003" => 5,
             "TX004" => 6,
+            "TX005" => 7,
             _ => 1,
         }
     }
@@ -127,6 +135,16 @@ pub struct Entry {
     pub nauthors: i64,
     /// Who committed to it, most commits first. Empty for a folder.
     pub authors: Vec<Author>,
+
+    // The access tier (#12): present only in an account's view, absent for the owner, whose
+    // paths are the store's own and who holds no shares.
+    /// The alias of the share this row was reached through; `""` for a single-root account,
+    /// whose root is the share.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<String>,
+    /// `ro` or `rw`, the rights of that share.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rights: Option<String>,
 }
 
 /// One author's commits to a file.
@@ -548,7 +566,115 @@ pub struct HeadingName {
     pub docs: i64,
 }
 
+
+// ---------------------------------------------------------------- accounts, tokens and shares
+
+/// One share as a caller sees it listed: the account's own name for it, the rights, and — only
+/// for the admin — where it actually is in the store.
+#[derive(Debug, Serialize)]
+pub struct ShareRow {
+    pub account: String,
+    pub alias: String,
+    pub rights: String,
+    /// The share root's store path. `None` in an account's own `whoami`, where naming it would
+    /// disclose the layout the alias exists to hide.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store_path: Option<String>,
+    pub node_id: i64,
+    /// The share root is in the trash: the alias is not listed, but the grant is still there.
+    pub dormant: bool,
+}
+
+/// Who this connection is.
+#[derive(Debug, Serialize)]
+pub struct Whoami {
+    /// `None` for the owner, who opened the store without a token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    pub admin: bool,
+    /// `agent`, `person`, or `owner` for the admin.
+    pub kind: String,
+    /// `aliased` or `single-root`.
+    pub namespace: String,
+    pub shares: Vec<ShareRow>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AccountRow {
+    pub name: String,
+    pub kind: String,
+    /// The store path of a single-root account's root, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    pub created_at: String,
+    pub disabled: bool,
+    pub shares: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TokenRow {
+    pub id: i64,
+    pub account: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+    /// Usable right now: not revoked, not expired.
+    pub live: bool,
+}
+
 pub trait Store {
+    // ------------------------------------------------------------ accounts, tokens and shares
+    //
+    // Every one of these is the admin's, and each implementation refuses it for a token session
+    // rather than leaving that to the CLI: the store is where the rule has to hold, because the
+    // CLI is not the only caller (#12 §4).
+
+    /// Present a bearer for this connection. Everything afterwards is answered in that account's
+    /// view. Called once, before any other operation.
+    fn authenticate(&mut self, _bearer: &str) -> Result<()> {
+        Err(StoreError::invalid("this store does not support tokens"))
+    }
+
+    /// Who this connection is, and what it can see.
+    fn whoami(&mut self) -> Result<Whoami>;
+
+    fn account_create(&mut self, name: &str, kind: &str, root: Option<&str>) -> Result<()>;
+    fn account_ls(&mut self) -> Result<Vec<AccountRow>>;
+    /// Turn a single-root account into a multi-share one, keeping its share under `alias`. An
+    /// explicit change: every path the account sees gains a `/<alias>` prefix.
+    fn account_convert(&mut self, name: &str, alias: Option<&str>) -> Result<String>;
+
+    /// Mint a bearer. Returned once, stored hashed, and not recoverable afterwards.
+    fn token_create(&mut self, account: &str, label: Option<&str>, expires_at: Option<&str>) -> Result<(String, i64)>;
+    fn token_ls(&mut self, account: Option<&str>) -> Result<Vec<TokenRow>>;
+    fn token_revoke(&mut self, id: i64) -> Result<()>;
+
+    /// Share `path` and everything below it with `account`, under `alias` (the folder's own name
+    /// by default). Every rule the model decides at grant time is applied here.
+    fn access_grant(&mut self, account: &str, path: &str, rights: &str, alias: Option<&str>) -> Result<ShareRow>;
+    /// Rename a share in one account's namespace. A move for that account, not a delete.
+    fn access_rename(&mut self, account: &str, from: &str, to: &str) -> Result<()>;
+    fn access_revoke(&mut self, account: &str, alias: &str) -> Result<()>;
+    /// Every share; with an account name, that account's; with a store path, who can see it.
+    fn access_ls(&mut self, who: Option<&str>) -> Result<Vec<ShareRow>>;
+
+    /// This connection's shares that exist but may not be used — revoked, or with their folder in
+    /// the trash — as the aliases they occupy in its own namespace.
+    ///
+    /// `sync` needs this and nothing else needs it. A revoked share's files vanish from every
+    /// listing, which is indistinguishable from their having been deleted, and sync deletes from
+    /// disk what the store no longer has. Without this it would empty a checkout the moment a
+    /// share was taken away — the one case in #12 that destroys data. Empty for the owner.
+    fn denied_shares(&mut self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     fn backend(&self) -> &'static str;
     /// Make the store usable: create what is missing, upgrade what is old.
     fn init(&mut self) -> Result<()>;

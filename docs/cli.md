@@ -121,8 +121,68 @@ environment and its own author name, and the instructions in
 | `links [PATH] [--broken [--dir DIR]]` | The links written in a file or every file below a folder: `path:line: [[target]] -> /resolved/path` with a status — `ok`, `ambiguous` (several files match; the nearest is taken), `anchor-missing`, `broken`, `not-in-store` (PDFs, images and other files a text store does not hold) or `external` (URLs, emails, `?tab=` queries, numbered references). Resolved by Obsidian's rules: markdown links relative to the note, `[[a/b]]` from the vault root, `[[name]]` by file name anywhere, `.md` optional, `#heading` checked (block `^ids` are not). `--broken` lists only what does not resolve; with `--dir`, links to files the store does not hold are looked for on disk. Both backends |
 | `backlinks PATH` | The links in any file that resolve to a file, or to a file below a folder |
 | `setting [KEY [VALUE]]` | Show or change a store setting. `path_history` is `on` (default) or `off`; `default` clears it. `--path-history` overrides it for one command. `link_updates` is what a move does to links that pointed at what moved: `report` (default: list them), `rewrite` (rewrite them, one commit per linking file) or `off`; moves made by `sync` never rewrite links. `asset_sync` is what `sync` does with assets without `--push`/`--pull`: `off` (default: list them), `push`, `pull` or `both`; `asset_pull` is which it pulls: `linked` (default: what the folder's notes link to) or `all` |
+| `whoami` | Who this connection is, and what it can see: the owner, or an account with each share, its alias and its rights |
+| `account create NAME [--kind agent\|person] [--root PATH]` | An account that can hold shares. `--root` makes it **single-root**: its root *is* that folder, it holds that one share and sees it at `/`, which is the shape for an agent that owns exactly one vault. Owner only |
+| `account ls` \| `account convert NAME [--as ALIAS]` | Every account; or turn a single-root account into one that holds shares under aliases, which gives every path it sees a `/<alias>` prefix — an announced change, not a silent one. Owner only |
+| `token create ACCOUNT [--label L] [--expires 30d]` | Mint a bearer. **Printed once**: the store keeps only its SHA-256, so it cannot be shown again. `--expires` takes `30d`, `12h`, `90m` or an ISO-8601 instant. Owner only |
+| `token ls [ACCOUNT]` \| `token revoke ID` | Every token, without any bearer; or stop one. Revoking a token leaves the account's shares alone. Owner only |
+| `access grant ACCOUNT PATH ro\|rw [--as ALIAS]` | Share a folder and everything below it. The alias is the account's own name for the share and the first segment of every path it sees through it; it defaults to the folder's name and a collision is **refused** rather than suffixed, because auto-suffixing would make an account's paths depend on the order its shares were added. Regranting the same folder changes its rights. Owner only |
+| `access rename ACCOUNT FROM TO` | Rename a share in one account's namespace. Recorded as a **move** for that account, so its next sync moves the directory on disk instead of deleting it and pulling every file down again. Owner only |
+| `access revoke ACCOUNT ALIAS` | Take a share away. The account's checkout keeps its files: the store then answers `forbidden` (TX005, exit 7) for them rather than `not found`, and `sync` leaves them alone. Owner only |
+| `access ls [ACCOUNT\|PATH]` | Who sees what. An account name lists that account's shares; a store path lists the accounts that can see it. Owner only |
 | `log [--since SEQ] [--limit N]` | The change log: every create, commit, mkdir, move and delete, in order |
 | `watch [--since SEQ] [-p PREFIX]` | Follow the change log live — one line per change, JSON lines with `--json` |
+
+## Delegating folders to accounts
+
+One store holds every vault; an **account** is given whole folders of it and sees nothing else.
+
+```sh
+textdb account create accounts-agent --kind agent
+textdb access grant accounts-agent /legal/contracts rw --as contracts
+textdb access grant accounts-agent /products ro
+textdb token create accounts-agent --label "claude session"   # prints the bearer, once
+```
+
+The account then works with `TEXTDB_TOKEN` set (or `--token`), and every path it says or hears is
+its own:
+
+```
+store (the owner's view)            accounts-agent's view
+/legal/contracts/acme.md            /contracts/acme.md        rw
+/legal/contracts/2026/q3.md         /contracts/2026/q3.md     rw
+/products/catalog/x.md              /products/catalog/x.md    ro
+/hr/salaries.md                     —
+```
+
+What the shape buys, and what it costs:
+
+- **A share is a folder and everything below it.** There are no partial folders and no deny
+  rules, so every total, count and `tree` an account sees is exact rather than recomputed, and no
+  ancestor of a share is ever shown.
+- **The alias belongs to the grant**, not to the current set of shares, so an account's paths
+  never move when another share is added or taken away. There is always exactly one alias level,
+  even for an account with a single share — otherwise adding a second one later would shift every
+  existing path down by one.
+- **No overlapping shares in one account.** `/legal` and `/legal/contracts` together would give
+  one file two paths with two rights. Grant the subfolder alone, or raise the parent to `rw`.
+- **Paths are per view; ids are not.** The same document is `/contracts/acme.md` to one account
+  and `/legal/contracts/acme.md` to the owner, so a path quoted from one namespace means nothing
+  in another. Every listing row carries the store's `id`, and every path-taking command accepts
+  `id:1234` — that is what to put in a message between agents, in a link to the web app, or in a
+  log.
+- **`forbidden` is not `not found`.** A path under an alias the account has, or had, is TX005
+  (exit 7); a path under no alias of theirs is TX003 (exit 5) and is indistinguishable from a
+  path that never existed. The difference is what stops `sync` deleting a checkout when a share
+  is revoked.
+- **The owner is whoever opens the store without a token.** On SQLite that is anyone who can open
+  the file, and on Postgres a superuser; both already mean "you own the store". The model is real
+  where the store is held by a server and clients hold tokens.
+
+Rights are `ro` (`cat`, `ls`, `tree`, `stat`, `search`, `grep`, `history`, `links`, `meta get`,
+`meta find`, `export`, and `sync` to disk) and `rw` (all of that, plus every write, inside the
+share). `mv` needs `rw` at both ends. `--author` is refused on a token session: an account writes
+as itself.
 
 ## Querying with SQL
 
@@ -373,6 +433,7 @@ textdb setting asset_sync both                     # make that what every sync o
 | 4 | `TX002` contention: retry budget exhausted on a very hot file, or another sync holds the directory | Retry shortly |
 | 5 | `TX003` not found | Check the path (`ls`, `tree`) |
 | 6 | `TX004` invalid edit: `old` missing or ambiguous, line range outside the file, empty content | Re-read and adjust |
+| 7 | `TX005` forbidden: it is in your view and you may not do this — a read-only share, a share whose folder is in the trash, or one that was taken away | `whoami` lists your shares and their rights. **Not** the same as 5: a path you can see but may not touch is 7, a path outside every share of yours is 5 and looks exactly like one that never existed |
 
 With `--json` an error is printed on stdout as
 `{"error": {"code": "TX001", "message": "…", "conflict": {"path", "region_line_from", "region_line_to", "base", "theirs", "ours", "current_version"}}}`.

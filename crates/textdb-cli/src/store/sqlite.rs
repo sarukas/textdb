@@ -4,16 +4,21 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension};
 use textdb_core::CommitKind;
+use textdb_core::access::{self as model, Namespace, Rights, View};
+use textdb_sqlite::access as acl;
 use textdb_sqlite::db::subtree_bounds;
 use textdb_sqlite::{normalize_path, TextDb, DEFAULT_PREFIX};
 
 use super::{
-    Author, BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, MovedBack, PathEvent,
-    RestoredFile, Result, RevertOutcome, SqlResult, Store, StoreError, SyncBase, Written,
+    AccountRow, Author, BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, MovedBack,
+    PathEvent, RestoredFile, Result, RevertOutcome, ShareRow, SqlResult, Store, StoreError, SyncBase, TokenRow, Whoami, Written,
 };
 
 pub struct SqliteStore {
     conn: Connection,
+    /// This connection's account. `View::admin()` until a bearer is presented, which is what a
+    /// store opened directly is — see #12 §3 on why "no token" means owner.
+    view: View,
     /// `--path-history`: this process's choice, or `None` to follow the store's setting.
     path_history: Option<bool>,
     /// `PRAGMA data_version` as of the last `wait`. It moves only when another connection
@@ -24,17 +29,23 @@ pub struct SqliteStore {
 impl SqliteStore {
     fn link_rows(&self, cond: &str, args: [String; 3]) -> Result<Vec<super::LinkRow>> {
         let p = DEFAULT_PREFIX;
+        // The linking file must be one the account can see; the *target* may not be, and that is
+        // not a reason to drop the row — it is the id-reference case, handled where the row is
+        // built, so that a hidden target is reported as hidden rather than as absent.
+        let (vis, vis_args) = self.visible("n.path", args.len());
+        let mut all: Vec<rusqlite::types::Value> = args.iter().map(|a| rusqlite::types::Value::Text(a.clone())).collect();
+        all.extend(vis_args);
         let mut stmt = self
             .conn
             .prepare(&format!(
                 "SELECT n.path, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status, r.path, n.version \
                  FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL \
                  LEFT JOIN {p}node r ON r.id = l.resolved_id AND r.deleted_at IS NULL \
-                 WHERE {cond} ORDER BY n.path, l.line, l.rowid"
+                 WHERE ({cond}) AND ({vis}) ORDER BY n.path, l.line, l.rowid"
             ))
             .map_err(sql)?;
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+            .query_map(rusqlite::params_from_iter(all.iter()), |r| {
                 Ok(super::LinkRow {
                     path: r.get(0)?,
                     version: r.get(8)?,
@@ -49,7 +60,26 @@ impl SqliteStore {
                 })
             })
             .map_err(sql)?;
-        rows.map(|r| r.map(super::asset_link)).collect::<rusqlite::Result<_>>().map_err(sql)
+        let rows: Vec<super::LinkRow> = rows.map(|r| r.map(super::asset_link)).collect::<rusqlite::Result<_>>().map_err(sql)?;
+        // Both paths into the caller's namespace. A target outside its shares keeps its row but
+        // names no path: `links` reports it `hidden`, which is what stops the layout leaking.
+        Ok(rows
+            .into_iter()
+            .filter_map(|mut l| {
+                l.path = self.seen(&l.path)?;
+                l.resolved = match l.resolved {
+                    Some(t) => match self.seen(&t) {
+                        Some(v) => Some(v),
+                        None => {
+                            l.status = Some("hidden".into());
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                Some(l)
+            })
+            .collect())
     }
 }
 
@@ -101,6 +131,8 @@ fn entry(e: textdb_sqlite::db::Entry) -> Entry {
         files: e.files,
         folders: e.folders,
         nauthors: e.nauthors,
+        share: e.share,
+        rights: e.rights,
         authors: e
             .authors
             .into_iter()
@@ -135,13 +167,78 @@ impl SqliteStore {
         textdb_sqlite::schema::migrate(&conn, DEFAULT_PREFIX).map_err(sql)?;
         Ok(SqliteStore {
             conn,
+            view: View::admin(),
             path_history: None,
             data_version: None,
         })
     }
 
     fn db(&self) -> TextDb<'_> {
-        TextDb::attach(&self.conn, DEFAULT_PREFIX, true).with_path_history(self.path_history)
+        TextDb::attach(&self.conn, DEFAULT_PREFIX, true)
+            .with_path_history(self.path_history)
+            .with_view(self.view.clone())
+    }
+
+    /// `(predicate, params)` restricting `col` to what this connection may see, for the queries
+    /// this module writes itself rather than going through `TextDb`. `("1", [])` for the admin,
+    /// so the SQL is unchanged for a store that delegates nothing.
+    fn visible(&self, col: &str, offset: usize) -> (String, Vec<rusqlite::types::Value>) {
+        match textdb_sqlite::access::visible_sql(&self.view, col) {
+            None => ("1".to_string(), Vec::new()),
+            Some((pred, args)) => (textdb_sqlite::access::renumber(&pred, offset), args),
+        }
+    }
+
+    /// A store path as this connection sees it, or `None` when it sees nothing there.
+    fn seen(&self, store_path: &str) -> Option<String> {
+        self.view.to_view(store_path)
+    }
+
+
+    /// Only the owner runs the delegation commands. A token session is refused here rather than
+    /// in the CLI, because the CLI is not the only caller.
+    fn admin_only(&self, what: &str) -> Result<()> {
+        if self.view.is_admin() {
+            return Ok(());
+        }
+        Err(StoreError::forbidden(format!(
+            "only the owner of the store can {what}"
+        )))
+    }
+
+    fn account_id(&self, name: &str) -> Result<i64> {
+        match acl::account_by_name(&self.conn, DEFAULT_PREFIX, name).map_err(StoreError::from)? {
+            Some(a) => Ok(a.id),
+            None => Err(StoreError::not_found(format!("there is no account called '{name}'"))),
+        }
+    }
+
+    /// The node a share is to bind to, as the admin names it. A grant is a folder: sharing a file
+    /// would be a different model, and refusing it here is clearer than discovering it later.
+    fn share_node(&self, path: &str) -> Result<(i64, String)> {
+        let path = normalize_path(path).map_err(StoreError::invalid)?;
+        let db = self.db();
+        match db.node_by_path(&path).map_err(StoreError::from)? {
+            Some(n) if n.kind == 0 => Ok((n.id, path)),
+            Some(_) => Err(StoreError::invalid(format!("{path} is a file; a share is a folder and everything below it"))),
+            None => Err(StoreError::not_found(format!("{path} does not exist"))),
+        }
+    }
+
+    /// `whoami` lists the shares an account can actually use; `access ls`, which is the owner's
+    /// view of the same table, lists every grant including the ones that are denied.
+    fn share_rows(&self, account: &str, grants: &model::Grants, as_admin: bool) -> Vec<ShareRow> {
+        grants
+            .live()
+            .map(|g| ShareRow {
+                account: account.to_string(),
+                alias: g.alias.clone(),
+                rights: g.rights.as_str().to_string(),
+                store_path: as_admin.then(|| g.store_path.clone()),
+                node_id: g.node_id,
+                dormant: !g.live(),
+            })
+            .collect()
     }
 
     /// Run reads that must agree with each other — content and the version it is — in one
@@ -157,6 +254,252 @@ impl SqliteStore {
 }
 
 impl Store for SqliteStore {
+    // ------------------------------------------------------------ accounts, tokens and shares
+
+    fn authenticate(&mut self, bearer: &str) -> Result<()> {
+        let now = textdb_sqlite::SqliteStorage::now();
+        match acl::authenticate(&self.conn, DEFAULT_PREFIX, bearer, &now).map_err(StoreError::from)? {
+            Ok(view) => {
+                self.view = view;
+                Ok(())
+            }
+            Err(e) => Err(StoreError::forbidden(e)),
+        }
+    }
+
+    fn whoami(&mut self) -> Result<Whoami> {
+        if self.view.is_admin() {
+            // The owner's "shares" are every account's, because that is what the question means
+            // when the answer is "everything".
+            return Ok(Whoami {
+                account: None,
+                admin: true,
+                kind: "owner".into(),
+                namespace: "store".into(),
+                shares: Vec::new(),
+            });
+        }
+        let name = self.view.name().unwrap_or_default().to_string();
+        let ns = match self.view.namespace() {
+            Namespace::SingleRoot => "single-root",
+            Namespace::Aliased => "aliased",
+        };
+        let kind = acl::account_by_name(&self.conn, DEFAULT_PREFIX, &name)
+            .map_err(StoreError::from)?
+            .map(|a| a.kind)
+            .unwrap_or_default();
+        // An account is never told where its shares live in the store: the alias exists to hide
+        // exactly that, and `whoami` is the one place it would be easy to leak it back.
+        Ok(Whoami {
+            account: Some(name.clone()),
+            admin: false,
+            kind,
+            namespace: ns.into(),
+            shares: self.share_rows(&name, self.view.grants(), false),
+        })
+    }
+
+    fn account_create(&mut self, name: &str, kind: &str, root: Option<&str>) -> Result<()> {
+        self.admin_only("create accounts")?;
+        let root_node = match root {
+            Some(p) => Some(self.share_node(p)?),
+            None => None,
+        };
+        let now = textdb_sqlite::SqliteStorage::now();
+        let account = acl::create_account(&self.conn, DEFAULT_PREFIX, name, kind, root_node.as_ref().map(|(id, _)| *id), &now)
+            .map_err(StoreError::from)?;
+        // A single-root account's root is a share like any other, held under the empty alias, so
+        // that everything downstream reads one table and not two.
+        if let Some((node_id, store_path)) = root_node {
+            let mut grants = model::Grants::new();
+            let g = grants
+                .add(Namespace::SingleRoot, node_id, &store_path, None, Rights::Rw)
+                .map_err(StoreError::invalid)?;
+            acl::insert_grant(&self.conn, DEFAULT_PREFIX, account.id, &g, Some("owner"), &now).map_err(StoreError::from)?;
+        }
+        Ok(())
+    }
+
+    fn account_ls(&mut self) -> Result<Vec<AccountRow>> {
+        self.admin_only("list accounts")?;
+        let mut out = Vec::new();
+        for a in acl::accounts(&self.conn, DEFAULT_PREFIX).map_err(StoreError::from)? {
+            let grants = acl::grants_of(&self.conn, DEFAULT_PREFIX, a.id).map_err(StoreError::from)?;
+            let root = match a.root_node_id {
+                Some(_) => grants.iter().next().map(|g| g.store_path.clone()),
+                None => None,
+            };
+            out.push(AccountRow {
+                name: a.name,
+                kind: a.kind,
+                root,
+                created_at: a.created_at,
+                disabled: a.disabled_at.is_some(),
+                shares: grants.len(),
+            });
+        }
+        Ok(out)
+    }
+
+    fn account_convert(&mut self, name: &str, alias: Option<&str>) -> Result<String> {
+        self.admin_only("convert accounts")?;
+        let a = match acl::account_by_name(&self.conn, DEFAULT_PREFIX, name).map_err(StoreError::from)? {
+            Some(a) => a,
+            None => return Err(StoreError::not_found(format!("there is no account called '{name}'"))),
+        };
+        if a.root_node_id.is_none() {
+            return Err(StoreError::invalid(format!("'{name}' already holds its shares under aliases")));
+        }
+        let grants = acl::grants_of(&self.conn, DEFAULT_PREFIX, a.id).map_err(StoreError::from)?;
+        let g = grants
+            .iter()
+            .next()
+            .ok_or_else(|| StoreError::invalid(format!("'{name}' has no share to convert")))?;
+        let alias = alias
+            .map(str::to_string)
+            .unwrap_or_else(|| g.store_path.rsplit('/').next().unwrap_or("share").to_string());
+        self.conn
+            .execute(
+                &format!("UPDATE {DEFAULT_PREFIX}grant SET alias = ?2 WHERE account_id = ?1"),
+                rusqlite::params![a.id, &alias],
+            )
+            .map_err(sql)?;
+        self.conn
+            .execute(
+                &format!("UPDATE {DEFAULT_PREFIX}account SET root_node_id = NULL WHERE id = ?1"),
+                [a.id],
+            )
+            .map_err(sql)?;
+        Ok(alias)
+    }
+
+    fn token_create(&mut self, account: &str, label: Option<&str>, expires_at: Option<&str>) -> Result<(String, i64)> {
+        self.admin_only("create tokens")?;
+        let id = self.account_id(account)?;
+        let now = textdb_sqlite::SqliteStorage::now();
+        acl::create_token(&self.conn, DEFAULT_PREFIX, id, label, expires_at, &now).map_err(StoreError::from)
+    }
+
+    fn token_ls(&mut self, account: Option<&str>) -> Result<Vec<TokenRow>> {
+        self.admin_only("list tokens")?;
+        let now = textdb_sqlite::SqliteStorage::now();
+        Ok(acl::tokens(&self.conn, DEFAULT_PREFIX, account)
+            .map_err(StoreError::from)?
+            .into_iter()
+            .map(|t| TokenRow {
+                live: t.live(&now),
+                id: t.id,
+                account: t.account,
+                label: t.label,
+                created_at: t.created_at,
+                expires_at: t.expires_at,
+                revoked_at: t.revoked_at,
+                last_used_at: t.last_used_at,
+            })
+            .collect())
+    }
+
+    fn token_revoke(&mut self, id: i64) -> Result<()> {
+        self.admin_only("revoke tokens")?;
+        let now = textdb_sqlite::SqliteStorage::now();
+        if acl::revoke_token(&self.conn, DEFAULT_PREFIX, id, &now).map_err(StoreError::from)? {
+            Ok(())
+        } else {
+            Err(StoreError::not_found(format!("there is no live token {id}")))
+        }
+    }
+
+    fn access_grant(&mut self, account: &str, path: &str, rights: &str, alias: Option<&str>) -> Result<ShareRow> {
+        self.admin_only("grant access")?;
+        let rights = Rights::parse(rights).ok_or_else(|| StoreError::invalid(format!("rights are 'ro' or 'rw', not '{rights}'")))?;
+        let a = match acl::account_by_name(&self.conn, DEFAULT_PREFIX, account).map_err(StoreError::from)? {
+            Some(a) => a,
+            None => return Err(StoreError::not_found(format!("there is no account called '{account}'"))),
+        };
+        let (node_id, store_path) = self.share_node(path)?;
+        let mut grants = acl::grants_of(&self.conn, DEFAULT_PREFIX, a.id).map_err(StoreError::from)?;
+        // Regranting the same node replaces its rights rather than being refused as a duplicate,
+        // which is what "raise this share to rw" has to mean.
+        let existing = grants.by_node(node_id).cloned();
+        let g = match existing {
+            Some(mut g) if alias.is_none() || alias == Some(g.alias.as_str()) => {
+                g.rights = rights;
+                g
+            }
+            _ => {
+                let ns = a.namespace();
+                // Every refusal here is "you asked for something the model does not allow",
+                // not "you may not": invalid, not forbidden.
+                grants.add(ns, node_id, &store_path, alias, rights).map_err(StoreError::invalid)?
+            }
+        };
+        let now = textdb_sqlite::SqliteStorage::now();
+        acl::insert_grant(&self.conn, DEFAULT_PREFIX, a.id, &g, Some("owner"), &now).map_err(StoreError::from)?;
+        Ok(ShareRow {
+            account: account.to_string(),
+            alias: g.alias.clone(),
+            rights: g.rights.as_str().to_string(),
+            store_path: Some(g.store_path.clone()),
+            node_id: g.node_id,
+            dormant: !g.live(),
+        })
+    }
+
+    fn access_rename(&mut self, account: &str, from: &str, to: &str) -> Result<()> {
+        self.admin_only("rename shares")?;
+        let id = self.account_id(account)?;
+        let mut grants = acl::grants_of(&self.conn, DEFAULT_PREFIX, id).map_err(StoreError::from)?;
+        grants.rename(from, to).map_err(StoreError::invalid)?;
+        if acl::rename_grant(&self.conn, DEFAULT_PREFIX, id, from, to).map_err(StoreError::from)? {
+            Ok(())
+        } else {
+            Err(StoreError::not_found(format!("'{account}' has no share called '{from}'")))
+        }
+    }
+
+    fn access_revoke(&mut self, account: &str, alias: &str) -> Result<()> {
+        self.admin_only("revoke shares")?;
+        let id = self.account_id(account)?;
+        let now = textdb_sqlite::SqliteStorage::now();
+        if acl::revoke_grant(&self.conn, DEFAULT_PREFIX, id, alias, &now).map_err(StoreError::from)? {
+            Ok(())
+        } else {
+            Err(StoreError::not_found(format!("'{account}' has no share called '{alias}'")))
+        }
+    }
+
+    fn denied_shares(&mut self) -> Result<Vec<String>> {
+        Ok(self
+            .view
+            .grants()
+            .iter()
+            .filter(|g| !g.live())
+            .map(|g| g.alias.clone())
+            .collect())
+    }
+
+    fn access_ls(&mut self, who: Option<&str>) -> Result<Vec<ShareRow>> {
+        self.admin_only("list shares")?;
+        let all = acl::all_grants(&self.conn, DEFAULT_PREFIX).map_err(StoreError::from)?;
+        let rows = all.into_iter().filter(|(account, g)| match who {
+            None => true,
+            // A path answers "who can see this?", an account name "what does this account see?".
+            // Which one was meant is decided by the shape of the argument, as `ls` does it.
+            Some(w) if w.starts_with('/') => model::contains(&g.store_path, w) || model::contains(w, &g.store_path),
+            Some(w) => account == w,
+        });
+        Ok(rows
+            .map(|(account, g)| ShareRow {
+                account,
+                alias: g.alias.clone(),
+                rights: g.rights.as_str().to_string(),
+                node_id: g.node_id,
+                dormant: !g.live(),
+                store_path: Some(g.store_path),
+            })
+            .collect())
+    }
+
     fn backend(&self) -> &'static str {
         "sqlite"
     }
@@ -400,7 +743,9 @@ impl Store for SqliteStore {
     }
 
     fn links(&mut self, path: &str, statuses: &[&str]) -> Result<Vec<super::LinkRow>> {
-        let path = normalize_path(path)?;
+        // The subtree the caller named, in store terms; `link_rows` adds the visible-set filter
+        // and turns both ends of each link back into the caller's paths.
+        let path = self.db().store_path(path)?;
         let (lo, hi) = subtree_bounds(&path).unwrap_or_else(|| ("/".into(), "0".into()));
         let only = if statuses.is_empty() {
             String::new()
@@ -411,7 +756,9 @@ impl Store for SqliteStore {
     }
 
     fn backlinks(&mut self, path: &str) -> Result<Vec<super::LinkRow>> {
-        let path = normalize_path(path)?;
+        // Links *from* files outside the caller's shares are dropped by `link_rows`, which is
+        // what #12 B13 asks for: you learn who links to your document only from inside your view.
+        let path = self.db().store_path(path)?;
         let (lo, hi) = subtree_bounds(&path).unwrap_or_else(|| ("/".into(), "0".into()));
         self.link_rows(
             &format!(
@@ -567,34 +914,41 @@ impl Store for SqliteStore {
     }
 
     fn file_heads(&mut self, prefix: &str) -> Result<Vec<FileHead>> {
-        let prefix = normalize_path(prefix)?;
+        use rusqlite::types::Value;
+        // What sync compares against disk, so it decides the shape of a checkout: the account's
+        // own layout, and nothing from outside its shares.
+        let prefix = self.db().store_path(prefix)?;
         let cols = "path, version, updated_by";
-        let map = |r: &rusqlite::Row| -> rusqlite::Result<FileHead> {
-            Ok(FileHead {
-                path: r.get(0)?,
-                version: r.get(1)?,
-                updated_by: r.get(2)?,
+        let (scope, args): (String, Vec<Value>) = match subtree_bounds(&prefix) {
+            None => ("1".into(), vec![]),
+            Some((lo, hi)) => ("path >= ?1 AND path < ?2".into(), vec![Value::Text(lo), Value::Text(hi)]),
+        };
+        let (vis, vis_args) = self.visible("path", args.len());
+        let mut all = args;
+        all.extend(vis_args);
+        let rows = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT {cols} FROM {DEFAULT_PREFIX}node WHERE deleted_at IS NULL AND kind = 1 AND ({scope}) AND ({vis})"
+            ))
+            .map_err(sql)?
+            .query_map(rusqlite::params_from_iter(all.iter()), |r| {
+                Ok(FileHead {
+                    path: r.get(0)?,
+                    version: r.get(1)?,
+                    updated_by: r.get(2)?,
+                })
             })
-        };
-        let rows = match subtree_bounds(&prefix) {
-            None => self
-                .conn
-                .prepare_cached(&format!("SELECT {cols} FROM {DEFAULT_PREFIX}node WHERE deleted_at IS NULL AND kind = 1"))
-                .map_err(sql)?
-                .query_map([], map)
-                .map_err(sql)?
-                .collect::<rusqlite::Result<Vec<_>>>(),
-            Some((lo, hi)) => self
-                .conn
-                .prepare_cached(&format!(
-                    "SELECT {cols} FROM {DEFAULT_PREFIX}node WHERE deleted_at IS NULL AND kind = 1 AND path >= ?1 AND path < ?2"
-                ))
-                .map_err(sql)?
-                .query_map([lo, hi], map)
-                .map_err(sql)?
-                .collect::<rusqlite::Result<Vec<_>>>(),
-        };
-        rows.map_err(sql)
+            .map_err(sql)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|mut h| {
+                h.path = self.seen(&h.path)?;
+                Some(h)
+            })
+            .collect())
     }
 
     fn sync_bases(&mut self, prefix: &str) -> Result<Vec<SyncBase>> {

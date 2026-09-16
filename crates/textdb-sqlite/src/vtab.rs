@@ -287,7 +287,7 @@ impl UpdateVTab<'_> for KbTab {
     fn delete(&mut self, arg: ValueRef<'_>) -> Result<()> {
         let id = ref_i64(arg).ok_or_else(|| Error::ModuleError("bad rowid".into()))?;
         let conn = self.conn();
-        let db = TextDb::attach(&conn, &self.prefix, false);
+        let db = TextDb::attach(&conn, &self.prefix, false).with_view(crate::access::session(unsafe { conn.handle() } as usize));
         let n = db
             .node_by_id(id)
             .map_err(map_err)?
@@ -297,7 +297,7 @@ impl UpdateVTab<'_> for KbTab {
 
     fn insert(&mut self, args: &Inserts<'_>) -> Result<i64> {
         let conn = self.conn();
-        let db = TextDb::attach(&conn, &self.prefix, false);
+        let db = TextDb::attach(&conn, &self.prefix, false).with_view(crate::access::session(unsafe { conn.handle() } as usize));
         let path = value_str(args.get::<Value>(2 + COL_PATH as usize)?)
             .ok_or_else(|| Error::ModuleError("TX004 path is required".into()))?;
         let path = normalize_path(&path).map_err(map_err)?;
@@ -323,7 +323,7 @@ impl UpdateVTab<'_> for KbTab {
 
     fn update(&mut self, args: &Updates<'_>) -> Result<()> {
         let conn = self.conn();
-        let db = TextDb::attach(&conn, &self.prefix, false);
+        let db = TextDb::attach(&conn, &self.prefix, false).with_view(crate::access::session(unsafe { conn.handle() } as usize));
         let id = value_i64(args.get::<Value>(0)?).ok_or_else(|| Error::ModuleError("bad rowid".into()))?;
         let n = db
             .node_by_id(id)
@@ -758,7 +758,8 @@ unsafe impl VTabCursor for FnCursor<'_> {
                 _ => None,
             }
         };
-        let db = TextDb::attach(self.tab.conn(), &self.tab.prefix, false);
+        let db = TextDb::attach(self.tab.conn(), &self.tab.prefix, false)
+            .with_view(crate::access::session(unsafe { self.tab.conn().handle() } as usize));
         self.rows = match self.kind {
             FnKind::Ls => {
                 let dir = s(&hidden[0]).unwrap_or_else(|| "/".into());

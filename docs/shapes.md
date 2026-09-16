@@ -49,6 +49,17 @@ needs one and no listing used to carry it.
 | 22 | `folders` | int \| null | `null` | live folders below |
 | 23 | `nauthors` | int | distinct authors | distinct authors below |
 | 24 | `authors` | array | `[{author, commits, first_ts, last_ts}]`, most commits first | `[]` |
+| 25 | `share` | string \| absent | the alias of the share this row was reached through | same |
+| 26 | `rights` | string \| absent | `ro` or `rw`, that share's rights | same |
+
+`share` and `rights` are the access tier (#12) and appear **only in an account's view**. The
+owner reaches everything directly and holds no shares, so for them both keys are absent rather
+than null — the record is the twenty-four columns it has always been. A single-root account's
+`share` is the empty string: its root *is* the share.
+
+In an account's view `path`, `name`, `dir` and `depth` are that account's own, under its alias;
+`id` is the store's and means the same thing in every view, which is why it is the reference to
+quote across them. `nbytes` is the canonical size.
 
 `nsections`, `nprops`, `nlinks`, `nlinks_broken` and `title` are computed once at commit from
 what the markdown extractor already returned, stored on the node row and rolled into the

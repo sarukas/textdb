@@ -11,8 +11,9 @@ use postgres::{Client, NoTls, Row};
 use textdb_sqlite::normalize_path;
 
 use super::{
-    BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, LineRange, LinkRow, MovedBack, MovedLink,
-    PathEvent, RestoredFile, Result, RevertOutcome, SqlResult, Store, StoreError, SyncBase, Written,
+    AccountRow, BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, LineRange, LinkRow,
+    MovedBack, MovedLink, PathEvent, RestoredFile, Result, RevertOutcome, ShareRow, SqlResult, Store, StoreError, SyncBase, TokenRow,
+    Whoami, Written,
 };
 
 /// The views `textdb sql` offers, as in SQLite: the live store by path. Temporary, so they live
@@ -170,6 +171,10 @@ fn entry(r: &Row) -> Entry {
         files: r.get(20),
         folders: r.get(21),
         nauthors: r.get(22),
+        // The share a row was reached through, when the connection has one. `try_get`, because
+        // the same `entry()` reads rows from queries written before these columns existed.
+        share: r.try_get("share").ok().flatten(),
+        rights: r.try_get("rights").ok().flatten(),
         authors: authors.and_then(|a| serde_json::from_str(&a).ok()).unwrap_or_default(),
     }
 }
@@ -405,6 +410,183 @@ fn batch_change(v: &serde_json::Value) -> BatchChange {
 }
 
 impl Store for PgStore {
+    // ------------------------------------------------------------ accounts, tokens and shares
+    //
+    // Every one of these is one call into `kb.*`, as with everything else in this module: the
+    // rules and the refusals are the extension's, so a client that talks to the database without
+    // going through this CLI gets exactly the same answers.
+
+    fn authenticate(&mut self, bearer: &str) -> Result<()> {
+        self.client.query_one("SELECT kb.auth($1)", &[&bearer]).map_err(pg)?;
+        Ok(())
+    }
+
+    fn whoami(&mut self) -> Result<Whoami> {
+        let rows = self.client.query("SELECT * FROM kb.whoami()", &[]).map_err(pg)?;
+        let first = rows.first().ok_or_else(|| StoreError::other("kb.whoami() said nothing"))?;
+        let account: Option<String> = first.get(0);
+        let admin: bool = first.get(1);
+        let kind: String = first.get(2);
+        let namespace: String = first.get(3);
+        let shares = rows
+            .iter()
+            .filter_map(|r| {
+                let alias: Option<String> = r.get(4);
+                alias.map(|alias| ShareRow {
+                    account: account.clone().unwrap_or_default(),
+                    alias,
+                    rights: r.get::<_, Option<String>>(5).unwrap_or_default(),
+                    // An account is never told where its shares live in the store.
+                    store_path: None,
+                    node_id: r.get::<_, Option<i64>>(6).unwrap_or_default(),
+                    dormant: r.get::<_, Option<bool>>(7).unwrap_or(false),
+                })
+            })
+            .collect();
+        Ok(Whoami { account, admin, kind, namespace, shares })
+    }
+
+    fn account_create(&mut self, name: &str, kind: &str, root: Option<&str>) -> Result<()> {
+        self.client
+            .query_one("SELECT kb.account_create($1, $2, $3)", &[&name, &kind, &root])
+            .map_err(pg)?;
+        Ok(())
+    }
+
+    fn account_ls(&mut self) -> Result<Vec<AccountRow>> {
+        let rows = self
+            .client
+            .query(
+                &format!("SELECT name, kind, root, {}, disabled, shares FROM kb.account_ls()", utc("created_at")),
+                &[],
+            )
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| AccountRow {
+                name: r.get(0),
+                kind: r.get(1),
+                root: r.get(2),
+                created_at: r.get(3),
+                disabled: r.get(4),
+                shares: r.get::<_, i64>(5) as usize,
+            })
+            .collect())
+    }
+
+    fn account_convert(&mut self, name: &str, alias: Option<&str>) -> Result<String> {
+        Ok(self
+            .client
+            .query_one("SELECT kb.account_convert($1, $2)", &[&name, &alias])
+            .map_err(pg)?
+            .get(0))
+    }
+
+    fn token_create(&mut self, account: &str, label: Option<&str>, expires_at: Option<&str>) -> Result<(String, i64)> {
+        // The expiry arrives as the store's own text format and is cast at the use site, because
+        // a bare parameter next to a timestamptz column resolves as text and the insert fails.
+        let row = self
+            .client
+            .query_one(
+                "SELECT bearer, id FROM kb.token_create($1, $2, $3::timestamptz)",
+                &[&account, &label, &expires_at],
+            )
+            .map_err(pg)?;
+        Ok((row.get(0), row.get(1)))
+    }
+
+    fn token_ls(&mut self, account: Option<&str>) -> Result<Vec<TokenRow>> {
+        let rows = self
+            .client
+            .query(
+                &format!(
+                    "SELECT id, account, label, {c}, {e}, {r}, {u}, live FROM kb.token_ls($1)",
+                    c = utc("created_at"),
+                    e = utc("expires_at"),
+                    r = utc("revoked_at"),
+                    u = utc("last_used_at"),
+                ),
+                &[&account],
+            )
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| TokenRow {
+                id: r.get(0),
+                account: r.get(1),
+                label: r.get(2),
+                created_at: r.get(3),
+                expires_at: r.get(4),
+                revoked_at: r.get(5),
+                last_used_at: r.get(6),
+                live: r.get(7),
+            })
+            .collect())
+    }
+
+    fn token_revoke(&mut self, id: i64) -> Result<()> {
+        self.client.query_one("SELECT kb.token_revoke($1)", &[&id]).map_err(pg)?;
+        Ok(())
+    }
+
+    fn access_grant(&mut self, account: &str, path: &str, rights: &str, alias: Option<&str>) -> Result<ShareRow> {
+        let row = self
+            .client
+            .query_one(
+                "SELECT alias, rights, store_path, node_id FROM kb.access_grant($1, $2, $3, $4)",
+                &[&account, &path, &rights, &alias],
+            )
+            .map_err(pg)?;
+        Ok(ShareRow {
+            account: account.to_string(),
+            alias: row.get(0),
+            rights: row.get(1),
+            store_path: Some(row.get(2)),
+            node_id: row.get(3),
+            dormant: false,
+        })
+    }
+
+    fn access_rename(&mut self, account: &str, from: &str, to: &str) -> Result<()> {
+        self.client
+            .query_one("SELECT kb.access_rename($1, $2, $3)", &[&account, &from, &to])
+            .map_err(pg)?;
+        Ok(())
+    }
+
+    fn access_revoke(&mut self, account: &str, alias: &str) -> Result<()> {
+        self.client
+            .query_one("SELECT kb.access_revoke($1, $2)", &[&account, &alias])
+            .map_err(pg)?;
+        Ok(())
+    }
+
+    fn denied_shares(&mut self) -> Result<Vec<String>> {
+        let rows = self
+            .client
+            .query("SELECT alias FROM kb.my_grant WHERE dormant ORDER BY alias", &[])
+            .map_err(pg)?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    fn access_ls(&mut self, who: Option<&str>) -> Result<Vec<ShareRow>> {
+        let rows = self
+            .client
+            .query("SELECT account, alias, rights, store_path, node_id, dormant FROM kb.access_ls($1)", &[&who])
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| ShareRow {
+                account: r.get(0),
+                alias: r.get(1),
+                rights: r.get(2),
+                store_path: Some(r.get(3)),
+                node_id: r.get(4),
+                dormant: r.get(5),
+            })
+            .collect())
+    }
+
     fn backend(&self) -> &'static str {
         "postgres"
     }

@@ -1164,6 +1164,17 @@ fn failure(e: &StoreError) -> String {
     }
 }
 
+/// The alias of the denied share a relative path falls under, if any.
+///
+/// `rel` is relative to the synced prefix, so for an account syncing its root the first segment
+/// is the alias; syncing one share, the alias is the prefix itself and every file is under it.
+fn denied_share_of(denied: &[String], rel: &str) -> Option<String> {
+    denied
+        .iter()
+        .find(|a| rel == a.as_str() || rel.starts_with(&format!("{a}/")) || a.is_empty())
+        .cloned()
+}
+
 pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     let prefix = normalize_path(&o.prefix)?;
     if !o.dir.exists() && !o.dry_run {
@@ -1185,6 +1196,10 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         .map(|c| c.id)
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+    // Shares this connection holds but may not use. Read before anything is planned: what the
+    // store no longer lists is otherwise indistinguishable from what it no longer has, and the
+    // plan below turns the second into a delete on disk.
+    let denied = st.denied_shares()?;
     let mut stored = find_sync_base(st, &prefix, &key)?;
     let mut moved_from: Option<String> = None;
     // A directory that was moved or renamed: the base is its own, found by the id it carries, so
@@ -1526,6 +1541,14 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
                 } else {
                     plan.conflicts.push((rel, tv, blob_id(&tb), merged));
                 }
+            }
+            // Gone from the store and unchanged here — unless it is under a share this account
+            // holds but may not use. A revoked share's files disappear from every listing, which
+            // looks exactly like a delete; deleting them would empty a vault because someone
+            // changed a permission. Forbidden is left alone, and said out loud.
+            (None, Some(false)) if denied_share_of(&denied, &rel).is_some() => {
+                let alias = denied_share_of(&denied, &rel).unwrap_or_default();
+                report.kept.push(note(&rel, &format!("{alias}/ is no longer shared with you; left alone")));
             }
             (None, Some(false)) => plan.disk_delete.push(rel),
             (Some(false), None) => plan.textdb_delete.push(rel),

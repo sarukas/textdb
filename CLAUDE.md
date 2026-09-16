@@ -61,6 +61,16 @@ Cast at the use site: `$10::bigint + 1`.
 is a tie and `ORDER BY ts DESC` picks arbitrarily among them. Where that matters — the folder
 journal's author — filter to the rows that carry a value rather than trusting the order.
 
+**A path is translated exactly once, at a public entry point.** With delegated access (#12) a
+caller's path is not a store path, and `TextDb`'s public methods turn one into the other on the
+way in. Several of them used to call each other — `upsert` calls `create`, `write` calls
+`update_content`, `create` calls `ensure_folder` — which translated a second time, and an
+account's own `/legal/contracts/x.md` fed back in names an alias it does not have. Hence the
+`*_at` variants (`create_at`, `update_content_at`, `commit_edits_at`, `ensure_folder_at`): they
+take a path that is already a store path and never translate. Public methods translate, `*_at`
+never does, and an internal caller uses `*_at`. The same rule holds on the way out — a row's
+`path` is translated once, where the row is built.
+
 **Root discovery walks up from the working directory.** A synced directory anywhere above a test
 pairs it with a store the test knows nothing about, and a test that syncs the current directory
 syncs *this repository*. The harnesses pin `TEXTDB_CEILING_DIRECTORIES` to the working directory

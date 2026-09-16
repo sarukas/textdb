@@ -18,6 +18,7 @@ pgrx = "=0.18.1"
 textdb-core = { path = "../textdb-core" }
 textdb-md = { path = "../textdb-md" }
 serde_json = { version = "1", features = ["preserve_order"] }
+rand = "0.8"
 
 [dev-dependencies]
 pgrx-tests = "=0.18.1"

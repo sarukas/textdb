@@ -18,7 +18,9 @@ textdb-core = { path = "../textdb-core" }
 textdb-md = { path = "../textdb-md" }
 rusqlite = { version = "0.40", default-features = false, features = ["cache", "vtab", "functions"] }
 serde_json = { workspace = true }
+# Bearer tokens (#12): sha2 hashes them for storage, rand mints them.
+rand = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-rand = { workspace = true }

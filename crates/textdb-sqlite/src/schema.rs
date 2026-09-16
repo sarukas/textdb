@@ -226,6 +226,44 @@ CREATE TABLE IF NOT EXISTS {p}asset_store (
   options    TEXT,                          -- JSON, driver specific
   created_at TEXT NOT NULL
 );
+-- Accounts, bearer tokens and folder-scoped grants (#12). The same three tables in the
+-- Postgres extension, so one access model serves both engines. Empty in a store nobody has
+-- delegated: a store with no account rows has no token to present, so every connection is the
+-- owner and the whole model costs one "is this table empty" check at open.
+CREATE TABLE IF NOT EXISTS {p}account (
+  id           INTEGER PRIMARY KEY,
+  name         TEXT    NOT NULL,
+  kind         TEXT    NOT NULL,             -- 'agent' | 'person'
+  root_node_id INTEGER NULL REFERENCES {p}node(id),   -- single-root accounts only
+  created_at   TEXT    NOT NULL,
+  disabled_at  TEXT    NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS {p}account_name ON {p}account(name);
+CREATE TABLE IF NOT EXISTS {p}token (
+  id          INTEGER PRIMARY KEY,
+  account_id  INTEGER NOT NULL REFERENCES {p}account(id),
+  hash        TEXT    NOT NULL,              -- sha256 of the bearer; the bearer is shown once
+  label       TEXT,
+  created_at  TEXT    NOT NULL,
+  expires_at  TEXT    NULL,
+  revoked_at  TEXT    NULL,
+  last_used_at TEXT   NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS {p}token_hash ON {p}token(hash);
+CREATE INDEX IF NOT EXISTS {p}token_account ON {p}token(account_id);
+CREATE TABLE IF NOT EXISTS {p}grant (
+  account_id  INTEGER NOT NULL REFERENCES {p}account(id),
+  node_id     INTEGER NOT NULL REFERENCES {p}node(id),
+  alias       TEXT    NOT NULL,              -- '' for a single-root account
+  rights      TEXT    NOT NULL,              -- 'ro' | 'rw'
+  granted_by  TEXT,
+  granted_at  TEXT    NOT NULL,
+  -- A revoked grant keeps its row: an account whose checkout still holds the files must be told
+  -- `forbidden`, not `not found`, or its next sync deletes them.
+  revoked_at  TEXT    NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS {p}grant_alias ON {p}grant(account_id, alias);
+CREATE UNIQUE INDEX IF NOT EXISTS {p}grant_node ON {p}grant(account_id, node_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS {p}fts USING fts5(text, content='', tokenize='unicode61');
 "#,
         p = p
@@ -360,8 +398,16 @@ pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> 
     Ok(missing.len())
 }
 
+/// Every shadow table, for `DROP TABLE kb`.
+///
+/// Children first: `grant` and `token` reference `account` and `node`, so the order matters
+/// wherever foreign keys are enforced. A table added to `create_sql` and forgotten here is left
+/// behind by a drop, and `sql_surface.rs::dropping_a_kb_table_removes_the_shadow_tables` is what
+/// notices — it counts what is left rather than naming what it expected, so it catches the next
+/// one too.
 pub fn drop_sql(p: &str) -> String {
     [
+        "grant", "token", "account",
         "node", "commit", "chunk", "tree_node", "chunk_ref", "section", "link", "frontmatter", "property", "checkpoint", "change", "path_event",
         "setting", "file_author", "sync", "sync_file", "asset_store", "fts",
     ]

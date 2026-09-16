@@ -1325,6 +1325,7 @@ dependencies = [
  "rand 0.8.8",
  "rusqlite",
  "serde_json",
+ "sha2",
  "tempfile",
  "textdb-core",
  "textdb-md",

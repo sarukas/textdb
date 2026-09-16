@@ -169,7 +169,9 @@ fn with_db<T>(
     };
     // Scalar functions run inside a SELECT: open one write transaction for the whole
     // operation instead of autocommitting every nested statement.
-    let db = TextDb::attach(conn, prefix, true);
+    // Whoever this connection authenticated as, if anyone (`textdb_auth`). Free when nobody on
+    // this process ever has.
+    let db = TextDb::attach(conn, prefix, true).with_view(crate::access::session(handle));
     f(&db).map_err(map_err)
 }
 
@@ -177,6 +179,31 @@ pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY;
     // See `with_db`: the handle these functions belong to, captured once.
     let h = unsafe { conn.handle() } as usize;
+
+    // `SELECT textdb_auth('tdb_…')` — the connection is that account from here on, and every
+    // function and the `kb` virtual table answer in its paths and see only its shares. This is
+    // the SQLite half of #12 §4; Postgres has `SET textdb.token`. Returns the account name.
+    // Called with NULL it goes back to being the owner, which is what the store is to anyone who
+    // can open the file anyway (#12 L1).
+    let p = prefix.to_string();
+    conn.create_scalar_function("textdb_auth", 1, flags, move |ctx| {
+        if ctx.get_raw(0) == ValueRef::Null {
+            crate::access::set_session(h, textdb_core::access::View::admin());
+            return Ok(None);
+        }
+        let bearer = arg_str(ctx, 0)?;
+        let conn = unsafe { ctx.get_connection()? };
+        let now = crate::storage::SqliteStorage::now();
+        match crate::access::authenticate(&conn, &p, &bearer, &now).map_err(map_err)? {
+            Ok(view) => {
+                let name = view.name().unwrap_or_default().to_string();
+                crate::access::set_session(h, view);
+                Ok(Some(name))
+            }
+            Err(e) => Err(Error::UserFunctionError(e.to_string().into())),
+        }
+    })?;
+
     let p = prefix.to_string();
     conn.create_scalar_function("textdb_content", -1, flags, move |ctx| {
         if ctx.len() < 1 {

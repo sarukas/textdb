@@ -55,6 +55,10 @@ struct Cli {
     /// Answer in JSON (errors too, on stdout).
     #[arg(long, global = true)]
     json: bool,
+    /// A bearer token. Everything is then answered in that account's view: its own paths, its own
+    /// shares, and nothing else. Without one the store is opened as its owner.
+    #[arg(long, short = 't', global = true, env = "TEXTDB_TOKEN", value_name = "BEARER")]
+    token: Option<String>,
     /// Record renames, moves and deletes in the history of what they touch: `on` or `off` for
     /// this command. Without it the store's `path_history` setting decides, which is on unless
     /// changed with `textdb setting path_history off`.
@@ -63,6 +67,87 @@ struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
 }
+
+
+#[derive(Subcommand)]
+enum AccountCmd {
+    /// Create an account. With `--root` its root *is* that folder: it holds that one share and
+    /// sees it at `/`, which is the shape for an agent that owns exactly one vault.
+    Create {
+        name: String,
+        #[arg(long, default_value = "agent", value_name = "agent|person")]
+        kind: String,
+        #[arg(long, value_parser = store_path)]
+        root: Option<String>,
+    },
+    /// Every account, with how many shares it holds.
+    Ls,
+    /// Turn a single-root account into one that holds shares under aliases. Every path it sees
+    /// gains a `/<alias>` prefix, so this is announced rather than silent.
+    Convert {
+        name: String,
+        /// The alias its existing share takes; the folder's own name by default.
+        #[arg(long = "as", value_name = "ALIAS")]
+        alias: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenCmd {
+    /// Mint a bearer for an account. Printed once and stored hashed: it cannot be shown again.
+    Create {
+        account: String,
+        #[arg(long)]
+        label: Option<String>,
+        /// When it stops working: `30d`, `12h`, or an ISO-8601 instant.
+        #[arg(long, value_name = "WHEN")]
+        expires: Option<String>,
+    },
+    /// Every token, without any bearer.
+    Ls {
+        account: Option<String>,
+    },
+    /// Stop a token. The account keeps its shares; this bearer stops working.
+    Revoke {
+        id: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum AccessCmd {
+    /// Share a folder and everything below it with an account.
+    Grant {
+        account: String,
+        #[arg(value_parser = store_path)]
+        path: String,
+        #[arg(value_name = "ro|rw")]
+        rights: String,
+        /// The account's name for this share, and the first segment of every path it sees through
+        /// it. The folder's own name by default; a collision is refused rather than suffixed.
+        #[arg(long = "as", value_name = "ALIAS")]
+        alias: Option<String>,
+    },
+    /// Rename a share in one account's namespace. A move for that account, so its next sync moves
+    /// the directory on disk instead of deleting it and pulling every file down again.
+    Rename {
+        account: String,
+        from: String,
+        to: String,
+    },
+    /// Take a share away. The account's checkout keeps its files: the store answers `forbidden`
+    /// for them, not `not found`, so nothing on disk is deleted.
+    Revoke {
+        account: String,
+        alias: String,
+    },
+    /// Who sees what. With an account name, that account's shares; with a store path, the
+    /// accounts that can see it.
+    Ls {
+        #[arg(value_name = "ACCOUNT|PATH")]
+        who: Option<String>,
+    },
+}
+
 
 /// A path inside the store, as given on the command line.
 ///
@@ -511,6 +596,17 @@ enum Cmd {
         #[arg(long)]
         keep_empty_folders: bool,
     },
+    /// Who this connection is, and what it can see.
+    Whoami,
+    /// Accounts that hold shares of this store (owner only).
+    #[command(subcommand)]
+    Account(AccountCmd),
+    /// Bearer tokens (owner only).
+    #[command(subcommand)]
+    Token(TokenCmd),
+    /// Folder-scoped shares (owner only).
+    #[command(subcommand)]
+    Access(AccessCmd),
     /// Show or change a store setting: `setting`, `setting path_history`,
     /// `setting path_history off` (`on`, or `default` to clear it).
     Setting {
@@ -584,8 +680,20 @@ fn run(mut cli: Cli, matches: &ArgMatches) -> Result<()> {
     }
     let mut store = store::open(&cli.store)?;
     let st = store.as_mut();
+    // Before anything else: from here on every path this process says or hears is the account's,
+    // and the store answers nothing about what lies outside its shares.
+    if let Some(bearer) = cli.token.as_deref() {
+        st.authenticate(bearer)?;
+    }
     if cli.path_history.is_some() {
         st.set_session_path_history(cli.path_history)?;
+    }
+    // A token session writes as its account, and cannot claim to be someone else (#12 §3).
+    let author_given = matches!(matches.value_source("author"), Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable));
+    if cli.token.is_some() && author_given {
+        return Err(StoreError::forbidden(
+            "--author names someone else; a token session writes as its own account",
+        ));
     }
     let author = Some(cli.author.as_str());
     match cli.cmd {
@@ -600,6 +708,10 @@ fn run(mut cli: Cli, matches: &ArgMatches) -> Result<()> {
                 line(format!("{} store ready: {shown} (last change #{seq})", st.backend()))
             }
         }
+        Cmd::Whoami => whoami(st, json),
+        Cmd::Account(c) => account_cmd(st, c, json),
+        Cmd::Token(c) => token_cmd(st, c, json),
+        Cmd::Access(c) => access_cmd(st, c, json),
         Cmd::Import { dir, prefix, ext, batch } => import(st, &dir, &prefix, &ext, batch, author, json),
         Cmd::Export { prefix, dir, dry_run } => export(st, &prefix, &dir, dry_run, json),
         Cmd::Sync {
@@ -1180,6 +1292,232 @@ fn history_text(items: &[HistoryItem]) -> String {
 
 /// Write to stdout. A reader that went away (`textdb cat big.md | head`) ends the program
 /// quietly instead of as an error.
+
+// ---------------------------------------------------------------- accounts, tokens and shares
+
+fn whoami(st: &mut dyn Store, json: bool) -> Result<()> {
+    let me = st.whoami()?;
+    if json {
+        return emit_json(&me);
+    }
+    if me.admin {
+        return line("owner of the store: every folder, every account, store paths");
+    }
+    let name = me.account.clone().unwrap_or_default();
+    line(format!("{name} ({}, {} namespace)", me.kind, me.namespace))?;
+    if me.shares.is_empty() {
+        return line("  no shares");
+    }
+    for sh in &me.shares {
+        let at = if sh.alias.is_empty() { "/".to_string() } else { format!("/{}/", sh.alias) };
+        let note = if sh.dormant { "  (its folder is in the trash)" } else { "" };
+        line(format!("  {:<4} {at}{note}", sh.rights))?;
+    }
+    Ok(())
+}
+
+fn account_cmd(st: &mut dyn Store, c: AccountCmd, json: bool) -> Result<()> {
+    match c {
+        AccountCmd::Create { name, kind, root } => {
+            st.account_create(&name, &kind, root.as_deref())?;
+            if json {
+                emit_json(&json!({ "account": name, "kind": kind, "root": root }))
+            } else if let Some(r) = root {
+                line(format!("account {name} ({kind}), whose root is {r}"))
+            } else {
+                line(format!("account {name} ({kind}); grant it a folder with `textdb access grant`"))
+            }
+        }
+        AccountCmd::Ls => {
+            let rows = st.account_ls()?;
+            if json {
+                return emit_json(&rows);
+            }
+            if rows.is_empty() {
+                return line("no accounts; the store is opened by its owner and by nobody else");
+            }
+            for a in rows {
+                let what = match &a.root {
+                    Some(r) => format!("root {r}"),
+                    None => format!("{} share{}", a.shares, if a.shares == 1 { "" } else { "s" }),
+                };
+                let off = if a.disabled { "  (disabled)" } else { "" };
+                line(format!("{:<24} {:<8} {what}{off}", a.name, a.kind))?;
+            }
+            Ok(())
+        }
+        AccountCmd::Convert { name, alias } => {
+            let alias = st.account_convert(&name, alias.as_deref())?;
+            if json {
+                emit_json(&json!({ "account": name, "alias": alias }))
+            } else {
+                line(format!(
+                    "{name} now holds its shares under aliases: every path it sees gains a /{alias} prefix"
+                ))
+            }
+        }
+    }
+}
+
+fn token_cmd(st: &mut dyn Store, c: TokenCmd, json: bool) -> Result<()> {
+    match c {
+        TokenCmd::Create { account, label, expires } => {
+            let expires_at = expires.as_deref().map(parse_expiry).transpose()?;
+            let (bearer, id) = st.token_create(&account, label.as_deref(), expires_at.as_deref())?;
+            // Printed here and nowhere again: the store keeps only its hash.
+            if json {
+                emit_json(&json!({ "bearer": bearer, "id": id, "account": account, "expires_at": expires_at }))
+            } else {
+                line(format!("{bearer}\ntoken {id} for {account}; this is the only time it is shown"))
+            }
+        }
+        TokenCmd::Ls { account } => {
+            let rows = st.token_ls(account.as_deref())?;
+            if json {
+                return emit_json(&rows);
+            }
+            if rows.is_empty() {
+                return line("no tokens");
+            }
+            for t in rows {
+                let state = if t.revoked_at.is_some() {
+                    "revoked".to_string()
+                } else if !t.live {
+                    "expired".to_string()
+                } else {
+                    match &t.expires_at {
+                        Some(e) => format!("until {e}"),
+                        None => "live".to_string(),
+                    }
+                };
+                line(format!(
+                    "{:<5} {:<24} {:<20} {}",
+                    t.id,
+                    t.account,
+                    state,
+                    t.label.unwrap_or_default()
+                ))?;
+            }
+            Ok(())
+        }
+        TokenCmd::Revoke { id } => {
+            st.token_revoke(id)?;
+            if json {
+                emit_json(&json!({ "revoked": id }))
+            } else {
+                line(format!("token {id} revoked; the account keeps its shares"))
+            }
+        }
+    }
+}
+
+fn access_cmd(st: &mut dyn Store, c: AccessCmd, json: bool) -> Result<()> {
+    match c {
+        AccessCmd::Grant { account, path, rights, alias } => {
+            let sh = st.access_grant(&account, &path, &rights, alias.as_deref())?;
+            if json {
+                emit_json(&sh)
+            } else {
+                let at = if sh.alias.is_empty() { "/".to_string() } else { format!("/{}/", sh.alias) };
+                line(format!("{account} sees {path} as {at} ({})", sh.rights))
+            }
+        }
+        AccessCmd::Rename { account, from, to } => {
+            st.access_rename(&account, &from, &to)?;
+            if json {
+                emit_json(&json!({ "account": account, "from": from, "to": to }))
+            } else {
+                line(format!("{account}: /{from}/ is now /{to}/; its next sync moves the directory"))
+            }
+        }
+        AccessCmd::Revoke { account, alias } => {
+            st.access_revoke(&account, &alias)?;
+            if json {
+                emit_json(&json!({ "account": account, "revoked": alias }))
+            } else {
+                line(format!(
+                    "{account} no longer sees /{alias}/; files already on its disk are left alone"
+                ))
+            }
+        }
+        AccessCmd::Ls { who } => {
+            let rows = st.access_ls(who.as_deref())?;
+            if json {
+                return emit_json(&rows);
+            }
+            if rows.is_empty() {
+                return line("nothing is shared");
+            }
+            for sh in rows {
+                let at = if sh.alias.is_empty() { "/".to_string() } else { format!("/{}/", sh.alias) };
+                let note = if sh.dormant { "  (in the trash)" } else { "" };
+                line(format!(
+                    "{:<24} {:<4} {:<24} {}{note}",
+                    sh.account,
+                    sh.rights,
+                    at,
+                    sh.store_path.unwrap_or_default()
+                ))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `30d`, `12h`, `90m`, or an ISO-8601 instant passed through as written.
+fn parse_expiry(s: &str) -> Result<String> {
+    let (n, unit) = s.split_at(s.len().saturating_sub(1));
+    let secs = match (n.parse::<i64>(), unit) {
+        (Ok(n), "d") => n * 86_400,
+        (Ok(n), "h") => n * 3_600,
+        (Ok(n), "m") => n * 60,
+        // Not a duration: take it as an instant the store can compare as text, which is what
+        // every timestamp in the store is.
+        _ => {
+            return if s.len() >= 10 && s.starts_with(|c: char| c.is_ascii_digit()) {
+                Ok(s.to_string())
+            } else {
+                Err(StoreError::invalid(format!(
+                    "'{s}' is not a duration (30d, 12h, 90m) or an ISO-8601 instant"
+                )))
+            }
+        }
+    };
+    let at = std::time::SystemTime::now() + std::time::Duration::from_secs(secs.max(0) as u64);
+    let d = at.duration_since(std::time::UNIX_EPOCH).map_err(StoreError::other)?;
+    Ok(iso8601_utc(d.as_secs()))
+}
+
+/// The store's timestamp format, without pulling in a date library for one call.
+fn iso8601_utc(secs: u64) -> String {
+    let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
+    let (mut y, mut d) = (1970i64, days);
+    loop {
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let len = if leap { 366 } else { 365 };
+        if d < len {
+            break;
+        }
+        d -= len;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let months = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0;
+    while d >= months[m] {
+        d -= months[m];
+        m += 1;
+    }
+    format!(
+        "{y:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z",
+        m + 1,
+        d + 1,
+        rest / 3600,
+        (rest % 3600) / 60,
+        rest % 60
+    )
+}
+
 fn out(bytes: &[u8]) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     match stdout.write_all(bytes).and_then(|_| stdout.flush()) {
