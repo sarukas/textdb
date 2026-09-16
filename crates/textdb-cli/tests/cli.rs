@@ -567,7 +567,8 @@ fn sql_bulk_edits_dry_runs_batches_revert_and_formats() {
     // Path helpers, TSV and one value per line.
     let files = sql(&["--format", "tsv", "SELECT path, dir, depth, ext FROM files ORDER BY path"]);
     assert_eq!(files.stdout, "path\tdir\tdepth\text\n/p/a.md\t/p\t2\tmd\n/p/b.md\t/p\t2\tmd\n/p/old/c.md\t/p/old\t3\tmd\n");
-    assert_eq!(sql(&["--format", "lines", "SELECT parent FROM folders WHERE path = '/p/old'"]).stdout, "/p\n");
+    // `folders.parent` is `dir` now: one name for the parent on every surface.
+    assert_eq!(sql(&["--format", "lines", "SELECT dir FROM folders WHERE path = '/p/old'"]).stdout, "/p\n");
     assert_eq!(sql(&["--format", "lines", "SELECT name FROM files ORDER BY name"]).stdout, "a.md\nb.md\nc.md\n");
     assert_eq!(sql(&["--format", "lines", "SELECT name, path FROM files"]).status, 6);
 
