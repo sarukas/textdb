@@ -1341,12 +1341,13 @@ fn assets_push_keeps_bytes_in_use_and_records_only_what_it_wrote() {
     let dw = w.to_str().unwrap();
     std::fs::write(w.join("a.md"), "a\n").unwrap();
     ok(&mut t(&["sync", "/w1", dw]), None);
-    ok(&mut t(&["sync", "/w2", dw]), None);
+    // One directory paired with a second folder: the config names one, so this says so on purpose.
+    ok(&mut t(&["sync", "--force", "/w2", dw]), None);
     std::fs::write(w.join("z.png"), b"\x89PNG z").unwrap();
     ok(&mut t(&["assets", "push", "--dir", dw]), None);
     let s = ok(&mut t(&["--json", "assets", "status", "--dir", dw]), None).json();
     assert_eq!((s["prefix"].as_str(), &s["counts"]), (Some("/w2"), &serde_json::json!({ "ok": 1 })), "{s}");
-    let other = run(&mut t(&["--json", "sync", "--dry-run", "/w1", dw]), None).json();
+    let other = run(&mut t(&["--json", "sync", "--dry-run", "--force", "/w1", dw]), None).json();
     assert_eq!(other["to_textdb"]["new"], serde_json::json!(["z.png.tdbasset"]), "{other}");
 
     // One push that takes a moved pointer's bytes for a new asset does not then replace them for
@@ -1977,7 +1978,8 @@ fn sync_in_a_git_checkout_credits_git_authors_and_commits_with_trailers() {
     std::fs::write(docs.join("a.md"), "a3\n").unwrap();
     git(&repo, &["-c", "user.name=carol", "-c", "user.email=carol@example.com", "commit", "-q", "-am", "a3"]);
     ok(textdb(&older).args(["write", "/docs/b.md"]), Some("b3\n"));
-    let boot = ok(textdb(&older).args(["--json", "sync", "--base", "HEAD~1", "/docs"]).arg(&docs), None).json();
+    // A second store for the same directory: the pairing names one, so this says so on purpose.
+    let boot = ok(textdb(&older).args(["--json", "sync", "--force", "--base", "HEAD~1", "/docs"]).arg(&docs), None).json();
     assert_eq!(boot["to_textdb"]["changed"], serde_json::json!(["a.md"]), "{boot}");
     assert_eq!(boot["to_disk"]["changed"], serde_json::json!(["b.md"]));
     assert_eq!(boot["conflicts"], serde_json::json!([]));
@@ -2709,4 +2711,107 @@ fn the_textdb_directory_ignores_itself() {
 
     let ignore = std::fs::read_to_string(dir.join(".textdb").join(".gitignore")).unwrap();
     assert!(ignore.contains('*'), "{ignore}");
+}
+
+/// A synced directory remembers what it is paired with, so `textdb sync` needs no arguments from
+/// anywhere inside it — and refuses a folder or store that contradicts the pairing, which used to
+/// import the whole tree again under a second prefix without a word.
+#[test]
+fn a_synced_directory_remembers_its_store_and_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(dir.join("notes/deep")).unwrap();
+    std::fs::write(dir.join("a.md"), "one\n").unwrap();
+    std::fs::write(dir.join("notes/deep/c.md"), "three\n").unwrap();
+    ok(textdb(&db).args(["sync", "/docs"]).arg(&dir), None);
+
+    let config = std::fs::read_to_string(dir.join(".textdb").join("config")).unwrap();
+    assert!(config.contains("prefix = \"/docs\""), "{config}");
+    assert!(config.contains("id = \""), "{config}");
+
+    // No arguments at all, three levels down: the pairing supplies the folder, the directory and
+    // the store, so `-s` is not needed either.
+    let mut bare = Command::new(env!("CARGO_BIN_EXE_textdb"));
+    bare.current_dir(dir.join("notes/deep"))
+        .env_remove("TEXTDB_STORE")
+        .env("TEXTDB_CONFIG_DIR", tmp.path().join("config"))
+        .arg("sync");
+    let out = ok(&mut bare, None);
+    assert!(out.stdout.contains("/docs with"), "{}", out.stdout);
+    assert!(out.stdout.contains("2 unchanged"), "{}", out.stdout);
+
+    // A different folder, and a different store, are refused by name.
+    let other = run(textdb(&db).args(["sync", "/elsewhere"]).arg(&dir), None);
+    assert_eq!(other.status, 6, "{}", other.stdout);
+    assert!(other.stderr.contains("is paired with /docs"), "{}", other.stderr);
+    let second = tmp.path().join("second.db");
+    let mut from_inside = Command::new(env!("CARGO_BIN_EXE_textdb"));
+    from_inside
+        .current_dir(&dir)
+        .env_remove("TEXTDB_STORE")
+        .env("TEXTDB_CONFIG_DIR", tmp.path().join("config"))
+        .arg("--store")
+        .arg(&second)
+        .arg("sync");
+    let moved = run(&mut from_inside, None);
+    assert_eq!(moved.status, 6, "{}", moved.stdout);
+    assert!(moved.stderr.contains("paired with the store"), "{}", moved.stderr);
+
+    // One argument is the folder in the store, so a lone directory is a mistake worth naming.
+    let mistake = run(textdb(&db).arg("sync").arg(&dir), None);
+    assert_eq!(mistake.status, 6, "{}", mistake.stdout);
+    assert!(mistake.stderr.contains("is a directory on this computer"), "{}", mistake.stderr);
+
+    // --force says so on purpose, and the pairing follows.
+    ok(textdb(&db).args(["sync", "--force", "/elsewhere"]).arg(&dir), None);
+    let config = std::fs::read_to_string(dir.join(".textdb").join("config")).unwrap();
+    assert!(config.contains("prefix = \"/elsewhere\""), "{config}");
+}
+
+/// The store's own files are never documents, whichever way they would travel.
+#[test]
+fn the_store_is_left_out_of_the_directory_it_syncs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("kb.db");
+    std::fs::write(dir.join("a.md"), "one\n").unwrap();
+
+    // `--ext '*'` takes in everything text-shaped, which is how `kb.db-wal` was offered.
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir).args(["--ext", "*"]), None);
+    let out = ok(textdb(&db).args(["sync", "/"]).arg(&dir).args(["--ext", "*"]), None);
+    assert!(out.stdout.contains("the store itself"), "{}", out.stdout);
+
+    let paths = ok(textdb(&db).args(["ls", "-1", "-R", "/"]), None).stdout;
+    assert!(paths.contains("/a.md"), "{paths}");
+    for name in ["kb.db", "kb.db-wal", "kb.db-shm"] {
+        assert!(!paths.contains(name), "{name} was taken in: {paths}");
+    }
+}
+
+/// What a sync walked past, and the one line a hook wants instead of the whole list.
+#[test]
+fn sync_says_what_it_left_out_and_can_keep_quiet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.md"), "one\n").unwrap();
+    std::fs::write(dir.join("data.csv"), "x,y\n").unwrap();
+    std::fs::write(dir.join("app.json"), "{}\n").unwrap();
+
+    let first = ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+    assert!(first.stdout.contains("left out        2 files by extension"), "{}", first.stdout);
+    assert!(first.stdout.contains("--ext to include them"), "{}", first.stdout);
+    // A plain directory is not an Obsidian vault, so no .textdbignore is written into it and
+    // nothing of sync's own counts as a change on disk.
+    assert!(!dir.join(".textdbignore").exists());
+    assert!(first.stdout.contains("disk 0 new"), "{}", first.stdout);
+
+    std::fs::write(dir.join("b.md"), "two\n").unwrap();
+    let quiet = ok(textdb(&db).args(["sync", "/"]).arg(&dir).arg("--quiet"), None);
+    assert!(!quiet.stdout.contains("textdb new"), "{}", quiet.stdout);
+    assert!(quiet.stdout.contains("left out"), "{}", quiet.stdout);
+    assert_eq!(quiet.stdout.lines().filter(|l| l.starts_with("synced:")).count(), 1, "{}", quiet.stdout);
 }

@@ -29,6 +29,7 @@ mod assets;
 mod git;
 mod links;
 mod lock;
+mod root;
 mod meta;
 mod outline;
 mod portable;
@@ -120,9 +121,16 @@ enum Cmd {
     /// they overlap the file on disk gets conflict markers. In a git checkout, changes that came
     /// from git are attributed to their git authors, and --commit commits what sync wrote.
     Sync {
+        /// The store folder. Left out, it is the one this directory was paired with by its first
+        /// sync (`.textdb/config`), so `textdb sync` on its own works from anywhere in the tree.
         #[arg(value_parser = store_path)]
-        prefix: String,
-        dir: PathBuf,
+        prefix: Option<String>,
+        /// The directory. Left out, it is the synced directory found by walking up from here.
+        dir: Option<PathBuf>,
+        /// Pair this directory with a folder or store it was not paired with before, replacing
+        /// what `.textdb/config` records.
+        #[arg(long)]
+        force: bool,
         /// Files found only on disk to take in, by extension (`*` for all). Files already synced
         /// are followed whatever their type.
         #[arg(long, default_value = "md,markdown,mdx,txt")]
@@ -161,6 +169,9 @@ enum Cmd {
         /// Do not wait for another sync of the same directory: exit 4 at once if one is running.
         #[arg(long, conflicts_with = "lock_timeout")]
         no_wait: bool,
+        /// Print the summary line and what went wrong, not the file-by-file list. For hooks.
+        #[arg(long, short = 'q')]
+        quiet: bool,
     },
     /// When a store folder was last synced, what changed in it since, and how it compares with a
     /// git commit (by git blob id).
@@ -555,10 +566,21 @@ fn cli_main() -> i32 {
     status
 }
 
-fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
+fn run(mut cli: Cli, matches: &ArgMatches) -> Result<()> {
     let json = cli.json;
     if let Cmd::Config = cli.cmd {
         return show_config(&cli, matches);
+    }
+    // A synced directory records the store and folder it is paired with, so `textdb sync` on its
+    // own works from anywhere inside the tree. Resolved before the store is opened, since which
+    // store to open is part of what the directory remembers.
+    if let Cmd::Sync { prefix, dir, force, .. } = &mut cli.cmd {
+        let given = matches!(matches.value_source("store"), Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable));
+        let (mut p, mut d, f) = (prefix.take(), dir.take(), *force);
+        root::resolve(&mut p, &mut d, f, &mut cli.store, given)?;
+        if let Cmd::Sync { prefix, dir, .. } = &mut cli.cmd {
+            (*prefix, *dir) = (p, d);
+        }
     }
     let mut store = store::open(&cli.store)?;
     let st = store.as_mut();
@@ -583,6 +605,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
         Cmd::Sync {
             prefix,
             dir,
+            force: _,
             ext,
             base,
             dry_run,
@@ -593,20 +616,24 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             pull,
             lock_timeout,
             no_wait,
+            quiet,
         } => sync::sync(
             st,
             sync::Options {
-                prefix,
-                dir,
+                // `root::resolve` filled both in above, from the directory's pairing.
+                prefix: prefix.expect("prefix resolved"),
+                dir: dir.expect("directory resolved"),
                 exts: sync::parse_exts(&ext),
                 base_rev: base,
                 dry_run,
                 commit,
                 author: cli.author.clone(),
                 store: config::redact(&cli.store),
+                store_file: cli.store.clone(),
                 accept_rules,
                 prune_empty_dirs,
                 lock_wait: if no_wait { Duration::ZERO } else { Duration::from_secs(lock_timeout) },
+                quiet,
                 assets: match (push, pull) {
                     (true, true) => Some("both".to_string()),
                     (true, false) => Some("push".to_string()),

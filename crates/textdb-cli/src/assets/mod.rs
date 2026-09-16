@@ -1575,6 +1575,11 @@ pub fn stores(st: &mut dyn Store, o: StoresOptions, json: bool) -> Result<()> {
         if let Some(problem) = (o.driver == "rclone").then(|| rclone::shared_root_problem(&root)).flatten() {
             return Err(StoreError::invalid(problem));
         }
+        // A local root is created here rather than left for the first push to fail on: `--add`
+        // then `push` said "the folder is not there", with nothing in between to have made it.
+        if o.driver == "local" && !std::path::Path::new(&root).exists() {
+            std::fs::create_dir_all(&root).map_err(|e| StoreError::other(format!("{root}: {e}")))?;
+        }
         st.put_asset_store(&AssetStore { name: name.clone(), driver: o.driver.clone(), root, options: None, created_at: None })?;
     }
     if let Some(name) = &o.remove {

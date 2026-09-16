@@ -48,6 +48,9 @@ pub struct Options {
     pub author: String,
     /// The store as trailers name it, without a password.
     pub store: String,
+    /// The store as given, so a SQLite file inside the directory can be left out of the sync.
+    /// Unredacted, since it is compared as a path and never printed.
+    pub store_file: String,
     /// Take in files that a change of include rules adds since the last sync.
     pub accept_rules: bool,
     /// Remove directories on disk that hold no files.
@@ -57,6 +60,8 @@ pub struct Options {
     pub assets: Option<String>,
     /// How long to wait for another sync of the same directory. Zero is `--no-wait`.
     pub lock_wait: Duration,
+    /// Print the summary line and what went wrong, nothing else. What a hook wants.
+    pub quiet: bool,
 }
 
 /// What a sync takes in from disk, recorded with its base so the next sync can tell when it
@@ -381,6 +386,26 @@ fn refuse_link(root: &Path, rel: &str) -> std::io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The store's own files, relative to the synced directory, when the store lives inside it.
+///
+/// A SQLite store is a file plus its `-wal`, `-shm` and `-journal` siblings, and `-wal` is
+/// text-shaped enough that `--ext '*'` offered it for import. None of the four is a document,
+/// and writing one from the store would corrupt the store this sync is reading.
+pub fn store_rels(store: &str, dir: &Path) -> Vec<String> {
+    let crate::config::StoreUrl::Sqlite(path) = crate::config::parse_store(store) else {
+        return Vec::new();
+    };
+    // Compared as canonical paths: `-s ./kb.db` and `-s /abs/kb.db` name the same file, and the
+    // directory may be reached through a link.
+    let file = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
+    let root = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let Ok(rel) = file.strip_prefix(&root) else {
+        return Vec::new();
+    };
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    ["", "-wal", "-shm", "-journal"].iter().map(|suffix| format!("{rel}{suffix}")).collect()
 }
 
 /// Whether a file found only on disk is taken in: one of `exts`, and not inside one of
@@ -1099,6 +1124,10 @@ pub struct Report {
     pub left_behind: Vec<Note>,
     /// Directories on disk that hold no files.
     pub empty_dirs: Vec<String>,
+    /// Files on disk this sync did not take in, by reason: `extension`, `binary`, `ignored`.
+    /// A `.csv` created after the first sync used to produce no line at all, so "why is my file
+    /// not there" had no answer anywhere in the output.
+    pub left_out: BTreeMap<String, Vec<String>>,
     /// Of those, removed by `--prune-empty-dirs`.
     pub removed_empty_dirs: usize,
     /// Assets, when the directory or the store has any, or an asset store is declared.
@@ -1142,6 +1171,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         )));
     }
     let generation = stored.as_ref().map_or(0, |b| b.generation);
+    let existing_id = crate::root::Config::read(&o.dir)?.map(|c| c.id).filter(|id| !id.is_empty());
     let heads = heads_by_rel(st, &prefix)?;
     let mut report = Report {
         prefix: prefix.clone(),
@@ -1273,7 +1303,18 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     let mut ignore_write: Option<(String, Option<String>)> = None;
     if !ignore_seeded {
         ignore_seeded = true;
-        if let Some(add) = default_ignore_additions(ignore_text.as_deref().unwrap_or("").trim_start_matches('\u{feff}')) {
+        // Only where Obsidian is: a Rust repository does not need three lines about plugins, and
+        // the file they were written into stayed untracked for no reason. The store counts as
+        // well as the disk — a sync into an empty directory would otherwise write out the very
+        // plugin code these lines exist to keep from being written.
+        let vault_rel = |rel: &&String| rel.starts_with(".obsidian/") || rel.contains("/.obsidian/");
+        let obsidian = o.dir.join(".obsidian").is_dir()
+            || heads.keys().any(|r| vault_rel(&r))
+            || walked.files.keys().any(|r| vault_rel(&r));
+        if let Some(add) = obsidian
+            .then(|| default_ignore_additions(ignore_text.as_deref().unwrap_or("").trim_start_matches('\u{feff}')))
+            .flatten()
+        {
             let mut text = ignore_text.clone().unwrap_or_default();
             if !text.is_empty() && !text.ends_with('\n') {
                 text.push('\n');
@@ -1292,6 +1333,12 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     }
     report.skipped.extend(ignore_notes.into_iter().map(|e| note(IGNORE_FILE, format!("not read: {e}"))));
     let ignored = |rel: &str| ignore.as_ref().is_some_and(|gi| ignored_by(gi, rel));
+    let store_rels = store_rels(&o.store_file, &o.dir);
+    if !store_rels.is_empty() {
+        // Allowed, since a store beside its notes is a reasonable thing to want, but said once:
+        // a reader wondering why `kb.db` is not in the listing has an answer.
+        report.skipped.push(note(&store_rels[0], "the store itself, inside the directory it syncs: left out of the sync"));
+    }
 
     let mut plan = Plan::default();
     let all: BTreeSet<String> = base.keys().chain(heads.keys()).chain(walked.files.keys()).cloned().collect();
@@ -1304,14 +1351,20 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         // `.textdbignore`: nothing there is synced either way, whether textdb, the last sync or only
         // the disk has it (a submodule's `.git` file under its short name, a plugin deleted in
         // textdb, a plugin taken in from disk).
-        let protected = protected_rel(&rel);
+        // The store's own file is never a document, whichever way it would travel: taking it in
+        // would version the database this sync is reading, and writing it from the store would
+        // corrupt it. `--ext '*'` used to offer `kb.db-wal`, which is text-shaped enough to pass.
+        let is_store = store_rels.iter().any(|s| s == &rel);
+        let protected = protected_rel(&rel) || is_store;
         if protected || ignored(&rel) {
             // Gone from both sides: the last sync's record of it goes too.
             if !heads.contains_key(&rel) && !walked.files.contains_key(&rel) {
                 continue;
             }
             if heads.contains_key(&rel) || base.contains_key(&rel) {
-                let why = if rel.split('/').next().is_some_and(|s| crate::assets::classify::names_dir(s, &[IGNORE_FILE])) {
+                let why = if is_store {
+                    "the store's own file: not synced"
+                } else if rel.split('/').next().is_some_and(|s| crate::assets::classify::names_dir(s, &[IGNORE_FILE])) {
                     "the directory's own .textdbignore, which sync never writes from textdb: not synced"
                 } else if protected {
                     "inside a folder sync never writes into (.git, .textdb, node_modules, …): not synced"
@@ -1331,6 +1384,13 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
                 (None, Some(_)) => {
                     if eligible(&rel, &o.exts) {
                         plan.candidates.push(rel);
+                    } else {
+                        // Only files in folders sync reads at all: a `node_modules` tree is not
+                        // something a user is waiting to see synced.
+                        let segs: Vec<&str> = rel.split('/').collect();
+                        if !segs.iter().any(|s| SKIP_DIRS.contains(s)) {
+                            report.left_out.entry("extension".to_string()).or_default().push(rel);
+                        }
                     }
                 }
                 (Some(_), Some(_)) => {
@@ -1646,7 +1706,15 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     for rel in &gone {
         ancestors(&mut emptied_by_sync, rel);
     }
-    report.empty_dirs = walked.dirs.iter().filter(|d| !holds.contains(*d) && !emptied_by_sync.contains(*d)).cloned().collect();
+    // A build tree or an ignored folder holds no documents by design, so counting its empty
+    // directories — and recommending --prune-empty-dirs, which would delete Cargo's output —
+    // was advice to act on the one thing sync must not touch.
+    report.empty_dirs = walked
+        .dirs
+        .iter()
+        .filter(|d| !holds.contains(*d) && !emptied_by_sync.contains(*d) && !protected_rel(d) && !ignored(d))
+        .cloned()
+        .collect();
     report.empty_dirs.sort();
     plan.carry = carry.into_iter().filter(|(from, to)| !ignored(from) && !ignored(to)).collect();
     plan.keep.retain(|rel| !pairs.renames.iter().any(|(from, _)| from == rel));
@@ -1814,6 +1882,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             &mut report,
             &rules,
             generation,
+            existing_id,
         )?;
     }
     if !report.stopped && !report.stopped_by_rules {
@@ -1854,7 +1923,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         }
         return Ok(());
     }
-    print_report(&report)?;
+    print_report(&report, o.quiet)?;
     let blocking = report.problems.iter().filter(|p| p.blocking).count();
     if report.stopped {
         return Err(StoreError::invalid(format!(
@@ -1910,6 +1979,8 @@ fn apply(
     rules: &Rules,
     // What the base was at when this sync read it; saving checks it has not moved since.
     generation: i64,
+    // The id this directory already calls itself, kept across syncs so a move does not lose it.
+    existing_id: Option<String>,
 ) -> Result<()> {
     let prefix = sides.prefix.clone();
     let dir = o.dir.as_path();
@@ -2150,7 +2221,20 @@ fn apply(
         rules: serde_json::to_string(rules).ok(),
         generation,
         files: rows.into_values().collect(),
-    })
+    })?;
+    // Written last, and only by a sync that got this far: the pairing this directory will be
+    // found by from now on. Kept as it was when it is already right, so an id stays stable.
+    let paired = crate::root::Config {
+        store: crate::root::Config::record_store(&o.store_file, dir),
+        prefix: prefix.clone(),
+        id: existing_id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+        created: crate::assets::driver::stamp(SystemTime::now()),
+    };
+    match crate::root::Config::read(dir)? {
+        Some(before) if before.store == paired.store && before.prefix == paired.prefix => Ok(()),
+        Some(before) => crate::root::Config { id: before.id, created: before.created, ..paired }.write(dir),
+        None => paired.write(dir),
+    }
 }
 
 /// `textdb sync /docs: 2 changed, 1 added` with who made the changes in the store and
@@ -2214,8 +2298,21 @@ fn list(s: &mut String, label: &str, items: &[String]) {
     }
 }
 
-fn print_report(r: &Report) -> Result<()> {
+fn print_report(r: &Report, quiet: bool) -> Result<()> {
     let mut s = String::new();
+    if quiet {
+        // The summary line, and anything that went wrong. A hook wants one line on success and
+        // the reason on failure; the file-by-file list is for a person reading along.
+        for (label, notes) in [("failed", &r.failed), ("conflict", &r.conflicts.iter().map(|c| note(c, "")).collect::<Vec<_>>())] {
+            for n in notes {
+                s.push_str(&format!("{label:<15} {}{}{}\n", n.path, if n.reason.is_empty() { "" } else { ": " }, n.reason));
+            }
+        }
+        for p in r.problems.iter().filter(|p| p.blocking) {
+            s.push_str(&format!("{:<15} {}: {}\n", "problem", p.path, p.detail));
+        }
+        return summary(r, s);
+    }
     if let Some(rc) = &r.rules {
         let before = match &rc.before {
             Some(b) => b.describe(),
@@ -2287,6 +2384,30 @@ fn print_report(r: &Report) -> Result<()> {
             let counts: Vec<String> = a.counts.iter().map(|(state, n)| format!("{n} {}", state.replace('-', " "))).collect();
             s.push_str(&format!("{:<15} {} (push and pull: {})\n", "assets", counts.join(", "), a.mode));
         }
+    }
+    summary(r, s)
+}
+
+/// The line every sync ends with, plus what it left out and the git line. Shared with `--quiet`,
+/// which prints this and nothing else.
+fn summary(r: &Report, mut s: String) -> Result<()> {
+    // One line naming the files sync walked past and why. Without it a `.csv` added after the
+    // first sync produced no output at all, and the only way to find out was to go looking.
+    for (why, rels) in &r.left_out {
+        let shown: Vec<&str> = rels.iter().take(3).map(String::as_str).collect();
+        let more = if rels.len() > 3 { ", …" } else { "" };
+        let fix = match why.as_str() {
+            "extension" => "; --ext to include them",
+            "binary" => "; .textdbignore, or an asset rule in .gitattributes",
+            _ => "",
+        };
+        s.push_str(&format!(
+            "{:<15} {} {} by {why} ({}{more}){fix}\n",
+            "left out",
+            rels.len(),
+            if rels.len() == 1 { "file" } else { "files" },
+            shown.join(", ")
+        ));
     }
     let verb = if r.stopped || (r.stopped_by_rules && !r.dry_run) {
         "nothing synced"

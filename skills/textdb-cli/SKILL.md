@@ -60,6 +60,9 @@ To keep a folder reconciled with a git checkout both ways, use `sync` rather tha
 ```sh
 textdb sync guides ~/src/repo/guides --dry-run   # changes each way, merges, conflicts
 textdb sync guides ~/src/repo/guides --commit    # apply; commit what changed on disk (Textdb-* trailers)
+textdb sync                                      # a synced directory remembers its store and folder:
+                                                 # no arguments needed from anywhere inside it
+textdb sync -q                                   # the summary line only, for a hook
 # One sync of a directory at a time: a second waits up to --lock-timeout (10s), then exits 4.
 # Safe to run from turn-start and turn-end hooks; --no-wait to skip rather than queue.
 textdb git-status guides ~/src/repo/guides       # last synced commit; store vs HEAD by blob id
