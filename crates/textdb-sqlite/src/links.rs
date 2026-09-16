@@ -400,6 +400,7 @@ impl<'c> TextDb<'c> {
 /// Fill the link columns of a store that had none: extract every live markdown file's links
 /// again and resolve them all.
 pub fn backfill(conn: &Connection, p: &str) -> Result<()> {
+    // No view, deliberately: migration-time, over every file in the store. See stats::backfill.
     let db = TextDb::attach(conn, p, false);
     let files: Vec<(i64, i64, Vec<u8>, String)> = {
         let mut stmt = conn

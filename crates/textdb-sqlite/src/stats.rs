@@ -129,6 +129,8 @@ impl TextDb<'_> {
 /// every file's current content once; run by [`crate::schema::migrate`] when it adds the
 /// columns, inside its savepoint.
 pub fn backfill(conn: &Connection, p: &str) -> Result<()> {
+    // No view, deliberately: this runs inside `migrate`, before any connection has a token, and
+    // it has to read every file in the store to compute what it is backfilling.
     let db = TextDb::attach(conn, p, false);
     let st = db.storage();
     let files: Vec<(i64, Vec<u8>)> = {

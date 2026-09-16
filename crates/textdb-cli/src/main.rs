@@ -1937,8 +1937,13 @@ fn ls_text(entries: &[Entry], long: bool, recursive: bool) -> String {
     }
     // The full tier. `LINKS` is total/broken; `UPDATED` keeps the seconds and the `Z` rather
     // than a 16-character cut that read as local time to anyone not in UTC.
+    //
+    // `RIGHTS` appears only when the rows carry it — an account's, never the owner's, who holds
+    // no shares. A column of blanks on every ordinary listing would be worse than no column.
+    let rights = entries.iter().any(|e| e.rights.is_some());
+    let rights_head = if rights { "RIGHTS  " } else { "" };
     s.push_str(&format!(
-        "{:>9} {:>7} {:>8} {:>5} {:>6} {:>7} {:>5}  {:<24}  {:<28}  {}\n",
+        "{:>9} {:>7} {:>8} {:>5} {:>6} {:>7} {:>5}  {:<24}  {:<28}  {rights_head}{}\n",
         "SIZE", "LINES", "WORDS", "SECT", "PROPS", "LINKS", "VERS", "UPDATED", "BY / CONTAINS", "NAME"
     ));
     for e in entries {
@@ -1957,8 +1962,9 @@ fn ls_text(entries: &[Entry], long: bool, recursive: bool) -> String {
         } else {
             e.nlinks.to_string()
         };
+        let mine = if rights { format!("{:<8}", e.rights.as_deref().unwrap_or("")) } else { String::new() };
         s.push_str(&format!(
-            "{:>9} {:>7} {:>8} {:>5} {:>6} {:>7} {:>5}  {:<24}  {:<28}  {}\n",
+            "{:>9} {:>7} {:>8} {:>5} {:>6} {:>7} {:>5}  {:<24}  {:<28}  {mine}{}\n",
             human_bytes(e.nbytes),
             e.nlines,
             e.nwords,

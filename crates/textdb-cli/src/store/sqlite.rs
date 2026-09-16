@@ -925,7 +925,11 @@ impl Store for SqliteStore {
         progress: &mut dyn FnMut(&ImportStats),
         on_error: &mut dyn FnMut(&str, &StoreError),
     ) -> Result<ImportStats> {
-        let db = TextDb::attach(&self.conn, DEFAULT_PREFIX, true);
+        // `self.db()`, not a bare `attach`: a handle without the connection's view is the owner's,
+        // and `import` would then write wherever it was pointed. It was the one entry point that
+        // still did that — every file below goes through `upsert`, which refuses a path outside a
+        // writable share once the view is attached.
+        let db = self.db();
         let mut stats = ImportStats::default();
         let mut pending = 0;
         self.conn.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;

@@ -254,6 +254,10 @@ impl TextDb<'_> {
     pub fn property_keys(&self, prefix: &str, limit: usize) -> Result<Vec<KeyRow>> {
         let lower = prefix.to_lowercase();
         let (lo, hi) = prefix_range(&lower);
+        // `docs` is a count of documents, and an account's count has to be of documents it can
+        // read — otherwise `meta keys` reports the existence of files it may not see, one
+        // integer at a time.
+        let (vis_sql, vis_args) = self.visible_for("n.path", 4);
         let mut st = self
             .conn
             .prepare_cached(&format!(
@@ -265,15 +269,23 @@ impl TextDb<'_> {
                              ELSE 'mixed' END
                    FROM {p}property r
                    JOIN {p}node n ON n.id = r.file_id AND n.deleted_at IS NULL
-                  WHERE (?1 = '' OR (r.key_lc >= ?2 AND r.key_lc < ?3))
+                  WHERE (?1 = '' OR (r.key_lc >= ?2 AND r.key_lc < ?3)) AND ({vis})
                   GROUP BY r.key
                   ORDER BY count(DISTINCT r.file_id) DESC, r.key
                   LIMIT ?4",
-                p = self.p
+                p = self.p,
+                vis = vis_sql,
             ))
             .map_err(sql_err)?;
+        let mut args: Vec<Value> = vec![
+            Value::Text(lower),
+            Value::Text(lo),
+            Value::Text(hi),
+            Value::Integer(limit as i64),
+        ];
+        args.extend(vis_args);
         let rows = st
-            .query_map(params![lower, lo, hi, limit as i64], |r| {
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
                 Ok(KeyRow {
                     key: r.get(0)?,
                     docs: r.get(1)?,
@@ -289,6 +301,7 @@ impl TextDb<'_> {
     pub fn property_values(&self, key: &str, prefix: &str, limit: usize) -> Result<Vec<ValueRow>> {
         let lower = prefix.to_lowercase();
         let (lo, hi) = prefix_range(&lower);
+        let (vis_sql, vis_args) = self.visible_for("n.path", 5);
         let mut st = self
             .conn
             .prepare_cached(&format!(
@@ -296,15 +309,24 @@ impl TextDb<'_> {
                    FROM {p}property r
                    JOIN {p}node n ON n.id = r.file_id AND n.deleted_at IS NULL
                   WHERE r.key_lc = ?1
-                    AND (?2 = '' OR (r.val_lc >= ?3 AND r.val_lc < ?4))
+                    AND (?2 = '' OR (r.val_lc >= ?3 AND r.val_lc < ?4)) AND ({vis})
                   GROUP BY r.val_txt
                   ORDER BY count(DISTINCT r.file_id) DESC, r.val_txt
                   LIMIT ?5",
-                p = self.p
+                p = self.p,
+                vis = vis_sql,
             ))
             .map_err(sql_err)?;
+        let mut args: Vec<Value> = vec![
+            Value::Text(key.to_lowercase()),
+            Value::Text(lower),
+            Value::Text(lo),
+            Value::Text(hi),
+            Value::Integer(limit as i64),
+        ];
+        args.extend(vis_args);
         let rows = st
-            .query_map(params![key.to_lowercase(), lower, lo, hi, limit as i64], |r| {
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
                 Ok(ValueRow {
                     value: r.get(0)?,
                     docs: r.get(1)?,
@@ -318,16 +340,21 @@ impl TextDb<'_> {
     pub fn property_find(&self, query: &str, folder: &str, limit: usize) -> Result<Vec<HitRow>> {
         let expr = textdb_md::query::parse(query).map_err(|e| textdb_core::TextdbError::InvalidEdit(e.to_string()))?;
         let sql = compile(&self.p, &expr).map_err(|e| textdb_core::TextdbError::InvalidEdit(e.to_string()))?;
+        let folder = &self.store_path(folder)?;
         let (lo, hi) = crate::db::subtree_bounds(folder).unwrap_or(("/".into(), "0".into()));
         // Every placeholder is a bare `?`, and the folder bounds come *after* the compiled
         // clause in the statement text. Numbering some of them `?N` while the compiled clause
         // used bare `?` made SQLite continue its own numbering past the highest explicit
         // index, so the terms silently bound to parameters that were never passed.
+        // Bare `?` throughout, so the visible-set predicate uses bare ones too and its arguments
+        // go in before the limit — the order in the statement text is the order here.
+        let (vis_sql, vis_args) = self.visible_bare("n.path");
         let mut args = sql.args;
         args.push(Value::Text(folder.to_string()));
         args.push(Value::Text(folder.to_string()));
         args.push(Value::Text(lo));
         args.push(Value::Text(hi));
+        args.extend(vis_args);
         args.push(Value::Integer(limit as i64));
         let mut st = self
             .conn
@@ -339,10 +366,12 @@ impl TextDb<'_> {
                     AND EXISTS (SELECT 1 FROM {p}property u WHERE u.file_id = n.id)
                     AND ({where_clause})
                     AND (? = '/' OR n.path = ? OR (n.path >= ? AND n.path < ?))
+                    AND ({vis})
                   ORDER BY n.path
                   LIMIT ?",
                 p = self.p,
                 where_clause = sql.where_clause,
+                vis = vis_sql,
             ))
             .map_err(sql_err)?;
         let rows = st
@@ -355,7 +384,17 @@ impl TextDb<'_> {
                 })
             })
             .map_err(sql_err)?;
-        rows.collect::<rusqlite::Result<_>>().map_err(sql_err)
+        let rows: Vec<HitRow> = rows.collect::<rusqlite::Result<_>>().map_err(sql_err)?;
+        // Each hit names a document, so each path is the caller's. The predicate above already
+        // dropped what it cannot see, so nothing here should fall out; `filter_map` rather than
+        // an unwrap because a row that somehow did would otherwise be a panic on a read.
+        Ok(rows
+            .into_iter()
+            .filter_map(|mut h| {
+                h.path = self.view_path(&h.path)?;
+                Some(h)
+            })
+            .collect())
     }
 }
 

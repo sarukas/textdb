@@ -1958,7 +1958,20 @@ impl TextDb<'_> {
         if body.is_empty() {
             return Ok(String::new());
         }
-        Ok(format!("--- {p}@{v1}\n+++ {p}@{v2}\n{body}", p = path, v1 = v1, v2 = v2, body = body))
+        // The header names the path the caller asked about, not the store's, and the body is text
+        // the caller reads.
+        //
+        // The body is projected as one blob, which is an approximation: the extractor is run over
+        // text whose lines carry `+`/`-`/` ` prefixes, so a link whose enclosing block structure
+        // depended on the line's first character — a fence, a list — may be recognised
+        // differently than it was in the document. Where a link *is* recognised the span is
+        // right and the rewrite is right; what can happen is that one is missed and shows a store
+        // path in a diff. `hunks` does not have this problem, because each side is whole text.
+        // The exact fix is to project each version and diff the projected texts, which needs
+        // `unified_diff` to take bytes rather than two roots.
+        let shown = self.view_path(&path).unwrap_or(path);
+        let body = String::from_utf8_lossy(&self.project_text(body.as_bytes())?).into_owned();
+        Ok(format!("--- {p}@{v1}\n+++ {p}@{v2}\n{body}", p = shown, v1 = v1, v2 = v2, body = body))
     }
 
     /// Line hunks that turn version `v1` of a file into version `v2`, for a client patching
@@ -1993,7 +2006,69 @@ impl TextDb<'_> {
         }
         let a = self.root_of_version(n.id, v1)?;
         let b = self.root_of_version(n.id, v2)?;
-        textdb_core::line_hunks(&st, &a, &b)
+        let hunks = textdb_core::line_hunks(&st, &a, &b)?;
+        if self.view.is_admin() {
+            return Ok(hunks);
+        }
+        // A diff is text the caller reads, so it is projected like any other. Each side is
+        // rewritten against its own version's links — resolved by scanning, because the index
+        // holds the current version's and an older one's spans would not line up.
+        hunks
+            .into_iter()
+            .map(|mut h| {
+                h.old_text = self.project_text(&h.old_text)?;
+                h.new_text = self.project_text(&h.new_text)?;
+                Ok(h)
+            })
+            .collect()
+    }
+
+    /// `(predicate, params)` restricting `col` to this connection's visible set, numbered from
+    /// `offset + 1`. `("1", [])` for the owner, so the SQL is what it was before #12.
+    pub(crate) fn visible_for(&self, col: &str, offset: usize) -> (String, Vec<rusqlite::types::Value>) {
+        match crate::access::visible_sql(&self.view, col) {
+            None => ("1".to_string(), Vec::new()),
+            Some((pred, args)) => (crate::access::renumber(&pred, offset), args),
+        }
+    }
+
+    /// The same with bare `?` placeholders, for a statement that numbers none of its own.
+    ///
+    /// Mixing the two is a trap SQLite does not report: numbering some placeholders `?N` while
+    /// others are bare makes it continue its own numbering past the highest explicit index, and
+    /// the bare ones then bind to parameters nobody passed. `property_find` already carries a
+    /// comment about losing an afternoon to exactly that.
+    pub(crate) fn visible_bare(&self, col: &str) -> (String, Vec<rusqlite::types::Value>) {
+        match crate::access::visible_sql(&self.view, col) {
+            None => ("1".to_string(), Vec::new()),
+            Some((pred, args)) => {
+                let mut out = String::with_capacity(pred.len());
+                let mut it = pred.chars().peekable();
+                while let Some(c) = it.next() {
+                    out.push(c);
+                    if c == '?' {
+                        while it.peek().is_some_and(|d| d.is_ascii_digit()) {
+                            it.next();
+                        }
+                    }
+                }
+                (out, args)
+            }
+        }
+    }
+
+    /// Project a fragment that has no link rows of its own — an old version, a hunk, a conflict
+    /// region — by scanning it with the same extractor the index is built with and resolving
+    /// each target store-wide.
+    pub(crate) fn project_text(&self, text: &[u8]) -> Result<Vec<u8>> {
+        if self.view.is_admin() || text.is_empty() {
+            return Ok(text.to_vec());
+        }
+        let spans = self.scan_targets_resolved(text)?;
+        if spans.is_empty() {
+            return Ok(text.to_vec());
+        }
+        Ok(textdb_core::access::project(&self.view, text, &spans).0)
     }
 
     /// The chunks of a file at `version` (HEAD when `None`), in document order, with where
