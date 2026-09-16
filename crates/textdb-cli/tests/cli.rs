@@ -2856,3 +2856,29 @@ fn assets_use_the_directory_you_are_standing_in() {
     // And it names the directory it used, which push never did.
     assert!(out.stdout.contains(one.to_str().unwrap()), "{}", out.stdout);
 }
+
+/// The sync base follows the directory's own id, so moving or renaming the directory is not a
+/// re-import of everything in it under a path that has changed.
+#[test]
+fn a_directory_that_moves_keeps_its_sync_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let one = tmp.path().join("one");
+    let two = tmp.path().join("two");
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::write(one.join("a.md"), "one\n").unwrap();
+    std::fs::write(one.join("b.md"), "two\n").unwrap();
+    let first = ok(textdb(&db).args(["sync", "/v"]).arg(&one), None);
+    assert!(first.stdout.contains("textdb 2 new"), "{}", first.stdout);
+
+    std::fs::rename(&one, &two).unwrap();
+    let after = ok(textdb(&db).args(["sync", "/v"]).arg(&two), None);
+    assert!(after.stdout.contains("2 unchanged"), "{}", after.stdout);
+    assert!(after.stdout.contains("textdb 0 new"), "{}", after.stdout);
+    // Said once, so a reader knows why the directory in the summary changed.
+    assert!(after.stdout.contains("was ") && after.stdout.contains("at the last sync"), "{}", after.stdout);
+
+    // And the base moved rather than being duplicated.
+    let bases = ok(textdb(&db).args(["--json", "sql", "SELECT dir FROM kb_sync"]), None).json();
+    assert_eq!(bases["rows"].as_array().unwrap().len(), 1, "{bases}");
+}

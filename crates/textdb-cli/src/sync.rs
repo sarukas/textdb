@@ -1124,6 +1124,10 @@ pub struct Report {
     pub left_behind: Vec<Note>,
     /// Directories on disk that hold no files.
     pub empty_dirs: Vec<String>,
+    /// Where this directory was when it was last synced, when it has moved since. The base
+    /// follows the directory's id rather than its path, so a move is not a re-import.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved_dir: Option<String>,
     /// Files on disk this sync did not take in, by reason: `extension`, `binary`, `ignored`.
     /// A `.csv` created after the first sync used to produce no line at all, so "why is my file
     /// not there" had no answer anywhere in the output.
@@ -1158,7 +1162,29 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     if o.commit && repo.is_none() {
         return Err(StoreError::invalid(format!("--commit needs {} to be in a git checkout", o.dir.display())));
     }
+    // The name this directory calls itself. Settled before the base is looked up, because a
+    // directory that moved is found by it rather than by a path that has changed.
+    let dir_id = crate::root::Config::read(&o.dir)?
+        .map(|c| c.id)
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
     let mut stored = find_sync_base(st, &prefix, &key)?;
+    let mut moved_from: Option<String> = None;
+    // A directory that was moved or renamed: the base is its own, found by the id it carries, so
+    // the sync continues from where it left off instead of treating every file as new.
+    if stored.is_none() {
+        let moved = st
+            .all_sync_bases()?
+            .into_iter()
+            .find(|b| b.prefix == prefix && b.dir_id.as_deref() == Some(dir_id.as_str()) && b.dir != key);
+        if let Some(b) = moved {
+            if !o.dry_run {
+                st.rename_sync_dir(&prefix, &b.dir, &key)?;
+            }
+            moved_from = Some(b.dir.clone());
+            stored = find_sync_base(st, &prefix, &key)?.or_else(|| Some(SyncBase { dir: key.clone(), ..b }));
+        }
+    }
     // A base an older build recorded under another form of the directory's name takes this one,
     // so the sync saves over it rather than next to it.
     if let Some(b) = stored.as_mut().filter(|b| b.dir != key && !o.dry_run) {
@@ -1171,13 +1197,13 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         )));
     }
     let generation = stored.as_ref().map_or(0, |b| b.generation);
-    let existing_id = crate::root::Config::read(&o.dir)?.map(|c| c.id).filter(|id| !id.is_empty());
     let heads = heads_by_rel(st, &prefix)?;
     let mut report = Report {
         prefix: prefix.clone(),
         dir: key.clone(),
         dry_run: o.dry_run,
         first_sync: stored.is_none(),
+        moved_dir: moved_from,
         ..Default::default()
     };
 
@@ -1882,7 +1908,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             &mut report,
             &rules,
             generation,
-            existing_id,
+            &dir_id,
         )?;
     }
     if !report.stopped && !report.stopped_by_rules {
@@ -1979,8 +2005,8 @@ fn apply(
     rules: &Rules,
     // What the base was at when this sync read it; saving checks it has not moved since.
     generation: i64,
-    // The id this directory already calls itself, kept across syncs so a move does not lose it.
-    existing_id: Option<String>,
+    // The id this directory calls itself, recorded with the base so a move does not lose it.
+    dir_id: &str,
 ) -> Result<()> {
     let prefix = sides.prefix.clone();
     let dir = o.dir.as_path();
@@ -2220,6 +2246,7 @@ fn apply(
         }),
         rules: serde_json::to_string(rules).ok(),
         generation,
+        dir_id: Some(dir_id.to_string()),
         files: rows.into_values().collect(),
     })?;
     // Written last, and only by a sync that got this far: the pairing this directory will be
@@ -2227,7 +2254,7 @@ fn apply(
     let paired = crate::root::Config {
         store: crate::root::Config::record_store(&o.store_file, dir),
         prefix: prefix.clone(),
-        id: existing_id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+        id: dir_id.to_string(),
         created: crate::assets::driver::stamp(SystemTime::now()),
     };
     match crate::root::Config::read(dir)? {
@@ -2393,6 +2420,9 @@ fn print_report(r: &Report, quiet: bool) -> Result<()> {
 fn summary(r: &Report, mut s: String) -> Result<()> {
     // One line naming the files sync walked past and why. Without it a `.csv` added after the
     // first sync produced no output at all, and the only way to find out was to go looking.
+    if let Some(from) = &r.moved_dir {
+        s.push_str(&format!("{:<15} this directory was {from} at the last sync; its base came with it\n", "moved"));
+    }
     for (why, rels) in &r.left_out {
         let shown: Vec<&str> = rels.iter().take(3).map(String::as_str).collect();
         let more = if rels.len() > 3 { ", …" } else { "" };

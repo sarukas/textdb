@@ -456,6 +456,10 @@ pub struct SyncBase {
     /// The directory lock is local; this is what catches a second machine sharing the folder.
     #[serde(skip)]
     pub generation: i64,
+    /// The directory's own name for itself (`.textdb/config`), so a directory that moves is
+    /// recognised by it rather than by a path that has changed.
+    #[serde(skip)]
+    pub dir_id: Option<String>,
     #[serde(skip)]
     pub files: Vec<BaseFile>,
 }

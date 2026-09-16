@@ -62,9 +62,10 @@ CREATE TABLE IF NOT EXISTS kb.sync_file (
   PRIMARY KEY (sync_id, rel)
 );
 ALTER TABLE kb.sync ADD COLUMN IF NOT EXISTS rules text;
-ALTER TABLE kb.sync ADD COLUMN IF NOT EXISTS generation bigint NOT NULL DEFAULT 0;";
+ALTER TABLE kb.sync ADD COLUMN IF NOT EXISTS generation bigint NOT NULL DEFAULT 0;
+ALTER TABLE kb.sync ADD COLUMN IF NOT EXISTS dir_id text;";
 
-const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at::text, author, git_commit, git_branch, git_remote, git_clean, rules, generation";
+const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at::text, author, git_commit, git_branch, git_remote, git_clean, rules, generation, dir_id";
 
 /// The asset store table, as the extension defines it, for stores installed before it was.
 const ASSET_TABLES: &str = "\
@@ -91,6 +92,7 @@ fn sync_row(r: &Row) -> (i64, SyncBase) {
             }),
             rules: r.get(10),
             generation: r.get(11),
+            dir_id: r.get(12),
             files: Vec::new(),
         },
     )
@@ -1139,13 +1141,14 @@ impl Store for PgStore {
         // `WHERE` on the conflict clause makes a stale save return no row rather than overwrite.
         let id: i64 = tx
             .query_opt(
-                "INSERT INTO kb.sync(prefix, dir, seq, author, git_commit, git_branch, git_remote, git_clean, rules, generation) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::bigint + 1) \
+                "INSERT INTO kb.sync(prefix, dir, seq, author, git_commit, git_branch, git_remote, git_clean, rules, generation, dir_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::bigint + 1, $11) \
                  ON CONFLICT (prefix, dir) DO UPDATE SET seq = excluded.seq, synced_at = now(), author = excluded.author, \
                  git_commit = excluded.git_commit, git_branch = excluded.git_branch, git_remote = excluded.git_remote, \
-                 git_clean = excluded.git_clean, rules = excluded.rules, generation = kb.sync.generation + 1 \
+                 git_clean = excluded.git_clean, rules = excluded.rules, generation = kb.sync.generation + 1, \
+                 dir_id = excluded.dir_id \
                  WHERE kb.sync.generation = $10::bigint RETURNING id",
-                &[&base.prefix, &base.dir, &base.seq, &base.author, &commit, &branch, &remote, &clean, &base.rules, &base.generation],
+                &[&base.prefix, &base.dir, &base.seq, &base.author, &commit, &branch, &remote, &clean, &base.rules, &base.generation, &base.dir_id],
             )
             .map_err(pg)?
             .ok_or_else(|| {
