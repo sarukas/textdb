@@ -9,7 +9,10 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 from .backends import open_backend
 from .backends.base import Bytes, to_text
-from .errors import Conflict, NotFound, TextdbError
+from .errors import Conflict, InvalidEdit, NotFound, TextdbError
+
+#: The sort keys `ls` accepts, the same set and spelling as `textdb ls --sort` and the Node client.
+SORT_KEYS: Tuple[str, ...] = ("name", "type", "size", "lines", "words", "versions", "created", "updated", "authors")
 
 DEFAULT_INCLUDE: Tuple[str, ...] = ("*.md", "*.markdown", "*.txt", "*.rst", "*.adoc", "*.org", "*.csv", "*.json", "*.yaml", "*.yml", "*.toml")
 
@@ -191,6 +194,40 @@ def normalize(path: str) -> str:
     return "/" + "/".join(segs)
 
 
+def _sorted(rows: List["Entry"], key: str, desc: bool, recursive: bool) -> List["Entry"]:
+    """`ls` ordering, matching `sort_entries` in the CLI so the three surfaces agree.
+
+    Folders come first unless the listing is recursive, in which case it is a path listing and
+    they interleave. Ties break on the name, or the path when recursive.
+    """
+    def ext(e: "Entry") -> str:
+        name = e.name
+        return name.rsplit(".", 1)[1].lower() if e.kind == "file" and "." in name else ""
+
+    def zero(v: Optional[int]) -> int:
+        return v or 0
+
+    of = {
+        "name": lambda e: "",
+        "type": ext,
+        "size": lambda e: zero(e.nbytes),
+        "lines": lambda e: zero(e.nlines),
+        "words": lambda e: zero(e.nwords),
+        "versions": lambda e: zero(e.versions),
+        "created": lambda e: e.created_at or "",
+        "updated": lambda e: e.updated_at or "",
+        "authors": lambda e: len(e.authors or []),
+    }[key]
+    tie = (lambda e: e.path) if recursive else (lambda e: e.name)
+    # Sorted twice rather than with one composite key: the tiebreak always reads ascending,
+    # and only the chosen key reverses, which is what `-r` means in the CLI.
+    rows = sorted(rows, key=tie)
+    rows = sorted(rows, key=of, reverse=desc)
+    if not recursive:
+        rows = sorted(rows, key=lambda e: e.kind != "folder")
+    return rows
+
+
 class Corpus:
     """A versioned text corpus. Open with a URL; the backend is chosen by scheme:
 
@@ -216,13 +253,34 @@ class Corpus:
         self.close()
 
     # ------------------------------------------------------------------ namespace
-    def ls(self, path: str = "/", *, recursive: bool = False) -> List[Entry]:
+    def ls(
+        self,
+        path: str = "/",
+        *,
+        recursive: bool = False,
+        sort: Optional[str] = "name",
+        order: str = "asc",
+        limit: Optional[int] = None,
+    ) -> List[Entry]:
         """Everything in a folder, or with ``recursive`` everything below it.
 
         Each row is the full twenty-four-key :class:`Entry`, the same record every other
-        surface returns.
+        surface returns. ``sort`` is one of :data:`SORT_KEYS` and orders the rows the way
+        ``textdb ls --sort`` and the Node client do — folders first unless ``recursive``,
+        then the key, then the name (the path when recursive) — and defaults to ``name`` for
+        that reason; pass ``None`` to keep the store's own path order. ``order`` is ``asc``
+        or ``desc``; ``limit`` caps the rows returned, after sorting.
         """
-        return [Entry(**r) for r in self.backend.ls(normalize(path), recursive)]
+        rows = [Entry(**r) for r in self.backend.ls(normalize(path), recursive)]
+        if sort is not None:
+            if sort not in SORT_KEYS:
+                raise InvalidEdit(f"sort must be one of {', '.join(SORT_KEYS)}")
+            if order not in ("asc", "desc"):
+                raise InvalidEdit("order must be asc or desc")
+            rows = _sorted(rows, sort, order == "desc", recursive)
+        if limit is not None:
+            rows = rows[: max(0, limit)]
+        return rows
 
     def entry(self, path: str) -> Entry:
         """One path's listing row — what ``textdb stat`` prints."""

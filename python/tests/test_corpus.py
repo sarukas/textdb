@@ -357,3 +357,26 @@ def test_search_returns_lines_with_the_version_they_belong_to(kb):
     assert hits[0].section == "Guide / Errors"
     assert hits[0].score > 0
     assert hits[0].more == 0
+
+
+def test_ls_sorts_and_limits_like_the_cli(kb):
+    root = P(kb, "/sorted")
+    kb.write(f"{root}/b.md", "one\n")
+    kb.write(f"{root}/a.md", "one\ntwo\nthree\n")
+    kb.write(f"{root}/sub/c.md", "x\n")
+
+    # Default: folders first, then names.
+    assert [e.name for e in kb.ls(root)] == ["sub", "a.md", "b.md"]
+    # A key sorts inside that: the folder still leads, the files go by size.
+    assert [e.name for e in kb.ls(root, sort="size")][1:] == ["b.md", "a.md"]
+    assert [e.name for e in kb.ls(root, sort="size", order="desc")][1:] == ["a.md", "b.md"]
+    # Recursive is a path listing, so folders interleave and the tiebreak is the path.
+    assert [e.path for e in kb.ls(root, recursive=True, sort="name")] == [
+        f"{root}/a.md", f"{root}/b.md", f"{root}/sub", f"{root}/sub/c.md",
+    ]
+    assert len(kb.ls(root, recursive=True, limit=2)) == 2
+
+    with pytest.raises(InvalidEdit):
+        kb.ls(root, sort="nope")
+    with pytest.raises(InvalidEdit):
+        kb.ls(root, sort="size", order="sideways")
