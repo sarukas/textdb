@@ -2021,9 +2021,11 @@ fn renames_moves_and_deletes_show_in_history_unless_turned_off() {
     let text = ok(textdb(&store).args(["history", "b/y.md"]), None).stdout;
     assert!(text.contains("renamed") && text.contains("/a/x.md -> /a/y.md"), "{text}");
     assert!(text.contains("/a/y.md -> /b/y.md  (with /a)"), "{text}");
+    // `--versions-only` filters the rows and keeps the row type: it used to drop the `type`
+    // tag that tells a version from a path event, so one command emitted two JSON shapes.
     let versions = ok(textdb(&store).args(["--json", "history", "/b/y.md", "--versions-only"]), None).json();
     assert_eq!(versions.as_array().unwrap().len(), 1);
-    assert!(versions[0].get("type").is_none(), "{versions}");
+    assert_eq!(versions[0]["type"], "version", "{versions}");
 
     // Off in the store: nothing recorded, unless one command asks for it.
     ok(textdb(&store).args(["setting", "path_history", "off"]), None);
