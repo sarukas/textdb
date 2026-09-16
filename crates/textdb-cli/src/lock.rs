@@ -4,11 +4,13 @@
 //! sides from it and commits, so one disk edit lands twice. A turn-end hook in one agent and a
 //! turn-start hook in another produce exactly that, which is what this exists to stop.
 //!
-//! It is an advisory lock (`flock`) rather than git's `index.lock` trick, so the kernel drops it
-//! when the process dies: a killed sync leaves nothing to clean up by hand. Where advisory locks
-//! are unreliable — some network shares, and Windows, which has no `flock` — the fallback is an
-//! `O_EXCL` file plus a liveness check of the pid it records, which is only meaningful for a
-//! holder on this host.
+//! It is an advisory lock rather than git's `index.lock` trick, so the operating system drops it
+//! when the process dies: a killed sync leaves nothing to clean up by hand. `File::try_lock` is
+//! `flock` on Unix and `LockFileEx` on Windows, so one call covers both; where a filesystem does
+//! not support locking at all it reports so, and a sync there runs unlocked rather than pretending.
+//!
+//! The hand-rolled fallback this replaced was not a lock: two processes could both read an empty
+//! record and both go on, because reading and writing it were separate steps.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
@@ -94,7 +96,14 @@ pub fn acquire(dir: &Path, timeout: Duration) -> Result<Lock> {
     // waiter has nothing to do until it finishes.
     let mut wait = Duration::from_millis(20);
     loop {
-        if try_lock(&file) {
+        let outcome = try_lock(&file);
+        if outcome != Outcome::Taken {
+            if outcome == Outcome::Unsupported {
+                eprintln!(
+                    "note: {} does not support file locking, so two syncs of it at once cannot be kept apart",
+                    dir.display()
+                );
+            }
             let mut lock = Lock { file, path };
             lock.record()?;
             // Holding the lock means no other sync of this directory is running, so anything in
@@ -138,39 +147,31 @@ fn read_holder(path: &Path) -> Holder {
     Holder::parse(&text)
 }
 
-#[cfg(unix)]
-fn try_lock(file: &File) -> bool {
-    use std::os::unix::io::AsRawFd;
-    // Non-blocking, so the wait and its message are ours rather than the kernel's.
-    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+/// Whether we now hold the lock.
+///
+/// A filesystem that cannot lock at all (some network mounts) reports `Unsupported`; there is no
+/// honest lock to take, so the sync goes ahead rather than failing on every run or, worse,
+/// believing itself alone. Every other error means someone holds it.
+fn try_lock(file: &File) -> Outcome {
+    use std::fs::TryLockError;
+    match file.try_lock() {
+        Ok(()) => Outcome::Held,
+        Err(TryLockError::WouldBlock) => Outcome::Taken,
+        Err(TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Unsupported => Outcome::Unsupported,
+        Err(TryLockError::Error(_)) => Outcome::Taken,
+    }
 }
 
-#[cfg(unix)]
+#[derive(PartialEq, Eq)]
+enum Outcome {
+    Held,
+    Taken,
+    /// This filesystem does not do locking.
+    Unsupported,
+}
+
 fn unlock(file: &File) {
-    use std::os::unix::io::AsRawFd;
-    unsafe {
-        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
-    }
-}
-
-#[cfg(not(unix))]
-fn try_lock(file: &File) -> bool {
-    // No `flock` here. A zero-length record means nobody holds it; a record naming a pid that is
-    // gone is stale and can be taken over. `Lock::record` writes ours immediately after.
-    let mut text = String::new();
-    let mut f = file;
-    if f.rewind().and_then(|()| f.read_to_string(&mut text)).is_err() {
-        return false;
-    }
-    text.trim().is_empty() || !alive(Holder::parse(&text).pid)
-}
-
-#[cfg(not(unix))]
-fn unlock(_file: &File) {}
-
-#[cfg(not(unix))]
-fn alive(pid: u32) -> bool {
-    pid != 0 && crate::assets::driver::process_running(pid)
+    let _ = file.unlock();
 }
 
 

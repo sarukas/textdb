@@ -62,9 +62,10 @@ textdb sync guides ~/src/repo/guides --dry-run   # changes each way, merges, con
 textdb sync guides ~/src/repo/guides --commit    # apply; commit what changed on disk (Textdb-* trailers)
 textdb sync                                      # a synced directory remembers its store and folder:
                                                  # no arguments needed from anywhere inside it
-textdb sync -q                                   # the summary line only, for a hook
-# One sync of a directory at a time: a second exits 4 at once rather than absorbing the
-# collision. Exit 4 means retry shortly; --lock-timeout SECONDS queues behind it instead.
+textdb sync -q --lock-timeout 30                 # the hook line: summary only, and queue rather than fail
+# One sync of a directory at a time. A second exits 4 at once, so a collision you typed is
+# visible; a hook should pass --lock-timeout instead, because a turn-start sync colliding with
+# another agent's turn-end sync wants to wait for it, not to start the turn on stale files.
 textdb git-status guides ~/src/repo/guides       # last synced commit; store vs HEAD by blob id
 ```
 

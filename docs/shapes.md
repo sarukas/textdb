@@ -42,7 +42,7 @@ needs one and no listing used to carry it.
 | 15 | `nsections` | int | headings | total below |
 | 16 | `nprops` | int | top-level front-matter keys | total below |
 | 17 | `nlinks` | int | links written in it | total below |
-| 18 | `nlinks_broken` | int | links that reach no document | total below |
+| 18 | `nlinks_broken` | int | links with status `broken`, `anchor-missing` or `ambiguous` — the ones needing attention, not only the ones reaching nothing | total below |
 | 19 | `versions` | int | version count | commits below |
 | 20 | `created_at` | string | | |
 | 21 | `files` | int \| null | `null` | live files below |

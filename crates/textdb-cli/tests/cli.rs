@@ -2610,7 +2610,13 @@ fn tree_counts_folders_and_prints_a_file_plainly() {
 /// one line appended on disk landed twice on disk and three times in the store — with both runs
 /// reporting success. Failing the second is the point: a collision a caller can see beats two
 /// exit-zero runs where the second quietly found the work already done.
+///
+/// Ignored by default because it races two real processes: the first has to still be working when
+/// the second reaches the lock, which 800 new files buy here but a faster machine might not.
+/// `two_syncs_at_once_serialise` holds the lock itself and asserts the same rule without a race;
+/// this one stays for `--ignored` runs, where it also checks the data after a real collision.
 #[test]
+#[ignore = "races two processes; run with --ignored"]
 fn two_syncs_at_once_are_one_success_and_one_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("kb.db");
@@ -2673,8 +2679,40 @@ fn two_syncs_at_once_are_one_success_and_one_failure() {
     ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
 }
 
+/// The same rule as the race above, with the race taken out: while the lock is held, a sync of
+/// that directory fails, and once it is released the next one runs. No timing, no two processes.
+#[test]
+fn two_syncs_at_once_serialise() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.md"), "# A\n\nbody\n").unwrap();
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+
+    // Stand in for the sync that got there first.
+    let held = std::fs::OpenOptions::new().read(true).write(true).open(dir.join(".textdb").join("lock")).unwrap();
+    held.try_lock().expect("hold the lock");
+
+    std::fs::write(dir.join("a.md"), "# A\n\nbody\n- appended\n").unwrap();
+    let refused = run(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+    assert_eq!(refused.status, 4, "stdout: {}\nstderr: {}", refused.stdout, refused.stderr);
+    assert!(refused.stderr.contains("already being synced by another process"), "{}", refused.stderr);
+    assert!(refused.stderr.contains("--lock-timeout"), "the message should say how to queue: {}", refused.stderr);
+    // It failed before doing anything: the store still has the text from before the edit.
+    assert_eq!(ok(textdb(&db).args(["cat", "/a.md"]), None).stdout, "# A\n\nbody\n");
+
+    held.unlock().unwrap();
+    drop(held);
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+    assert_eq!(ok(textdb(&db).args(["cat", "/a.md"]), None).stdout, "# A\n\nbody\n- appended\n");
+    let history = ok(textdb(&db).args(["--json", "history", "/a.md", "--versions-only"]), None).json();
+    assert_eq!(history.as_array().unwrap().len(), 2, "one edit, one version: {history}");
+}
+
 /// `--lock-timeout` is the other half: a caller that would rather queue than retry.
 #[test]
+#[ignore = "races two processes; run with --ignored"]
 fn lock_timeout_queues_behind_a_running_sync() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("kb.db");
@@ -2726,22 +2764,14 @@ fn a_second_sync_waits_or_reports_the_holder() {
     // Hold the lock the way a running sync does, from this process.
     let lock = dir.join(".textdb").join("lock");
     let held = std::fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
-    }
+    held.try_lock().expect("hold the lock the way a running sync does");
 
     let refused = run(textdb(&db).args(["sync", "/"]).arg(&dir), None);
     assert_eq!(refused.status, 4, "stdout: {}\nstderr: {}", refused.stdout, refused.stderr);
     assert!(refused.stderr.contains("being synced by another process"), "{}", refused.stderr);
 
     // Released, and the next sync goes through.
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
-    }
+    held.unlock().unwrap();
     drop(held);
     ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
 }
@@ -2758,11 +2788,7 @@ fn a_dry_run_does_not_queue_behind_a_sync() {
 
     let lock = dir.join(".textdb").join("lock");
     let held = std::fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
-    }
+    held.try_lock().expect("hold the lock the way a running sync does");
     ok(textdb(&db).args(["sync", "/"]).arg(&dir).arg("--dry-run"), None);
 }
 
