@@ -34,6 +34,14 @@ pub struct Config {
     /// paths against someone else's tree. The **bearer is never written here**: a checkout is
     /// copied, backed up and committed, and a credential in it would go with it.
     pub account: Option<String>,
+    /// The aliases this account's shares stood at when the directory was last synced, each with
+    /// the store's node id for the share root: `contracts:7,products:9`.
+    ///
+    /// The id is what makes a rename legible. An alias renamed centrally is otherwise one share
+    /// gone and another arrived, and sync would delete a directory and write it back under the
+    /// new name, losing whatever else was in it; matched by id, the directory moves. Node ids
+    /// name nodes, not paths, so this says nothing about where the share is in the store.
+    pub shares: Vec<(String, i64)>,
 }
 
 const FILE: &str = "config";
@@ -104,6 +112,12 @@ impl Config {
             created: get("created"),
             ext: Some(ext).filter(|e| !e.is_empty()),
             account: Some(get("account")).filter(|a| !a.is_empty()),
+            shares: get("shares")
+                .split(',')
+                .filter(|p| !p.is_empty())
+                .filter_map(|p| p.rsplit_once(':'))
+                .filter_map(|(alias, id)| id.parse().ok().map(|id| (alias.to_string(), id)))
+                .collect(),
         }))
     }
 
@@ -124,7 +138,16 @@ impl Config {
             self.id,
             self.created,
             self.ext.as_deref().unwrap_or_default(),
-            self.account.as_deref().map(|a| format!("account = \"{a}\"\n")).unwrap_or_default()
+            format!(
+                "{}{}",
+                self.account.as_deref().map(|a| format!("account = \"{a}\"\n")).unwrap_or_default(),
+                if self.shares.is_empty() {
+                    String::new()
+                } else {
+                    let list: Vec<String> = self.shares.iter().map(|(alias, id)| format!("{alias}:{id}")).collect();
+                    format!("shares = \"{}\"\n", list.join(","))
+                }
+            )
         );
         std::fs::write(&path, text).map_err(|e| StoreError::other(format!("{}: {e}", path.display())))
     }

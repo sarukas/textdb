@@ -1654,7 +1654,10 @@ fn g_a_real_delete_propagates_to_the_checkout() {
     });
 }
 
-/// G12: `--commit` records the account as the author, in the view's own paths.
+/// G12: `--commit` names the account the checkout belongs to, in the view's own paths.
+///
+/// A commit holds only what sync wrote to disk (`cli.rs`), so the change under test is made
+/// centrally; what the account edits locally is its own git's business.
 #[test]
 fn g_commit_names_the_account() {
     scenarios!("G12");
@@ -1666,7 +1669,7 @@ fn g_commit_names_the_account() {
             assert!(Command::new("git").args(&args).current_dir(&kb).status().unwrap().success());
         }
         ok(f.as_("accounts-agent").args(["sync", "/"]).arg(&kb), None);
-        std::fs::write(kb.join("contracts/acme.md"), "# Acme\n\nfor the commit\n").unwrap();
+        ok(f.as_("admin").args(["write", "/legal/contracts/acme.md"]), Some("# Acme\n\nfor the commit\n"));
         ok(f.as_("accounts-agent").args(["sync", "--commit"]).current_dir(&kb), None);
         let log = Command::new("git").args(["log", "-1", "--format=%B"]).current_dir(&kb).output().unwrap();
         let message = String::from_utf8_lossy(&log.stdout).into_owned();

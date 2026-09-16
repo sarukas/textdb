@@ -1114,6 +1114,14 @@ pub struct Report {
     pub to_textdb: Changes,
     /// Moved in the store because the file moved on disk.
     pub moved: Vec<Move>,
+    /// Share directories renamed on disk because the account's alias for them was renamed
+    /// centrally (#12 §4). Whatever else was in them came along.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub renamed_shares: Vec<Move>,
+    /// Files moved on disk to follow a move made in the store, with their base and with whatever
+    /// was edited here and not yet synced.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub followed_moves: Vec<Move>,
     pub merged: Vec<String>,
     /// Conflict markers written to these files on disk.
     pub conflicts: Vec<String>,
@@ -1201,7 +1209,32 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     // plan below turns the second into a delete on disk.
     // Who this checkout belongs to. Noted in its config so whoever opens the directory later can
     // see whose layout it is; the bearer never goes to disk.
-    let account = st.whoami()?.account;
+    let me = st.whoami()?;
+    let account = me.account.clone();
+    // An alias renamed centrally is the same share under a new name (#12 §4). Matched by the
+    // store's node id — which the last sync recorded in `.textdb/config` — it reads as a rename
+    // here too, so the directory moves with everything in it. Read as one share gone and another
+    // arrived it would be a delete and a fresh write, and whatever else was in the directory
+    // (a local note, an untracked file) would go with the delete.
+    let renamed_aliases: Vec<(String, String)> = match crate::root::Config::read(&o.dir)? {
+        Some(cfg) => {
+            let now: HashMap<i64, &str> = me.shares.iter().map(|sh| (sh.node_id, sh.alias.as_str())).collect();
+            cfg.shares
+                .iter()
+                .filter_map(|(was, id)| now.get(id).map(|alias| (was.clone(), (*alias).to_string())))
+                .filter(|(was, alias)| was != alias && !was.is_empty() && !alias.is_empty())
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    // The share this directory is a checkout of was itself renamed: the folder it is paired with
+    // is the same node, under the name the account now has for it.
+    let prefix = renamed_aliases.iter().fold(prefix, |prefix, (was, alias)| match prefix.strip_prefix(&format!("/{was}")) {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("/{alias}{rest}"),
+        _ => prefix,
+    });
+    // Alias -> the node it names, for the config this sync leaves behind.
+    let share_ids: Vec<(String, i64)> = me.shares.iter().map(|sh| (sh.alias.clone(), sh.node_id)).collect();
     let shares = st.share_state()?;
     let denied: Vec<String> = shares.iter().filter(|(_, s)| s == "denied").map(|(a, _)| a.clone()).collect();
     let read_only: Vec<String> = shares.iter().filter(|(_, s)| s == "ro").map(|(a, _)| a.clone()).collect();
@@ -1228,6 +1261,40 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         st.rename_sync_dir(&prefix, &b.dir, &key)?;
         b.dir = key.clone();
     }
+    // Carry an alias rename through to disk and to the base, before either side is read: from
+    // here on the directory looks as though it had always been called this, so the rest of the
+    // sync has nothing to do about it. Aliases sit at the top of a view, so only a checkout of
+    // the whole view holds them as directories; a checkout of one share had its prefix renamed
+    // above instead.
+    let mut renamed_shares: Vec<Move> = Vec::new();
+    let mut rename_notes: Vec<Note> = Vec::new();
+    if prefix == "/" {
+        for (was, alias) in &renamed_aliases {
+            let (from, to) = (o.dir.join(was), o.dir.join(alias));
+            if !from.is_dir() {
+                continue;
+            }
+            if to.exists() {
+                // Something is there already. Left for the ordinary path, which writes the files
+                // under the new name and says what it deleted, rather than merging two trees here.
+                rename_notes.push(note(alias, &format!("{was}/ is now {alias}/, but {alias}/ is here already: left as it is")));
+                continue;
+            }
+            renamed_shares.push(Move { from: format!("{was}/"), to: format!("{alias}/") });
+            if o.dry_run {
+                continue;
+            }
+            std::fs::rename(&from, &to).map_err(|e| StoreError::other(format!("{was}/ -> {alias}/: {e}")))?;
+            if let Some(b) = stored.as_mut() {
+                let (old, new) = (format!("{was}/"), format!("{alias}/"));
+                for f in &mut b.files {
+                    if let Some(rest) = f.rel.strip_prefix(old.as_str()) {
+                        f.rel = format!("{new}{rest}");
+                    }
+                }
+            }
+        }
+    }
     if stored.is_some() && o.base_rev.is_some() {
         return Err(StoreError::invalid(format!(
             "{prefix} has been synced with {key} before and has a base already; --base is for the first sync only"
@@ -1241,8 +1308,10 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         dry_run: o.dry_run,
         first_sync: stored.is_none(),
         moved_dir: moved_from,
+        renamed_shares,
         ..Default::default()
     };
+    report.kept.append(&mut rename_notes);
 
     let stored_rows: HashMap<String, BaseFile> = stored
         .as_ref()
@@ -1279,6 +1348,63 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         report.base_commit = Some(commit);
     }
 
+    // Paths deleted or moved away in the store since the last sync: a file there now may be another
+    // with the same version number, so its content tells. Read before the directory is walked,
+    // because a move is followed on disk first and the walk must see the result.
+    let mut gone_since: HashSet<String> = HashSet::new();
+    let mut moved_since: Vec<(String, String)> = Vec::new();
+    if let Some(b) = &stored {
+        const PAGE: i64 = 10_000;
+        let mut since = b.seq;
+        loop {
+            let page = st.feed(since, PAGE)?;
+            for c in &page {
+                match c.op.as_str() {
+                    "delete" => drop(gone_since.insert(c.path.clone())),
+                    "move" => {
+                        if let Some(from) = c.old_path.clone() {
+                            moved_since.push((from.clone(), c.path.clone()));
+                            gone_since.insert(from);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match page.last() {
+                Some(last) if page.len() as i64 == PAGE => since = last.seq,
+                _ => break,
+            }
+        }
+    }
+    // A file moved centrally is the same document under a new path, so the copy on disk follows
+    // it — with whatever was edited here and not yet synced. Left to the ordinary plan it would
+    // be a delete at the old path and a new file at the new one, and an unsynced edit would be
+    // added back at the old path as a second document (#12 M10).
+    if !moved_since.is_empty() {
+        let rel_of = |path: &str| -> Option<String> {
+            let under = if prefix == "/" { path.strip_prefix('/') } else { path.strip_prefix(&prefix).and_then(|r| r.strip_prefix('/')) };
+            under.filter(|r| !r.is_empty()).map(str::to_string)
+        };
+        for (from, to) in &moved_since {
+            let (Some(from_rel), Some(to_rel)) = (rel_of(from), rel_of(to)) else { continue };
+            // Only a file this directory actually holds at the old path, and only when nothing is
+            // at the new one: anything else is for the ordinary plan to reconcile.
+            if !base.contains_key(&from_rel) || base.contains_key(&to_rel) {
+                continue;
+            }
+            if !o.dir.join(&from_rel).is_file() || o.dir.join(&to_rel).exists() {
+                continue;
+            }
+            if !o.dry_run {
+                move_disk(&o.dir, &from_rel, &to_rel).map_err(|e| StoreError::other(format!("{from_rel} -> {to_rel}: {e}")))?;
+                if let Some(row) = base.remove(&from_rel) {
+                    base.insert(to_rel.clone(), row);
+                }
+            }
+            report.followed_moves.push(Move { from: from_rel, to: to_rel });
+        }
+    }
+
     let mut tracked_dirs = HashSet::new();
     for rel in base.keys().chain(heads.keys()) {
         let mut at = 0;
@@ -1306,27 +1432,6 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         textdb: HashMap::new(),
         disk: HashMap::new(),
     };
-    // Paths deleted or moved away in the store since the last sync: a file there now may be another
-    // with the same version number, so its content tells.
-    let mut gone_since: HashSet<String> = HashSet::new();
-    if let Some(b) = &stored {
-        const PAGE: i64 = 10_000;
-        let mut since = b.seq;
-        loop {
-            let page = sides.st.feed(since, PAGE)?;
-            for c in &page {
-                match c.op.as_str() {
-                    "delete" => drop(gone_since.insert(c.path.clone())),
-                    "move" => gone_since.extend(c.old_path.clone()),
-                    _ => {}
-                }
-            }
-            match page.last() {
-                Some(last) if page.len() as i64 == PAGE => since = last.seq,
-                _ => break,
-            }
-        }
-    }
     // The path, or a folder it is in, went away.
     let recreated = |rel: &str| {
         if gone_since.is_empty() {
@@ -1994,6 +2099,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             generation,
             &dir_id,
             account.as_deref(),
+            &share_ids,
         )?;
     }
     if !report.stopped && !report.stopped_by_rules {
@@ -2094,6 +2200,9 @@ fn apply(
     dir_id: &str,
     // The account this checkout belongs to, noted in its config. Never the bearer.
     account: Option<&str>,
+    // Its aliases and the node each one names, noted in the config so the next sync can tell a
+    // rename from a share gone and another arrived.
+    shares: &[(String, i64)],
 ) -> Result<()> {
     let prefix = sides.prefix.clone();
     let dir = o.dir.as_path();
@@ -2303,7 +2412,7 @@ fn apply(
             .cloned()
             .collect();
         if !paths.is_empty() {
-            let message = commit_message(o, &prefix, plan, report, heads, from_commit, seq, &not_done);
+            let message = commit_message(o, &prefix, plan, report, heads, from_commit, seq, &not_done, account);
             let result = git::commit(dir, &paths, &message);
             if let Some(g) = report.git.as_mut() {
                 match result {
@@ -2346,10 +2455,15 @@ fn apply(
         // Normalised, so it round-trips through `parse_exts` unchanged.
         ext: Some(o.exts.join(",")),
         account: account.map(str::to_string),
+        shares: shares.to_vec(),
     };
     match crate::root::Config::read(dir)? {
         Some(before)
-            if before.store == paired.store && before.prefix == paired.prefix && before.ext == paired.ext && before.account == paired.account =>
+            if before.store == paired.store
+                && before.prefix == paired.prefix
+                && before.ext == paired.ext
+                && before.account == paired.account
+                && before.shares == paired.shares =>
         {
             Ok(())
         }
@@ -2369,6 +2483,9 @@ fn commit_message(
     from_commit: Option<&str>,
     seq: i64,
     not_done: &HashSet<&str>,
+    // Whose view this checkout is. The commit says so, because the same directory synced by two
+    // accounts holds two different sets of paths and the message is the only record of which.
+    account: Option<&str>,
 ) -> String {
     let done = |rel: &&String| !not_done.contains(rel.as_str());
     // What was written, as the report has it (a file new on disk is added, `.textdbignore` too).
@@ -2404,6 +2521,11 @@ fn commit_message(
         m.push_str(&format!("Changed in textdb{since} by {}.\n\n", by.join(", ")));
     }
     m.push_str(&format!("Textdb-Store: {}\nTextdb-Prefix: {prefix}\nTextdb-Seq: {seq}\n", o.store));
+    // The account's own name, never its share roots: `prefix` above is already the view's path,
+    // and the store's path for it is not this checkout's business (#12 §3).
+    if let Some(name) = account {
+        m.push_str(&format!("Textdb-Account: {name}\n"));
+    }
     for a in authors.keys() {
         m.push_str(&format!("Textdb-Author: {a}\n"));
     }
@@ -2448,6 +2570,12 @@ fn print_report(r: &Report, quiet: bool) -> Result<()> {
     list(&mut s, "textdb new", &r.to_textdb.new);
     list(&mut s, "textdb changed", &r.to_textdb.changed);
     list(&mut s, "textdb deleted", &r.to_textdb.deleted);
+    for m in &r.followed_moves {
+        s.push_str(&format!("{:<15} {} -> {} (moved in textdb)\n", "disk moved", m.from, m.to));
+    }
+    for m in &r.renamed_shares {
+        s.push_str(&format!("{:<15} {} -> {} (renamed for you in textdb)\n", "share moved", m.from, m.to));
+    }
     for m in &r.moved {
         s.push_str(&format!("{:<15} {} -> {}\n", "textdb moved", m.from, m.to));
     }
