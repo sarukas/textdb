@@ -253,6 +253,7 @@ impl PgStore {
                 status: r.get(6),
                 resolved: r.get(7),
                 asset: false,
+                resolved_id: None,
             })
             .map(super::asset_link)
             .collect())
@@ -491,12 +492,14 @@ impl Store for PgStore {
     }
 
     fn token_create(&mut self, account: &str, label: Option<&str>, expires_at: Option<&str>) -> Result<(String, i64)> {
-        // The expiry arrives as the store's own text format and is cast at the use site, because
-        // a bare parameter next to a timestamptz column resolves as text and the insert fails.
+        // `$3::text::timestamptz`, not `$3::timestamptz`. A bare parameter under a single cast
+        // is inferred as the cast's *target*, so Postgres declares `$3` a timestamptz and
+        // rust-postgres then refuses to send a string for it ("error serializing parameter 2").
+        // The first cast pins the parameter to text, which is what the expiry actually is.
         let row = self
             .client
             .query_one(
-                "SELECT bearer, id FROM kb.token_create($1, $2, $3::timestamptz)",
+                "SELECT bearer, id FROM kb.token_create($1, $2, $3::text::timestamptz)",
                 &[&account, &label, &expires_at],
             )
             .map_err(pg)?;
@@ -647,7 +650,13 @@ impl Store for PgStore {
         let path = normalize_path(path)?;
         let row = self
             .client
-            .query_opt(&format!("SELECT {} FROM kb.entry e WHERE e.path = $1", entry_cols()), &[&path])
+            .query_opt(
+                &format!(
+                    "SELECT {c} FROM (SELECT * FROM kb.entry UNION ALL SELECT * FROM kb.root_entry) e WHERE e.path = $1",
+                    c = entry_cols()
+                ),
+                &[&path],
+            )
             .map_err(pg)?
             .ok_or_else(|| StoreError::not_found(format!("not found: {path}")))?;
         Ok(entry(&row))
@@ -662,11 +671,16 @@ impl Store for PgStore {
             }
             None => {
                 // One statement, so the content and its version come from the same snapshot.
+                //
+                // `kb.entry`, not `kb.node`: the raw table holds store paths, and the caller's
+                // path is its own. Everything this module sends is in the caller's namespace and
+                // the extension translates — reaching past it to a table was a leak waiting to
+                // happen and, once accounts existed, simply failed to find anything.
                 let row = self
                     .client
                     .query_opt(
-                        "SELECT kb.content(path, NULL::bigint), version FROM kb.node \
-                         WHERE path = $1 AND kind = 1 AND deleted_at IS NULL",
+                        "SELECT kb.content(path, NULL::bigint), version FROM kb.entry \
+                         WHERE path = $1 AND kind = 'file'",
                         &[&path],
                     )
                     .map_err(pg)?

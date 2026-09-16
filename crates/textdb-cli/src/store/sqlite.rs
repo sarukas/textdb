@@ -38,7 +38,7 @@ impl SqliteStore {
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "SELECT n.path, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status, r.path, n.version \
+                "SELECT n.path, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status, r.path, n.version, r.id \
                  FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL \
                  LEFT JOIN {p}node r ON r.id = l.resolved_id AND r.deleted_at IS NULL \
                  WHERE ({cond}) AND ({vis}) ORDER BY n.path, l.line, l.rowid"
@@ -57,6 +57,7 @@ impl SqliteStore {
                     status: r.get(6)?,
                     resolved: r.get(7)?,
                     asset: false,
+                    resolved_id: r.get(9)?,
                 })
             })
             .map_err(sql)?;
@@ -71,7 +72,12 @@ impl SqliteStore {
                     Some(t) => match self.seen(&t) {
                         Some(v) => Some(v),
                         None => {
+                            // The reader is told there is a document and nothing about where it
+                            // is: the target reads as the id form, exactly as the text does.
                             l.status = Some("hidden".into());
+                            if let Some(id) = l.resolved_id {
+                                l.target = format!("textdb:{id}");
+                            }
                             None
                         }
                     },

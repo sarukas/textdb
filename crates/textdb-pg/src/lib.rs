@@ -576,6 +576,30 @@ CREATE VIEW kb.entry AS
   -- evaluated once, so a store that delegates nothing plans exactly as it did before.
   WHERE n.deleted_at IS NULL AND ((SELECT kb.current_account()) IS NULL OR kb.visible(n.path));
 
+-- An aliased account's root: the list of its shares, not a node. `kb.entry` is built on
+-- `kb.node` and so has no row for it, and `stat /` then answered "not found" on a path the
+-- account uses constantly. The totals are its shares' added up, and `kind` is `root` — neither
+-- file nor folder, because nothing can be written there.
+CREATE VIEW kb.root_entry AS
+  SELECT '/'::text AS path, '/'::text AS name, 'root'::text AS kind, NULL::bigint AS version,
+         coalesce(sum(e.nbytes), 0)::bigint AS nbytes, coalesce(sum(e.nlines), 0)::bigint AS nlines,
+         max(e.updated_at) AS updated_at, NULL::text AS updated_by, 0::bigint AS id,
+         NULL::text AS dir, 0::bigint AS depth, NULL::text AS ext, NULL::text AS title,
+         coalesce(sum(e.nwords), 0)::bigint AS nwords, coalesce(sum(e.nsections), 0)::bigint AS nsections,
+         coalesce(sum(e.nprops), 0)::bigint AS nprops, coalesce(sum(e.nlinks), 0)::bigint AS nlinks,
+         coalesce(sum(e.nlinks_broken), 0)::bigint AS nlinks_broken,
+         coalesce(sum(e.versions), 0)::bigint AS versions, min(e.created_at) AS created_at,
+         coalesce(sum(e.files), 0)::bigint AS files, coalesce(sum(e.folders) + count(*), 0)::bigint AS folders,
+         0::bigint AS nauthors, '[]'::jsonb AS authors, NULL::text AS share, NULL::text AS rights
+    FROM kb.entry e
+   WHERE (SELECT kb.current_account()) IS NOT NULL
+     AND NOT EXISTS (SELECT 1 FROM kb.my_grant WHERE alias = '')
+     AND e.dir = '/'
+  -- An aggregate with no GROUP BY returns one row of NULLs over an empty set, so without this
+  -- the owner — for whom the WHERE matches nothing — still got a row here, and `stat /` came
+  -- back with two.
+  HAVING count(*) > 0;
+
 CREATE VIEW kb.folder AS
   -- The full listing record, folders only. `n_children` and `nbytes_total` are gone: a folder
   -- row now carries `files`, `folders` and `nbytes` like every other listing surface, and the
@@ -583,10 +607,20 @@ CREATE VIEW kb.folder AS
   SELECT * FROM kb.entry WHERE kind = 'folder' AND path <> '/';
 
 -- The files and folders in the folder `path`, by name; with `recursive`, everything below it, by path.
+-- The listing of a folder, in the *caller's* namespace.
+--
+-- `kb.entry` speaks view paths, so the folder has to be named in view paths too: comparing
+-- `e.dir` against the node's own `path` worked only while the two were the same string, which
+-- they stopped being the moment an account could see the store under an alias. `kb._node_id`
+-- still does the existence check and the refusal, so a path outside the caller's shares is
+-- refused there rather than quietly listing nothing.
 CREATE FUNCTION kb.ls(path text, recursive boolean DEFAULT false) RETURNS SETOF kb.entry LANGUAGE sql STABLE AS $$
-  SELECT e.* FROM kb.node d JOIN kb.entry e
-    ON CASE WHEN recursive THEN e.path <> '/' AND (d.path = '/' OR e.path LIKE kb._subtree_like(d.path)) ELSE e.dir IS NOT DISTINCT FROM d.path END
-  WHERE d.id = kb._node_id($1)   -- $1: `path` alone would be the tables' columns
+  SELECT e.* FROM (SELECT kb._node_id($1) AS id) d
+  JOIN LATERAL (SELECT CASE WHEN (SELECT kb.current_account()) IS NULL THEN n.path
+                            ELSE coalesce(kb.to_view(n.path), '/') END AS p
+                  FROM kb.node n WHERE n.id = d.id) v ON true
+  JOIN kb.entry e
+    ON CASE WHEN recursive THEN e.path <> '/' AND (v.p = '/' OR e.path LIKE kb._subtree_like(v.p)) ELSE e.dir IS NOT DISTINCT FROM v.p END
   ORDER BY CASE WHEN recursive THEN e.path ELSE e.name END
 $$;
 
@@ -1430,6 +1464,9 @@ mod kb {
             }
             for (r, l) in rows.zip(&s.links) {
                 let stored = textdb_core::Link {
+                    // Not read back: this comparison asks whether the structure changed, and a
+                    // span moves whenever anything before it does.
+                    span: l.span,
                     target_path: r.get::<String>(1).map_err(storage_err)?.unwrap_or_default(),
                     line: r.get::<i64>(2).map_err(storage_err)?.unwrap_or(0) as u64,
                     kind: r.get::<String>(3).map_err(storage_err)?.unwrap_or_default(),
@@ -3100,16 +3137,16 @@ mod kb {
                     None,
                     &[account_id.into()],
                 )
-                .map_err(spi_err)?;
+                .map_err(storage_err)?;
             let mut out = Vec::new();
             for r in t {
                 out.push(Grant {
-                    node_id: r.get::<i64>(1).map_err(spi_err)?.unwrap_or_default(),
-                    alias: r.get::<String>(2).map_err(spi_err)?.unwrap_or_default(),
-                    rights: Rights::parse(&r.get::<String>(3).map_err(spi_err)?.unwrap_or_default()).unwrap_or(Rights::Ro),
-                    store_path: r.get::<String>(4).map_err(spi_err)?.unwrap_or_default(),
-                    dormant: r.get::<bool>(5).map_err(spi_err)?.unwrap_or(false),
-                    revoked: r.get::<bool>(6).map_err(spi_err)?.unwrap_or(false),
+                    node_id: r.get::<i64>(1).map_err(storage_err)?.unwrap_or_default(),
+                    alias: r.get::<String>(2).map_err(storage_err)?.unwrap_or_default(),
+                    rights: Rights::parse(&r.get::<String>(3).map_err(storage_err)?.unwrap_or_default()).unwrap_or(Rights::Ro),
+                    store_path: r.get::<String>(4).map_err(storage_err)?.unwrap_or_default(),
+                    dormant: r.get::<bool>(5).map_err(storage_err)?.unwrap_or(false),
+                    revoked: r.get::<bool>(6).map_err(storage_err)?.unwrap_or(false),
                 });
             }
             Ok::<_, TextdbError>(out)
@@ -3162,7 +3199,7 @@ mod kb {
                 "INSERT INTO kb.grant (account_id, node_id, alias, rights, granted_by) VALUES ($1, $2, '', 'rw', 'owner')",
                 &[id.into(), node_id.into()],
             )
-            .unwrap_or_else(|e| fail(spi_err(e)));
+            .unwrap_or_else(|e| spi_err(e));
         }
         name.to_string()
     }
@@ -3190,16 +3227,16 @@ mod kb {
                     None,
                     &[],
                 )
-                .map_err(spi_err)?;
+                .map_err(storage_err)?;
             let mut out = Vec::new();
             for r in t {
                 out.push((
-                    r.get::<String>(1).map_err(spi_err)?.unwrap_or_default(),
-                    r.get::<String>(2).map_err(spi_err)?.unwrap_or_default(),
-                    r.get::<String>(3).map_err(spi_err)?,
-                    r.get::<pgrx::datum::TimestampWithTimeZone>(4).map_err(spi_err)?.unwrap(),
-                    r.get::<bool>(5).map_err(spi_err)?.unwrap_or(false),
-                    r.get::<i64>(6).map_err(spi_err)?.unwrap_or_default(),
+                    r.get::<String>(1).map_err(storage_err)?.unwrap_or_default(),
+                    r.get::<String>(2).map_err(storage_err)?.unwrap_or_default(),
+                    r.get::<String>(3).map_err(storage_err)?,
+                    r.get::<pgrx::datum::TimestampWithTimeZone>(4).map_err(storage_err)?.unwrap(),
+                    r.get::<bool>(5).map_err(storage_err)?.unwrap_or(false),
+                    r.get::<i64>(6).map_err(storage_err)?.unwrap_or_default(),
                 ));
             }
             Ok::<_, TextdbError>(out)
@@ -3229,9 +3266,9 @@ mod kb {
             "UPDATE kb.grant SET alias = $2 WHERE account_id = $1",
             &[id.into(), alias.as_str().into()],
         )
-        .unwrap_or_else(|e| fail(spi_err(e)));
+        .unwrap_or_else(|e| spi_err(e));
         Spi::run_with_args("UPDATE kb.account SET root_node_id = NULL WHERE id = $1", &[id.into()])
-            .unwrap_or_else(|e| fail(spi_err(e)));
+            .unwrap_or_else(|e| spi_err(e));
         alias
     }
 
@@ -3290,18 +3327,18 @@ mod kb {
                     None,
                     &[account.into()],
                 )
-                .map_err(spi_err)?;
+                .map_err(storage_err)?;
             let mut out = Vec::new();
             for r in t {
                 out.push((
-                    r.get::<i64>(1).map_err(spi_err)?.unwrap_or_default(),
-                    r.get::<String>(2).map_err(spi_err)?.unwrap_or_default(),
-                    r.get::<String>(3).map_err(spi_err)?,
-                    r.get::<pgrx::datum::TimestampWithTimeZone>(4).map_err(spi_err)?.unwrap(),
-                    r.get::<pgrx::datum::TimestampWithTimeZone>(5).map_err(spi_err)?,
-                    r.get::<pgrx::datum::TimestampWithTimeZone>(6).map_err(spi_err)?,
-                    r.get::<pgrx::datum::TimestampWithTimeZone>(7).map_err(spi_err)?,
-                    r.get::<bool>(8).map_err(spi_err)?.unwrap_or(false),
+                    r.get::<i64>(1).map_err(storage_err)?.unwrap_or_default(),
+                    r.get::<String>(2).map_err(storage_err)?.unwrap_or_default(),
+                    r.get::<String>(3).map_err(storage_err)?,
+                    r.get::<pgrx::datum::TimestampWithTimeZone>(4).map_err(storage_err)?.unwrap(),
+                    r.get::<pgrx::datum::TimestampWithTimeZone>(5).map_err(storage_err)?,
+                    r.get::<pgrx::datum::TimestampWithTimeZone>(6).map_err(storage_err)?,
+                    r.get::<pgrx::datum::TimestampWithTimeZone>(7).map_err(storage_err)?,
+                    r.get::<bool>(8).map_err(storage_err)?.unwrap_or(false),
                 ));
             }
             Ok::<_, TextdbError>(out)
@@ -3365,7 +3402,7 @@ mod kb {
              granted_by = excluded.granted_by, granted_at = now(), revoked_at = NULL",
             &[id.into(), g.node_id.into(), g.alias.as_str().into(), g.rights.as_str().into()],
         )
-        .unwrap_or_else(|e| fail(spi_err(e)));
+        .unwrap_or_else(|e| spi_err(e));
         TableIterator::once((g.alias.clone(), g.rights.as_str().to_string(), g.store_path.clone(), g.node_id))
     }
 
@@ -3432,16 +3469,16 @@ mod kb {
                     None,
                     &[],
                 )
-                .map_err(spi_err)?;
+                .map_err(storage_err)?;
             let mut out = Vec::new();
             for r in t {
                 out.push((
-                    r.get::<String>(1).map_err(spi_err)?.unwrap_or_default(),
-                    r.get::<String>(2).map_err(spi_err)?.unwrap_or_default(),
-                    r.get::<String>(3).map_err(spi_err)?.unwrap_or_default(),
-                    r.get::<String>(4).map_err(spi_err)?.unwrap_or_default(),
-                    r.get::<i64>(5).map_err(spi_err)?.unwrap_or_default(),
-                    r.get::<bool>(6).map_err(spi_err)?.unwrap_or(false),
+                    r.get::<String>(1).map_err(storage_err)?.unwrap_or_default(),
+                    r.get::<String>(2).map_err(storage_err)?.unwrap_or_default(),
+                    r.get::<String>(3).map_err(storage_err)?.unwrap_or_default(),
+                    r.get::<String>(4).map_err(storage_err)?.unwrap_or_default(),
+                    r.get::<i64>(5).map_err(storage_err)?.unwrap_or_default(),
+                    r.get::<bool>(6).map_err(storage_err)?.unwrap_or(false),
                 ));
             }
             Ok::<_, TextdbError>(out)
@@ -3491,13 +3528,13 @@ mod kb {
                     None,
                     &[id.into()],
                 )
-                .map_err(spi_err)?;
+                .map_err(storage_err)?;
             let r = t.into_iter().next();
             Ok::<_, TextdbError>(match r {
                 Some(r) => (
-                    r.get::<String>(1).map_err(spi_err)?.unwrap_or_default(),
-                    r.get::<String>(2).map_err(spi_err)?.unwrap_or_default(),
-                    r.get::<bool>(3).map_err(spi_err)?.unwrap_or(false),
+                    r.get::<String>(1).map_err(storage_err)?.unwrap_or_default(),
+                    r.get::<String>(2).map_err(storage_err)?.unwrap_or_default(),
+                    r.get::<bool>(3).map_err(storage_err)?.unwrap_or(false),
                 ),
                 None => (String::new(), String::new(), false),
             })
@@ -3547,7 +3584,7 @@ mod kb {
             "UPDATE kb.account SET disabled_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1",
             &[id.into(), disabled.into()],
         )
-        .unwrap_or_else(|e| fail(spi_err(e)));
+        .unwrap_or_else(|e| spi_err(e));
         true
     }
 

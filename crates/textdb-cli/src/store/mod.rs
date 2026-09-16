@@ -275,6 +275,11 @@ pub struct LinkRow {
     pub resolved: Option<String>,
     /// It resolves to an asset.
     pub asset: bool,
+    /// The store's id for the document it reached. Not printed: it is what turns a target the
+    /// reader may not see into its `textdb:<id>` form, and the id is already the `resolved` row's
+    /// own elsewhere.
+    #[serde(skip)]
+    pub resolved_id: Option<i64>,
 }
 
 /// A link row as a store holds it, with a link to an asset's pointer shown as the asset.
