@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::backend::*;
 use crate::backends::fs::{regex_escape, slice_lines, FsBackend};
-use crate::backends::{du, first_hit_line, query_terms};
+use crate::backends::{du, first_hit_line_and_text, query_terms};
 use crate::reference::splice;
 
 pub struct FsGitBackend {
@@ -195,9 +195,11 @@ impl Backend for FsGitBackend {
         let mut hits = Vec::new();
         for f in String::from_utf8_lossy(&out.stdout).lines() {
             let body = std::fs::read(self.root.join(f))?;
+            let (line, snippet) = first_hit_line_and_text(&body, &terms);
             hits.push(Hit {
                 path: format!("/{}", f),
-                line: first_hit_line(&body, &terms),
+                line,
+                snippet,
             });
         }
         Ok(hits)

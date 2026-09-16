@@ -300,12 +300,13 @@ impl Backend for TextdbSqlite {
     }
     fn search(&self, query: &str, prefix: &str) -> R<Vec<Hit>> {
         self.with(|c| {
-            let mut st = c.prepare_cached("SELECT path, line FROM textdb_search(?1, ?2, 100000)")?;
+            let mut st = c.prepare_cached("SELECT path, line, snippet FROM textdb_search(?1, ?2, 100000)")?;
             let rows = st
                 .query_map(params![query, prefix], |r| {
                     Ok(Hit {
                         path: r.get(0)?,
                         line: r.get::<_, i64>(1)? as u64,
+                        snippet: r.get(2)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -373,6 +374,39 @@ impl Backend for TextdbSqlite {
         let (body, _) = self.read_versioned(path)?;
         let next = set_frontmatter_key(&body, key, value);
         self.overwrite(path, &next)
+    }
+    fn outline(&self, prefix: &str, heading: Option<&str>, mode: &str, max_level: Option<u32>) -> R<Vec<OutlineRow>> {
+        self.with(|c| {
+            let mut st = c.prepare_cached(
+                "SELECT path, heading, level, line_from, nwords, nwords_total, nbytes
+                   FROM textdb_outline(?1, ?2, ?3, ?4, 1000000)",
+            )?;
+            let rows = st
+                .query_map(params![prefix, heading, mode, max_level.map(|l| l as i64)], |r| {
+                    Ok(OutlineRow {
+                        path: r.get(0)?,
+                        heading: r.get(1)?,
+                        level: r.get::<_, i64>(2)? as u32,
+                        line_from: r.get::<_, i64>(3)? as u64,
+                        nwords: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                        nwords_total: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                        file_nbytes: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+    fn heading_names(&self, prefix: &str, starts: &str) -> R<Vec<(String, u64, u64)>> {
+        self.with(|c| {
+            let mut st = c.prepare_cached("SELECT heading, sections, docs FROM textdb_headings(?1, ?2, 100000)")?;
+            let rows = st
+                .query_map(params![prefix, starts], |r| {
+                    Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
     }
     fn sections(&self, path: &str) -> R<Vec<SectionRow>> {
         self.with(|c| {

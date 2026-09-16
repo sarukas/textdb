@@ -24,6 +24,7 @@ pub fn markdown(ctx: &Ctx) -> anyhow::Result<()> {
         "move_relink" => move_relink(ctx),
         "frontmatter" => frontmatter(ctx),
         "sections" => sections(ctx),
+        "outline" => outline(ctx),
         "feed" => feed(ctx),
         "property_search" => property_search(ctx),
         other => anyhow::bail!("unknown md variant {}", other),
@@ -595,6 +596,241 @@ fn sections(ctx: &Ctx) -> anyhow::Result<()> {
         ctx.cell.metric("", "section_body_correct", 1.0);
     } else {
         ctx.cell.fail("", "section_body_correct", &format!("{} of {} documents", empty, n));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// MD-08 — outlines: headings above one document
+// ---------------------------------------------------------------------------------------
+
+/// One generated document's heading tree, as the oracle expects to read it back.
+struct Outlined {
+    path: String,
+    body: Vec<u8>,
+    /// `(heading, level)` in document order.
+    headings: Vec<(String, u32)>,
+}
+
+/// A vault whose headings are distributed the way a real one's are: a few that nearly every
+/// note carries, a long tail that one or two do, and a nesting tree under each.
+///
+/// That mix is the point. A benchmark where every document has the same headings measures an
+/// index seek that always returns everything, and one where every heading is unique measures
+/// a seek that always returns one row; neither is what a vault asks.
+fn outline_corpus(prefix: &str, n: usize, size: usize, depth: usize) -> Vec<Outlined> {
+    // Carried by a decreasing share of documents: `Summary` by every one, `Risks` by a
+    // sixteenth, so a query can be selective or not and both shapes get measured.
+    const SHARED: [&str; 5] = ["Summary", "Next Steps", "Notes", "Open Questions", "Risks"];
+    (0..n)
+        .map(|i| {
+            let mut body = String::new();
+            let mut headings = Vec::new();
+            body.push_str(&format!("---\ntitle: Doc {}\nstatus: draft\n---\n\n", i));
+            let mut push = |body: &mut String, text: &str, level: u32| {
+                body.push_str(&format!("{} {}\n\n", "#".repeat(level as usize), text));
+                headings.push((text.to_string(), level));
+            };
+            // One top-level heading unique to this document, so a vault-wide query for it
+            // returns exactly one row however large the vault is.
+            push(&mut body, &format!("Doc {:05}", i), 1);
+            for (k, shared) in SHARED.iter().enumerate() {
+                if i % (1 << k) != 0 {
+                    continue;
+                }
+                push(&mut body, shared, 2);
+                // Nesting below it, down to `depth`, so the level filter has something to cut.
+                for d in 3..=depth.max(2) {
+                    push(&mut body, &format!("{} detail {}", shared, d), d as u32);
+                }
+            }
+            // Filler to the requested size, with every line distinct so the write path costs
+            // what the other families' documents cost.
+            let mut line = 0usize;
+            while body.len() < size {
+                body.push_str(&format!("body line {:06} of document {:05} with some words\n", line, i));
+                line += 1;
+            }
+            Outlined {
+                path: format!("{}/f{:05}.md", prefix, i),
+                body: body.into_bytes(),
+                headings,
+            }
+        })
+        .collect()
+}
+
+/// What headings cost above one document: a folder, a whole vault, a heading query in each of
+/// the three match shapes, the level filter, and the autosuggest call.
+///
+/// MD-05 already covers one document's outline. This is the part that was never measured, and
+/// the part where the shape of the query decides whether an index can be used at all:
+/// `exact` and `prefix` are seeks over the folded heading, `contains` has to scan.
+fn outline(ctx: &Ctx) -> anyhow::Result<()> {
+    let n = ctx.params.usize("n_files", 2000);
+    let size = ctx.params.usize("file_size", 4096);
+    let depth = ctx.params.usize("depth", 3);
+    let probes = ctx.params.usize("probes", 200);
+    let docs = outline_corpus("/out", n, size, depth);
+    let plain: Vec<Doc> = docs
+        .iter()
+        .map(|d| Doc {
+            path: d.path.clone(),
+            body: d.body.clone(),
+            resolved: Vec::new(),
+            broken: 0,
+            headings: d.headings.iter().map(|(h, _)| h.clone()).collect(),
+        })
+        .collect();
+    if !write_all(ctx, &plain, "")? {
+        return Ok(());
+    }
+
+    // Every heading the generator wrote, so each oracle below compares against what is really
+    // there rather than against whatever the backend happens to return.
+    let total: usize = docs.iter().map(|d| d.headings.len()).sum();
+    let with_summary = docs.iter().filter(|d| d.headings.iter().any(|(h, _)| h == "Summary")).count();
+    let tops: usize = docs.iter().map(|d| d.headings.iter().filter(|(_, l)| *l == 1).count()).sum();
+
+    // One document, through the same call the wider ones use: the floor everything else is
+    // read against.
+    let mut one = Latencies::default();
+    let mut wrong = 0;
+    for d in docs.iter().take(probes) {
+        let p = d.path.clone();
+        match ctx.op(ops::OUTLINE, &mut one, || ctx.backend.outline(&p, None, "exact", None)) {
+            Ok(rows) => {
+                let got: Vec<(String, u32)> = rows.iter().map(|r| (r.heading.clone(), r.level)).collect();
+                if got != d.headings {
+                    wrong += 1;
+                }
+            }
+            Err(e) => {
+                if unsupported(ctx, "outline", &e) {
+                    return Ok(());
+                }
+                ctx.err("", "outline", &e);
+                return Ok(());
+            }
+        }
+    }
+    ctx.cell.lat("", "outline_one_doc", &one);
+    if wrong == 0 {
+        ctx.cell.metric("", "outline_matches_source", 1.0);
+    } else {
+        ctx.cell.fail("", "outline_matches_source", &format!("{} of {} documents", wrong, probes.min(n)));
+    }
+
+    // The whole vault in one call: what an outline pane over everything costs, and the row
+    // count that says whether it really returned everything.
+    let mut all = Latencies::default();
+    let mut got_all = 0;
+    for _ in 0..ctx.params.usize("vault_reps", 5) {
+        match ctx.op(ops::OUTLINE, &mut all, || ctx.backend.outline("/out", None, "exact", None)) {
+            Ok(rows) => got_all = rows.len(),
+            Err(e) => {
+                ctx.err("", "outline_vault", &e);
+                return Ok(());
+            }
+        }
+    }
+    ctx.cell.lat("", "outline_vault", &all);
+    if got_all == total {
+        ctx.cell.metric("", "outline_vault_complete", 1.0);
+    } else {
+        ctx.cell.fail("", "outline_vault_complete", &format!("{} rows, expected {}", got_all, total));
+    }
+    ctx.cell.metric("", "outline_vault_rows", total as f64);
+
+    // A heading query in each of the three shapes, against the same selective heading, so the
+    // three numbers differ only by what the index can do for them.
+    for (mode, needle, expect) in [
+        ("exact", "summary", with_summary),
+        ("prefix", "summ", with_summary),
+        ("contains", "ummar", with_summary),
+    ] {
+        let mut lat = Latencies::default();
+        let mut found = 0;
+        for _ in 0..probes.min(50) {
+            match ctx.op(ops::OUTLINE, &mut lat, || ctx.backend.outline("/out", Some(needle), mode, None)) {
+                Ok(rows) => found = rows.len(),
+                Err(e) => {
+                    ctx.err("", &format!("outline_{}", mode), &e);
+                    return Ok(());
+                }
+            }
+        }
+        ctx.cell.lat("", &format!("outline_match_{}", mode), &lat);
+        // Folded matching means the lower-case needle has to find the capitalised heading.
+        if found == expect {
+            ctx.cell.metric("", &format!("outline_match_{}_correct", mode), 1.0);
+        } else {
+            ctx.cell
+                .fail("", &format!("outline_match_{}_correct", mode), &format!("{} rows, expected {}", found, expect));
+        }
+    }
+
+    // The level filter, which a table of contents uses to show only the top of each document.
+    let mut lvl = Latencies::default();
+    let mut got_tops = 0;
+    for _ in 0..probes.min(50) {
+        match ctx.op(ops::OUTLINE, &mut lvl, || ctx.backend.outline("/out", None, "exact", Some(1))) {
+            Ok(rows) => got_tops = rows.len(),
+            Err(e) => {
+                ctx.err("", "outline_level", &e);
+                return Ok(());
+            }
+        }
+    }
+    ctx.cell.lat("", "outline_level_1", &lvl);
+    if got_tops == tops {
+        ctx.cell.metric("", "outline_level_correct", 1.0);
+    } else {
+        ctx.cell.fail("", "outline_level_correct", &format!("{} rows, expected {}", got_tops, tops));
+    }
+
+    // Autosuggest, which runs per keystroke: the empty prefix (every heading in the vault)
+    // and a two-character one, since those are the two extremes a box actually issues.
+    for (label, starts) in [("all", ""), ("prefix", "ne")] {
+        let mut lat = Latencies::default();
+        let mut rows = 0;
+        for _ in 0..probes.min(50) {
+            match ctx.op(ops::HEADING_NAMES, &mut lat, || ctx.backend.heading_names("/out", starts)) {
+                Ok(r) => rows = r.len(),
+                Err(e) => {
+                    ctx.err("", "heading_names", &e);
+                    return Ok(());
+                }
+            }
+        }
+        ctx.cell.lat("", &format!("heading_names_{}", label), &lat);
+        ctx.cell.metric("", &format!("heading_names_{}_rows", label), rows as f64);
+    }
+
+    // Word counts: the figure the rows carry has to be the figure the document really has.
+    match ctx.backend.outline(&docs[0].path, None, "exact", None) {
+        Ok(rows) if !rows.is_empty() => {
+            let own: u64 = rows.iter().filter_map(|r| r.nwords).sum();
+            let root_total = rows[0].nwords_total.unwrap_or(0);
+            // The first heading is the document's only level-1 one, so its total is every
+            // section's own words — the composition property, checked against live rows.
+            if root_total == own {
+                ctx.cell.metric("", "section_words_compose", 1.0);
+            } else {
+                ctx.cell
+                    .fail("", "section_words_compose", &format!("root total {} != sum of own {}", root_total, own));
+            }
+            // And the file column is really the file's, not a repeat of the section's.
+            if rows[0].file_nbytes.unwrap_or(0) as usize >= docs[0].body.len() {
+                ctx.cell.metric("", "outline_carries_file_columns", 1.0);
+            } else {
+                ctx.cell.fail("", "outline_carries_file_columns", "file nbytes missing or short");
+            }
+        }
+        Ok(_) => ctx.cell.fail("", "section_words_compose", "no rows"),
+        Err(e) => {
+            ctx.err("", "outline", &e);
+        }
     }
     Ok(())
 }

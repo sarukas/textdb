@@ -112,3 +112,21 @@ file_size = 4096
 [test.poc]
 n_files = 2000
 file_size = 2048
+
+[[test]]
+id = "MD-08"
+family = "MD"
+kind = "markdown"
+reps = 3
+note = "headings above one document: a whole vault in one call, a heading query as exact/prefix/contains, the level filter, and the per-keystroke autosuggest"
+[test.spec]
+variant = "outline"
+n_files = 20000
+file_size = 4096
+depth = 3
+probes = 200
+vault_reps = 5
+[test.poc]
+n_files = 2000
+file_size = 2048
+probes = 100

@@ -1,0 +1,17 @@
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"verify_pre","metric":"clean_start","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"verify_pre","metric":"canary_roundtrip","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"","metric":"import_s","value":6.638959985,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"","metric":"footprint_after_import","value":34173672.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"","metric":"footprint_over_raw","value":2.7811021909833284,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"single","metric":"recall","value":0.9998757892557706,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"single","metric":"precision","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"single","metric":"snippet_coverage","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"single","metric":"snippet_shows_the_term","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"and2","metric":"recall","value":0.9997501249375312,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"and2","metric":"precision","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"and2","metric":"snippet_coverage","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"and2","metric":"snippet_shows_the_term","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"phrase","metric":"recall","value":0.9985324332257117,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"phrase","metric":"precision","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"phrase","metric":"snippet_coverage","value":1.0,"note":"ok"}
+{"test":"SR-01/02","family":"SR","backend":"textdb-sqlite","mode":"fast","cache":"warm","rep":1,"case":"phrase","metric":"snippet_shows_the_term","value":1.0,"note":"ok"}

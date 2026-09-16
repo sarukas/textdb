@@ -8,7 +8,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::backend::*;
-use crate::backends::{du, first_hit_line, query_terms};
+use crate::backends::{du, first_hit_line_and_text, query_terms};
 use crate::reference::splice;
 
 pub struct FsBackend {
@@ -125,9 +125,11 @@ impl FsBackend {
         for f in files.unwrap_or_default() {
             let body = fs::read(&f)?;
             let rel = format!("/{}", Path::new(&f).strip_prefix(&self.root).unwrap().to_string_lossy());
+            let (line, snippet) = first_hit_line_and_text(&body, &terms);
             hits.push(Hit {
                 path: rel,
-                line: first_hit_line(&body, &terms),
+                line,
+                snippet,
             });
         }
         Ok(hits)

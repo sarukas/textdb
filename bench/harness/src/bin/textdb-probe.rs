@@ -616,6 +616,62 @@ fn probe_diff(big: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Where `search` spends its time: finding which documents match, against turning each of
+/// those into a line and a snippet.
+///
+/// The snippet is often assumed to be the expensive part. It is not separable from the line:
+/// both come from one `locate_terms` scan of the same chunk bytes, and getting the bytes at
+/// all costs a node lookup, a chunk fetch and a `find_leaf` walk of the document's tree.
+/// What this measures is that whole resolution phase against the index query underneath it,
+/// which is the split an optimisation would actually act on.
+fn probe_search() -> anyhow::Result<()> {
+    let s = open_stores()?;
+    println!("## search — index query against per-hit resolution\n");
+    // A corpus wide enough that a common term matches many documents: the shape where hit
+    // resolution dominates, and the one a knowledge base actually has.
+    const DOCS: usize = 400;
+    for size in [4 << 10usize, 64 << 10] {
+        let l = label(size);
+        for i in 0..DOCS {
+            let body = format!("{}\nneedle-{} appears here\n", corpus(size, i), i % 7);
+            s.td.execute(
+                "INSERT INTO kb(path, content, author) VALUES (?1, ?2, 'probe')",
+                params![format!("/{}/d{:04}.md", l, i), &body],
+            )?;
+        }
+        let db = textdb_sqlite::TextDb::attach(&s.td, "kb_", false);
+        let prefix = format!("/{}", l);
+        // Two shapes: a term in every document, and one in a seventh of them.
+        for (name, q) in [("wide", "consectetur"), ("narrow", "needle-3")] {
+            let matched = db.search_paths(q, &prefix, 100_000)?.len();
+            if matched == 0 {
+                println!("  {:>6}  {:6}  no matches; skipped", l, name);
+                continue;
+            }
+            let reps = if size >= 64 << 10 { 20 } else { 100 };
+            let paths = timed(reps, |_| {
+                db.search_paths(q, &prefix, 100_000).unwrap();
+            });
+            let full = timed(reps, |_| {
+                db.search(q, &prefix, 100_000).unwrap();
+            });
+            println!(
+                "  {:>6}  {:6}  {:4} hits | paths only {:8.4} ms | with line+snippet {:8.4} ms | resolution {:8.4} ms ({:5.1}% of total, {:6.1} us/hit)",
+                l,
+                name,
+                matched,
+                paths,
+                full,
+                full - paths,
+                100.0 * (full - paths) / full,
+                1000.0 * (full - paths) / matched as f64,
+            );
+        }
+    }
+    println!();
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let which = std::env::args().nth(1).unwrap_or_else(|| "all".into());
     match which.as_str() {
@@ -623,6 +679,7 @@ fn main() -> anyhow::Result<()> {
         "statements" => probe_statements()?,
         "scalar" => probe_scalar()?,
         "prefix" => probe_prefix()?,
+        "search" => probe_search()?,
         "writepath" => probe_writepath()?,
         "tree" => probe_tree()?,
         "diff" => probe_diff(false)?,
@@ -632,13 +689,14 @@ fn main() -> anyhow::Result<()> {
             probe_statements()?;
             probe_scalar()?;
             probe_prefix()?;
+            probe_search()?;
             probe_writepath()?;
             probe_tree()?;
             probe_diff(false)?;
         }
         other => {
             eprintln!("unknown probe '{}'", other);
-            eprintln!("usage: textdb-probe [all|ops|statements|scalar|prefix|writepath|tree|diff|diff-big]");
+            eprintln!("usage: textdb-probe [all|ops|statements|scalar|prefix|search|writepath|tree|diff|diff-big]");
             std::process::exit(2);
         }
     }

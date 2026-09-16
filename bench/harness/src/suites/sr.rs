@@ -118,6 +118,10 @@ pub fn search(ctx: &Ctx) -> anyhow::Result<()> {
     for kind in [QKind::Single, QKind::And2, QKind::Phrase, QKind::Prefix] {
         let case = format!("{:?}", kind).to_lowercase();
         let mut lat = Latencies::default();
+        // Snippet quality, alongside recall and precision: how many hits carried a snippet,
+        // and how many of those actually showed a searched-for term.
+        let (mut snippets_ok, mut snippets_wrong, mut snippets_absent) = (0usize, 0usize, 0usize);
+        let mut snippet_examples: Vec<String> = Vec::new();
         let (mut tp, mut fp, mut fn_) = (0usize, 0usize, 0usize);
         let mut na = false;
         for _ in 0..n_queries {
@@ -154,6 +158,38 @@ pub fn search(ctx: &Ctx) -> anyhow::Result<()> {
                 .collect();
             match ctx.op(ops::SEARCH, &mut lat, || ctx.backend.search(&query, &prefix_filter)) {
                 Ok(hits) => {
+                    // A snippet is what the user reads, so a search that finds the right
+                    // document and shows the wrong line is still wrong. The check is the
+                    // weakest one that would catch that: the snippet has to contain a term
+                    // that was searched for. A prefix query matches on the stem, and a phrase
+                    // on either word, since a snippet is a window and may cut at either end.
+                    for h in &hits {
+                        // Only documents that genuinely match are judged. A false positive's
+                        // snippet is meaningless by construction — there is no term in the
+                        // document to show — and `precision` already counts it.
+                        if !truth.contains(&h.path) {
+                            continue;
+                        }
+                        let Some(sn) = h.snippet.as_deref() else {
+                            snippets_absent += 1;
+                            continue;
+                        };
+                        // Folded the way the index and the store fold, and word by word so a
+                        // phrase is not looked for with its spaces intact.
+                        let low = textdb_core::fold::fold(sn);
+                        if terms
+                            .iter()
+                            .flat_map(|t| t.split_whitespace())
+                            .any(|t| low.contains(&textdb_core::fold::fold(t.trim_end_matches('*'))))
+                        {
+                            snippets_ok += 1;
+                        } else {
+                            if snippet_examples.len() < 3 {
+                                snippet_examples.push(format!("{} @{} for {:?}: {:?}", h.path, h.line, query, sn));
+                            }
+                            snippets_wrong += 1;
+                        }
+                    }
                     let got: BTreeSet<String> = hits.into_iter().map(|h| h.path).collect();
                     for p in &truth {
                         if got.contains(*p) {
@@ -182,6 +218,22 @@ pub fn search(ctx: &Ctx) -> anyhow::Result<()> {
         let precision = if tp + fp > 0 { tp as f64 / (tp + fp) as f64 } else { 1.0 };
         ctx.cell.metric(&case, "recall", recall);
         ctx.cell.metric(&case, "precision", precision);
+        // Reported as a share of the hits that carried one, so a backend with no snippets is
+        // not scored as if it had wrong ones — that shows up in `snippet_coverage` instead.
+        let with = snippets_ok + snippets_wrong;
+        if with + snippets_absent > 0 {
+            ctx.cell
+                .metric(&case, "snippet_coverage", with as f64 / (with + snippets_absent) as f64);
+        }
+        if snippets_wrong > 0 {
+            ctx.cell.fail(
+                &case,
+                "snippet_shows_the_term",
+                &format!("{} of {} hits; e.g. {}", snippets_wrong, with, snippet_examples.join("; ")),
+            );
+        } else if with > 0 {
+            ctx.cell.metric(&case, "snippet_shows_the_term", 1.0);
+        }
     }
     ctx.set_reference(reference);
     Ok(())

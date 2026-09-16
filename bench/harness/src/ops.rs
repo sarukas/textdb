@@ -28,6 +28,10 @@ pub const FRONTMATTER: &str = "frontmatter";
 pub const SET_META: &str = "set_meta";
 pub const SECTIONS: &str = "sections";
 pub const SECTION: &str = "section";
+/// Headings across a folder or a whole vault, rather than one document's.
+pub const OUTLINE: &str = "outline";
+/// The distinct headings in use — the autosuggest call, run per keystroke.
+pub const HEADING_NAMES: &str = "heading_names";
 pub const CHANGES_SINCE: &str = "changes_since";
 pub const SYNC: &str = "sync";
 pub const PROP_KEYS: &str = "prop_keys";
@@ -56,6 +60,8 @@ pub const ALL: &[&str] = &[
     SET_META,
     SECTIONS,
     SECTION,
+    OUTLINE,
+    HEADING_NAMES,
     CHANGES_SINCE,
     SYNC,
     PROP_KEYS,

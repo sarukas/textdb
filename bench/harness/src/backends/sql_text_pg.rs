@@ -10,7 +10,7 @@ use postgres::{Client, NoTls};
 
 use crate::backend::*;
 use crate::backends::fs::slice_lines;
-use crate::backends::{first_hit_line, query_terms};
+use crate::backends::{first_hit_line_and_text, query_terms};
 
 static INSTANCE: AtomicU64 = AtomicU64::new(1);
 
@@ -281,9 +281,13 @@ impl Backend for SqlTextPg {
             )?;
             Ok(rows
                 .iter()
-                .map(|r| Hit {
-                    path: r.get(0),
-                    line: first_hit_line(r.get::<_, String>(1).as_bytes(), &terms),
+                .map(|r| {
+                    let (line, snippet) = first_hit_line_and_text(r.get::<_, String>(1).as_bytes(), &terms);
+                    Hit {
+                        path: r.get(0),
+                        line,
+                        snippet,
+                    }
                 })
                 .collect())
         })

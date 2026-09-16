@@ -8,6 +8,7 @@ pub mod chunker;
 pub mod commit;
 pub mod diff;
 pub mod edit;
+pub mod fold;
 pub mod hash;
 pub mod myers;
 pub mod node;

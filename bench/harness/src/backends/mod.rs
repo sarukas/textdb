@@ -48,15 +48,34 @@ pub fn query_terms(q: &str) -> Vec<String> {
 
 /// Line (1-based) of the first occurrence of any query term in `body`, for rg-parity hits.
 pub fn first_hit_line(body: &[u8], terms: &[String]) -> u64 {
-    let text = String::from_utf8_lossy(body).to_lowercase();
+    // Folded, not merely lowercased, for the same reason the store folds: the corpus is full
+    // of diacritics and the index strips them, so a raw comparison would put the baselines'
+    // hits on the wrong line and make them look wrong against a store that is right.
+    let text = textdb_core::fold::fold(&String::from_utf8_lossy(body));
     let mut best: Option<usize> = None;
-    for t in terms {
-        let t = t.trim_end_matches('*').to_lowercase();
+    // A quoted phrase arrives as one term with its spaces intact, so it is matched word by
+    // word: the words are adjacent in the query but the text between them in a document may
+    // be punctuation, and looking for the phrase literally would find nothing.
+    for t in terms.iter().flat_map(|t| t.split_whitespace()) {
+        let t = textdb_core::fold::fold(t.trim_end_matches('*'));
         if let Some(p) = text.find(&t) {
             best = Some(best.map_or(p, |b| b.min(p)));
         }
     }
     text[..best.unwrap_or(0)].matches('\n').count() as u64 + 1
+}
+
+/// Line (1-based) and the whole matching line, for the backends that have no snippet of
+/// their own and would otherwise be compared against nothing.
+///
+/// This is what `fs` shows a user: the line ripgrep printed. It is the fair baseline for a
+/// store that builds a snippet — the oracle only asks that a snippet contain a term that was
+/// searched for, which the matching line trivially does.
+pub fn first_hit_line_and_text(body: &[u8], terms: &[String]) -> (u64, Option<String>) {
+    let line = first_hit_line(body, terms);
+    let text = String::from_utf8_lossy(body);
+    let snippet = text.lines().nth(line.saturating_sub(1) as usize).map(|l| l.to_string());
+    (line, snippet)
 }
 
 /// Read a TEXT or BLOB column as bytes (rusqlite refuses `Vec<u8>` for TEXT).

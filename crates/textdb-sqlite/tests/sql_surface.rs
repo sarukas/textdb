@@ -716,3 +716,74 @@ fn a_deleted_document_leaves_the_outline() {
         .unwrap();
     assert_eq!(docs, 1);
 }
+
+#[test]
+fn a_hit_found_through_folding_shows_the_line_that_matched() {
+    // The index tokenises with fts5's `unicode61`, which strips diacritics, so `facade`
+    // finds a document holding `façade`. Choosing the line to show used to compare raw text,
+    // find nothing and fall back to the top of the chunk: the document was right and the
+    // line was wrong. See `textdb_core::fold`.
+    let conn = setup();
+    conn.execute(
+        "INSERT INTO kb(path, content) VALUES ('/a.md', ?1)",
+        params!["# Doc\n\nfiller line one\nthe word façade appears on this line\nfiller two\n"],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO kb(path, content) VALUES ('/b.md', ?1)",
+        params!["# Kita\n\nnieko\nčia ąžuolas auga\n"],
+    )
+    .unwrap();
+
+    for (query, want_line, want_in_snippet) in [
+        ("facade", 4, "façade"),
+        ("façade", 4, "façade"),
+        ("azuolas", 4, "ąžuolas"),
+        ("ąžuolas", 4, "ąžuolas"),
+    ] {
+        let (line, snippet): (i64, String) = conn
+            .query_row(
+                "SELECT line, snippet FROM textdb_search(?1, '/', 10)",
+                params![query],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        assert_eq!(line, want_line, "{query} showed the wrong line: {snippet:?}");
+        assert!(snippet.contains(want_in_snippet), "{query} showed {snippet:?}");
+    }
+}
+
+#[test]
+fn a_snippet_shows_the_match_however_the_query_was_written() {
+    let conn = setup();
+    let pad = "filler word here ".repeat(30);
+    conn.execute(
+        "INSERT INTO kb(path, content) VALUES ('/a.md', ?1)",
+        params![format!("---\ntitle: T\ndraft: false\n---\n# Head\n{pad}NEEDLE appears late{pad}\n")],
+    )
+    .unwrap();
+
+    let hit = |q: &str| -> (i64, String) {
+        conn.query_row("SELECT line, snippet FROM textdb_search(?1, '/', 5)", params![q], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap_or_else(|e| panic!("{q}: {e}"))
+    };
+
+    // A match past the first 200 characters of a long line is still shown: the snippet is a
+    // window around it, not the head of the line, and says so at the end it cut.
+    let (line, snippet) = hit("needle");
+    assert_eq!(line, 6);
+    assert!(snippet.contains("NEEDLE appears late"), "{snippet:?}");
+    assert!(snippet.starts_with('…') && snippet.ends_with('…'), "{snippet:?}");
+
+    // A quoted phrase is matched word by word, so punctuation between the words does not
+    // hide it: `query_terms` keeps the phrase as one term with a space in it.
+    let (line, snippet) = hit("\"draft false\"");
+    assert_eq!(line, 3);
+    assert_eq!(snippet, "draft: false");
+
+    // A line that fits is shown whole, with no ellipsis.
+    let (_, snippet) = hit("head");
+    assert_eq!(snippet, "# Head");
+}

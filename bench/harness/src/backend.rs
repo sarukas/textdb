@@ -81,6 +81,29 @@ pub struct Entry {
 pub struct Hit {
     pub path: String,
     pub line: u64,
+    /// The text the store shows for this hit, when it produces one.
+    ///
+    /// `None` means the backend has no snippet to give — `fs` and the `sql-text-*` stores
+    /// return the matching line themselves, so they do; a backend that returned nothing would
+    /// be recorded as not having the capability rather than as wrong. What is checked is that
+    /// a snippet, where there is one, actually contains a term that was searched for: a fast
+    /// search that shows the wrong line is not a working search.
+    pub snippet: Option<String>,
+}
+
+/// One heading as an outline query returns it, with the file columns that come alongside.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutlineRow {
+    pub path: String,
+    pub heading: String,
+    pub level: u32,
+    pub line_from: u64,
+    /// Words in the section's own lines, and in it plus everything nested under it.
+    pub nwords: Option<u64>,
+    pub nwords_total: Option<u64>,
+    /// The document's own byte count, repeated on each of its rows — the point of the call
+    /// is that a caller does not have to ask for it separately.
+    pub file_nbytes: Option<u64>,
 }
 
 /// One recorded link, as the store resolved it.
@@ -207,6 +230,15 @@ pub trait Backend: Send + Sync {
         Err(BackendError::NotSupported("no section index"))
     }
     /// The body of one section, addressed by its heading path.
+    /// Headings under `prefix`, optionally only those matching `heading` in `mode`
+    /// (`exact`, `prefix` or `contains`) and no deeper than `max_level`.
+    fn outline(&self, _prefix: &str, _heading: Option<&str>, _mode: &str, _max_level: Option<u32>) -> R<Vec<OutlineRow>> {
+        Err(BackendError::NotSupported("no section index"))
+    }
+    /// The distinct headings in use under `prefix` that start with `starts`.
+    fn heading_names(&self, _prefix: &str, _starts: &str) -> R<Vec<(String, u64, u64)>> {
+        Err(BackendError::NotSupported("no section index"))
+    }
     fn section(&self, _path: &str, _heading: &str) -> R<Option<Vec<u8>>> {
         Err(BackendError::NotSupported("no section index"))
     }

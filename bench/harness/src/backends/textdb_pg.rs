@@ -266,12 +266,13 @@ impl Backend for TextdbPg {
     }
     fn search(&self, query: &str, prefix: &str) -> R<Vec<Hit>> {
         self.with(|c| {
-            let rows = c.query("SELECT path, line FROM kb.search($1, $2, $3)", &[&query, &prefix, &100_000i64])?;
+            let rows = c.query("SELECT path, line, snippet FROM kb.search($1, $2, $3)", &[&query, &prefix, &100_000i64])?;
             Ok(rows
                 .iter()
                 .map(|r| Hit {
                     path: r.get(0),
                     line: r.get::<_, i64>(1) as u64,
+                    snippet: r.get(2),
                 })
                 .collect())
         })
@@ -330,6 +331,37 @@ impl Backend for TextdbPg {
         let (body, _) = self.read_versioned(path)?;
         let next = super::textdb_sqlite::set_frontmatter_key(&body, key, value);
         self.overwrite(path, &next)
+    }
+    fn outline(&self, prefix: &str, heading: Option<&str>, mode: &str, max_level: Option<u32>) -> R<Vec<OutlineRow>> {
+        self.with(|c| {
+            let lvl = max_level.map(|l| l as i64);
+            let rows = c.query(
+                "SELECT path, heading, level, line_from, nwords, nwords_total, nbytes
+                   FROM kb.outline($1, $2, $3, $4, 1000000)",
+                &[&prefix, &heading, &mode, &lvl],
+            )?;
+            Ok(rows
+                .iter()
+                .map(|r| OutlineRow {
+                    path: r.get(0),
+                    heading: r.get(1),
+                    level: r.get::<_, i64>(2) as u32,
+                    line_from: r.get::<_, i64>(3) as u64,
+                    nwords: r.get::<_, Option<i64>>(4).map(|v| v as u64),
+                    nwords_total: r.get::<_, Option<i64>>(5).map(|v| v as u64),
+                    file_nbytes: r.get::<_, Option<i64>>(6).map(|v| v as u64),
+                })
+                .collect())
+        })
+    }
+    fn heading_names(&self, prefix: &str, starts: &str) -> R<Vec<(String, u64, u64)>> {
+        self.with(|c| {
+            let rows = c.query("SELECT heading, sections, docs FROM kb.headings($1, $2, 100000)", &[&prefix, &starts])?;
+            Ok(rows
+                .iter()
+                .map(|r| (r.get(0), r.get::<_, i64>(1) as u64, r.get::<_, i64>(2) as u64))
+                .collect())
+        })
     }
     fn sections(&self, path: &str) -> R<Vec<SectionRow>> {
         self.with(|c| {

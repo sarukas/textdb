@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::backend::*;
 use crate::backends::fs::slice_lines;
-use crate::backends::{col_bytes, first_hit_line, query_terms};
+use crate::backends::{col_bytes, first_hit_line_and_text, query_terms};
 
 static INSTANCE: AtomicU64 = AtomicU64::new(1);
 
@@ -285,9 +285,9 @@ impl Backend for SqlTextSqlite {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows
                 .into_iter()
-                .map(|(p, b)| Hit {
-                    line: first_hit_line(&b, &terms),
-                    path: p,
+                .map(|(p, b)| {
+                    let (line, snippet) = first_hit_line_and_text(&b, &terms);
+                    Hit { line, path: p, snippet }
                 })
                 .collect())
         })
