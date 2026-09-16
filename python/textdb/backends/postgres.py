@@ -164,8 +164,12 @@ class PostgresBackend(Backend):
     # history / search ------------------------------------------------------------
     @_wrap
     def history(self, path: str):
-        rows = self._rows("SELECT version, author, ts, message FROM kb.history(%s)", (path,))
-        return [dict(version=r[0], author=r[1], ts=r[2], message=r[3], nbytes=None) for r in rows]
+        rows = self._rows(
+            f"SELECT version, author, {_utc('ts')}, message, nbytes, kind, base_version, nlines, nwords "
+            "FROM kb.history(%s)",
+            (path,),
+        )
+        return [dict(version=r[0], author=r[1], ts=r[2], message=r[3], nbytes=r[4], kind=r[5], base_version=r[6], nlines=r[7], nwords=r[8]) for r in rows]
 
     @_wrap
     def diff(self, path: str, v1: int, v2: int) -> str:

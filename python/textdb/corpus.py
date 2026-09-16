@@ -150,10 +150,24 @@ class PropertyHit:
 
 @dataclass
 class Commit:
+    """One version of a file: the same nine fields, in the same order, as the ``commits`` view
+    and ``textdb_history`` on either engine.
+
+    This used to be four of them, so the SDK could not say how a commit landed or how big the
+    file was at it.
+    """
     version: int
     author: Optional[str]
-    ts: Any
+    #: ISO-8601 UTC with milliseconds and ``Z``, a ``str`` on both backends.
+    ts: str
     message: Optional[str]
+    nbytes: Optional[int]
+    #: How the commit landed: ``direct``, ``rebased`` or ``merged``.
+    kind: Optional[str]
+    #: The version the writer started from; ``None`` for a file's first version.
+    base_version: Optional[int]
+    nlines: Optional[int]
+    nwords: Optional[int]
 
 
 @dataclass
@@ -304,7 +318,7 @@ class Corpus:
 
     # -------------------------------------------------------------- history/search
     def history(self, path: str) -> List[Commit]:
-        return [Commit(r["version"], r["author"], r["ts"], r["message"]) for r in self.backend.history(normalize(path))]
+        return [Commit(**r) for r in self.backend.history(normalize(path))]
 
     def diff(self, path: str, v1: int, v2: int) -> str:
         return self.backend.diff(normalize(path), v1, v2)

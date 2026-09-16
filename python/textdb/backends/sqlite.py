@@ -169,8 +169,11 @@ class SqliteBackend(Backend):
     # history / search ------------------------------------------------------------
     @_wrap
     def history(self, path: str):
-        rows = self.conn.execute("SELECT version, author, ts, message, nbytes FROM textdb_history(?)", (path,)).fetchall()
-        return [dict(version=r[0], author=r[1], ts=r[2], message=r[3], nbytes=r[4]) for r in rows]
+        rows = self.conn.execute(
+            "SELECT version, author, ts, message, nbytes, kind, base_version, nlines, nwords FROM textdb_history(?)",
+            (path,),
+        ).fetchall()
+        return [dict(version=r[0], author=r[1], ts=r[2], message=r[3], nbytes=r[4], kind=r[5], base_version=r[6], nlines=r[7], nwords=r[8]) for r in rows]
 
     @_wrap
     def diff(self, path: str, v1: int, v2: int) -> str:

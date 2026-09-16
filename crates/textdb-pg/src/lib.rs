@@ -2435,7 +2435,9 @@ mod kb {
         // itself and not `100XXXdone`.
         let like = format!("{}/%", folder.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
         let sql = format!(
-            "SELECT n.path, coalesce(n.nbytes, 0), coalesce(n.updated_at::text, ''),
+            // ISO-8601 UTC, not `::text` in the session's time zone: the same field came back
+            // `2026-09-16T05:04:00.000Z` on SQLite and `2026-09-16 05:04:00+00` here.
+            "SELECT n.path, coalesce(n.nbytes, 0), coalesce(to_char(n.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), ''),
                     (SELECT f.data::text FROM kb.frontmatter f WHERE f.file_id = n.id AND f.version = n.version)
                FROM kb.node n
               WHERE n.deleted_at IS NULL AND n.kind = 1

@@ -219,6 +219,10 @@ pub struct MovedLink {
 pub struct LinkRow {
     /// The file the link is written in.
     pub path: String,
+    /// The version the line number belongs to. Every row that carries a `line` carries one:
+    /// the whole contract is that a line number belongs to a version, and an agent that reads
+    /// a link and then edits by line had nothing to pass as `--base-version`.
+    pub version: i64,
     pub line: i64,
     /// `wiki`, `embed`, `md` or `image`.
     pub kind: String,
@@ -230,7 +234,6 @@ pub struct LinkRow {
     /// The file it points to; for an asset, the asset (its pointer is that with `.tdbasset`).
     pub resolved: Option<String>,
     /// It resolves to an asset.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub asset: bool,
 }
 

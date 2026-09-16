@@ -222,7 +222,7 @@ impl PgStore {
             .client
             .query(
                 &format!(
-                    "SELECT n.path, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status, r.path \
+                    "SELECT n.path, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status, r.path, n.version \
                      FROM kb.link l JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL \
                      LEFT JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL \
                      WHERE {cond} ORDER BY n.path COLLATE \"C\", l.line, l.id"
@@ -234,6 +234,7 @@ impl PgStore {
             .iter()
             .map(|r| LinkRow {
                 path: r.get(0),
+                version: r.get(8),
                 line: r.get(1),
                 kind: r.get(2),
                 target: r.get(3),
