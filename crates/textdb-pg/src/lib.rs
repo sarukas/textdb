@@ -96,7 +96,7 @@ CREATE TABLE kb.section (file_id bigint NOT NULL, version bigint NOT NULL, headi
   nwords bigint, nwords_total bigint);
 CREATE INDEX section_file ON kb.section(file_id, version);
 CREATE INDEX section_heading ON kb.section(heading_lc text_pattern_ops);
-CREATE INDEX section_level ON kb.section(level, heading_lc);
+CREATE INDEX section_level ON kb.section(level);
 -- Links as written (target without anchor or alias), and what each resolves to by the rules the
 -- stores share (textdb_md::resolve). target_name (last segment, lower case, without .md) finds
 -- the rows a created, moved or deleted file can change.

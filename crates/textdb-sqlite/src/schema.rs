@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS {p}section (
 );
 CREATE INDEX IF NOT EXISTS {p}section_file ON {p}section(file_id, version);
 CREATE INDEX IF NOT EXISTS {p}section_heading ON {p}section(heading_lc);
-CREATE INDEX IF NOT EXISTS {p}section_level ON {p}section(level, heading_lc);
+CREATE INDEX IF NOT EXISTS {p}section_level ON {p}section(level);
 CREATE TABLE IF NOT EXISTS {p}link (
   file_id INTEGER NOT NULL, version INTEGER NOT NULL,
   target_path TEXT NOT NULL, line INTEGER NOT NULL,
@@ -265,7 +265,7 @@ fn index_sql(p: &str) -> String {
          CREATE INDEX IF NOT EXISTS {p}property_kn ON {p}property(key_lc, val_num);
          CREATE INDEX IF NOT EXISTS {p}property_file ON {p}property(file_id);
          CREATE INDEX IF NOT EXISTS {p}section_heading ON {p}section(heading_lc);
-         CREATE INDEX IF NOT EXISTS {p}section_level ON {p}section(level, heading_lc);"
+         CREATE INDEX IF NOT EXISTS {p}section_level ON {p}section(level);"
     )
 }
 

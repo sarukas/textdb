@@ -582,6 +582,9 @@ misreading.
 
 ## Coverage gaps found by reading the surfaces, not the numbers (2026-09-16)
 
+**Closed on the same day — see "Closing the outline and snippet gaps" below for what they
+cost and what they turned up. Kept here for the reasoning that found them.**
+
 Neither of these is a regression. Both are places where the suite measures a narrower thing
 than the feature offers, so a cost we already pay has never been attributed.
 
@@ -670,6 +673,125 @@ optimisation phrased as "operate on whole lines by operating on chunks" is unsou
 Content is stored byte-exact and never normalised (spec A3, property test P1). Line-ending
 normalisation on reconstruction was considered and rejected: it is not worth the round-trip
 fidelity, and the chunk-boundary assumption that would have made it cheap does not hold.
+
+## Closing the outline and snippet gaps, and what it cost (2026-09-16)
+
+The two coverage gaps recorded above are closed. Both turned up defects that the missing
+measurement had been hiding, and one of them was worth an order of magnitude.
+
+### Postgres: stale planner statistics, and an OR that estimated at one row
+
+A heading query over a 2,000-note vault took **74.4 ms**. The plan was a nested loop driven
+from `node`, rescanning `section_heading` once per document: 4,000,000 row visits and 12,078
+buffer hits to return 2,000 rows.
+
+Two causes, separable and both measured on one host:
+
+| | ms |
+|---|---|
+| as found | 74.4 |
+| after `ANALYZE` alone, same query, same bound parameters | 2.1 |
+
+The statistics were whatever autovacuum computed while the tables were still nearly empty.
+That is not an unlucky case, it is *the* case for a store built in one burst — an import, a
+sync, a restore — because autovacuum's threshold is a share of the rows it already knows
+about, so a store that arrives all at once is analysed once, early, and then never again.
+Every query joining `section`, `property` or `link` to `node` is exposed the same way.
+
+`kb.analyze_store()` refreshes them. `Backend::settle()` is a new harness hook — "the corpus
+is loaded, do whatever a store does before it is queried" — offered to every backend, taken
+by the one that needs it, and deliberately untimed: measuring an un-analysed store would be
+measuring a misconfiguration.
+
+The second cause was the scope predicate, `n.path = $1 OR (n.path >= $2 AND n.path < $3)`,
+which the planner estimates at one row. A prefix is now resolved *before* the query to either
+a file id or a subtree range, so the predicate is one indexed comparison; the level filter is
+emitted only when it applies rather than as `$4 IS NULL OR s.level <= $4`.
+
+Together, over 2,000 notes:
+
+| | before | after | |
+|---|---|---|---|
+| `outline_match_exact` | 74.40 ms | 7.70 ms | **9.66x** |
+| `heading_names_prefix` | 6.74 ms | 3.89 ms | 1.73x |
+| `outline_one_doc` | 764 us | 447 us | 1.71x |
+| `outline_level_1` | 11.42 ms | 8.03 ms | 1.42x |
+| `outline_match_prefix` | 18.89 ms | 15.72 ms | 1.20x |
+| `outline_vault` | 42.35 ms | 36.32 ms | 1.17x |
+
+**Where the rest of it goes, and why it stops here.** The server executes the prefix query in
+4.1 ms of the 15.7 ms measured — about 3 us per row of SPI materialisation, the same overhead
+already recorded for chunk fetches. Fixing it needs streaming instead of a better plan, which
+`TableIterator` over an SPI result does not give. SQLite is unchanged throughout: its plans
+were already right and its costs are proportional to the rows returned (~2 us/row).
+
+### The section index: a composite that was never used as one
+
+Four columns and two indexes were added to `section`. Attributing the cost over 64,000 rows:
+
+| | ms | |
+|---|---|---|
+| 6 columns, 1 index (as it was) | 83.8 | 1.00x |
+| 10 columns, 1 index | 99.6 | 1.19x |
+| + `section_heading (heading_lc)` | 160.8 | 1.92x |
+| + `section_level (level, heading_lc)` | 188.4 | 2.25x |
+
+The level index took 17% of the insert cost, and no plan ever used it as a composite — only
+`level < ?`. Narrowing it to `section(level)` keeps the read exactly as fast and gives some of
+the write back:
+
+| | `(level, heading_lc)` | no index | `(level)` |
+|---|---|---|---|
+| MD-05 create (32 headings) | 1.745 ms | 1.569 ms | 1.637 ms |
+| `outline_level_1` | 4.163 ms | 5.016 ms | 4.162 ms |
+
+Dropping it outright is the better write and the worse read, and the read loss applies to
+every level-filtered query while the write win shows only on heading-dense documents. The
+narrow index is not a trade at all, so that is what is there.
+
+### What the write path actually cost, measured properly
+
+A first comparison against the 2026-09-15 run said writes were 1.3-1.6x slower. It was
+wrong, and instructively so: `create_txt` had "slowed" by the same factor, and `.txt`
+documents never run the extractor. It was host drift between two days. A worktree at the
+commit before this work, built and run back to back on one host, says:
+
+| | before | after | |
+|---|---|---|---|
+| `create_md` (8 headings, no links) | 0.913 ms | 0.928 ms | flat |
+| `create_md` (8 headings, 64 links) | 2.641 ms | 2.661 ms | flat |
+| `replace_md` (8 headings) | 0.735 ms | 0.701 ms | flat |
+| MD-05 `create` (32 headings) | 1.367 ms | 1.637 ms | 1.20x slower |
+
+So the cost is confined to heading-dense documents, and `replace` is flat — which is the
+evidence that the counts-only write path holds. Word counts move on nearly every body edit
+while the heading tree stays put, and `write_structure` now tells those apart: an unchanged
+tree refreshes the counts with one statement keyed on `line_from` instead of the delete,
+re-insert and relink a real structure change needs.
+
+### Snippets were never the cost
+
+The suspicion behind the original gap was that snippet rendering was expensive. It is not.
+Splitting `search` into finding candidates and resolving them (`textdb-probe search`):
+
+| document | query | hits | paths only | with line + snippet | resolution |
+|---|---|---|---|---|---|
+| 4 KiB | wide | 400 | 4.66 ms | 6.20 ms | 1.54 ms (24.8%, 3.8 us/hit) |
+| 4 KiB | narrow | 57 | 0.33 ms | 0.56 ms | 0.23 ms (40.6%, 4.0 us/hit) |
+| 64 KiB | wide | 400 | 51.42 ms | 54.40 ms | 2.98 ms (5.5%, 7.4 us/hit) |
+| 64 KiB | narrow | 57 | 0.63 ms | 0.96 ms | 0.33 ms (34.1%, 5.7 us/hit) |
+
+The line and the snippet come from one scan of the same chunk bytes, so they are not
+separable from each other; what *is* separable is the whole resolution phase from the index
+query underneath it, and for a wide query the index query is 94.5% of the total. That is gap
+1 above — the `limit * 50` hit window — not the snippet.
+
+What checking snippets did find was three ways of showing the wrong text for a right answer,
+all in `locate_terms`: raw comparison against a diacritic-folding index, a quoted phrase
+looked for with its spaces intact, and a 200-character *prefix* of the line rather than a
+window around the match. Over the SR corpus that was thousands of wrong snippets on
+single-term, 2-term and prefix queries, and 3,223 of 6,804 on phrases. The logic now lives
+once, in `textdb_core::snippet`; it existed twice and the two copies had drifted.
 
 ## Tried and rejected — do not pay for these twice
 
