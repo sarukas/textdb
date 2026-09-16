@@ -2362,25 +2362,14 @@ mod kb {
         }
     }
 
-    /// The line (0-based, within `bytes`) holding the most of the query's terms — the first such
-    /// line — and that line as the snippet; line 0 when none holds any. As `locate_terms` in the
-    /// SQLite binding: terms compared as lower case text, a prefix without its `*`.
+    /// The line of `bytes` that best matches `terms`, and a window of it around the match.
+    ///
+    /// One implementation, shared with the SQLite binding, so a snippet means the same thing
+    /// on either engine. This used to be a second copy of the same logic and drifted: it
+    /// compared raw text against a diacritic-folding index, looked for a quoted phrase with
+    /// its spaces intact, and showed the head of a long line rather than the match.
     fn locate_terms(bytes: &[u8], terms: &[String]) -> (usize, String) {
-        let raw = String::from_utf8_lossy(bytes);
-        let wanted: Vec<String> = terms.iter().map(|t| t.trim_end_matches('*').to_lowercase()).filter(|t| !t.is_empty()).collect();
-        let (mut best_count, mut best_line) = (0, 0);
-        for (i, line) in raw.lines().enumerate() {
-            let lower = line.to_lowercase();
-            let n = wanted.iter().filter(|t| lower.contains(t.as_str())).count();
-            if n > best_count {
-                (best_count, best_line) = (n, i);
-                if n == wanted.len() {
-                    break;
-                }
-            }
-        }
-        let snippet = raw.lines().nth(best_line).unwrap_or("").chars().take(200).collect();
-        (best_line, snippet)
+        textdb_core::snippet::locate_terms(bytes, terms)
     }
 
     #[allow(dead_code)]

@@ -1733,7 +1733,7 @@ impl TextDb<'_> {
                 None => {
                     // The chunk left this file; fall back to a HEAD scan for the terms.
                     let body = (*st.document(&root)?.0).clone();
-                    let (line, snippet) = locate_terms(&body, &terms);
+                    let (line, snippet) = textdb_core::snippet::locate_terms(&body, &terms);
                     if snippet.is_empty() {
                         continue;
                     }
@@ -1749,7 +1749,7 @@ impl TextDb<'_> {
                     continue;
                 }
             };
-            let (line_in_chunk, snippet) = locate_terms(&bytes, &terms);
+            let (line_in_chunk, snippet) = textdb_core::snippet::locate_terms(&bytes, &terms);
             hits.push(Hit {
                 path,
                 line: leaf.line_off as i64 + line_in_chunk as i64 + 1,
@@ -1865,86 +1865,4 @@ pub fn fts5_term(t: &str) -> String {
 /// FTS5 syntax for a whole query (terms ANDed within one document row).
 pub fn fts5_query(q: &str) -> String {
     query_terms(q).iter().map(|t| fts5_term(t)).collect::<Vec<_>>().join(" AND ")
-}
-
-/// The line (0-based, within `bytes`) holding the most of the query's terms — the first such
-/// line — and that line as the snippet; line 0 when none holds any. Terms are compared as lower
-/// case text, a prefix without its `*`. The chunk is the best-ranked one for the first term, so
-/// The line of `bytes` that best matches `terms`, and a snippet window around the match.
-///
-/// Three things this has to get right, each of which it used to get wrong:
-///
-/// * **Folding.** The index tokenises with fts5's `unicode61`, which strips diacritics, so a
-///   chunk holding `façade` is indexed under `facade`. Comparing raw text found nothing for
-///   such a hit and fell through to the top of the chunk. Both sides go through
-///   `textdb_core::fold`.
-/// * **Phrases.** `query_terms` keeps a quoted phrase as one term with the spaces in it, so
-///   `"draft false"` was looked for literally and never matched `draft: false`. A term is
-///   matched word by word instead, which is also what makes the document-level AND the rest
-///   of search uses consistent with what it shows.
-/// * **Where the window sits.** The snippet used to be the first 200 characters of the line,
-///   so on a long line — which is most lines in a real document — the match was off the end
-///   and the user read text that had nothing to do with the query. It is now a window around
-///   the match, elided at whichever end was cut.
-fn locate_terms(bytes: &[u8], terms: &[String]) -> (usize, String) {
-    /// Characters shown. Enough to read, short enough for a list of results.
-    const WIDTH: usize = 200;
-    /// How much of the window sits before the match, so it reads with a little lead-in.
-    const LEAD: usize = 60;
-
-    let raw = String::from_utf8_lossy(bytes);
-    // Each query term becomes the words it needs; a phrase needs all of its own.
-    let wanted: Vec<Vec<String>> = terms
-        .iter()
-        .map(|t| {
-            t.split_whitespace()
-                .map(|w| textdb_core::fold::fold(w.trim_end_matches('*')))
-                .filter(|w| !w.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .filter(|ws: &Vec<String>| !ws.is_empty())
-        .collect();
-    if wanted.is_empty() {
-        return (0, raw.lines().next().unwrap_or("").chars().take(WIDTH).collect());
-    }
-
-    // Scored on two counts, in that order: how many whole terms the line satisfies, then how
-    // many individual words it holds. The second is what keeps a phrase whose words fall on
-    // different lines from scoring zero everywhere and landing on the top of the chunk — the
-    // store's AND is document-level, so a line with one of the words is the honest thing to
-    // show when no line has both.
-    let (mut best_score, mut best_line, mut best_at) = ((0usize, 0usize), 0usize, 0usize);
-    for (i, line) in raw.lines().enumerate() {
-        let folded = textdb_core::fold::fold(line);
-        let n = wanted.iter().filter(|ws| ws.iter().all(|w| folded.contains(w.as_str()))).count();
-        let words = wanted.iter().flatten().filter(|w| folded.contains(w.as_str())).count();
-        if (n, words) > best_score {
-            // Where to centre the window: the earliest word of any term that this line has.
-            let at = wanted
-                .iter()
-                .flatten()
-                .filter_map(|w| folded.find(w.as_str()))
-                .min()
-                .unwrap_or(0);
-            // `fold` is one character in, one character out, so a byte offset in the folded
-            // line counts the same number of characters as it does in the original.
-            (best_score, best_line, best_at) = ((n, words), i, folded[..at].chars().count());
-            if n == wanted.len() {
-                break;
-            }
-        }
-    }
-
-    let line = raw.lines().nth(best_line).unwrap_or("");
-    let total = line.chars().count();
-    let snippet = if total <= WIDTH {
-        line.to_string()
-    } else {
-        let from = best_at.saturating_sub(LEAD).min(total.saturating_sub(WIDTH));
-        let body: String = line.chars().skip(from).take(WIDTH).collect();
-        let head = if from > 0 { "…" } else { "" };
-        let tail = if from + WIDTH < total { "…" } else { "" };
-        format!("{head}{body}{tail}")
-    };
-    (best_line, snippet)
 }

@@ -13,6 +13,7 @@ pub mod hash;
 pub mod myers;
 pub mod node;
 pub mod path;
+pub mod snippet;
 pub mod storage;
 pub mod structure;
 pub mod tree;

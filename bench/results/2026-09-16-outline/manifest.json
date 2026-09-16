@@ -10,7 +10,7 @@
   "disk": "0",
   "filesystem": "ext4 (/dev/vda)",
   "git": "git version 2.43.0",
-  "harness_commit": "6e0391ce54b0f683b37c44b4d250c38afc12d5db",
+  "harness_commit": "0e9bda317a1ba04c7f384d8733ec54c8cf92752e",
   "host": "vm",
   "kernel": "6.18.44-fc-v33",
   "mode": "fast",
@@ -25,5 +25,5 @@
   "seed": 20260912,
   "size": "m",
   "sqlite": "3.53.2",
-  "started": "2026-09-16T05:36:27Z"
+  "started": "2026-09-16T05:39:41Z"
 }

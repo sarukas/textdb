@@ -187,6 +187,15 @@ that count is precisely what CW is there to report. Those violations are recorde
 Ground truth is the reference tokenizer (word boundary, case-insensitive), equivalent to
 `rg -w -i -F`. AND is document-level for every backend.
 
+Every case also checks the **snippet** — the text a store shows for a hit. The check is the
+weakest useful one: the snippet has to contain a term that was searched for, folded the way
+the index folds and word by word so a quoted phrase is not looked for with its spaces
+intact. Only true positives are judged, since a false positive has no term to show and
+`precision` already counts it; `snippet_coverage` records what share of hits carried one at
+all, so a backend with no snippets is not scored as though it had wrong ones. Finding a
+document and showing the wrong line is not a working search, and until this was checked
+three separate ways of doing exactly that went unnoticed.
+
 ### NS — namespace
 
 | Test | What it measures |
@@ -214,6 +223,13 @@ other family measures.
 | MD-04 | Front matter: reading the parsed block per document, and setting one key with the rest of the document byte-identical |
 | MD-05 | Documents with 32 headings: listing sections, and fetching one section's body by heading |
 | MD-06 | Change feed: a watcher polling after every write, and one catching up from zero |
+| MD-07 | Front-matter property search: what the vault uses, what a property holds, and queries over both, with the per-keystroke autosuggest calls timed apart |
+| MD-08 | Headings above one document: a whole vault in one call, a heading query as `exact` / `prefix` / `contains` (the first two seek the folded index, the third scans), the level filter, and the per-keystroke autosuggest |
+
+MD-08's corpus distributes headings the way a vault does: `Summary` on every note, `Risks` on
+a sixteenth, and one heading unique to each document. A benchmark where every document has
+the same headings measures a seek that always returns everything, and one where every heading
+is unique measures a seek that always returns one row; neither is the question.
 
 Every case is generated with a **known** link graph, front matter and heading tree, so the
 oracle is what the generator wrote rather than whatever the backend returns. A backend that
