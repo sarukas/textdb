@@ -569,12 +569,15 @@ impl Store for PgStore {
         Ok(())
     }
 
-    fn denied_shares(&mut self) -> Result<Vec<String>> {
+    fn share_state(&mut self) -> Result<Vec<(String, String)>> {
         let rows = self
             .client
-            .query("SELECT alias FROM kb.my_grant WHERE dormant ORDER BY alias", &[])
+            .query(
+                "SELECT alias, CASE WHEN dormant THEN 'denied' ELSE rights END FROM kb.my_grant ORDER BY alias",
+                &[],
+            )
             .map_err(pg)?;
-        Ok(rows.iter().map(|r| r.get(0)).collect())
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
     fn access_ls(&mut self, who: Option<&str>) -> Result<Vec<ShareRow>> {

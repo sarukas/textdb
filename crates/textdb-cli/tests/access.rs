@@ -1753,8 +1753,10 @@ fn i_a_single_root_account_owns_its_root_but_cannot_leave_it() {
         refused(&run(f.as_("contracts-agent").args(["rm", "/"]), None), FORBIDDEN, "TX005");
         refused(&run(f.as_("contracts-agent").args(["mv", "/", "/x"]), None), FORBIDDEN, "TX005");
 
-        // I4: a path that climbs out normalises inside the root and finds nothing above it.
-        refused(&run(f.as_("contracts-agent").args(["cat", "/../policies/nda.md"]), None), NOT_FOUND, "TX003");
+        // I4: a path that climbs out. `..` is not a segment textdb accepts from anyone, account
+        // or owner, so it is refused as malformed rather than as a permission — the more useful
+        // answer, since no spelling of `..` would have reached outside the root either.
+        refused(&run(f.as_("contracts-agent").args(["cat", "/../policies/nda.md"]), None), INVALID, "TX004");
     });
 }
 

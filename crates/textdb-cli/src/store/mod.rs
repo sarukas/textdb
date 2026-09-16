@@ -687,6 +687,16 @@ pub trait Store {
     /// disk what the store no longer has. Without this it would empty a checkout the moment a
     /// share was taken away — the one case in #12 that destroys data. Empty for the owner.
     fn denied_shares(&mut self) -> Result<Vec<String>> {
+        Ok(self.share_state()?.into_iter().filter(|(_, s)| s == "denied").map(|(a, _)| a).collect())
+    }
+
+    /// Every share of this connection as `(alias, "ro" | "rw" | "denied")`.
+    ///
+    /// `sync` is the only caller and needs all three: it must not try to push a file under a
+    /// read-only share (the store would refuse it file by file, which reads as a failure rather
+    /// than as the rule it is), and it must not delete from disk what a denied share left there.
+    /// Empty for the owner, who writes everywhere.
+    fn share_state(&mut self) -> Result<Vec<(String, String)>> {
         Ok(Vec::new())
     }
 

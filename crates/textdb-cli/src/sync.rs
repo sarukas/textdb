@@ -1199,7 +1199,12 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     // Shares this connection holds but may not use. Read before anything is planned: what the
     // store no longer lists is otherwise indistinguishable from what it no longer has, and the
     // plan below turns the second into a delete on disk.
-    let denied = st.denied_shares()?;
+    // Who this checkout belongs to. Noted in its config so whoever opens the directory later can
+    // see whose layout it is; the bearer never goes to disk.
+    let account = st.whoami()?.account;
+    let shares = st.share_state()?;
+    let denied: Vec<String> = shares.iter().filter(|(_, s)| s == "denied").map(|(a, _)| a.clone()).collect();
+    let read_only: Vec<String> = shares.iter().filter(|(_, s)| s == "ro").map(|(a, _)| a.clone()).collect();
     let mut stored = find_sync_base(st, &prefix, &key)?;
     let mut moved_from: Option<String> = None;
     // A directory that was moved or renamed: the base is its own, found by the id it carries, so
@@ -1508,6 +1513,10 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             (None, None) => {}
             (Some(false), Some(false)) => plan.keep.push(rel),
             (Some(true), Some(false)) => plan.to_disk.push(rel),
+            (Some(false), Some(true)) if denied_share_of(&read_only, &rel).is_some() => {
+                let alias = denied_share_of(&read_only, &rel).unwrap_or_default();
+                report.kept.push(note(&rel, &format!("{alias}/ is read-only for you; your change stays here")));
+            }
             (Some(false), Some(true)) => plan.to_textdb.push((rel, t.map(|t| t.version))),
             (Some(true), Some(true)) => {
                 // A file that is binary on disk now is not merged: conflict markers would destroy it,
@@ -1638,9 +1647,17 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     });
     plan.moves = moves;
     for rel in std::mem::take(&mut plan.candidates) {
-        if !moved_to.contains(&rel) {
-            plan.to_textdb.push((rel, None));
+        if moved_to.contains(&rel) {
+            continue;
         }
+        // A file made on disk under a read-only share belongs to whoever made it, and stays
+        // there. Offering it to the store would get it refused file by file, which reads as a
+        // failure rather than as the rule it is.
+        if let Some(alias) = denied_share_of(&read_only, &rel) {
+            report.kept.push(note(&rel, &format!("{alias}/ is read-only for you; this file stays here")));
+            continue;
+        }
+        plan.to_textdb.push((rel, None));
     }
     // A binary file (a NUL byte in its first 8000 bytes, as git tells) is not text for the store:
     // it stays on disk, and the store keeps what it had, with a word on what to do about it.
@@ -1957,6 +1974,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             &rules,
             generation,
             &dir_id,
+            account.as_deref(),
         )?;
     }
     if !report.stopped && !report.stopped_by_rules {
@@ -2055,6 +2073,8 @@ fn apply(
     generation: i64,
     // The id this directory calls itself, recorded with the base so a move does not lose it.
     dir_id: &str,
+    // The account this checkout belongs to, noted in its config. Never the bearer.
+    account: Option<&str>,
 ) -> Result<()> {
     let prefix = sides.prefix.clone();
     let dir = o.dir.as_path();
@@ -2306,9 +2326,14 @@ fn apply(
         created: crate::assets::driver::stamp(SystemTime::now()),
         // Normalised, so it round-trips through `parse_exts` unchanged.
         ext: Some(o.exts.join(",")),
+        account: account.map(str::to_string),
     };
     match crate::root::Config::read(dir)? {
-        Some(before) if before.store == paired.store && before.prefix == paired.prefix && before.ext == paired.ext => Ok(()),
+        Some(before)
+            if before.store == paired.store && before.prefix == paired.prefix && before.ext == paired.ext && before.account == paired.account =>
+        {
+            Ok(())
+        }
         Some(before) => crate::root::Config { id: before.id, created: before.created, ..paired }.write(dir),
         None => paired.write(dir),
     }

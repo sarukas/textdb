@@ -498,13 +498,15 @@ impl Store for SqliteStore {
         }
     }
 
-    fn denied_shares(&mut self) -> Result<Vec<String>> {
+    fn share_state(&mut self) -> Result<Vec<(String, String)>> {
         Ok(self
             .view
             .grants()
             .iter()
-            .filter(|g| !g.live())
-            .map(|g| g.alias.clone())
+            .map(|g| {
+                let state = if g.live() { g.rights.as_str() } else { "denied" };
+                (g.alias.clone(), state.to_string())
+            })
             .collect())
     }
 

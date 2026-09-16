@@ -27,6 +27,13 @@ pub struct Config {
     /// The extensions the last sync took in, so `textdb sync` on its own uses the same ones.
     /// `None` for a config written before this was recorded.
     pub ext: Option<String>,
+    /// The account this directory was synced as, when it was synced with a token (#12).
+    ///
+    /// A note to whoever opens the directory later, and nothing more — the layout on disk is that
+    /// account's, so a second account syncing the same directory would be reconciling its own
+    /// paths against someone else's tree. The **bearer is never written here**: a checkout is
+    /// copied, backed up and committed, and a credential in it would go with it.
+    pub account: Option<String>,
 }
 
 const FILE: &str = "config";
@@ -90,7 +97,14 @@ impl Config {
             )));
         }
         let ext = get("ext");
-        Ok(Some(Config { store, prefix, id: get("id"), created: get("created"), ext: Some(ext).filter(|e| !e.is_empty()) }))
+        Ok(Some(Config {
+            store,
+            prefix,
+            id: get("id"),
+            created: get("created"),
+            ext: Some(ext).filter(|e| !e.is_empty()),
+            account: Some(get("account")).filter(|a| !a.is_empty()),
+        }))
     }
 
     /// Write the config, creating `.textdb/` if it is not there.
@@ -104,12 +118,13 @@ impl Config {
         let text = format!(
             "# Written by `textdb sync`. It pairs this directory with a folder in a store, so\n\
              # `textdb sync` from anywhere inside the tree knows what to sync with what.\n\
-             store = \"{}\"\nprefix = \"{}\"\nid = \"{}\"\ncreated = \"{}\"\next = \"{}\"\n",
+             store = \"{}\"\nprefix = \"{}\"\nid = \"{}\"\ncreated = \"{}\"\next = \"{}\"\n{}",
             self.store,
             self.prefix,
             self.id,
             self.created,
-            self.ext.as_deref().unwrap_or_default()
+            self.ext.as_deref().unwrap_or_default(),
+            self.account.as_deref().map(|a| format!("account = \"{a}\"\n")).unwrap_or_default()
         );
         std::fs::write(&path, text).map_err(|e| StoreError::other(format!("{}: {e}", path.display())))
     }

@@ -451,12 +451,20 @@ pub fn to_store(view: &View, view_path: &str) -> Result<String> {
     match view.to_store(view_path) {
         Resolved::In { store_path, .. } => Ok(store_path),
         Resolved::Root => Ok("/".to_string()),
-        Resolved::Forbidden { alias, why } => Err(TextdbError::Forbidden(format!(
-            "/{alias}: {}",
-            why.why()
-        ))),
+        Resolved::Forbidden { alias, why } => Err(TextdbError::Forbidden(denial(&alias, why))),
         Resolved::NotFound => Err(TextdbError::NotFound(view_path.to_string())),
     }
+}
+
+/// What to say about a share the account holds and may not use.
+///
+/// A single-root account has no alias to name — its root *is* the share — so the message says
+/// that rather than pointing at `/`, which reads like a bug in the caller.
+fn denial(alias: &str, why: textdb_core::access::Denial) -> String {
+    if alias.is_empty() {
+        return format!("your root share is no longer available: {}", why.why());
+    }
+    format!("/{alias}: {}", why.why())
 }
 
 /// As [`to_store`], but for an operation that writes, so a read-only share is refused here.
@@ -465,7 +473,7 @@ pub fn to_store_rw(view: &View, view_path: &str) -> Result<String> {
     match view.to_store_rw(view_path) {
         Resolved::In { store_path, .. } => Ok(store_path),
         Resolved::Root => Err(TextdbError::Forbidden(at_the_root(view))),
-        Resolved::Forbidden { alias, why } => Err(TextdbError::Forbidden(format!("/{alias}: {}", why.why()))),
+        Resolved::Forbidden { alias, why } => Err(TextdbError::Forbidden(denial(&alias, why))),
         // A write one level below the root names something that would have to *be* a share.
         // Saying so is not a disclosure — the account already knows its own shares — and the
         // alternative is "not found: /notes.md", which reads like a bug in the caller rather
