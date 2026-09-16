@@ -131,8 +131,14 @@ pub fn create_account(conn: &Connection, p: &str, name: &str, kind: &str, root_n
     if name.is_empty() || name.contains('/') || name.trim() != name {
         return Err(TextdbError::InvalidEdit(format!("'{name}' cannot be an account name")));
     }
-    if !matches!(kind, "agent" | "person") {
-        return Err(TextdbError::InvalidEdit(format!("account kind is 'agent' or 'person', not '{kind}'")));
+    // `admin` is the third: an account that sees the store whole, for a deployment where nobody
+    // opens the file and every caller arrives with a bearer (#12 H19). It is not a share-holder,
+    // so it takes no root and gets no grants.
+    if !matches!(kind, "agent" | "person" | "admin") {
+        return Err(TextdbError::InvalidEdit(format!("account kind is 'agent', 'person' or 'admin', not '{kind}'")));
+    }
+    if kind == "admin" && root_node_id.is_some() {
+        return Err(TextdbError::InvalidEdit("an admin account sees the whole store, so it has no root".into()));
     }
     if account_by_name(conn, p, name)?.is_some() {
         return Err(TextdbError::InvalidEdit(format!("there is already an account called '{name}'")));
@@ -348,6 +354,11 @@ pub fn authenticate(conn: &Connection, p: &str, bearer: &str, now: &str) -> Resu
         &format!("UPDATE {p}token SET last_used_at = ?2 WHERE id = ?1"),
         rusqlite::params![token_id, now],
     );
+    // An admin account's token *is* the owner: the store whole, in its own paths. Not a fallback
+    // — an unknown or revoked bearer is still refused above — but a kind the owner granted.
+    if account.kind == "admin" {
+        return Ok(Ok(View::admin()));
+    }
     let grants = grants_of(conn, p, account.id)?;
     Ok(Ok(View::account(&account.name, account.namespace(), grants)))
 }

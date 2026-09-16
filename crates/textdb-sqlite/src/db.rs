@@ -328,6 +328,19 @@ impl<'c> TextDb<'c> {
         self
     }
 
+    /// The same handle as the owner: no filter, no translation, store paths in and out.
+    ///
+    /// For an operation whose rights have already been settled over the whole set it touches and
+    /// which then works in store paths — `revert_batch` is the one. Calling a public method with
+    /// a store path would translate it a second time (CLAUDE.md), and every path here is one the
+    /// account has already been shown to be allowed to write.
+    pub(crate) fn as_owner(&self) -> TextDb<'c> {
+        TextDb::attach(self.conn, &self.p, self.manage_tx)
+            .with_path_history(self.path_history)
+            .with_link_updates(self.link_updates)
+            .with_message(self.message.as_deref())
+    }
+
     /// A path as the caller wrote it, as a store path.
     pub fn store_path(&self, p: &str) -> Result<String> {
         if let Some(p) = self.by_id(p)? {

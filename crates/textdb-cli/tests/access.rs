@@ -1174,7 +1174,10 @@ fn d_a_deleted_share_root_is_dormant_rather_than_gone() {
 fn d_update_links_rewrites_only_what_the_account_may_write() {
     scenarios!("D14");
     on_each_engine(|f| {
-        ok(f.as_("admin").args(["write", "--create", "/hr/notes.md"]), Some("see [[q3]]\n"));
+        // A root-absolute link, so the move breaks it and the rewrite has something to want:
+        // a name link like `[[q3]]` resolves to the same document after the move and is not a
+        // link the move touches at all.
+        ok(f.as_("admin").args(["write", "--create", "/hr/notes.md"]), Some("see [q3](/legal/contracts/2026/q3.md)\n"));
         let out = ok(f.as_("accounts-agent").args(["mv", "/contracts/2026/q3.md", "/contracts/q3.md", "--update-links"]), None);
         assert!(out.stdout.contains("outside your shares") || out.stderr.contains("outside your shares"), "D14: {}", out.stdout);
         let said = out.stdout.clone() + &out.stderr;
