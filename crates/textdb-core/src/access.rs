@@ -839,6 +839,12 @@ pub struct TargetSpan {
     pub resolved: Option<String>,
     /// The resolved node's id, for the hidden-target form.
     pub resolved_id: Option<i64>,
+    /// The display text a wiki link was written with (`[[nda|the NDA]]`), when it has one.
+    ///
+    /// Only the hidden form needs it: `[[textdb:8]]` renders as an opaque number where `[[nda]]`
+    /// rendered as a word, so the projector supplies the name the link was written with as the
+    /// alias. A link that already has one keeps it.
+    pub alias: Option<String>,
 }
 
 /// What a projection did to one link, so a caller can report it without re-deriving it.
@@ -871,6 +877,12 @@ pub fn is_root_link(kind: &str, target: &str, resolved: &str) -> bool {
     let resolved = resolved.strip_suffix(".tdbasset").unwrap_or(resolved);
     // `.md` is optional in both link forms, so both spellings name the same document.
     want == resolved || format!("{want}.md") == resolved
+}
+
+/// The word a link target reads as: its last segment, without `.md`.
+fn display_name(target: &str) -> String {
+    let last = target.trim_end_matches('/').rsplit('/').next().unwrap_or(target);
+    last.strip_suffix(".md").unwrap_or(last).to_string()
 }
 
 /// Write `store_path` the way `target` was written: `.md` kept only if it was there, and a wiki
@@ -908,8 +920,23 @@ pub fn project(view: &View, text: &[u8], links: &[TargetSpan]) -> (Vec<u8>, Vec<
         if l.from > l.to || l.to > out.len() {
             continue;
         }
-        let Some(resolved) = l.resolved.as_deref() else { continue };
         let md = l.kind == "md" || l.kind == "image";
+        let Some(resolved) = l.resolved.as_deref() else {
+            // Nothing in the store to resolve against, so the target is taken at face value. A
+            // root path is namespace-dependent whether or not it names a document that exists —
+            // `[[legal/contracts/2026/q4]]` is what this account calls `contracts/2026/q4` — and
+            // leaving it alone would put the store's layout in text the account may edit. One
+            // that names nothing it can see stays exactly as written.
+            let looks_root = if md { l.target.starts_with('/') } else { l.target.contains('/') };
+            if !looks_root {
+                continue;
+            }
+            let store = format!("/{}", l.target.trim_start_matches('/'));
+            let Some(seen) = view.to_view(&store) else { continue };
+            acts[i] = Projected::Path;
+            out.splice(l.from..l.to, like(&l.target, &seen, md).into_bytes());
+            continue;
+        };
         let replacement = match view.to_view(resolved) {
             // Visible: only a root path is namespace-dependent; everything else already means
             // the same thing here as it does centrally.
@@ -923,7 +950,13 @@ pub fn project(view: &View, text: &[u8], links: &[TargetSpan]) -> (Vec<u8>, Vec<
             None => {
                 let Some(id) = l.resolved_id else { continue };
                 acts[i] = Projected::Hidden;
-                format!("textdb:{id}")
+                // A wiki link renders its target, so an id on its own would read as a number
+                // where a word was. The name the link was written with becomes the alias — it is
+                // the author's own text, and it says nothing about where the document lives.
+                match (md, l.alias.as_deref()) {
+                    (false, None) => format!("textdb:{id}|{}", display_name(&l.target)),
+                    _ => format!("textdb:{id}"),
+                }
             }
         };
         out.splice(l.from..l.to, replacement.into_bytes());
@@ -1011,6 +1044,7 @@ mod projection_tests {
             kind: kind.to_string(),
             resolved: resolved.map(str::to_string),
             resolved_id: id,
+            alias: None,
         }
     }
 
@@ -1101,6 +1135,7 @@ mod projection_tests {
                 kind: "md".into(),
                 resolved: Some("/legal/contracts/b.md".into()),
                 resolved_id: Some(2),
+                alias: None,
             },
         ];
         let (out, _) = project(&v, t.as_bytes(), &l);

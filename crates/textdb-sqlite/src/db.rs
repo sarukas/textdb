@@ -401,7 +401,7 @@ impl<'c> TextDb<'c> {
         let mut st = self
             .conn
             .prepare_cached(&format!(
-                "SELECT l.target_path, l.span_from, l.span_to, coalesce(l.kind, ''), r.path, l.resolved_id \
+                "SELECT l.target_path, l.span_from, l.span_to, coalesce(l.kind, ''), r.path, l.resolved_id, l.alias \
                  FROM {p}link l LEFT JOIN {p}node r ON r.id = l.resolved_id AND r.deleted_at IS NULL \
                  WHERE l.file_id = ?1 AND l.span_from IS NOT NULL AND l.external = 0",
                 p = self.p
@@ -416,6 +416,7 @@ impl<'c> TextDb<'c> {
                     kind: r.get(3)?,
                     resolved: r.get(4)?,
                     resolved_id: r.get(5)?,
+                    alias: r.get(6)?,
                 })
             })
             .map_err(sql_err)?;
@@ -474,6 +475,7 @@ impl<'c> TextDb<'c> {
                     kind: l.kind,
                     resolved: None,
                     resolved_id: None,
+                    alias: l.alias,
                 })
             })
             .collect()
