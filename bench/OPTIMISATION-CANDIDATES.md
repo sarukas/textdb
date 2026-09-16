@@ -632,6 +632,45 @@ listing, vault-wide listing, any heading-text predicate, filtering by level, and
 never been timed) are all unmeasured. MD-01 does cover what maintaining the sidecar costs the
 write path, so the indexing side is fine; it is the reading side above one file that is not.
 
+### Counts: two holes, and one semantic worth writing down
+
+Line counts are carried at four levels — `node.nlines` per file, `node.t_lines` as the folder
+rollup, `commit.nlines` per version, `chunk.nlines` per chunk — and each tree node's children
+carry cumulative `nlines`, which is what makes descent by line O(log n) without visiting
+leaves. Word counts are `node.nwords` and `node.t_words` with `wc -w` semantics, kept current
+by `word_delta`, which counts only the changed line regions on the strength of a word never
+spanning a newline: maintenance costs the size of the edit, not the size of the document.
+
+What is missing:
+
+- **No `nwords` on `commit`.** Lines have per-version history and words do not, so word count
+  over time cannot be charted without materialising every version. The incremental machinery
+  to fill it already exists — the commit path computes the delta it would need — so this is a
+  column and a write, not an algorithm.
+- **No per-line or per-chunk word count.** `chunk` carries `nlines` but not `nwords`, and
+  nothing anywhere stores words per line. "The longest line in this document by words" is a
+  full read. Adding `nwords` to `chunk` would be nearly free — the bytes are in hand at
+  insert and `WordCounter` already composes across pieces — and would let word statistics
+  come off the index the way line counts do.
+- **`nlines` is a newline count, not a line count.** It is literally the number of `\n` bytes
+  (`chunker.rs:158`), so a file with no trailing newline undercounts by one: `"alpha\ngamma"`
+  reports `nlines = 1` for two lines of text. Defensible, matches `wc -l`, consistent across
+  every surface — but it is not what a UI showing "N lines" wants, and nothing documents it.
+
+### A chunk is not a line, and code that assumes otherwise will be wrong
+
+Worth stating because the assumption is natural and keeps coming up. `snap()`
+(`chunker.rs:131`) moves a CDC boundary forward to just past the next `\n` **only when one
+falls within `ChunkParams::snap` = 256 bytes**; past that it cuts mid-line, which is exactly
+what the LL family covers (minified JSON, single-line files). The invariant the code actually
+holds is the weaker one stated at line 130: a chunk ending in any other byte was cut knowing
+the next 256 bytes contain no `\n`. So a `\r\n` pair can straddle two chunks, and any
+optimisation phrased as "operate on whole lines by operating on chunks" is unsound.
+
+Content is stored byte-exact and never normalised (spec A3, property test P1). Line-ending
+normalisation on reconstruction was considered and rejected: it is not worth the round-trip
+fidelity, and the chunk-boundary assumption that would have made it cheap does not hold.
+
 ## Tried and rejected — do not pay for these twice
 
 - **Batching search hit resolution through `json_each`** (previous pass): worse. The
