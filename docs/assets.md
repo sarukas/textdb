@@ -223,9 +223,12 @@ Git's history keeps the old blobs. `--json` gives `{ dry_run, tracked_assets, by
 in_store_already, blocked }` for a dry run and `{ dry_run, tracked_assets, pushed, migrated, bytes,
 pointers_ignored, blocked, conflicts, failed, gitignore_changed, commit }` otherwise.
 
-`DIR` defaults to the directory a store folder was last synced with; with `--dir`, `PATH` must be
-in the folder that directory was synced with, and only a directory never synced takes `PATH` as
-the store folder it holds. `push` publishes `new` and `modified` assets (`conflict` ones too with
+`DIR` defaults to the synced directory the command is run from — found by walking up from the
+current directory, as `textdb sync` finds it — and otherwise to the directory a store folder was
+last synced with. Two directories per folder is the normal state (a person's vault and an agent's
+checkout), so "whichever was synced last" picked the wrong one silently; every command names the
+directory it used. With `--dir`, `PATH` must be in the folder that directory was synced with, and
+only a directory never synced takes `PATH` as the store folder it holds. `push` publishes `new` and `modified` assets (`conflict` ones too with
 `--force`), refuses an asset whose pointer on disk differs from the store's (sync first) or whose
 pointer changed in the store during the push, exits 3 when something was left for a conflict,
 keeps an asset's id when its bytes change, and records the pointers it wrote in the directory's

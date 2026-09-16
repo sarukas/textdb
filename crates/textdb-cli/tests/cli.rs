@@ -59,6 +59,10 @@ fn textdb(store: &Path) -> Command {
         .env_remove("TEXTDB_AUTHOR")
         .env_remove("TEXTDB_PATH_HISTORY")
         .env("TEXTDB_CONFIG_DIR", config)
+        // Root discovery walks up from the working directory, so a synced directory anywhere
+        // above the test would pair it with a store it knows nothing about. The ceiling stops
+        // the walk where it starts, which is what a test wants: only what it set up itself.
+        .env("TEXTDB_CEILING_DIRECTORIES", std::env::current_dir().unwrap_or_default())
         .arg("--store")
         .arg(store);
     cmd
@@ -2814,4 +2818,41 @@ fn sync_says_what_it_left_out_and_can_keep_quiet() {
     assert!(!quiet.stdout.contains("textdb new"), "{}", quiet.stdout);
     assert!(quiet.stdout.contains("left out"), "{}", quiet.stdout);
     assert_eq!(quiet.stdout.lines().filter(|l| l.starts_with("synced:")).count(), 1, "{}", quiet.stdout);
+}
+
+/// Two directories per folder is the normal state — a person's vault and an agent's checkout —
+/// and `assets` used to take whichever was synced with the folder last, silently. It now takes
+/// the one the command is run from, and says which it used.
+#[test]
+fn assets_use_the_directory_you_are_standing_in() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let bucket = tmp.path().join("bucket");
+    let one = tmp.path().join("one");
+    let two = tmp.path().join("two");
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::create_dir_all(&two).unwrap();
+    std::fs::write(one.join("a.md"), "see ![[logo.png]]\n").unwrap();
+
+    ok(textdb(&db).args(["assets", "stores", "--add", "team", "--root", bucket.to_str().unwrap()]), None);
+    // --add creates a local root rather than leaving the first push to fail on a missing folder.
+    assert!(bucket.is_dir());
+
+    ok(textdb(&db).args(["sync", "/v"]).arg(&one), None);
+    ok(textdb(&db).args(["sync", "/v"]).arg(&two), None);
+    // `two` was synced last, so that is what the old rule would have picked.
+    std::fs::write(one.join("logo.png"), b"\x89PNG one").unwrap();
+
+    let mut from_one = Command::new(env!("CARGO_BIN_EXE_textdb"));
+    from_one
+        .current_dir(&one)
+        .env_remove("TEXTDB_STORE")
+        .env("TEXTDB_CONFIG_DIR", tmp.path().join("config"))
+        .arg("--store")
+        .arg(&db)
+        .args(["assets", "push"]);
+    let out = ok(&mut from_one, None);
+    assert!(out.stdout.contains("pushed 1 assets"), "{}", out.stdout);
+    // And it names the directory it used, which push never did.
+    assert!(out.stdout.contains(one.to_str().unwrap()), "{}", out.stdout);
 }

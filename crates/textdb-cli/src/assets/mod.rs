@@ -180,6 +180,17 @@ pub fn vault(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>) -> Resu
         return Ok(Vault { prefix: p, dir: dir.to_path_buf() });
     }
     let p = path.unwrap_or_else(|| "/".to_string());
+    // The directory the user is standing in comes first. Two directories per folder is the normal
+    // state — a person's vault and an agent's checkout — and "whichever was synced with this
+    // folder last" picked the wrong one silently: `assets push` run from the original pushed
+    // nothing and never said which directory it had looked at.
+    if let Ok(here) = std::env::current_dir() {
+        if let Some((root, config)) = crate::root::Config::find(&here) {
+            if (under(&config.prefix, &p) || under(&p, &config.prefix)) && root.is_dir() {
+                return Ok(Vault { prefix: config.prefix, dir: root });
+            }
+        }
+    }
     bases
         .iter()
         .find(|b| under(&b.prefix, &p) && Path::new(&b.dir).is_dir())
@@ -1136,10 +1147,20 @@ pub fn push(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, o: PushOpt
         }
     }
     if json {
-        emit_json(&json!({ "dry_run": o.dry_run, "pushed": pushed, "bytes": bytes, "conflicts": conflicts, "failed": failed }))?;
+        emit_json(&json!({
+            "prefix": v.prefix,
+            "dir": v.dir.display().to_string(),
+            "dry_run": o.dry_run,
+            "pushed": pushed,
+            "bytes": bytes,
+            "conflicts": conflicts,
+            "failed": failed
+        }))?;
     } else {
         let verb = if o.dry_run { "would push" } else { "pushed" };
-        let mut s = format!("{verb} {} assets ({})\n", pushed.len(), size_text(bytes));
+        // Which directory, always: two per folder is the normal state, and "pushed 0 assets" from
+        // the wrong one looked exactly like "pushed 0 assets" from the right one.
+        let mut s = format!("{verb} {} assets ({}) from {} ({})\n", pushed.len(), size_text(bytes), v.dir.display(), v.prefix);
         for p in &pushed {
             s.push_str(&format!("  {:<10} {}\n", p["state"].as_str().unwrap_or(""), p["path"].as_str().unwrap_or("")));
         }

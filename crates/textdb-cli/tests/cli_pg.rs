@@ -60,6 +60,8 @@ fn textdb(db: &Db) -> Command {
         .env_remove("TEXTDB_AUTHOR")
         .env_remove("TEXTDB_PATH_HISTORY")
         .env("TEXTDB_CONFIG_DIR", std::env::temp_dir().join(format!("textdb-cli-pg-config-{}", db.name)))
+        // As in cli.rs: discovery must not wander above the test into a synced directory.
+        .env("TEXTDB_CEILING_DIRECTORIES", std::env::current_dir().unwrap_or_default())
         .arg("--store")
         .arg(&db.url);
     cmd
