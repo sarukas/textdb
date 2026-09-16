@@ -15,8 +15,16 @@ edit the `.db` file with other tools.
 ```sh
 export TEXTDB_STORE=path/to/kb.db       # or postgres://user@host/db
 export TEXTDB_AUTHOR=agent-<name>        # your writes are attributed to this name
+export TEXTDB_TOKEN=tdb_…               # only if you were given one; see below
 export MSYS_NO_PATHCONV=1               # Git Bash on Windows only: stops "/a.md" being rewritten
 ```
+
+**If you were given a token**, you are an *account* and see only the folders shared with you,
+each at your own root under a name of its own: what the owner calls `/legal/contracts` may be
+`/contracts/` to you. Run `textdb whoami` first — it lists your shares and whether each is `ro`
+or `rw`. Use the paths it shows and nothing else; a path outside your shares is "not found", and
+that is all you can learn about it. Your writes are attributed to your account, so
+`TEXTDB_AUTHOR` is ignored and naming someone else is refused.
 
 With `MSYS_NO_PATHCONV=1`, give local files and directories (the store, `sync`/`export` targets)
 as Windows (`C:/Users/me/kb.db`) or relative paths: `/c/Users/...` is no longer translated and the
@@ -226,6 +234,7 @@ three-way merge was clean), `unchanged` (nothing to do).
 | 4 | Contention on a very hot file, or another sync holds the directory | Wait a moment and retry |
 | 5 | Not found | Check the path with `ls` / `tree`; it may have moved (`textdb log`) |
 | 6 | Invalid edit: `--old` text missing or not unique, line range outside the file, empty content | Re-read (`cat -n`) and choose a unique anchor or a valid range |
+| 7 | Forbidden: you can see it and may not do this — a read-only share, or one that was taken away | `whoami` shows your shares and their rights. **Not** the same as 5: 7 means it is there and yours to read; 5 means it is outside your shares and you cannot tell it from a path that never existed. Do not retry; ask whoever owns the store |
 | 2 | Usage error, including a path mangled into `C:/…` by the shell | Drop the leading slash or set `MSYS_NO_PATHCONV=1` |
 
 ## History and other people's changes
@@ -313,7 +322,11 @@ pass `--keep-empty-folders` to keep them.
 3. On exit status 3, rebuild on `theirs`; never overwrite with a stale whole-document `write`
    that lacks `-b`.
 4. Use `append` for journals and logs.
-5. Use your own `TEXTDB_AUTHOR`, so the changes you make are attributed to you.
-6. Do not `rm` or `mv` folders you were not asked to reorganise; people are browsing them.
-7. To find things across many files, write one `textdb sql` query rather than a shell loop over
+5. Use your own `TEXTDB_AUTHOR`, so the changes you make are attributed to you. With a token
+   your account name is used instead, and you cannot write as anyone else.
+6. Quote an `id:` when you tell someone else about a document. Paths are per view — yours are
+   not the owner's — but `textdb stat PATH` gives an `id`, and `id:1234` names the same document
+   in every view, including a link to the web app.
+7. Do not `rm` or `mv` folders you were not asked to reorganise; people are browsing them.
+8. To find things across many files, write one `textdb sql` query rather than a shell loop over
    `cat`/`ls`; check a `--write` statement's `SELECT` first.

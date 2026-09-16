@@ -57,6 +57,18 @@ Postgres extension: absolute `/` paths, folders on demand, tombstone deletes, fu
 | `cp -r /clients ./export` | `SELECT * FROM textdb_export('/clients');` or `textdb-corpus export kb.db ./export` |
 | `rsync ./notes/ /clients/` (import; unchanged files make no version) | `textdb-corpus import ./notes kb.db` or Python `Corpus.load_folder` |
 
+## If you were given a token
+
+```sql
+SELECT textdb_auth('tdb_…');   -- your account name, or an error if the token is not usable
+SELECT path FROM textdb_ls('/');
+```
+
+You then see only the folders shared with you, each at your own root under a name of its own:
+what the owner calls `/legal/contracts` may be `/contracts/` to you. Use the paths `textdb_ls`
+shows. Your writes are attributed to your account. Without a token you are the owner and see the
+store's own paths — which is what being able to open the file already means.
+
 ## Read
 
 ```sql
@@ -93,6 +105,7 @@ Errors are SQLite error messages beginning with a code:
 | `TX002` | Retry budget exhausted | Wait briefly, retry |
 | `TX003` | Path/version not found | List the folder |
 | `TX004` | `old` missing or not unique / bad path | Read and choose a unique anchor |
+| `TX005` | Forbidden: it is in your view and you may not do this — a read-only share, or one taken away | `SELECT textdb_auth(...)` first, then check your shares. Not the same as `TX003`, which means it is outside your shares and cannot be told from a path that never existed |
 
 ## History
 

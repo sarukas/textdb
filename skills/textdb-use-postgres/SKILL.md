@@ -65,6 +65,18 @@ the SQL forms are transactional, versioned, and (with `kb.edit`/`base_version`) 
 concurrent writes. `kb.search` is line-based too: one row per line that really holds the
 terms, with the `version` that line number belongs to.
 
+## If you were given a token
+
+```sql
+SET textdb.token = 'tdb_…';            -- or SELECT kb.auth('tdb_…')
+SELECT * FROM kb.whoami();             -- your shares, each with its alias and rights
+```
+
+You then see only the folders shared with you, each at your own root under a name of its own:
+what the owner calls `/legal/contracts` may be `/contracts/` to you. Use the paths `kb.whoami()`
+and `kb.ls('/')` show. Your writes are attributed to your account. Without a token you are the
+owner of the store and see its own paths, which is what connecting to the database already means.
+
 ## Find and read
 
 ```sql
@@ -109,6 +121,7 @@ DELETE FROM kb.file WHERE path = '/archive/acme/plan.md';
 | `TX002` | Too many concurrent commits on this file right now | Wait 50–200 ms, retry once or twice |
 | `TX003` | Path or version not found | List the folder; the file may have been moved |
 | `TX004` | Anchor text missing or ambiguous, or bad path | Read the current content, choose a unique anchor |
+| `TX005` | Forbidden: it is in your view and you may not do this — a read-only share, or one that was taken away | `SELECT * FROM kb.whoami()` lists your shares and their rights. Not the same as `TX003`, which means it is outside your shares and is indistinguishable from a path that never existed. Do not retry |
 
 Never loop on `UPDATE … SET content` without `base_version` to "win" a conflict: it silently
 overwrites other agents' lines. A successful write whose `version` did not move means an
