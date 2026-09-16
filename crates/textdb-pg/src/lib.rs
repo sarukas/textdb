@@ -1907,6 +1907,31 @@ mod kb {
     /// have written, so no document has to be read. Word counts need the bytes and stay
     /// `NULL` until each document is next written. Idempotent, and the number it returns is
     /// how many rows it repaired.
+    /// Refresh the planner's statistics for the store's tables.
+    ///
+    /// A store built in one burst — an import, a sync, a restore — gets analysed once by
+    /// autovacuum while it is still nearly empty and then not again, because autovacuum's
+    /// threshold is a share of the rows already counted. The stale statistics cost far more
+    /// than they look like they should: with them, a heading query over 2,000 notes planned
+    /// as a nested loop that rescanned `section_heading` once per document and took 69 ms;
+    /// after `ANALYZE` the same query, same parameters, planned as a hash join and took
+    /// 2.1 ms. Every query that joins `section`, `property` or `link` to `node` is exposed
+    /// the same way.
+    ///
+    /// Cheap and safe to repeat, so a bulk loader should call it when it finishes rather
+    /// than wait for autovacuum to notice.
+    #[pg_extern]
+    fn analyze_store() {
+        // `ANALYZE` cannot run inside the caller's transaction block on some paths, and a
+        // failure here is a missed optimisation rather than a lost write, so it is reported
+        // and not raised.
+        for t in ["kb.node", "kb.section", "kb.property", "kb.link", "kb.chunk", "kb.chunk_ref", "kb.commit"] {
+            if let Err(e) = Spi::run(&format!("ANALYZE {t}")) {
+                pgrx::warning!("kb.analyze_store: {t}: {e}");
+            }
+        }
+    }
+
     #[pg_extern]
     fn rebuild_headings() -> i64 {
         ok(crate::sections::backfill())
@@ -1951,6 +1976,51 @@ mod kb {
 
     /// Front-matter property names in use, most-used first; `prefix` narrows them.
     ///
+    /// What a prefix means for a query: one document, or everything under a folder.
+    ///
+    /// Resolved once, before the query, so the predicate is a single indexed comparison
+    /// instead of `path = $1 OR (path >= $2 AND path < $3)`. That OR estimated at one row,
+    /// which made the planner drive the join from `node` and probe `section` once per
+    /// document: 69.8 ms against 2.9 ms for the same answer, 12,078 buffer hits against 236.
+    enum Scope {
+        File(i64),
+        Subtree(String, String),
+    }
+
+    impl Scope {
+        fn of(path: &str) -> Scope {
+            // A file is addressed by id. Anything else — a folder, the root, a path that is
+            // not there — takes the range that holds everything below it.
+            let id = Spi::get_one_with_args::<i64>(
+                "SELECT id FROM kb.node WHERE path = $1 AND deleted_at IS NULL AND kind = 1",
+                &[path.into()],
+            )
+            .ok()
+            .flatten();
+            match id {
+                Some(id) => Scope::File(id),
+                None => {
+                    let (lo, hi) = subtree_bounds(path);
+                    Scope::Subtree(lo, hi)
+                }
+            }
+        }
+
+        /// The predicate, appending its bound values to `args`.
+        fn sql(&self, args: &mut Vec<String>) -> String {
+            match self {
+                // An id comes from the database and is an integer, so it is written in.
+                Scope::File(id) => format!("n.id = {}", id),
+                Scope::Subtree(lo, hi) => {
+                    let sql = format!("n.path >= ${} AND n.path < ${}", args.len() + 1, args.len() + 2);
+                    args.push(lo.clone());
+                    args.push(hi.clone());
+                    sql
+                }
+            }
+        }
+    }
+
     /// Headings under `prefix`, with the file columns a caller would otherwise join for.
     ///
     /// `prefix` is a folder or a single document; `/` is the whole vault. `heading` narrows to
@@ -1986,46 +2056,48 @@ mod kb {
         ),
     > {
         let prefix = ok(normalize_path(prefix));
-        let (lo, hi) = subtree_bounds(&prefix);
+        let scope = Scope::of(&prefix);
         let folded = heading.map(|h| h.to_lowercase());
-        // The predicate is chosen before any text is emitted so the placeholder numbers line
-        // up: `prefix` needs two bound values, the others one.
-        let (clause, hlo, hhi) = match (folded.as_deref(), mode) {
-            (None, _) => (String::new(), String::new(), String::new()),
-            (Some(h), "prefix") => {
-                let (a, b) = prefix_range(h);
-                (" AND s.heading_lc >= $6 AND s.heading_lc < $7".to_string(), a, b)
+        // Every predicate is built only when it applies, and the placeholders are numbered as
+        // the parts are appended. Two shapes that looked harmless cost 24x between them:
+        // `path = $1 OR (path >= $2 AND path < $3)` estimated at one row, which made the
+        // planner drive the join from `node` and probe `section` once per document, and
+        // `$4 IS NULL OR level <= $4` is opaque to it for the same reason.
+        let mut args: Vec<String> = Vec::new();
+        let mut where_sql = scope.sql(&mut args);
+        if let Some(h) = folded.as_deref() {
+            match mode {
+                "prefix" => {
+                    let (a, b) = prefix_range(h);
+                    where_sql.push_str(&format!(" AND s.heading_lc >= ${} AND s.heading_lc < ${}", args.len() + 1, args.len() + 2));
+                    args.push(a);
+                    args.push(b);
+                }
+                "contains" => {
+                    where_sql.push_str(&format!(" AND s.heading_lc LIKE ${} ESCAPE '\\'", args.len() + 1));
+                    args.push(format!("%{}%", h.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")));
+                }
+                _ => {
+                    where_sql.push_str(&format!(" AND s.heading_lc = ${}", args.len() + 1));
+                    args.push(h.to_string());
+                }
             }
-            (Some(h), "contains") => (
-                " AND s.heading_lc LIKE $6 ESCAPE '\\'".to_string(),
-                format!("%{}%", h.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")),
-                String::new(),
-            ),
-            (Some(h), _) => (" AND s.heading_lc = $6".to_string(), h.to_string(), String::new()),
-        };
+        }
+        if let Some(l) = max_level {
+            where_sql.push_str(&format!(" AND s.level <= ${}::int", args.len() + 1));
+            args.push(l.to_string());
+        }
         let sql = format!(
             "SELECT n.path, s.heading, s.heading_path, s.level::bigint, s.line_from, s.line_to,
                     s.nwords, s.nwords_total, n.nbytes, n.nlines, n.nwords, n.version,
                     n.updated_at, n.updated_by
                FROM kb.section s JOIN kb.node n ON n.id = s.file_id
-              WHERE n.deleted_at IS NULL AND (n.path = $1 OR (n.path >= $2 AND n.path < $3))
-                AND ($4::bigint IS NULL OR s.level <= $4){clause}
-              ORDER BY n.path, s.line_from LIMIT $5"
+              WHERE n.deleted_at IS NULL AND {where_sql}
+              ORDER BY n.path, s.line_from LIMIT {lim}",
+            lim = lim.max(1)
         );
         let rows = Spi::connect(|client| {
-            let mut args: Vec<pgrx::datum::DatumWithOid> = vec![
-                prefix.as_str().into(),
-                lo.as_str().into(),
-                hi.as_str().into(),
-                max_level.into(),
-                lim.max(1).into(),
-            ];
-            if !clause.is_empty() {
-                args.push(hlo.as_str().into());
-                if !hhi.is_empty() {
-                    args.push(hhi.as_str().into());
-                }
-            }
+            let args: Vec<pgrx::datum::DatumWithOid> = args.iter().map(|a| a.as_str().into()).collect();
             let r = client.select(&sql, None, &args).unwrap_or_else(|e| spi_err(e));
             let mut out = Vec::new();
             for row in r {
@@ -2060,31 +2132,30 @@ mod kb {
         lim: default!(i64, 100),
     ) -> TableIterator<'static, (name!(heading, String), name!(sections, i64), name!(docs, i64))> {
         let prefix = ok(normalize_path(prefix));
-        let (lo, hi) = subtree_bounds(&prefix);
         let lower = starts.to_lowercase();
-        let (hlo, hhi) = prefix_range(&lower);
+        // Built the same way `outline` builds its predicate, and for the same reason: an OR
+        // over two indexed columns, or a clause guarded by `$n = ''`, is opaque to the
+        // planner and costs a join driven from the wrong side.
+        let mut args: Vec<String> = Vec::new();
+        let mut where_sql = Scope::of(&prefix).sql(&mut args);
+        if !lower.is_empty() {
+            let (hlo, hhi) = prefix_range(&lower);
+            where_sql.push_str(&format!(" AND s.heading_lc >= ${} AND s.heading_lc < ${}", args.len() + 1, args.len() + 2));
+            args.push(hlo);
+            args.push(hhi);
+        }
+        let sql = format!(
+            "SELECT min(s.heading), count(*), count(DISTINCT s.file_id)
+               FROM kb.section s JOIN kb.node n ON n.id = s.file_id
+              WHERE n.deleted_at IS NULL AND {where_sql}
+              GROUP BY s.heading_lc
+              ORDER BY count(*) DESC, s.heading_lc
+              LIMIT {lim}",
+            lim = lim.max(1)
+        );
         let rows = Spi::connect(|client| {
-            let r = client
-                .select(
-                    "SELECT min(s.heading), count(*), count(DISTINCT s.file_id)
-                       FROM kb.section s JOIN kb.node n ON n.id = s.file_id
-                      WHERE n.deleted_at IS NULL AND (n.path = $1 OR (n.path >= $2 AND n.path < $3))
-                        AND ($4 = '' OR (s.heading_lc >= $5 AND s.heading_lc < $6))
-                      GROUP BY s.heading_lc
-                      ORDER BY count(*) DESC, s.heading_lc
-                      LIMIT $7",
-                    None,
-                    &[
-                        prefix.as_str().into(),
-                        lo.as_str().into(),
-                        hi.as_str().into(),
-                        lower.as_str().into(),
-                        hlo.as_str().into(),
-                        hhi.as_str().into(),
-                        lim.max(1).into(),
-                    ],
-                )
-                .unwrap_or_else(|e| spi_err(e));
+            let args: Vec<pgrx::datum::DatumWithOid> = args.iter().map(|a| a.as_str().into()).collect();
+            let r = client.select(&sql, None, &args).unwrap_or_else(|e| spi_err(e));
             let mut out = Vec::new();
             for row in r {
                 out.push((

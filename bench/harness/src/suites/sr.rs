@@ -50,6 +50,11 @@ pub fn search(ctx: &Ctx) -> anyhow::Result<()> {
     let (import_lat, paths) = import_corpus(ctx, &mut reference, n_files, size, "/sr")?;
     let import_s = t0.elapsed().as_secs_f64();
     ctx.cell.metric("", "import_s", import_s);
+    // Outside the import timing: this is what a store does before it is queried, not part of
+    // what loading it costs.
+    if let Err(e) = ctx.backend.settle() {
+        ctx.err("", "settle", &e);
+    }
     ctx.cell.lat("", "create", &import_lat);
     let fp_after_import = ctx.backend.storage_bytes().unwrap_or(0);
     ctx.cell.metric("", "footprint_after_import", fp_after_import as f64);

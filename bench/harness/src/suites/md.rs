@@ -135,6 +135,10 @@ fn write_all(ctx: &Ctx, docs: &[Doc], case: &str) -> anyhow::Result<bool> {
         }
     }
     ctx.cell.lat(case, "create", &lat);
+    // The corpus is in; let the store get ready before anything is timed against it.
+    if let Err(e) = ctx.backend.settle() {
+        ctx.err(case, "settle", &e);
+    }
     Ok(true)
 }
 
@@ -689,7 +693,6 @@ fn outline(ctx: &Ctx) -> anyhow::Result<()> {
     // Every heading the generator wrote, so each oracle below compares against what is really
     // there rather than against whatever the backend happens to return.
     let total: usize = docs.iter().map(|d| d.headings.len()).sum();
-    let with_summary = docs.iter().filter(|d| d.headings.iter().any(|(h, _)| h == "Summary")).count();
     let tops: usize = docs.iter().map(|d| d.headings.iter().filter(|(_, l)| *l == 1).count()).sum();
 
     // One document, through the same call the wider ones use: the floor everything else is
@@ -742,12 +745,20 @@ fn outline(ctx: &Ctx) -> anyhow::Result<()> {
     }
     ctx.cell.metric("", "outline_vault_rows", total as f64);
 
-    // A heading query in each of the three shapes, against the same selective heading, so the
-    // three numbers differ only by what the index can do for them.
+    // A heading query in each of the three shapes, against the same heading, so the three
+    // numbers differ only by what the index can do for them.
+    //
+    // Each expectation is counted off the generated headings rather than assumed: `summ` as a
+    // prefix also matches `Summary detail 3`, so the three shapes do not return the same
+    // number of rows and writing `with_summary` for all of them would be checking the oracle
+    // against itself.
+    let count_if = |f: &dyn Fn(&str) -> bool| -> usize {
+        docs.iter().flat_map(|d| d.headings.iter()).filter(|(h, _)| f(&h.to_lowercase())).count()
+    };
     for (mode, needle, expect) in [
-        ("exact", "summary", with_summary),
-        ("prefix", "summ", with_summary),
-        ("contains", "ummar", with_summary),
+        ("exact", "summary", count_if(&|h: &str| h == "summary")),
+        ("prefix", "summ", count_if(&|h: &str| h.starts_with("summ"))),
+        ("contains", "ummar", count_if(&|h: &str| h.contains("ummar"))),
     ] {
         let mut lat = Latencies::default();
         let mut found = 0;

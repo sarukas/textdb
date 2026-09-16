@@ -232,6 +232,18 @@ pub trait Backend: Send + Sync {
     /// The body of one section, addressed by its heading path.
     /// Headings under `prefix`, optionally only those matching `heading` in `mode`
     /// (`exact`, `prefix` or `contains`) and no deeper than `max_level`.
+    /// Called once after a corpus is loaded and before it is queried: whatever a store does
+    /// to be ready, which a real deployment would do too.
+    ///
+    /// It exists because a store built in one burst is not the same store as one that grew:
+    /// `textdb-pg` is left with the planner statistics autovacuum worked out while the tables
+    /// were nearly empty, and a heading query over 2,000 notes then plans as a nested loop and
+    /// takes 69 ms instead of 2.1 ms. Measuring the un-analysed store would be measuring a
+    /// misconfiguration, and measuring without offering every backend the same chance would
+    /// be unfair; this is the same chance, taken by whoever needs it. Untimed, on purpose.
+    fn settle(&self) -> R<()> {
+        Ok(())
+    }
     fn outline(&self, _prefix: &str, _heading: Option<&str>, _mode: &str, _max_level: Option<u32>) -> R<Vec<OutlineRow>> {
         Err(BackendError::NotSupported("no section index"))
     }

@@ -332,6 +332,12 @@ impl Backend for TextdbPg {
         let next = super::textdb_sqlite::set_frontmatter_key(&body, key, value);
         self.overwrite(path, &next)
     }
+    fn settle(&self) -> R<()> {
+        self.with(|c| {
+            c.execute("SELECT kb.analyze_store()", &[])?;
+            Ok(())
+        })
+    }
     fn outline(&self, prefix: &str, heading: Option<&str>, mode: &str, max_level: Option<u32>) -> R<Vec<OutlineRow>> {
         self.with(|c| {
             let lvl = max_level.map(|l| l as i64);
@@ -456,9 +462,12 @@ impl Backend for TextdbPg {
                     "VACUUM FULL kb.tree_node",
                     "VACUUM FULL kb.node",
                     "SELECT gin_clean_pending_list('kb.chunk_tsv')",
+                    // Without this the planner keeps whatever autovacuum worked out while the
+                    // store was still nearly empty, which is what a bulk-loaded store has.
+                    "SELECT kb.analyze_store()",
                 ],
             )?;
-            Ok("VACUUM FULL + gin_clean_pending_list (GC stub: none)")
+            Ok("VACUUM FULL + gin_clean_pending_list + ANALYZE (GC stub: none)")
         })
     }
     fn leaf_hashes(&self, path: &str) -> R<Option<std::collections::HashSet<textdb_core::Hash>>> {
