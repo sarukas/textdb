@@ -138,6 +138,10 @@ pub fn extract(bytes: &[u8]) -> Structure {
         })
         .collect();
 
+    // Words per line, accumulated once, so every section's two counts are a subtraction
+    // rather than a re-scan. `cum[i]` is the words in lines 1..=i.
+    let cum = word_prefix(bytes, &starts);
+
     // Sections: each heading spans until the next heading of the same or higher level.
     let mut sections = Vec::new();
     let mut stack: Vec<(u32, String)> = Vec::new();
@@ -156,11 +160,22 @@ pub fn extract(bytes: &[u8]) -> Structure {
             .find(|n| n.level <= h.level)
             .map(|n| n.line - 1)
             .unwrap_or(last_line);
+        let line_to = line_to.max(h.line);
+        // The section's own lines run to the next heading of any level, since that heading
+        // starts a section of its own; everything after it inside `line_to` is nested.
+        let own_to = headings[i + 1..]
+            .first()
+            .map(|n| (n.line - 1).max(h.line))
+            .unwrap_or(line_to)
+            .min(line_to);
         sections.push(Section {
             heading_path,
             level: h.level,
             line_from: h.line,
-            line_to: line_to.max(h.line),
+            line_to,
+            heading: h.text.clone(),
+            nwords: words_in(&cum, h.line, own_to),
+            nwords_total: words_in(&cum, h.line, line_to),
         });
     }
     Structure {
@@ -168,6 +183,35 @@ pub fn extract(bytes: &[u8]) -> Structure {
         links,
         frontmatter,
     }
+}
+
+/// Words in lines 1..=i for every i, so a line range costs one subtraction.
+///
+/// Index 0 is the empty prefix. A word never spans a newline, so counting each line
+/// independently and adding is the same number as counting the whole range at once — which
+/// is what makes a section's two figures exact and lets a parent's total be built from its
+/// children's.
+fn word_prefix(bytes: &[u8], starts: &[usize]) -> Vec<u64> {
+    let mut cum = Vec::with_capacity(starts.len() + 1);
+    cum.push(0u64);
+    let mut running = 0u64;
+    for (i, &from) in starts.iter().enumerate() {
+        let to = starts.get(i + 1).copied().unwrap_or(bytes.len());
+        running += textdb_core::words::count_words(&bytes[from.min(bytes.len())..to.min(bytes.len())]);
+        cum.push(running);
+    }
+    cum
+}
+
+/// Words in the 1-based inclusive line range `[from, to]`.
+fn words_in(cum: &[u64], from: u64, to: u64) -> u64 {
+    if cum.len() <= 1 || to < from {
+        return 0;
+    }
+    let last = cum.len() as u64 - 1;
+    let hi = to.min(last) as usize;
+    let lo = from.saturating_sub(1).min(last) as usize;
+    cum[hi].saturating_sub(cum[lo])
 }
 
 /// Find the section whose heading matches `heading`: exact heading-path match first, then
@@ -190,6 +234,64 @@ mod tests {
     use super::*;
 
     const DOC: &str = "---\ntitle: Test doc\ntags: [a, b]\ndraft: false\n---\n# Intro\n\nSee [[Other Note]] and [local](./x.md) and [web](https://example.com).\n\n## Goals\nline\n\n### Detail\nmore\n\n## Scope\nend\n# Second\ntail";
+
+    #[test]
+    fn section_word_counts_are_exact_and_compose() {
+        let s = extract(DOC.as_bytes());
+        let by = |h: &str| s.sections.iter().find(|x| x.heading_path == h).unwrap();
+
+        // Own lines only: the heading line plus what sits under it before the next heading.
+        // "## Goals" is two words, "line" one.
+        assert_eq!(by("Intro / Goals").nwords, 3);
+        // Totals include everything nested: "### Detail" (2) + "more" (1) on top of the 3.
+        assert_eq!(by("Intro / Goals").nwords_total, 6);
+        // A leaf section's two figures are the same number.
+        let detail = by("Intro / Goals / Detail");
+        assert_eq!((detail.nwords, detail.nwords_total), (3, 3));
+
+        // The parent's total is its own words plus every descendant's own words. This is the
+        // property that makes the two columns worth storing rather than one.
+        for parent in &s.sections {
+            let nested: u64 = s
+                .sections
+                .iter()
+                .filter(|c| c.line_from > parent.line_from && c.line_to <= parent.line_to)
+                .map(|c| c.nwords)
+                .sum();
+            assert_eq!(
+                parent.nwords_total,
+                parent.nwords + nested,
+                "{} total {} != own {} + nested {}",
+                parent.heading_path,
+                parent.nwords_total,
+                parent.nwords,
+                nested
+            );
+        }
+
+        // Every top-level section's total, plus anything before the first heading, accounts
+        // for the whole document — nothing double counted, nothing dropped.
+        let top: u64 = s.sections.iter().filter(|x| x.level == 1).map(|x| x.nwords_total).sum();
+        let first = s.sections.first().unwrap().line_from;
+        let starts = line_starts(DOC.as_bytes());
+        let preamble = starts
+            .get(..(first as usize).saturating_sub(1))
+            .map(|_| {
+                let end = starts[(first as usize) - 1];
+                textdb_core::words::count_words(&DOC.as_bytes()[..end])
+            })
+            .unwrap_or(0);
+        assert_eq!(top + preamble, textdb_core::words::count_words(DOC.as_bytes()));
+    }
+
+    #[test]
+    fn heading_is_the_last_component_of_the_path() {
+        let s = extract(DOC.as_bytes());
+        for x in &s.sections {
+            assert_eq!(x.heading, x.heading_path.rsplit(" / ").next().unwrap());
+        }
+        assert_eq!(s.sections.iter().find(|x| x.level == 3).unwrap().heading, "Detail");
+    }
 
     #[test]
     fn sections_links_frontmatter() {

@@ -109,6 +109,10 @@ pub struct CommitRow {
     pub ts: String,
     pub message: Option<String>,
     pub nbytes: Option<i64>,
+    /// Lines and words as of this version. `nwords` is `None` for commits written before the
+    /// column existed; `kb_rebuild_counts()` fills those in.
+    pub nlines: Option<i64>,
+    pub nwords: Option<i64>,
     pub root: Hash,
     /// How the commit landed: `direct`, `rebased` or `merged`. `None` for commits written
     /// before the column existed.
@@ -532,7 +536,7 @@ impl<'c> TextDb<'c> {
         };
         self.conn
             .prepare_cached(&format!(
-                "INSERT INTO {}commit(file_id, version, root, parent_root, author, ts, message, nbytes, nlines, kind, base_version, batch) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                "INSERT INTO {}commit(file_id, version, root, parent_root, author, ts, message, nbytes, nlines, nwords, kind, base_version, batch) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?13, ?10, ?11, ?12)",
                 self.p
             ))
             .map_err(sql_err)?
@@ -548,7 +552,8 @@ impl<'c> TextDb<'c> {
                 nlines as i64,
                 c.kind.as_str(),
                 base_version,
-                crate::bulk::current_batch(self.conn)
+                crate::bulk::current_batch(self.conn),
+                nwords
             ])
             .map_err(sql_err)?;
         let op = if c.version == 1 { "create" } else { "commit" };
@@ -667,7 +672,14 @@ impl<'c> TextDb<'c> {
     /// A rewrite batches its inserts into one multi-`VALUES` statement per table instead of
     /// one statement per row.
     fn write_structure(&self, file_id: i64, version: i64, s: &textdb_core::structure::Structure) -> Result<()> {
-        if self.structure_matches(file_id, s)? {
+        let diff = self.structure_diff(file_id, s)?;
+        if diff != StructureDiff::Different {
+            // Word counts move on almost every body edit while the heading tree stays put, so
+            // they are refreshed on their own rather than forcing the whole rewrite below.
+            // One statement for the document, keyed on `line_from`: a heading owns its line.
+            if diff == StructureDiff::CountsOnly {
+                self.update_section_counts(file_id, &s.sections)?;
+            }
             self.touch_property_version(file_id, version)?;
             for t in ["section", "link"] {
                 self.conn
@@ -700,16 +712,17 @@ impl<'c> TextDb<'c> {
         const MAX_ROWS_PER_BATCH: usize = 4000;
         for batch in s.sections.chunks(MAX_ROWS_PER_BATCH) {
             let mut sql = format!(
-                "INSERT INTO {}section(file_id, version, heading_path, level, line_from, line_to) VALUES ",
+                "INSERT INTO {}section(file_id, version, heading_path, level, line_from, line_to, \
+                 heading, heading_lc, nwords, nwords_total) VALUES ",
                 self.p
             );
             for i in 0..batch.len() {
                 if i > 0 {
                     sql.push(',');
                 }
-                sql.push_str("(?,?,?,?,?,?)");
+                sql.push_str("(?,?,?,?,?,?,?,?,?,?)");
             }
-            let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(batch.len() * 6);
+            let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(batch.len() * 10);
             for sec in batch {
                 vals.push(file_id.into());
                 vals.push(version.into());
@@ -717,6 +730,10 @@ impl<'c> TextDb<'c> {
                 vals.push((sec.level as i64).into());
                 vals.push((sec.line_from as i64).into());
                 vals.push((sec.line_to as i64).into());
+                vals.push(sec.heading.clone().into());
+                vals.push(sec.heading.to_lowercase().into());
+                vals.push((sec.nwords as i64).into());
+                vals.push((sec.nwords_total as i64).into());
             }
             self.conn
                 .prepare_cached(&sql)
@@ -743,19 +760,74 @@ impl<'c> TextDb<'c> {
         Ok(())
     }
 
-    /// Do the stored rows for `file_id` already describe `s`, version aside?
-    fn structure_matches(&self, file_id: i64, s: &textdb_core::structure::Structure) -> Result<bool> {
+}
+
+/// What a commit changed about a document's structure rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StructureDiff {
+    /// Nothing; only the `version` column has to move forward.
+    Same,
+    /// The heading tree is intact but word counts under it moved — the common case for a
+    /// body edit, and much cheaper to serve than a rewrite.
+    CountsOnly,
+    /// Headings, links or front matter moved; the rows are rebuilt.
+    Different,
+}
+
+impl TextDb<'_> {
+    /// Refresh only the word counts of rows whose heading tree is already correct.
+    ///
+    /// `line_from` keys the update because a heading owns its line: two sections of one
+    /// document can never start on the same one.
+    fn update_section_counts(&self, file_id: i64, sections: &[textdb_core::structure::Section]) -> Result<()> {
+        const MAX_ROWS_PER_BATCH: usize = 4000;
+        for batch in sections.chunks(MAX_ROWS_PER_BATCH) {
+            let mut sql = format!(
+                "UPDATE {}section AS s SET nwords = v.column2, nwords_total = v.column3 FROM (VALUES ",
+                self.p
+            );
+            for i in 0..batch.len() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push_str("(?,?,?)");
+            }
+            sql.push_str(") AS v WHERE s.file_id = ? AND s.line_from = v.column1");
+            let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(batch.len() * 3 + 1);
+            for sec in batch {
+                vals.push((sec.line_from as i64).into());
+                vals.push((sec.nwords as i64).into());
+                vals.push((sec.nwords_total as i64).into());
+            }
+            vals.push(file_id.into());
+            self.conn
+                .prepare_cached(&sql)
+                .map_err(sql_err)?
+                .execute(rusqlite::params_from_iter(vals))
+                .map_err(sql_err)?;
+        }
+        Ok(())
+    }
+
+    /// How the stored rows for `file_id` differ from `s`, version aside.
+    ///
+    /// Three outcomes rather than two because the two kinds of change have very different
+    /// costs: a heading tree that has not moved needs no delete, no re-insert and no relink,
+    /// even when every word count under it has changed.
+    fn structure_diff(&self, file_id: i64, s: &textdb_core::structure::Structure) -> Result<StructureDiff> {
+        let mut counts_differ = false;
         let mut st = self
             .conn
             .prepare_cached(&format!(
-                "SELECT heading_path, level, line_from, line_to FROM {}section WHERE file_id = ?1 ORDER BY rowid",
+                "SELECT heading_path, level, line_from, line_to, nwords, nwords_total \
+                   FROM {}section WHERE file_id = ?1 ORDER BY rowid",
                 self.p
             ))
             .map_err(sql_err)?;
         let mut rows = st.query(params![file_id]).map_err(sql_err)?;
         for sec in &s.sections {
             let Some(r) = rows.next().map_err(sql_err)? else {
-                return Ok(false);
+                return Ok(StructureDiff::Different);
             };
             let stored: (String, i64, i64, i64) = (
                 r.get(0).map_err(sql_err)?,
@@ -764,11 +836,15 @@ impl<'c> TextDb<'c> {
                 r.get(3).map_err(sql_err)?,
             );
             if stored != (sec.heading_path.clone(), sec.level as i64, sec.line_from as i64, sec.line_to as i64) {
-                return Ok(false);
+                return Ok(StructureDiff::Different);
+            }
+            let words: (Option<i64>, Option<i64>) = (r.get(4).map_err(sql_err)?, r.get(5).map_err(sql_err)?);
+            if words != (Some(sec.nwords as i64), Some(sec.nwords_total as i64)) {
+                counts_differ = true;
             }
         }
         if rows.next().map_err(sql_err)?.is_some() {
-            return Ok(false);
+            return Ok(StructureDiff::Different);
         }
         drop(rows);
 
@@ -782,7 +858,7 @@ impl<'c> TextDb<'c> {
         let mut rows = st.query(params![file_id]).map_err(sql_err)?;
         for l in &s.links {
             let Some(r) = rows.next().map_err(sql_err)? else {
-                return Ok(false);
+                return Ok(StructureDiff::Different);
             };
             let stored = textdb_core::Link {
                 target_path: r.get(0).map_err(sql_err)?,
@@ -793,11 +869,11 @@ impl<'c> TextDb<'c> {
                 external: r.get::<_, i64>(5).map_err(sql_err)? != 0,
             };
             if &stored != l {
-                return Ok(false);
+                return Ok(StructureDiff::Different);
             }
         }
         if rows.next().map_err(sql_err)?.is_some() {
-            return Ok(false);
+            return Ok(StructureDiff::Different);
         }
         drop(rows);
 
@@ -809,7 +885,10 @@ impl<'c> TextDb<'c> {
             .optional()
             .map_err(sql_err)?;
         let want = s.frontmatter.as_ref().map(|fm| fm.to_string());
-        Ok(stored_fm.flatten() == want)
+        if stored_fm.flatten() != want {
+            return Ok(StructureDiff::Different);
+        }
+        Ok(if counts_differ { StructureDiff::CountsOnly } else { StructureDiff::Same })
     }
 
     pub fn read(&self, path: &str) -> Result<Vec<u8>> {
@@ -1228,7 +1307,8 @@ impl<'c> TextDb<'c> {
         let mut stmt = self
             .conn
             .prepare_cached(&format!(
-                "SELECT version, author, ts, message, nbytes, root, kind, base_version FROM {}commit WHERE file_id = ?1 ORDER BY version",
+                "SELECT version, author, ts, message, nbytes, root, kind, base_version, nlines, nwords \
+                   FROM {}commit WHERE file_id = ?1 ORDER BY version",
                 self.p
             ))
             .map_err(sql_err)?;
@@ -1244,6 +1324,8 @@ impl<'c> TextDb<'c> {
                     root: to_hash(&root).unwrap_or([0u8; 32]),
                     kind: r.get(6)?,
                     base_version: r.get(7)?,
+                    nlines: r.get(8)?,
+                    nwords: r.get(9)?,
                 })
             })
             .map_err(sql_err)?;

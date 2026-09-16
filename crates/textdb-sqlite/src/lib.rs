@@ -16,6 +16,7 @@ pub mod links;
 pub mod path_history;
 pub mod property;
 pub mod schema;
+pub mod sections;
 pub mod stats;
 pub mod storage;
 pub mod trash;
@@ -45,6 +46,8 @@ pub fn register(conn: &Connection, prefix: &str) -> Result<()> {
         ("textdb_prop_keys", FnKind::PropKeys),
         ("textdb_prop_values", FnKind::PropValues),
         ("textdb_prop_find", FnKind::PropFind),
+        ("textdb_outline", FnKind::Outline),
+        ("textdb_headings", FnKind::Headings),
     ] {
         conn.create_module(
             name,

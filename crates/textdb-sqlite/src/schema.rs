@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS {p}commit (
   message      TEXT,
   nbytes       INTEGER,
   nlines       INTEGER,
+  nwords       INTEGER,                        -- as of this version, so word count has history
   kind         TEXT,                          -- direct, rebased, merged
   base_version INTEGER,                       -- the version the writer started from
   batch        TEXT    NULL,                  -- the run that made it (`textdb sql --write`), see bulk.rs
@@ -66,10 +67,18 @@ CREATE TABLE IF NOT EXISTS {p}chunk_ref (
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS {p}section (
   file_id INTEGER NOT NULL, version INTEGER NOT NULL,
-  heading_path TEXT NOT NULL, level INTEGER NOT NULL,
-  line_from INTEGER NOT NULL, line_to INTEGER NOT NULL
+  heading_path TEXT NOT NULL,                  -- the breadcrumb, `Parent / Child`
+  level INTEGER NOT NULL,
+  line_from INTEGER NOT NULL, line_to INTEGER NOT NULL,
+  heading TEXT NOT NULL DEFAULT '',            -- the last component, as written
+  heading_lc TEXT NOT NULL DEFAULT '',         -- folded, so a match is an index seek
+  -- Size of the section's own lines, and of it plus everything nested under it. Words never
+  -- span a line and sections partition by line, so both are exact.
+  nwords INTEGER, nwords_total INTEGER
 );
 CREATE INDEX IF NOT EXISTS {p}section_file ON {p}section(file_id, version);
+CREATE INDEX IF NOT EXISTS {p}section_heading ON {p}section(heading_lc);
+CREATE INDEX IF NOT EXISTS {p}section_level ON {p}section(level, heading_lc);
 CREATE TABLE IF NOT EXISTS {p}link (
   file_id INTEGER NOT NULL, version INTEGER NOT NULL,
   target_path TEXT NOT NULL, line INTEGER NOT NULL,
@@ -233,6 +242,12 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("change", "batch", "TEXT NULL"),
     // Sync: the include rules each base was made with.
     ("sync", "rules", "TEXT"),
+    // Counts: words per version, and the size of each section (words.rs).
+    ("commit", "nwords", "INTEGER"),
+    ("section", "nwords", "INTEGER"),
+    ("section", "nwords_total", "INTEGER"),
+    ("section", "heading_lc", "TEXT NOT NULL DEFAULT ''"),
+    ("section", "heading", "TEXT NOT NULL DEFAULT ''"),
     // Properties: the folded forms the indexes are built on.
     ("property", "key_lc", "TEXT NOT NULL DEFAULT ''"),
     ("property", "val_lc", "TEXT NULL"),
@@ -248,7 +263,9 @@ fn index_sql(p: &str) -> String {
          CREATE INDEX IF NOT EXISTS {p}change_batch ON {p}change(batch) WHERE batch IS NOT NULL;
          CREATE INDEX IF NOT EXISTS {p}property_kv ON {p}property(key_lc, val_lc);
          CREATE INDEX IF NOT EXISTS {p}property_kn ON {p}property(key_lc, val_num);
-         CREATE INDEX IF NOT EXISTS {p}property_file ON {p}property(file_id);"
+         CREATE INDEX IF NOT EXISTS {p}property_file ON {p}property(file_id);
+         CREATE INDEX IF NOT EXISTS {p}section_heading ON {p}section(heading_lc);
+         CREATE INDEX IF NOT EXISTS {p}section_level ON {p}section(level, heading_lc);"
     )
 }
 
@@ -279,6 +296,7 @@ pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> 
         // otherwise current still reaches here with it empty. Backfilling is what makes the
         // first `meta find` on an existing vault return anything.
         crate::property::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+        crate::sections::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
         return Ok(0);
     }
     let backfill = missing.iter().any(|(table, _, _)| **table == "node");
@@ -296,6 +314,7 @@ pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> 
             crate::links::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
         }
         crate::property::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+        crate::sections::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
         Ok(())
     };
     match run() {

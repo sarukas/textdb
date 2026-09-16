@@ -507,6 +507,8 @@ pub enum FnKind {
     PropKeys,
     PropValues,
     PropFind,
+    Outline,
+    Headings,
 }
 
 pub struct FnSpec {
@@ -519,7 +521,7 @@ impl FnKind {
         match self {
             FnKind::Ls => c"CREATE TABLE x(name TEXT, kind TEXT, nbytes INTEGER, nlines INTEGER, updated_at TEXT, path TEXT, nwords INTEGER, versions INTEGER, created_at TEXT, updated_by TEXT, nauthors INTEGER, authors TEXT, files INTEGER, folders INTEGER, id INTEGER, dir TEXT HIDDEN, recursive INTEGER HIDDEN)",
             FnKind::Search => c"CREATE TABLE x(path TEXT, line INTEGER, snippet TEXT, rank REAL, query TEXT HIDDEN, prefix TEXT HIDDEN, lim INTEGER HIDDEN)",
-            FnKind::History => c"CREATE TABLE x(version INTEGER, author TEXT, ts TEXT, message TEXT, nbytes INTEGER, kind TEXT, base_version INTEGER, path TEXT HIDDEN)",
+            FnKind::History => c"CREATE TABLE x(version INTEGER, author TEXT, ts TEXT, message TEXT, nbytes INTEGER, kind TEXT, base_version INTEGER, nlines INTEGER, nwords INTEGER, path TEXT HIDDEN)",
             FnKind::Export => c"CREATE TABLE x(path TEXT, content TEXT, prefix TEXT HIDDEN)",
             FnKind::Feed => c"CREATE TABLE x(seq INTEGER, ts TEXT, op TEXT, path TEXT, old_path TEXT, node_kind TEXT, version INTEGER, base_version INTEGER, commit_kind TEXT, author TEXT, message TEXT, since INTEGER HIDDEN, lim INTEGER HIDDEN)",
             FnKind::Hunks => c"CREATE TABLE x(old_from INTEGER, old_count INTEGER, new_from INTEGER, new_count INTEGER, old_text TEXT, new_text TEXT, path TEXT HIDDEN, v1 INTEGER HIDDEN, v2 INTEGER HIDDEN)",
@@ -527,6 +529,8 @@ impl FnKind {
             FnKind::PropKeys => c"CREATE TABLE x(key TEXT, docs INTEGER, values_n INTEGER, kind TEXT, prefix TEXT HIDDEN, lim INTEGER HIDDEN)",
             FnKind::PropValues => c"CREATE TABLE x(value TEXT, docs INTEGER, key TEXT HIDDEN, prefix TEXT HIDDEN, lim INTEGER HIDDEN)",
             FnKind::PropFind => c"CREATE TABLE x(path TEXT, nbytes INTEGER, updated_at TEXT, frontmatter TEXT, query TEXT HIDDEN, folder TEXT HIDDEN, lim INTEGER HIDDEN)",
+            FnKind::Outline => c"CREATE TABLE x(path TEXT, heading TEXT, heading_path TEXT, level INTEGER, line_from INTEGER, line_to INTEGER, nwords INTEGER, nwords_total INTEGER, nbytes INTEGER, nlines INTEGER, file_nwords INTEGER, version INTEGER, updated_at TEXT, updated_by TEXT, prefix TEXT HIDDEN, heading_match TEXT HIDDEN, mode TEXT HIDDEN, max_level INTEGER HIDDEN, lim INTEGER HIDDEN)",
+            FnKind::Headings => c"CREATE TABLE x(heading TEXT, sections INTEGER, docs INTEGER, prefix TEXT HIDDEN, starts TEXT HIDDEN, lim INTEGER HIDDEN)",
             FnKind::PathHistory => c"CREATE TABLE x(id INTEGER, ts TEXT, op TEXT, old_path TEXT, new_path TEXT, via TEXT, version INTEGER, author TEXT, path TEXT HIDDEN, node_id INTEGER HIDDEN)",
         }
     }
@@ -535,7 +539,7 @@ impl FnKind {
         match self {
             FnKind::Ls => 15,
             FnKind::Search => 4,
-            FnKind::History => 7,
+            FnKind::History => 9,
             FnKind::Export => 2,
             FnKind::Feed => 11,
             FnKind::Hunks => 6,
@@ -544,6 +548,8 @@ impl FnKind {
             FnKind::PropKeys => 4,
             FnKind::PropValues => 2,
             FnKind::PropFind => 4,
+            FnKind::Outline => 14,
+            FnKind::Headings => 3,
         }
     }
     fn n_hidden(self) -> c_int {
@@ -559,6 +565,8 @@ impl FnKind {
             FnKind::PropKeys => 2,
             FnKind::PropValues => 3,
             FnKind::PropFind => 3,
+            FnKind::Outline => 5,
+            FnKind::Headings => 3,
         }
     }
 }
@@ -736,6 +744,46 @@ unsafe impl VTabCursor for FnCursor<'_> {
                     .map(|h| vec![Value::Text(h.path), Value::Integer(h.line), Value::Text(h.snippet), Value::Real(h.rank)])
                     .collect()
             }
+            FnKind::Outline => {
+                let prefix = s(&hidden[0]).unwrap_or_else(|| "/".into());
+                let heading = s(&hidden[1]);
+                let mode = crate::sections::Match::parse(&s(&hidden[2]).unwrap_or_default());
+                let max_level = hidden_i64(&hidden[3]);
+                let lim = hidden_i64(&hidden[4]).map_or(1000, |i| i.max(0) as usize);
+                let int = |v: Option<i64>| v.map_or(Value::Null, Value::Integer);
+                crate::sections::outline(self.tab.conn(), &self.tab.prefix, &prefix, heading.as_deref(), mode, max_level, lim)
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(|r| {
+                        vec![
+                            Value::Text(r.path),
+                            Value::Text(r.heading),
+                            Value::Text(r.heading_path),
+                            Value::Integer(r.level),
+                            Value::Integer(r.line_from),
+                            Value::Integer(r.line_to),
+                            int(r.nwords),
+                            int(r.nwords_total),
+                            int(r.file_nbytes),
+                            int(r.file_nlines),
+                            int(r.file_nwords),
+                            Value::Integer(r.file_version),
+                            Value::Text(r.updated_at),
+                            r.updated_by.map_or(Value::Null, Value::Text),
+                        ]
+                    })
+                    .collect()
+            }
+            FnKind::Headings => {
+                let prefix = s(&hidden[0]).unwrap_or_else(|| "/".into());
+                let starts = s(&hidden[1]).unwrap_or_default();
+                let lim = hidden_i64(&hidden[2]).map_or(100, |i| i.max(0) as usize);
+                crate::sections::heading_names(self.tab.conn(), &self.tab.prefix, &prefix, &starts, lim)
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(|(h, n, d)| vec![Value::Text(h), Value::Integer(n), Value::Integer(d)])
+                    .collect()
+            }
             FnKind::PropKeys => {
                 let prefix = s(&hidden[0]).unwrap_or_default();
                 let lim = hidden_i64(&hidden[1]).map(|i| i.max(0) as usize).unwrap_or(200);
@@ -793,6 +841,8 @@ unsafe impl VTabCursor for FnCursor<'_> {
                             c.nbytes.map_or(Value::Null, Value::Integer),
                             c.kind.map_or(Value::Null, Value::Text),
                             c.base_version.map_or(Value::Null, Value::Integer),
+                            c.nlines.map_or(Value::Null, Value::Integer),
+                            c.nwords.map_or(Value::Null, Value::Integer),
                         ]
                     })
                     .collect()

@@ -5,9 +5,18 @@ pub struct Section {
     /// Heading path, e.g. `"Intro / Goals"`.
     pub heading_path: String,
     pub level: u32,
-    /// 1-based inclusive line span.
+    /// 1-based inclusive line span, heading line included.
     pub line_from: u64,
     pub line_to: u64,
+    /// The last component of the heading path, as written: `"Goals"`.
+    pub heading: String,
+    /// Words in this section's own lines, heading line included.
+    ///
+    /// A word never spans a line and sections partition a document by line, so this is exact
+    /// and the two figures compose: `nwords_total` is this plus every nested section's own.
+    pub nwords: u64,
+    /// Words in this section and everything nested under it.
+    pub nwords_total: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
