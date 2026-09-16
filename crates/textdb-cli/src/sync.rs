@@ -1516,8 +1516,26 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             (Some(false), Some(true)) if denied_share_of(&read_only, &rel).is_some() => {
                 let alias = denied_share_of(&read_only, &rel).unwrap_or_default();
                 report.kept.push(note(&rel, &format!("{alias}/ is read-only for you; your change stays here")));
+                // Keep the base row exactly as it was. Without this the file has no base at the
+                // next sync, which reads as "in the store and on disk, unrelated" — a conflict,
+                // on a file the reader was told would simply be left alone.
+                plan.hold.push(rel);
             }
             (Some(false), Some(true)) => plan.to_textdb.push((rel, t.map(|t| t.version))),
+            // Both sides changed, under a share this account can only read. A conflict is the
+            // right answer for an `rw` share — resolve it and push — but here the reader can
+            // never push, so markers would sit in the file for ever and every later sync would
+            // conflict again. The local text is kept as it is and the store's newer version is
+            // simply not pulled while it stands, which is the same rule as G3 applied to a file
+            // that also moved centrally.
+            (Some(true), Some(true)) if denied_share_of(&read_only, &rel).is_some() => {
+                let alias = denied_share_of(&read_only, &rel).unwrap_or_default();
+                report.kept.push(note(
+                    &rel,
+                    &format!("changed here and in textdb, and {alias}/ is read-only for you; your version is kept"),
+                ));
+                plan.hold.push(rel);
+            }
             (Some(true), Some(true)) => {
                 // A file that is binary on disk now is not merged: conflict markers would destroy it,
                 // and merged bytes would pass it into the store. Both sides keep what they have.
@@ -1558,6 +1576,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             (None, Some(false)) if denied_share_of(&denied, &rel).is_some() => {
                 let alias = denied_share_of(&denied, &rel).unwrap_or_default();
                 report.kept.push(note(&rel, &format!("{alias}/ is no longer shared with you; left alone")));
+                plan.hold.push(rel);
             }
             (None, Some(false)) => plan.disk_delete.push(rel),
             (Some(false), None) => plan.textdb_delete.push(rel),

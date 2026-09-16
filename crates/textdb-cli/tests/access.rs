@@ -1631,7 +1631,10 @@ fn g_a_revoked_share_leaves_the_disk_alone() {
         let out = ok(f.as_("accounts-agent").args(["sync"]).current_dir(&kb), None).stdout;
         assert!(out.contains("left alone") && out.contains("products"), "G8: {out}");
         assert!(kb.join("products/roadmap.md").is_file(), "G8: nothing deleted");
-        assert!(!out.contains("deleted"), "G8: {out}");
+        // The summary line always carries the words "0 deleted", so their absence could never
+        // hold; what matters is that no file was listed for deletion on either side.
+        assert!(!out.contains("disk deleted") && !out.contains("textdb deleted"), "G8: {out}");
+        assert!(out.contains("0 deleted; textdb 0 new, 0 changed, 0 deleted"), "G8: {out}");
     });
 }
 
