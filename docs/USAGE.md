@@ -15,8 +15,8 @@ demand and moved or deleted as subtrees; deletes are tombstones (history stays r
 
 | View | Columns | Writable |
 |---|---|---|
-| `kb.file` | `id, path, name, parent_path, content, version, nbytes, nlines, frontmatter, updated_at, updated_by, base_version` | INSERT (upsert), UPDATE `content` / `path` / `updated_by`, DELETE |
-| `kb.folder` | `id, path, name, parent_path, n_children, nbytes_total, updated_at` | INSERT (mkdir -p), UPDATE `path`, DELETE |
+| `kb.file` | the minimal listing tier — `path, name, kind, version, nbytes, nlines, updated_at, updated_by` — plus `id, dir, content, frontmatter, base_version` | INSERT (upsert), UPDATE `content` / `path` / `updated_by`, DELETE |
+| `kb.folder` | the full listing record, folders only (`kb.entry` filtered); `n_children` and `nbytes_total` are now `files + folders` and `nbytes` | INSERT (mkdir -p), UPDATE `path`, DELETE |
 | `kb.file_version` | `id, path, version, content, parent_version, author, ts, message` | read-only |
 
 ```sql

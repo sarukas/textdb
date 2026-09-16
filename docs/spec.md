@@ -199,9 +199,17 @@ Trait `StructureExtractor { fn extract(&self, bytes) -> Structure }` producing s
 
 - Loadable extension via `rusqlite` `vtab` module.
 - `CREATE VIRTUAL TABLE kb USING textdb(store='kb_')` creates shadow tables `kb_node`, `kb_chunk`, `kb_tree_node`, `kb_commit`, `kb_section`, `kb_link`, and `kb_fts` (FTS5, external-content on `kb_chunk`).
-- Virtual table columns: `id, path, name, parent_path, kind, content, version, nbytes, nlines, updated_at`.
+- Virtual table columns: the minimal listing tier plus what only the writable table has —
+  `path, name, kind, version, nbytes, nlines, updated_at, updated_by, id, dir, content`. A folder's
+  `nbytes`/`nlines` are the totals below it, not NULL.
 - `xUpdate` implements INSERT (create, `mkdir -p`), UPDATE of `content` (diff OLD/NEW → edit set → commit with rebase), UPDATE of `path` (move), DELETE (tombstone).
-- Table-valued functions: `textdb_ls(path[, recursive])` (with word counts, authors and folder totals, see `docs/live-app.md`), `textdb_search(query, prefix)`, `textdb_history(path)`, `textdb_lines(path, from, to)`, `textdb_section(path, heading)`, `textdb_diff(path, v1, v2)`, `textdb_content(path, version)`.
+- Table-valued functions: `textdb_ls(path[, recursive])` and `textdb_entry(path)`, both returning the
+  full listing record `path, name, kind, version, nbytes, nlines, updated_at, updated_by, id, dir, depth, ext, title, nwords, nsections, nprops, nlinks, nlinks_broken, versions, created_at, files, folders, nauthors, authors` in that order;
+  `textdb_search(query, prefix, limit, per_file)` returning one row per matching line as
+  `path, version, line, text, section, score, more`; `textdb_history(path)`, `textdb_lines(path, from, to)`,
+  `textdb_section(path, heading)`, `textdb_outline(path, heading, match, level, limit)`,
+  `textdb_headings(path, starts, limit)`, `textdb_prop_keys/values/find`, `textdb_diff(path, v1, v2)`,
+  `textdb_content(path, version)`.
 - Single writer per connection is accepted; this stage validates algorithms, not concurrency.
 
 ### 7.2 Postgres (`textdb-pg`) — Stage 3
@@ -211,9 +219,8 @@ pgrx extension. Schema `kb`.
 Views (updatable via `INSTEAD OF` triggers):
 
 ```
-kb.folder       (id, path, name, parent_path, n_children, nbytes_total, updated_at)
-kb.file         (id, path, name, parent_path, content, version, nbytes, nlines,
-                 frontmatter, updated_at, updated_by)
+kb.entry        the full listing record (below); kb.folder is it filtered to folders
+kb.file         the minimal tier plus id, dir, content, frontmatter, base_version
 kb.file_version (id, path, version, content, parent_version, author, ts, message)
 ```
 
@@ -227,9 +234,11 @@ edit(kb.file, old text, new text) → bigint   -- strict: old must be unique; ra
 append(kb.file, text) → bigint
 diff(kb.file, bigint, bigint) → text
 kb.ls(path, recursive boolean DEFAULT false) → SETOF kb.entry
-                                        -- id, parent_id, path, name, kind, nbytes, nlines, nwords, versions,
-                                        -- updated_at, updated_by, created_at, files, folders, nauthors, authors jsonb;
-                                        -- a folder's figures total everything below it
+                                        -- path, name, kind, version, nbytes, nlines, updated_at, updated_by,
+                                        -- id, dir, depth, ext, title, nwords, nsections, nprops, nlinks,
+                                        -- nlinks_broken, versions, created_at, files, folders, nauthors,
+                                        -- authors jsonb — the same columns in the same order as SQLite's
+                                        -- textdb_ls. A folder's figures total everything below it.
 kb.compact_folder_totals() → bigint     -- fold kb.folder_delta into the folder rows (maintenance)
 kb.rebuild_folder_totals() → void       -- recompute every folder's totals from its files
 kb.search(tsquery text, prefix text) → TABLE(path, line, snippet, rank)

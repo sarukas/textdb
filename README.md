@@ -126,4 +126,5 @@ backend cannot post a fast number. See [`bench/README.md`](bench/README.md) for 
 the ten test families and what each measures.
 
 Front-matter property search is documented in [`docs/properties.md`](docs/properties.md), and
-markdown heading outlines in [`docs/outlines.md`](docs/outlines.md).
+markdown heading outlines in [`docs/outlines.md`](docs/outlines.md). What every listing and
+search surface returns, key for key, is [`docs/shapes.md`](docs/shapes.md).
