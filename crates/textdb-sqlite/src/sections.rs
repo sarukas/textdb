@@ -180,20 +180,25 @@ fn fold_range(s: &str) -> (String, String) {
 
 /// Fill `heading` and `heading_lc` for rows written by a build that had no such columns.
 ///
-/// The last component of the stored `heading_path` is exactly what the extractor would have
-/// written, so this recovers them without reading a single document. Splitting is done here
-/// rather than in SQL because SQLite has no "substring after the last occurrence" and the
-/// expressions that fake one are wrong on headings that themselves contain `" / "`.
+/// `heading_path` is a lossy join — a heading may itself contain `" / "`, and then splitting
+/// on the last separator is simply wrong (`Top / Child / With Slash` is a *two*-level path
+/// whose leaf is `Child / With Slash`, not `With Slash`). The components are still recoverable
+/// exactly, though, without reading a single document: a section's parent always appears
+/// before it in document order and its `heading_path` is exactly this one's prefix, so the
+/// heading is what remains after the longest earlier path in the same file that this one
+/// continues.
 ///
-/// Word counts cannot be recovered this way — they need the bytes. They stay `NULL` until a
-/// document is next written, or until `rebuild_counts` does the store in one pass.
+/// Word counts cannot be recovered this way — they need the bytes — and stay `NULL` until a
+/// document is next written.
 pub fn backfill(conn: &Connection, p: &str) -> Result<usize> {
-    let pending: Vec<(i64, String)> = {
+    let pending: Vec<(i64, i64, String)> = {
         let mut st = conn
-            .prepare(&format!("SELECT rowid, heading_path FROM {p}section WHERE heading = ''"))
+            .prepare(&format!(
+                "SELECT rowid, file_id, heading_path FROM {p}section WHERE heading = '' ORDER BY file_id, line_from"
+            ))
             .map_err(sql_err)?;
         let rows = st
-            .query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?)))
             .map_err(sql_err)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)?
     };
@@ -203,9 +208,59 @@ pub fn backfill(conn: &Connection, p: &str) -> Result<usize> {
     let mut set = conn
         .prepare(&format!("UPDATE {p}section SET heading = ?1, heading_lc = ?2 WHERE rowid = ?3"))
         .map_err(sql_err)?;
-    for (rowid, path) in &pending {
-        let last = path.rsplit(" / ").next().unwrap_or(path);
-        set.execute(params![last, last.to_lowercase(), rowid]).map_err(sql_err)?;
+    let mut file = i64::MIN;
+    let mut seen: Vec<String> = Vec::new();
+    for (rowid, file_id, path) in &pending {
+        if *file_id != file {
+            file = *file_id;
+            seen.clear();
+        }
+        let heading = leaf_of(path, &seen);
+        set.execute(params![heading, heading.to_lowercase(), rowid]).map_err(sql_err)?;
+        seen.push(path.clone());
     }
     Ok(pending.len())
+}
+
+/// The last component of `path` given the paths of the sections before it in the same file.
+///
+/// The longest `ancestors` entry that `path` continues is its parent, so whatever follows it
+/// is the heading — separator characters in the heading included.
+fn leaf_of<'a>(path: &'a str, ancestors: &[String]) -> &'a str {
+    ancestors
+        .iter()
+        .filter(|a| path.len() > a.len() + 3 && path.starts_with(a.as_str()) && path[a.len()..].starts_with(" / "))
+        .max_by_key(|a| a.len())
+        .map_or(path, |a| &path[a.len() + 3..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::leaf_of;
+
+    #[test]
+    fn a_heading_containing_the_separator_survives_the_round_trip() {
+        let mut seen: Vec<String> = Vec::new();
+        let cases = [
+            ("Top", "Top"),
+            // The leaf here is `Child / With Slash`: a two-level path, not a three-level one.
+            ("Top / Child / With Slash", "Child / With Slash"),
+            ("Top / Child / With Slash / Deep", "Deep"),
+            // A sibling at the top level starts a new branch.
+            ("Second", "Second"),
+            ("Second / Leaf", "Leaf"),
+        ];
+        for (path, want) in cases {
+            assert_eq!(leaf_of(path, &seen), want, "{path}");
+            seen.push(path.to_string());
+        }
+    }
+
+    #[test]
+    fn a_path_that_merely_starts_like_another_is_not_its_child() {
+        let seen = vec!["Top".to_string()];
+        // `Topic` starts with `Top` but does not continue it.
+        assert_eq!(leaf_of("Topic", &seen), "Topic");
+        assert_eq!(leaf_of("Top / A", &seen), "A");
+    }
 }
