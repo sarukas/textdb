@@ -1158,7 +1158,12 @@ fn d_a_deleted_share_root_is_dormant_rather_than_gone() {
         refused(&out, FORBIDDEN, "TX005");
         assert!(out.stderr.contains("no longer available") || out.stderr.contains("root share"), "D11: {}", out.stderr);
 
-        // D12: restored, the grants revive with the same alias.
+        // D12: restored, the grants revive with the same alias. The store's trash is SQLite's
+        // alone — Postgres has none yet (docs/assets.md) — so the half of D12 that needs one runs
+        // where there is one. Dormancy itself, which is what D11 is about, is on both.
+        if f.engine() != Engine::Sqlite {
+            return;
+        }
         let trashed = ok(f.as_("admin").args(["--json", "trash", "ls"]), None).json();
         let entry = trashed.as_array().unwrap().iter().find(|e| e["path"] == "/legal/contracts").expect("D12");
         let id = entry["id"].as_i64().expect("D12: a trash id");

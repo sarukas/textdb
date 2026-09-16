@@ -37,6 +37,18 @@ mod search;
 mod sql_query;
 mod sync;
 
+#[derive(clap::Subcommand)]
+enum TrashCmd {
+    /// The trash, newest delete first; with an ID, what went to the trash inside that folder.
+    Ls {
+        /// A trashed folder's id: its own entries rather than the top-level items.
+        parent: Option<i64>,
+    },
+    /// Put a trash entry back where it was, with everything that went with it. Refused, changing
+    /// nothing, when something is at that path already.
+    Restore { id: i64 },
+}
+
 #[derive(Parser)]
 #[command(
     name = "textdb",
@@ -327,6 +339,12 @@ enum Cmd {
         /// Say what reverting would do, without changing anything.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// What was deleted and not yet purged: `trash ls`, and `trash restore ID` to put one back
+    /// where it was with everything that went with it. SQLite stores.
+    Trash {
+        #[command(subcommand)]
+        cmd: TrashCmd,
     },
     /// List one folder.
     Ls {
@@ -818,6 +836,30 @@ fn run(mut cli: Cli, matches: &ArgMatches) -> Result<()> {
             let options = sql_query::SqlOptions { write, dry_run, full, format };
             sql_query::run(st, &statement, &params, author, options)
         }
+        Cmd::Trash { cmd } => match cmd {
+            TrashCmd::Ls { parent } => {
+                let rows = st.trash(parent)?;
+                if json {
+                    return emit_json(&rows);
+                }
+                let mut s = String::new();
+                for r in &rows {
+                    let by = r.deleted_by.as_deref().unwrap_or("-");
+                    s.push_str(&format!("{:>8}  {:<6} {:<40} {} by {by}\n", r.id, r.kind, r.path, r.deleted_at));
+                }
+                if rows.is_empty() {
+                    s.push_str("the trash is empty\n");
+                }
+                out(s.as_bytes())
+            }
+            TrashCmd::Restore { id } => {
+                let r = st.trash_restore(id, author)?;
+                if json {
+                    return emit_json(&r);
+                }
+                out(format!("restored {} {}\n", r.kind, r.path).as_bytes())
+            }
+        },
         Cmd::RevertBatch {
             batch,
             skip_changed,

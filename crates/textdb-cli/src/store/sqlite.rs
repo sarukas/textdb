@@ -11,7 +11,8 @@ use textdb_sqlite::{normalize_path, TextDb, DEFAULT_PREFIX};
 
 use super::{
     AccountRow, Author, BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, MovedBack,
-    PathEvent, RestoredFile, Result, RevertOutcome, Share, ShareRow, SqlResult, Store, StoreError, SyncBase, TokenRow, Whoami, Written,
+    PathEvent, RestoredFile, Result, RevertOutcome, Share, ShareRow, SqlResult, Store, StoreError, SyncBase, TokenRow, TrashRow, Whoami,
+    Written,
 };
 
 pub struct SqliteStore {
@@ -878,6 +879,14 @@ impl Store for SqliteStore {
             .collect())
     }
 
+    fn trash(&mut self, parent: Option<i64>) -> Result<Vec<TrashRow>> {
+        Ok(self.db().trash(parent)?.into_iter().map(trash_row).collect())
+    }
+
+    fn trash_restore(&mut self, id: i64, author: Option<&str>) -> Result<TrashRow> {
+        Ok(trash_row(self.db().restore(id, author)?))
+    }
+
     fn set_session_path_history(&mut self, on: Option<bool>) -> Result<()> {
         self.path_history = on;
         Ok(())
@@ -1294,6 +1303,23 @@ impl Store for SqliteStore {
 fn new_batch_id(conn: &Connection) -> Result<String> {
     conn.query_row("SELECT strftime('%Y%m%d-%H%M%S', 'now') || '-' || lower(hex(randomblob(2)))", [], |r| r.get(0))
         .map_err(sql)
+}
+
+fn trash_row(e: textdb_sqlite::trash::TrashEntry) -> TrashRow {
+    TrashRow {
+        id: e.id,
+        name: e.name,
+        kind: if e.kind == 1 { "file".into() } else { "folder".into() },
+        path: e.path,
+        version: e.version,
+        nbytes: e.nbytes,
+        nlines: e.nlines,
+        files: e.files,
+        updated_at: e.updated_at,
+        updated_by: e.updated_by,
+        deleted_at: e.deleted_at,
+        deleted_by: e.deleted_by,
+    }
 }
 
 fn batch_change(i: textdb_sqlite::bulk::BatchItem) -> BatchChange {

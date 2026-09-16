@@ -606,6 +606,30 @@ pub struct ShareRow {
     pub dormant: bool,
 }
 
+/// One item in the trash: what it was, and the delete it went with.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrashRow {
+    pub id: i64,
+    pub name: String,
+    /// `file` or `folder`.
+    pub kind: String,
+    /// Where it was when it was deleted, in the caller's own paths.
+    pub path: String,
+    pub version: i64,
+    pub nbytes: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nlines: Option<i64>,
+    /// 1 for a file; for a folder, the files deleted with it.
+    pub files: i64,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
+    /// Empty for an entry that has just been restored.
+    pub deleted_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_by: Option<String>,
+}
+
 /// Who this connection is.
 #[derive(Debug, Serialize)]
 pub struct Whoami {
@@ -713,6 +737,20 @@ pub trait Store {
     /// Make the store usable: create what is missing, upgrade what is old.
     fn init(&mut self) -> Result<()>;
     /// Every folder and file under `prefix` (not `prefix` itself unless it is a file).
+    /// The trash: what was deleted and not yet purged, newest delete first; with `parent`, the
+    /// entries that went to the trash inside that trashed folder.
+    ///
+    /// SQLite only. Postgres has no trash yet (docs/assets.md), so the backend says so rather
+    /// than answering an empty list, which would read as "nothing is deleted".
+    fn trash(&mut self, _parent: Option<i64>) -> Result<Vec<TrashRow>> {
+        Err(StoreError::invalid("this store has no trash"))
+    }
+
+    /// Put a trash entry back where it was, with everything that went to the trash with it.
+    fn trash_restore(&mut self, _id: i64, _author: Option<&str>) -> Result<TrashRow> {
+        Err(StoreError::invalid("this store has no trash"))
+    }
+
     fn nodes(&mut self, prefix: &str) -> Result<Vec<Entry>>;
     /// The folder's entries by name, or with `recursive` everything below it by path. A folder's
     /// size, lines, words and versions are totals over the files below it.
