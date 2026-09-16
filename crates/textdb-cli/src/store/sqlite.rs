@@ -282,6 +282,11 @@ impl Store for SqliteStore {
         let now = textdb_sqlite::SqliteStorage::now();
         match acl::authenticate(&self.conn, DEFAULT_PREFIX, bearer, &now).map_err(StoreError::from)? {
             Ok(view) => {
+                // Bound to the connection as well as kept here: the virtual table and the
+                // `textdb_*` table functions run inside SQLite with only the handle to go on,
+                // and a session they cannot find is the owner's (#12 K3, K9).
+                textdb_sqlite::access::set_session(unsafe { self.conn.handle() } as usize, view.clone());
+                install_raw_table_guard(&self.conn, DEFAULT_PREFIX)?;
                 self.view = view;
                 Ok(())
             }
@@ -1065,7 +1070,8 @@ impl Store for SqliteStore {
     }
 
     fn sql(&mut self, query: &str, params: &[String], author: Option<&str>, write: bool, dry_run: bool) -> Result<SqlResult> {
-        self.conn.execute_batch(&sql_views(DEFAULT_PREFIX)).map_err(sql)?;
+        let views = sql_views(DEFAULT_PREFIX, &self.view);
+        self.conn.execute_batch(&views).map_err(sql)?;
         let before = self.db().last_seq()?;
         let batch = if write { Some(new_batch_id(&self.conn)?) } else { None };
         // Read-only covers everything the statement runs, the textdb functions' own writes
@@ -1301,13 +1307,35 @@ fn batch_change(i: textdb_sqlite::bulk::BatchItem) -> BatchChange {
     }
 }
 
-fn sql_views(p: &str) -> String {
-    format!(
-        "-- `files` and `folders` are the canonical listing record filtered by kind: the same
-         -- columns in the same order as textdb_ls, textdb_entry and kb.entry. `folders.parent`
-         -- is `dir` now, the one name for it on every surface.
-         CREATE TEMP VIEW IF NOT EXISTS files AS
-           SELECT
+/// The views `textdb sql` offers, built for one connection's view of the store.
+///
+/// Every one of them reads `textdb_nodes`, which is the node table with the account's paths and
+/// nothing it cannot see. For the owner that view is the table — same expression, same predicate,
+/// so SQLite flattens it away and the plan is what it was before accounts existed. For a token
+/// session the filter and the translation are written into the definition rather than applied by
+/// each query, which is what keeps `files`, `commits` and the rest honest without every one of
+/// them having to remember (#12 K).
+///
+/// Dropped and made again on each `sql` call: a connection that authenticates in the middle of
+/// its life must not keep the views it had before.
+fn sql_views(p: &str, view: &textdb_core::access::View) -> String {
+    use textdb_sqlite::access::{to_view_literal, view_name_literal, visible_literal};
+    let path_expr = to_view_literal(view, "path").unwrap_or_else(|| "path".to_string());
+    let name_expr = view_name_literal(view, "path", "name").unwrap_or_else(|| "name".to_string());
+    let vis = visible_literal(view, "path").map(|v| format!(" AND ({v})")).unwrap_or_default();
+    // The node columns every view below draws on, less `path` and `name`, which the two
+    // expressions above replace, and less the internal ones (`parent_id`, `root`, `deleted_at`)
+    // that no surface has ever shown.
+    const REST: &str = "id, kind, version, nbytes, nlines, nwords, nauthors, created_at, updated_at, updated_by, \
+                        title, nsections, nprops, nlinks, nlinks_broken, \
+                        t_files, t_folders, t_bytes, t_lines, t_words, t_versions, t_sections, t_props, \
+                        t_links, t_links_broken, t_updated_at";
+    // `files` and `folders` are the canonical listing record filtered by kind: the same columns
+    // in the same order as textdb_ls, textdb_entry and kb.entry. `folders.parent` is `dir` now,
+    // the one name for it on every surface.
+    let listing = |kind: i64| {
+        format!(
+            "SELECT
                   path, name,
                   CASE kind WHEN 1 THEN 'file' ELSE 'folder' END AS kind,
                   CASE kind WHEN 1 THEN version END AS version,
@@ -1331,58 +1359,54 @@ fn sql_views(p: &str) -> String {
                   CASE kind WHEN 0 THEN t_files END AS files,
                   CASE kind WHEN 0 THEN t_folders END AS folders,
                   coalesce(nauthors, 0) AS nauthors
-           FROM {p}node WHERE kind = 1 AND deleted_at IS NULL
+           FROM textdb_nodes WHERE kind = {kind}"
+        )
+    };
+    format!(
+        "DROP VIEW IF EXISTS temp.textdb_nodes;
+         DROP VIEW IF EXISTS temp.files; DROP VIEW IF EXISTS temp.folders;
+         DROP VIEW IF EXISTS temp.frontmatter; DROP VIEW IF EXISTS temp.sections;
+         DROP VIEW IF EXISTS temp.links; DROP VIEW IF EXISTS temp.properties;
+         DROP VIEW IF EXISTS temp.commits; DROP VIEW IF EXISTS temp.authors;
+         CREATE TEMP VIEW textdb_nodes AS
+           SELECT {path_expr} AS path, {name_expr} AS name, {REST}
+           FROM {p}node WHERE deleted_at IS NULL{vis};
+         CREATE TEMP VIEW files AS
+           {files}
            -- No limit really, but a view with one is not flattened into a query with a WHERE: without
            -- it SQLite may call `textdb_content(path)` in that WHERE on folder rows, which fails.
            LIMIT -1;
-         CREATE TEMP VIEW IF NOT EXISTS folders AS
-           SELECT
-                  path, name,
-                  CASE kind WHEN 1 THEN 'file' ELSE 'folder' END AS kind,
-                  CASE kind WHEN 1 THEN version END AS version,
-                  CASE kind WHEN 1 THEN coalesce(nbytes, 0) ELSE t_bytes END AS nbytes,
-                  CASE kind WHEN 1 THEN coalesce(nlines, 0) ELSE t_lines END AS nlines,
-                  CASE WHEN kind = 0 AND t_updated_at > updated_at THEN t_updated_at ELSE updated_at END AS updated_at,
-                  updated_by, id,
-                  CASE WHEN path = '/' THEN NULL WHEN length(path) = length(name) + 1 THEN '/'
-                       ELSE substr(path, 1, length(path) - length(name) - 1) END AS dir,
-                  CASE WHEN path = '/' THEN 0 ELSE length(path) - length(replace(path, '/', '')) END AS depth,
-                  CASE WHEN kind = 1 AND name GLOB '?*.*'
-                       THEN lower(substr(name, length(rtrim(name, replace(name, '.', ''))) + 1)) END AS ext,
-                  title,
-                  CASE kind WHEN 1 THEN coalesce(nwords, 0) ELSE t_words END AS nwords,
-                  CASE kind WHEN 1 THEN nsections ELSE t_sections END AS nsections,
-                  CASE kind WHEN 1 THEN nprops ELSE t_props END AS nprops,
-                  CASE kind WHEN 1 THEN nlinks ELSE t_links END AS nlinks,
-                  CASE kind WHEN 1 THEN nlinks_broken ELSE t_links_broken END AS nlinks_broken,
-                  CASE kind WHEN 1 THEN version ELSE t_versions END AS versions,
-                  created_at,
-                  CASE kind WHEN 0 THEN t_files END AS files,
-                  CASE kind WHEN 0 THEN t_folders END AS folders,
-                  coalesce(nauthors, 0) AS nauthors
-           FROM {p}node WHERE kind = 0 AND deleted_at IS NULL;
-         CREATE TEMP VIEW IF NOT EXISTS frontmatter AS
-           SELECT n.path, f.data FROM {p}frontmatter f JOIN {p}node n ON n.id = f.file_id AND n.deleted_at IS NULL;
-         CREATE TEMP VIEW IF NOT EXISTS sections AS
+         CREATE TEMP VIEW folders AS
+           {folders};
+         CREATE TEMP VIEW frontmatter AS
+           SELECT n.path, f.data FROM {p}frontmatter f JOIN textdb_nodes n ON n.id = f.file_id;
+         CREATE TEMP VIEW sections AS
            SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to,
                   s.heading AS title, s.nwords, s.nwords_total,
                   n.nbytes, n.nlines, n.nwords AS file_nwords, n.version, n.updated_at, n.updated_by
-           FROM {p}section s JOIN {p}node n ON n.id = s.file_id AND n.deleted_at IS NULL;
-         CREATE TEMP VIEW IF NOT EXISTS links AS
-           SELECT n.path, n.version, l.line, coalesce(l.kind, '') AS kind, l.target_path AS target, l.anchor, l.alias, l.status,
+           FROM {p}section s JOIN textdb_nodes n ON n.id = s.file_id;
+         CREATE TEMP VIEW links AS
+           SELECT n.path, n.version, l.line, coalesce(l.kind, '') AS kind,
+                  -- A target this account cannot see is the id reference its content reads as,
+                  -- never the path the link was written with (#12 E).
+                  CASE WHEN l.resolved_id IS NOT NULL AND r.id IS NULL THEN 'textdb:' || l.resolved_id
+                       ELSE l.target_path END AS target,
+                  l.anchor, l.alias, l.status,
                   CASE WHEN r.path LIKE '%.tdbasset' THEN substr(r.path, 1, length(r.path) - 9) ELSE r.path END AS resolved,
                   r.path LIKE '%.tdbasset' AS asset
-           FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL
-           LEFT JOIN {p}node r ON r.id = l.resolved_id AND r.deleted_at IS NULL;
-         CREATE TEMP VIEW IF NOT EXISTS properties AS
+           FROM {p}link l JOIN textdb_nodes n ON n.id = l.file_id
+           LEFT JOIN textdb_nodes r ON r.id = l.resolved_id;
+         CREATE TEMP VIEW properties AS
            SELECT n.path, r.key, r.val_txt AS value, r.val_num AS number, r.ord
-           FROM {p}property r JOIN {p}node n ON n.id = r.file_id AND n.deleted_at IS NULL;
-         CREATE TEMP VIEW IF NOT EXISTS commits AS
+           FROM {p}property r JOIN textdb_nodes n ON n.id = r.file_id;
+         CREATE TEMP VIEW commits AS
            SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines, c.nwords, c.batch
-           FROM {p}commit c JOIN {p}node n ON n.id = c.file_id AND n.deleted_at IS NULL;
-         CREATE TEMP VIEW IF NOT EXISTS authors AS
+           FROM {p}commit c JOIN textdb_nodes n ON n.id = c.file_id;
+         CREATE TEMP VIEW authors AS
            SELECT n.path, nullif(a.author, '') AS author, a.commits, a.first_ts, a.last_ts
-           FROM {p}file_author a JOIN {p}node n ON n.id = a.file_id AND n.deleted_at IS NULL;"
+           FROM {p}file_author a JOIN textdb_nodes n ON n.id = a.file_id;",
+        files = listing(1),
+        folders = listing(0),
     )
 }
 
@@ -1400,9 +1424,25 @@ fn sql_value(v: rusqlite::types::ValueRef) -> serde_json::Value {
     }
 }
 
-/// A statement's own error: the SQL is the caller's, so it is reported as invalid input.
+/// A statement's own error: the SQL is the caller's, so it is reported as invalid input —
+/// unless the store itself refused a row, in which case the answer is the store's.
+///
+/// A virtual table or a `textdb_*` function raises through SQLite, which wraps the message and
+/// loses the kind. The message still opens with the code, so a write refused for want of rights
+/// is `TX005 forbidden` here as it is everywhere else, and exits 7 rather than 2 (#12 C, K).
 fn statement_error(e: rusqlite::Error, write: bool) -> StoreError {
     let message = e.to_string();
+    if let Some(at) = message.find("TX00") {
+        let code = &message[at..(at + 5).min(message.len())];
+        let rest = message[at..].to_string();
+        match code {
+            "TX001" => return StoreError::conflict(rest),
+            "TX002" => return StoreError::contention(rest),
+            "TX003" => return StoreError::not_found(rest),
+            "TX005" => return StoreError::forbidden(rest),
+            _ => {}
+        }
+    }
     if !write && message.contains("readonly") {
         StoreError::invalid(format!("{message}: this statement changes the store; run it with --write"))
     } else {
@@ -1410,9 +1450,60 @@ fn statement_error(e: rusqlite::Error, write: bool) -> StoreError {
     }
 }
 
+// Whether the statement being compiled is the caller's own, and the name of the table an
+// authorizer refused it.
+//
+// The authorizer below fires for *every* statement this connection compiles, the virtual table's
+// own reads of `kb_node` included, and those are the implementation rather than the caller. They
+// are compiled while a statement runs; the caller's is compiled here, between these two calls,
+// which is the difference the flag records.
+thread_local! {
+    static COMPILING_CALLER_SQL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REFUSED_TABLE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Refuse a token session the store's own tables (#12 K2).
+///
+/// `kb` and the `textdb_*` functions are the surface; `kb_node`, `kb_commit`, `kb_grant` and the
+/// rest are the owner's, and reading them would walk straight past every filter this feature
+/// adds. The views `sql_views` defines read them too, which is why the accessor decides: SQLite
+/// names the view a read came through, and a read with no view behind it is the caller's own.
+fn install_raw_table_guard(conn: &Connection, prefix: &str) -> Result<()> {
+    let prefix = prefix.to_string();
+    conn.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+        use rusqlite::hooks::{AuthAction, Authorization};
+        if !COMPILING_CALLER_SQL.with(std::cell::Cell::get) || ctx.accessor.is_some() {
+            return Authorization::Allow;
+        }
+        let table = match ctx.action {
+            AuthAction::Read { table_name, .. } => table_name,
+            AuthAction::Insert { table_name } | AuthAction::Update { table_name, .. } => table_name,
+            AuthAction::Delete { table_name } | AuthAction::DropTable { table_name } => table_name,
+            AuthAction::AlterTable { table_name, .. } => table_name,
+            _ => return Authorization::Allow,
+        };
+        if !table.starts_with(&prefix) {
+            return Authorization::Allow;
+        }
+        REFUSED_TABLE.with(|t| *t.borrow_mut() = Some(table.to_string()));
+        Authorization::Deny
+    }))
+    .map_err(sql)
+}
+
 fn run_sql(conn: &Connection, query: &str, params: &[String], author: Option<&str>, write: bool) -> Result<SqlResult> {
     let fail = |e: rusqlite::Error| statement_error(e, write);
-    let mut stmt = conn.prepare(query).map_err(fail)?;
+    REFUSED_TABLE.with(|t| *t.borrow_mut() = None);
+    COMPILING_CALLER_SQL.with(|f| f.set(true));
+    let compiled = conn.prepare(query);
+    COMPILING_CALLER_SQL.with(|f| f.set(false));
+    if let Some(table) = REFUSED_TABLE.with(|t| t.borrow_mut().take()) {
+        return Err(StoreError::forbidden(format!(
+            "{table} is the store's own table and is not yours to read; the views and `kb` are ({})",
+            "files, folders, commits, links, properties, sections, authors, frontmatter"
+        )));
+    }
+    let mut stmt = compiled.map_err(fail)?;
     if !write && !stmt.readonly() {
         return Err(StoreError::invalid("this statement changes the store; run it with --write"));
     }

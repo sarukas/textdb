@@ -801,15 +801,18 @@ fn run(mut cli: Cli, matches: &ArgMatches) -> Result<()> {
             file,
             format,
         } => {
-            let statement = match (file, query.as_deref()) {
+            // `-f -` is stdin, as `sql -` already is: the same convention, so a statement piped
+            // in does not have to be a file first.
+            let stdin_file = file.as_deref().is_some_and(|f| f.as_os_str() == "-");
+            let statement = match (file.filter(|_| !stdin_file), query.as_deref()) {
                 (Some(file), _) => String::from_utf8(read_file(&file)?)
                     .map_err(|_| StoreError::invalid(format!("{} is not UTF-8 text", file.display())))?,
-                (None, None | Some("-")) => {
+                (None, Some(text)) if !stdin_file && text != "-" => text.to_string(),
+                (None, _) => {
                     let mut text = String::new();
                     std::io::stdin().read_to_string(&mut text)?;
                     text
                 }
-                (None, Some(text)) => text.to_string(),
             };
             let format = if json { sql_query::SqlFormat::Json } else { format };
             let options = sql_query::SqlOptions { write, dry_run, full, format };

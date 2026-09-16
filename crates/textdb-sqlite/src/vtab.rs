@@ -288,11 +288,8 @@ impl UpdateVTab<'_> for KbTab {
         let id = ref_i64(arg).ok_or_else(|| Error::ModuleError("bad rowid".into()))?;
         let conn = self.conn();
         let db = TextDb::attach(&conn, &self.prefix, false).with_view(crate::access::session(unsafe { conn.handle() } as usize));
-        let n = db
-            .node_by_id(id)
-            .map_err(map_err)?
-            .ok_or_else(|| Error::ModuleError(format!("TX003 not found: id {}", id)))?;
-        db.delete(&n.path).map_err(map_err)
+        let path = db.path_in_view(id).map_err(map_err)?.ok_or_else(|| Error::ModuleError(format!("TX003 not found: id {}", id)))?;
+        db.delete(&path).map_err(map_err)
     }
 
     fn insert(&mut self, args: &Inserts<'_>) -> Result<i64> {
@@ -309,16 +306,17 @@ impl UpdateVTab<'_> for KbTab {
             return db.ensure_folder(&path).map_err(map_err);
         }
         let body = content.unwrap_or_default();
-        // INSERT OR REPLACE / upsert semantics: existing path with content → update.
-        if db.node_by_path(&path).map_err(map_err)?.is_some() {
+        // INSERT OR REPLACE / upsert semantics: existing path with content → update. The path is
+        // the caller's, so what is there is asked for in the caller's own terms: reaching past
+        // the view to the node table with it would find nothing and make every write a create.
+        if db.entry(&path).is_ok() {
             db.update_content(&path, &body, None, author.as_deref(), message.as_deref())
                 .map_err(map_err)?;
         } else {
             db.create(&path, &body, author.as_deref(), message.as_deref())
                 .map_err(map_err)?;
         }
-        let n = db.node_by_path(&path).map_err(map_err)?.unwrap();
-        Ok(n.id)
+        Ok(db.entry(&path).map_err(map_err)?.id)
     }
 
     fn update(&mut self, args: &Updates<'_>) -> Result<()> {
@@ -329,7 +327,8 @@ impl UpdateVTab<'_> for KbTab {
             .node_by_id(id)
             .map_err(map_err)?
             .ok_or_else(|| Error::ModuleError(format!("TX003 not found: id {}", id)))?;
-        let mut path = n.path.clone();
+        // In the caller's own terms from here on, so every method below translates once.
+        let mut path = db.path_in_view(id).map_err(map_err)?.ok_or_else(|| Error::ModuleError(format!("TX003 not found: id {}", id)))?;
         if let Some(new_path) = value_str(args.get::<Value>(2 + COL_PATH as usize)?) {
             let new_path = normalize_path(&new_path).map_err(map_err)?;
             if new_path != path {
@@ -380,18 +379,38 @@ unsafe impl VTabCursor for KbCursor<'_> {
     fn filter(&mut self, idx_num: c_int, _idx_str: Option<&str>, args: &Filters<'_>) -> Result<()> {
         let prefix = &self.tab.prefix;
         let cols = "id, path, name, kind, root, version, nbytes, nlines, updated_at, updated_by, t_bytes, t_lines";
+        // This connection's account. Every path below is that account's, in and out: the equality
+        // it was given is one of its paths, the rows it gets back carry its paths, and what it
+        // cannot see is not in the answer at all (#12 K).
+        let view = crate::access::session(unsafe { self.tab.conn().handle() } as usize);
+        // A range or a scan cannot be narrowed by bounds written in the account's paths — they
+        // are not the store's — so it becomes a scan of what the account can see and SQLite
+        // applies the bounds itself, which it does anyway because `best_index` omits neither.
+        let idx_num = if view.is_admin() || idx_num == IDX_PATH_EQ || idx_num == IDX_ID_EQ { idx_num } else { IDX_SCAN };
+        let vis = crate::access::visible_sql(&view, "path");
+        let scan_where = match &vis {
+            None => "deleted_at IS NULL AND path <> '/'".to_string(),
+            Some((pred, _)) => format!("deleted_at IS NULL AND path <> '/' AND ({pred})"),
+        };
+        let scan_args: Vec<Value> = vis.as_ref().map(|(_, a)| a.clone()).unwrap_or_default();
         let (sql, params): (String, Vec<Value>) = match idx_num {
-            IDX_PATH_EQ => (
-                format!("SELECT {} FROM {}node WHERE path = ?1 AND deleted_at IS NULL", cols, prefix),
-                vec![Value::Text(
-                    normalize_path(&value_str(args.get::<Value>(0)?).unwrap_or_default()).unwrap_or_default(),
-                )],
-            ),
+            IDX_PATH_EQ => {
+                let asked = normalize_path(&value_str(args.get::<Value>(0)?).unwrap_or_default()).unwrap_or_default();
+                // Outside every share, or under one that may not be used: no such row here.
+                let store = match crate::access::to_store(&view, &asked) {
+                    Ok(p) => p,
+                    Err(_) => String::new(),
+                };
+                (
+                    format!("SELECT {} FROM {}node WHERE path = ?1 AND deleted_at IS NULL", cols, prefix),
+                    vec![Value::Text(store)],
+                )
+            }
             IDX_ID_EQ => (
                 format!("SELECT {} FROM {}node WHERE id = ?1 AND deleted_at IS NULL", cols, prefix),
                 vec![Value::Integer(value_i64(args.get::<Value>(0)?).unwrap_or(-1))],
             ),
-            n if n & IDX_PATH_RANGE != 0 => {
+            n if n & IDX_PATH_RANGE != 0 && view.is_admin() => {
                 // The bounds are widened to `>=` / `<=` whatever the caller wrote; `omit` was
                 // left false in `best_index` so SQLite re-applies the exact comparison.
                 let mut where_ = String::from("deleted_at IS NULL AND path <> '/'");
@@ -412,11 +431,8 @@ unsafe impl VTabCursor for KbCursor<'_> {
                 )
             }
             _ => (
-                format!(
-                    "SELECT {} FROM {}node WHERE deleted_at IS NULL AND path <> '/' ORDER BY path",
-                    cols, prefix
-                ),
-                Vec::new(),
+                format!("SELECT {} FROM {}node WHERE {} ORDER BY path", cols, prefix, scan_where),
+                scan_args,
             ),
         };
         // `prepare_cached` on the *table's* connection: the cache lives as long as the
@@ -440,9 +456,18 @@ unsafe impl VTabCursor for KbCursor<'_> {
                 t_lines: r.get(11)?,
             })
         };
-        self.rows = stmt
-            .query_map(rusqlite::params_from_iter(params), map)?
-            .collect::<Result<Vec<_>>>()?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), map)?.collect::<Result<Vec<_>>>()?;
+        // Out in the account's paths, and never a row it cannot see: an id equality and a scan
+        // both reach the whole table, so this is the filter as much as the translation.
+        self.rows = rows
+            .into_iter()
+            .filter_map(|mut r| {
+                let p = view.to_view(&r.path)?;
+                r.name = if p == "/" { "/".to_string() } else { crate::db::name_of(&p).to_string() };
+                r.path = p;
+                Some(r)
+            })
+            .collect();
         self.i = 0;
         Ok(())
     }

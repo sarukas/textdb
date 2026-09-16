@@ -408,6 +408,75 @@ pub fn writable_sql(view: &View, col: &str) -> Option<(String, Vec<rusqlite::typ
     Some((parts.join(" OR "), args))
 }
 
+/// A SQL string literal: the one place a store path is put into SQL text rather than bound.
+fn quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// [`visible_sql`] written with the paths inline instead of as parameters.
+///
+/// A view definition cannot carry parameters, so the three surfaces built out of views —
+/// `textdb sql`'s `files`, `folders`, `commits` and the rest — need the predicate as text. The
+/// values are store paths from the grant table, quoted by [`quote`]; nothing a caller typed
+/// reaches this.
+pub fn visible_literal(view: &View, col: &str) -> Option<String> {
+    if view.is_admin() {
+        return None;
+    }
+    let parts: Vec<String> = view
+        .grants()
+        .live()
+        .map(|g| {
+            let (lo, hi) = (format!("{}/", g.store_path), format!("{}0", g.store_path));
+            format!("({col} = {} OR ({col} >= {} AND {col} < {}))", quote(&g.store_path), quote(&lo), quote(&hi))
+        })
+        .collect();
+    Some(if parts.is_empty() { "0".to_string() } else { parts.join(" OR ") })
+}
+
+/// `View::to_view` as a SQL expression over `col`: the account's own path, or NULL where it sees
+/// nothing. `None` for the admin, for whom the column is already the answer.
+///
+/// The share root is the row whose path *is* the grant's; everything below keeps its tail. A
+/// single-root account's root is `/` and has no alias in front of it.
+pub fn to_view_literal(view: &View, col: &str) -> Option<String> {
+    use textdb_core::access::Namespace;
+    if view.is_admin() {
+        return None;
+    }
+    let single = view.namespace() == Namespace::SingleRoot;
+    let mut arms = String::new();
+    for g in view.grants().live() {
+        let (root, lo, hi) = (quote(&g.store_path), quote(&format!("{}/", g.store_path)), quote(&format!("{}0", g.store_path)));
+        let head = if single { String::new() } else { format!("/{}", g.alias) };
+        let root_is = if single { "/".to_string() } else { head.clone() };
+        arms.push_str(&format!(
+            " WHEN {col} = {root} THEN {} WHEN {col} >= {lo} AND {col} < {hi} THEN {} || substr({col}, {})",
+            quote(&root_is),
+            quote(&head),
+            g.store_path.len() + 1
+        ));
+    }
+    Some(if arms.is_empty() { "NULL".to_string() } else { format!("CASE{arms} END") })
+}
+
+/// The name a row has in this view: the alias where the row is a share root, its own name
+/// everywhere else. Below a share root a path's last segment does not change, so only the roots
+/// are named here.
+pub fn view_name_literal(view: &View, path_col: &str, name_col: &str) -> Option<String> {
+    use textdb_core::access::Namespace;
+    if view.is_admin() {
+        return None;
+    }
+    let single = view.namespace() == Namespace::SingleRoot;
+    let mut arms = String::new();
+    for g in view.grants().live() {
+        let name = if single { "/".to_string() } else { g.alias.clone() };
+        arms.push_str(&format!(" WHEN {path_col} = {} THEN {}", quote(&g.store_path), quote(&name)));
+    }
+    Some(if arms.is_empty() { name_col.to_string() } else { format!("CASE{arms} ELSE {name_col} END") })
+}
+
 /// Renumber the `?n` placeholders of a predicate so it can be appended after `offset` existing
 /// parameters. `visible_sql` numbers from 1 because most callers have no others.
 pub fn renumber(sql: &str, offset: usize) -> String {

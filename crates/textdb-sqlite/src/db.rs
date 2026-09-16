@@ -516,6 +516,13 @@ impl<'c> TextDb<'c> {
         self.view.to_view(p)
     }
 
+    /// The path a node has in this caller's view, or `None` when it has none — the node is gone,
+    /// or it is outside every share. For a surface that addresses rows by id (the `kb` table) and
+    /// must then speak paths.
+    pub fn path_in_view(&self, id: i64) -> Result<Option<String>> {
+        Ok(self.node_by_id(id)?.filter(|n| n.deleted_at.is_none()).and_then(|n| self.view_path(&n.path)))
+    }
+
     /// Translate an `Entry` in place, dropping it when the account cannot see it.
     pub(crate) fn to_view_entry(&self, mut e: Entry) -> Option<Entry> {
         if self.view.is_admin() {
@@ -2265,12 +2272,20 @@ impl TextDb<'_> {
         // name takes the index after it.
         let (vis_sql, vis_args) = match crate::access::visible_sql(&self.view, "path") {
             None => ("for_account IS NULL".to_string(), Vec::new()),
-            Some((pred, args)) => {
-                let me = 2 + args.len() + 1;
-                (
-                    format!("(for_account IS NULL AND ({})) OR for_account = ?{me}", crate::access::renumber(&pred, 2)),
-                    args,
-                )
+            Some((pred, mut args)) => {
+                // Either end of a move. A subtree that left the view has its new path outside it
+                // and its old path inside; one that arrived has it the other way round. Both are
+                // events here — a delete and a create — and taking the row on its new path alone
+                // would drop the first of them silently, which is the one that matters.
+                let (old_pred, old_args) = crate::access::visible_sql(&self.view, "old_path").unwrap_or_else(|| ("0".to_string(), Vec::new()));
+                let both = format!(
+                    "({}) OR ({})",
+                    crate::access::renumber(&pred, 2),
+                    crate::access::renumber(&old_pred, 2 + args.len())
+                );
+                let me = 2 + args.len() + old_args.len() + 1;
+                args.extend(old_args);
+                (format!("(for_account IS NULL AND ({both})) OR for_account = ?{me}"), args)
             }
         };
         let mut stmt = self
@@ -2312,21 +2327,87 @@ impl TextDb<'_> {
             })
             .map_err(sql_err)?;
         let rows = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|mut c| {
-                // A row about this account's own shares already carries its paths: it is about
-                // the alias, which has no store path to translate from.
-                if c.for_account.is_some() {
-                    return Some(c);
+        let mut out = Vec::with_capacity(rows.len());
+        for c in rows {
+            self.to_view_change(c, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Turn one stored change into what this account's feed says about it, appending to `out`.
+    ///
+    /// Usually one row becomes one row. A move across the edge of the view is the exception: what
+    /// left is a delete and what arrived is a create, and because a folder moves as a single row
+    /// the files under it have to be named one by one — a sync that heard only "the folder is
+    /// gone" would have nothing to match its files against. The files are those the store holds
+    /// *now*, so a subtree that moved twice is reported at its latest shape; the feed is a
+    /// projection of the view, not a second history.
+    fn to_view_change(&self, mut c: ChangeRow, out: &mut Vec<ChangeRow>) -> Result<()> {
+        // A row about this account's own shares already carries its paths: it is about the alias,
+        // which has no store path to translate from.
+        if c.for_account.is_some() {
+            out.push(c);
+            return Ok(());
+        }
+        let here = self.view_path(&c.path);
+        let there = c.old_path.as_deref().and_then(|p| self.view_path(p));
+        if c.op != "move" || c.old_path.is_none() {
+            if let Some(p) = here {
+                c.path = p;
+                c.old_path = there;
+                out.push(c);
+            }
+            return Ok(());
+        }
+        // The share root itself moved. The account holds the node, not the path it sits at, so
+        // its own paths did not change and there is nothing to say (#12 F4).
+        if self.view.grants().iter().any(|g| g.node_id == c.node_id) {
+            return Ok(());
+        }
+        let old_store = c.old_path.clone().unwrap_or_default();
+        match (here, there) {
+            // Both ends visible: the move it is.
+            (Some(p), Some(from)) => {
+                c.path = p;
+                c.old_path = Some(from);
+                out.push(c);
+            }
+            // Moved in from outside: everything under it is new here.
+            (Some(_), None) => {
+                for (path, _) in self.files_under(&c.path)? {
+                    let Some(view) = self.view_path(&path) else { continue };
+                    out.push(ChangeRow { op: "create".to_string(), path: view, old_path: None, ..c.clone() });
                 }
-                c.path = self.view_path(&c.path)?;
-                // A move whose other end is outside the view reads as what it is from here: the
-                // file arrived, or it left. Only an account that can see both ends sees a move.
-                c.old_path = c.old_path.as_deref().and_then(|p| self.view_path(p));
-                Some(c)
-            })
-            .collect())
+            }
+            // Moved out: what this account had at the old paths is gone.
+            (None, Some(_)) => {
+                for (path, _) in self.files_under(&c.path)? {
+                    let was = format!("{old_store}{}", &path[c.path.len()..]);
+                    let Some(view) = self.view_path(&was) else { continue };
+                    out.push(ChangeRow { op: "delete".to_string(), path: view, old_path: None, ..c.clone() });
+                }
+            }
+            (None, None) => {}
+        }
+        Ok(())
+    }
+
+    /// The files at or below `store_path` as it stands now, as `(path, id)`. The store's own
+    /// paths: the caller decides what to do with them.
+    fn files_under(&self, store_path: &str) -> Result<Vec<(String, i64)>> {
+        let (lo, hi) = (format!("{store_path}/"), format!("{store_path}0"));
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT path, id FROM {p}node \
+                 WHERE kind = 1 AND deleted_at IS NULL AND (path = ?1 OR (path >= ?2 AND path < ?3)) ORDER BY path",
+                p = self.p,
+            ))
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![store_path, lo, hi], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
     }
 
     /// The newest sequence number in the change feed, 0 when it is empty. A watcher that
