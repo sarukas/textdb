@@ -102,7 +102,13 @@ CREATE TABLE IF NOT EXISTS {p}link (
   external    INTEGER NOT NULL DEFAULT 0,     -- URL, email, query, numbered reference
   target_name TEXT,                           -- last segment, lower case, without .md (see links.rs)
   resolved_id INTEGER,                        -- the file it points to
-  status      TEXT                            -- ok, ambiguous, anchor-missing, broken, not-in-store, external
+  status      TEXT,
+  -- The bytes of the target as written, so a rewrite (a move, or #12's link projection) changes
+  -- a target without re-parsing free text: code spans, fenced blocks and escaped brackets are
+  -- left alone by construction rather than by a second parser agreeing with the first. NULL for
+  -- a reference link or an autolink, whose target is not written where the link is.
+  span_from   INTEGER,
+  span_to     INTEGER                            -- ok, ambiguous, anchor-missing, broken, not-in-store, external
 );
 CREATE INDEX IF NOT EXISTS {p}link_file ON {p}link(file_id, version);
 CREATE TABLE IF NOT EXISTS {p}frontmatter (
@@ -292,6 +298,8 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("link", "target_name", "TEXT"),
     ("link", "resolved_id", "INTEGER"),
     ("link", "status", "TEXT"),
+    ("link", "span_from", "INTEGER"),
+    ("link", "span_to", "INTEGER"),
     // The sync base's compare-and-swap counter, for two machines sharing one folder: the
     // directory lock is local, so only this catches a sync that landed from elsewhere.
     ("sync", "generation", "INTEGER NOT NULL DEFAULT 0"),

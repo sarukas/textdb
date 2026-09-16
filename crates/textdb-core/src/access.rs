@@ -822,3 +822,299 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------- link projection (#12 part 2)
+
+/// One link's target and where it is written, as the projector needs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetSpan {
+    /// The target exactly as written, without `#anchor` or `|alias`.
+    pub target: String,
+    /// Byte range of that text inside the document.
+    pub from: usize,
+    pub to: usize,
+    /// `wiki`, `embed`, `md` or `image`.
+    pub kind: String,
+    /// The store path of the document it resolved to, if it resolved to one.
+    pub resolved: Option<String>,
+    /// The resolved node's id, for the hidden-target form.
+    pub resolved_id: Option<i64>,
+}
+
+/// What a projection did to one link, so a caller can report it without re-deriving it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Projected {
+    /// Left exactly as written.
+    Same,
+    /// Rewritten to the reader's own path for the target.
+    Path,
+    /// Rewritten to `textdb:<id>`, because the reader cannot see the target.
+    Hidden,
+}
+
+/// Does this target text name its resolved document as a path from the vault root?
+///
+/// This is the whole of "`match = root`" from the design, decided from what is already stored
+/// rather than recorded at index time: the link text, and the store path it reached. A target
+/// that got there by file name (`[[q3]]`), by suffix (`[[2026/q3]]` matching deeper), or
+/// relatively (`../policies/nda.md`) is **not** a root path — it means the same thing in every
+/// namespace and must stay byte-identical.
+pub fn is_root_link(kind: &str, target: &str, resolved: &str) -> bool {
+    let md = kind == "md" || kind == "image";
+    if md && !target.starts_with('/') {
+        return false;
+    }
+    if !md && !target.contains('/') {
+        return false;
+    }
+    let want = format!("/{}", target.trim_start_matches('/'));
+    let resolved = resolved.strip_suffix(".tdbasset").unwrap_or(resolved);
+    // `.md` is optional in both link forms, so both spellings name the same document.
+    want == resolved || format!("{want}.md") == resolved
+}
+
+/// Write `store_path` the way `target` was written: `.md` kept only if it was there, and a wiki
+/// target without its leading slash, as Obsidian writes a vault path.
+fn like(target: &str, store_path: &str, md: bool) -> String {
+    let kept = target.to_ascii_lowercase().ends_with(".md");
+    let p = if kept { store_path.to_string() } else { store_path.strip_suffix(".md").unwrap_or(store_path).to_string() };
+    if md {
+        p
+    } else {
+        p.trim_start_matches('/').to_string()
+    }
+}
+
+/// Rewrite a document's root-absolute link targets into `view`'s own paths.
+///
+/// Spans only: nothing here looks at the text between links, so code spans, fenced blocks,
+/// escaped brackets and URLs are untouched by construction. Rewriting never adds or removes a
+/// newline, so **line numbers are identical** in canonical and projected text — which is what
+/// lets `cat -n`, `replace-lines`, `hunks` and search line numbers mean the same thing in every
+/// view.
+///
+/// Returns the text and what happened to each link, in the order given.
+pub fn project(view: &View, text: &[u8], links: &[TargetSpan]) -> (Vec<u8>, Vec<Projected>) {
+    let mut acts = vec![Projected::Same; links.len()];
+    if view.is_admin() || links.is_empty() {
+        return (text.to_vec(), acts);
+    }
+    // Back to front, so an earlier span's offsets are still right after a later one is replaced.
+    let mut order: Vec<usize> = (0..links.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(links[i].from));
+    let mut out = text.to_vec();
+    for i in order {
+        let l = &links[i];
+        if l.from > l.to || l.to > out.len() {
+            continue;
+        }
+        let Some(resolved) = l.resolved.as_deref() else { continue };
+        let md = l.kind == "md" || l.kind == "image";
+        let replacement = match view.to_view(resolved) {
+            // Visible: only a root path is namespace-dependent; everything else already means
+            // the same thing here as it does centrally.
+            Some(seen) if is_root_link(&l.kind, &l.target, resolved) => {
+                acts[i] = Projected::Path;
+                like(&l.target, &seen, md)
+            }
+            Some(_) => continue,
+            // Hidden: whatever form it was written in, the reader learns only that there is a
+            // document and cannot see it. `textdb:13` is not a path and cannot collide with one.
+            None => {
+                let Some(id) = l.resolved_id else { continue };
+                acts[i] = Projected::Hidden;
+                format!("textdb:{id}")
+            }
+        };
+        out.splice(l.from..l.to, replacement.into_bytes());
+    }
+    (out, acts)
+}
+
+/// The inverse: a document written in `view`'s paths, as the store holds it.
+///
+/// `resolve` is how the caller turns a store path into the node it names, so an id reference can
+/// be written back as that node's *current* path — which is why an id link survives a move that
+/// happened while the reader had the file open.
+pub fn unproject(view: &View, text: &[u8], links: &[TargetSpan], path_of_id: impl Fn(i64) -> Option<String>) -> Vec<u8> {
+    if view.is_admin() || links.is_empty() {
+        return text.to_vec();
+    }
+    let mut order: Vec<usize> = (0..links.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(links[i].from));
+    let mut out = text.to_vec();
+    for i in order {
+        let l = &links[i];
+        if l.from > l.to || l.to > out.len() {
+            continue;
+        }
+        let md = l.kind == "md" || l.kind == "image";
+        let replacement = match l.target.strip_prefix("textdb:") {
+            // An id reference: back to wherever that document is *now*, which is why an id
+            // link survives a move made while the reader had the file open.
+            //
+            // `textdb:13` says nothing about how the path was spelled, so the spelling comes
+            // from the link form: a markdown target is a path and keeps its extension, a wiki
+            // target is a vault path and drops `.md`, as Obsidian writes them.
+            Some(n) => match n.trim().parse::<i64>().ok().and_then(&path_of_id) {
+                Some(p) if md => p,
+                Some(p) => p.strip_suffix(".md").unwrap_or(&p).trim_start_matches('/').to_string(),
+                None => continue,
+            },
+            None => {
+                // A root path in the account's namespace becomes the store's. One that names
+                // nothing it can see is left exactly as written: there is no document to point
+                // at, and the text is the author's (#12 §3.4).
+                let looks_root = if md { l.target.starts_with('/') } else { l.target.contains('/') };
+                if !looks_root {
+                    continue;
+                }
+                let local = format!("/{}", l.target.trim_start_matches('/'));
+                match to_store_path(view, &local) {
+                    Some(store) => like(&l.target, &store, md),
+                    None => continue,
+                }
+            }
+        };
+        out.splice(l.from..l.to, replacement.into_bytes());
+    }
+    out
+}
+
+/// A view path to a store path, for un-projection: `None` when the account cannot address it.
+///
+/// Unlike [`View::to_store`] this never refuses — a link to nothing is not an error, it is a
+/// broken link, and the writer's bytes are kept as they are.
+fn to_store_path(view: &View, local: &str) -> Option<String> {
+    match view.to_store(local) {
+        Resolved::In { store_path, .. } => Some(store_path),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    fn view() -> View {
+        let mut g = Grants::new();
+        g.add(Namespace::Aliased, 1, "/legal/contracts", Some("contracts"), Rights::Rw).unwrap();
+        View::account("accounts-agent", Namespace::Aliased, g)
+    }
+
+    fn span(text: &str, target: &str, kind: &str, resolved: Option<&str>, id: Option<i64>) -> TargetSpan {
+        let from = text.find(target).expect("target in text");
+        TargetSpan {
+            target: target.to_string(),
+            from,
+            to: from + target.len(),
+            kind: kind.to_string(),
+            resolved: resolved.map(str::to_string),
+            resolved_id: id,
+        }
+    }
+
+    #[test]
+    fn a_root_link_is_rewritten_to_the_readers_path() {
+        let t = "see [q3](/legal/contracts/2026/q3.md)\n";
+        let l = [span(t, "/legal/contracts/2026/q3.md", "md", Some("/legal/contracts/2026/q3.md"), Some(9))];
+        let (out, acts) = project(&view(), t.as_bytes(), &l);
+        assert_eq!(String::from_utf8(out).unwrap(), "see [q3](/contracts/2026/q3.md)\n");
+        assert_eq!(acts, [Projected::Path]);
+    }
+
+    #[test]
+    fn a_hidden_target_becomes_an_id_and_names_no_path() {
+        let t = "see [nda](/legal/policies/nda.md)\n";
+        let l = [span(t, "/legal/policies/nda.md", "md", Some("/legal/policies/nda.md"), Some(13))];
+        let (out, acts) = project(&view(), t.as_bytes(), &l);
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(out, "see [nda](textdb:13)\n");
+        assert!(!out.contains("policies"));
+        assert_eq!(acts, [Projected::Hidden]);
+    }
+
+    #[test]
+    fn everything_that_is_not_a_root_path_keeps_its_bytes() {
+        let v = view();
+        // A name link, a relative link, and a suffix match: each means the same in every
+        // namespace, so none is touched.
+        for (t, target, kind, resolved) in [
+            ("see [[q3]]\n", "q3", "wiki", "/legal/contracts/2026/q3.md"),
+            ("see [q3](2026/q3.md)\n", "2026/q3.md", "md", "/legal/contracts/2026/q3.md"),
+            ("see [[2026/q3]]\n", "2026/q3", "wiki", "/legal/contracts/2026/q3.md"),
+        ] {
+            let l = [span(t, target, kind, Some(resolved), Some(9))];
+            let (out, acts) = project(&v, t.as_bytes(), &l);
+            assert_eq!(String::from_utf8(out).unwrap(), t, "{target}");
+            assert_eq!(acts, [Projected::Same], "{target}");
+        }
+    }
+
+    #[test]
+    fn projection_and_un_projection_are_inverse() {
+        let v = view();
+        let canonical = "a [q3](/legal/contracts/2026/q3.md) and [[legal/contracts/acme]]\n";
+        let l = [
+            span(canonical, "/legal/contracts/2026/q3.md", "md", Some("/legal/contracts/2026/q3.md"), Some(9)),
+            span(canonical, "legal/contracts/acme", "wiki", Some("/legal/contracts/acme.md"), Some(4)),
+        ];
+        let (projected, _) = project(&v, canonical.as_bytes(), &l);
+        let projected = String::from_utf8(projected).unwrap();
+        assert_eq!(projected, "a [q3](/contracts/2026/q3.md) and [[contracts/acme]]\n");
+        // Re-scanned in the projected text, as a real save would.
+        let back = [
+            span(&projected, "/contracts/2026/q3.md", "md", None, None),
+            span(&projected, "contracts/acme", "wiki", None, None),
+        ];
+        let out = unproject(&v, projected.as_bytes(), &back, |_| None);
+        assert_eq!(String::from_utf8(out).unwrap(), canonical);
+    }
+
+    #[test]
+    fn an_id_reference_un_projects_to_wherever_the_document_is_now() {
+        let v = view();
+        let t = "see [nda](textdb:13)\n";
+        let l = [span(t, "textdb:13", "md", None, None)];
+        let out = unproject(&v, t.as_bytes(), &l, |id| (id == 13).then(|| "/law/policies/nda.md".to_string()));
+        assert_eq!(String::from_utf8(out).unwrap(), "see [nda](/law/policies/nda.md)\n");
+    }
+
+    #[test]
+    fn a_local_link_to_nothing_is_stored_as_written() {
+        let v = view();
+        let t = "see [[hr/salaries]]\n";
+        let l = [span(t, "hr/salaries", "wiki", None, None)];
+        assert_eq!(String::from_utf8(unproject(&v, t.as_bytes(), &l, |_| None)).unwrap(), t);
+    }
+
+    #[test]
+    fn two_links_on_one_line_both_move() {
+        let v = view();
+        let t = "[a](/legal/contracts/a.md) [b](/legal/contracts/b.md)\n";
+        let l = [
+            span(t, "/legal/contracts/a.md", "md", Some("/legal/contracts/a.md"), Some(1)),
+            TargetSpan {
+                target: "/legal/contracts/b.md".into(),
+                from: t.rfind("/legal/contracts/b.md").unwrap(),
+                to: t.rfind("/legal/contracts/b.md").unwrap() + "/legal/contracts/b.md".len(),
+                kind: "md".into(),
+                resolved: Some("/legal/contracts/b.md".into()),
+                resolved_id: Some(2),
+            },
+        ];
+        let (out, _) = project(&v, t.as_bytes(), &l);
+        assert_eq!(String::from_utf8(out).unwrap(), "[a](/contracts/a.md) [b](/contracts/b.md)\n");
+    }
+
+    #[test]
+    fn line_numbers_never_move() {
+        let v = view();
+        let t = "one\n[q3](/legal/contracts/2026/q3.md)\nthree\n";
+        let l = [span(t, "/legal/contracts/2026/q3.md", "md", Some("/legal/contracts/2026/q3.md"), Some(9))];
+        let (out, _) = project(&v, t.as_bytes(), &l);
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(out.lines().count(), t.lines().count());
+        assert_eq!(out.lines().nth(2), Some("three"));
+    }
+}

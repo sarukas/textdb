@@ -389,6 +389,104 @@ impl<'c> TextDb<'c> {
             .map_err(sql_err)
     }
 
+    /// The link targets written in a document, with where each is written and what it reached.
+    ///
+    /// Only what projection needs. One indexed lookup on `file_id`, and it returns nothing for
+    /// a document with no links written in place — which is most of them. It runs only for a
+    /// token session; the owner never reaches here.
+    fn target_spans(&self, file_id: i64) -> Result<Vec<textdb_core::access::TargetSpan>> {
+        let mut st = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT l.target_path, l.span_from, l.span_to, coalesce(l.kind, ''), r.path, l.resolved_id \
+                 FROM {p}link l LEFT JOIN {p}node r ON r.id = l.resolved_id AND r.deleted_at IS NULL \
+                 WHERE l.file_id = ?1 AND l.span_from IS NOT NULL AND l.external = 0",
+                p = self.p
+            ))
+            .map_err(sql_err)?;
+        let rows = st
+            .query_map([file_id], |r| {
+                Ok(textdb_core::access::TargetSpan {
+                    target: r.get(0)?,
+                    from: r.get::<_, i64>(1)? as usize,
+                    to: r.get::<_, i64>(2)? as usize,
+                    kind: r.get(3)?,
+                    resolved: r.get(4)?,
+                    resolved_id: r.get(5)?,
+                })
+            })
+            .map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+    }
+
+    /// A document as this caller reads it: root-absolute links in its own paths, and the ones it
+    /// cannot see as `textdb:<id>` (#12 part 2).
+    pub(crate) fn project_doc(&self, file_id: i64, text: Vec<u8>) -> Result<Vec<u8>> {
+        if self.view.is_admin() {
+            return Ok(text);
+        }
+        let spans = self.target_spans(file_id)?;
+        if spans.is_empty() {
+            return Ok(text);
+        }
+        Ok(textdb_core::access::project(&self.view, &text, &spans).0)
+    }
+
+    /// The inverse, for text arriving from a caller. The links are scanned from the text itself,
+    /// because it is what the caller wrote and has no rows yet.
+    pub(crate) fn unproject_doc(&self, text: &[u8]) -> Result<Vec<u8>> {
+        if self.view.is_admin() {
+            return Ok(text.to_vec());
+        }
+        let spans = self.scan_targets(text);
+        if spans.is_empty() {
+            return Ok(text.to_vec());
+        }
+        let by_id = |id: i64| {
+            self.conn
+                .query_row(
+                    &format!("SELECT path FROM {}node WHERE id = ?1 AND deleted_at IS NULL", self.p),
+                    [id],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+        };
+        Ok(textdb_core::access::unproject(&self.view, text, &spans, by_id))
+    }
+
+    /// The link targets written in some text, straight from the markdown extractor — the same
+    /// scanner the index is built with, so the projector and the index cannot disagree about
+    /// what is a link.
+    fn scan_targets(&self, text: &[u8]) -> Vec<textdb_core::access::TargetSpan> {
+        let Some(ex) = self.extractor.as_ref() else { return Vec::new() };
+        ex.extract(text)
+            .links
+            .into_iter()
+            .filter(|l| !l.external)
+            .filter_map(|l| {
+                l.span.map(|(a, b)| textdb_core::access::TargetSpan {
+                    target: l.target_path,
+                    from: a as usize,
+                    to: b as usize,
+                    kind: l.kind,
+                    resolved: None,
+                    resolved_id: None,
+                })
+            })
+            .collect()
+    }
+
+    /// Line replacements with each piece of text in the store's namespace.
+    fn unproject_ranges(&self, ranges: &[(u64, u64, Vec<u8>)]) -> Result<Vec<(u64, u64, Vec<u8>)>> {
+        if self.view.is_admin() {
+            return Ok(ranges.to_vec());
+        }
+        ranges
+            .iter()
+            .map(|(a, b, t)| Ok((*a, *b, self.unproject_doc(t)?)))
+            .collect()
+    }
+
     /// Put the caller's own paths back into an error on its way out.
     ///
     /// Errors carry paths too — a conflict payload names the file it is about, and a not-found
@@ -650,7 +748,8 @@ impl<'c> TextDb<'c> {
     /// Create a file (parents created), commit version 1.
     pub fn create(&self, path: &str, content: &[u8], author: Option<&str>, message: Option<&str>) -> Result<u64> {
         let path = self.store_path_rw(path)?;
-        self.create_at(&path, content, author, message).map_err(|e| self.to_view_err(e))
+        let content = self.unproject_doc(content)?;
+        self.create_at(&path, &content, author, message).map_err(|e| self.to_view_err(e))
     }
 
     pub(crate) fn create_at(&self, path: &str, content: &[u8], author: Option<&str>, message: Option<&str>) -> Result<u64> {
@@ -695,6 +794,7 @@ impl<'c> TextDb<'c> {
     /// identical content produces no new version.
     pub fn upsert(&self, path: &str, content: &[u8], author: Option<&str>) -> Result<WriteResult> {
         let path = self.store_path_rw(path)?;
+        let content = &self.unproject_doc(content)?;
         self.tx(|db| match db.node_by_path(&path)? {
             None => Ok(WriteResult {
                 version: db.create_at(&path, content, author, Some("import"))?,
@@ -1138,6 +1238,10 @@ impl TextDb<'_> {
                 anchor: r.get(3).map_err(sql_err)?,
                 alias: r.get(4).map_err(sql_err)?,
                 external: r.get::<_, i64>(5).map_err(sql_err)? != 0,
+                // Not read back: this comparison asks whether the *structure* changed, and a
+                // span moves whenever anything before it does, which would make every edit look
+                // like a structure change and re-index the whole document.
+                span: l.span,
             };
             if &stored != l {
                 return Ok(StructureDiff::Different);
@@ -1176,7 +1280,14 @@ impl TextDb<'_> {
         let path = self.store_path(path)?;
         let n = self.file_by_path(&path)?;
         let root = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
-        self.storage().document(&root)
+        let (bytes, utf8) = self.storage().document(&root)?;
+        if self.view.is_admin() {
+            return Ok((bytes, utf8));
+        }
+        // The account reads its own paths inside the document too, or its checkout is a vault
+        // full of links that resolve nowhere (#12 Q6).
+        let projected = self.project_doc(n.id, (*bytes).clone())?;
+        Ok((std::sync::Arc::new(projected), utf8))
     }
 
     pub fn root_of_version(&self, file_id: i64, version: u64) -> Result<Hash> {
@@ -1210,7 +1321,33 @@ impl TextDb<'_> {
         let path = self.store_path(path)?;
         let n = self.node_by_path_any(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let root = self.root_of_version(n.id, version)?;
-        self.storage().document(&root)
+        let (bytes, utf8) = self.storage().document(&root)?;
+        if self.view.is_admin() {
+            return Ok((bytes, utf8));
+        }
+        // Projected with the link rows as they are *now*: the index holds the current version's
+        // links, so an old version's spans may not line up. Re-scanning the old text is what
+        // keeps the rewrite honest — the same scanner, applied to the bytes in hand.
+        let spans = self.scan_targets_resolved(&bytes)?;
+        Ok((std::sync::Arc::new(textdb_core::access::project(&self.view, &bytes, &spans).0), utf8))
+    }
+
+    /// As `scan_targets`, but resolving each target store-wide so the projector knows which
+    /// document it reached — needed where there are no link rows to read: an older version, or
+    /// text that has not been committed.
+    fn scan_targets_resolved(&self, text: &[u8]) -> Result<Vec<textdb_core::access::TargetSpan>> {
+        let mut spans = self.scan_targets(text);
+        for s in &mut spans {
+            let store = format!("/{}", s.target.trim_start_matches('/'));
+            for candidate in [store.clone(), format!("{store}.md")] {
+                if let Some(n) = self.node_by_path(&candidate)? {
+                    s.resolved = Some(n.path);
+                    s.resolved_id = Some(n.id);
+                    break;
+                }
+            }
+        }
+        Ok(spans)
     }
 
     /// Replace the whole content (`UPDATE kb SET content = …`). The diff OLD→NEW is
@@ -1224,7 +1361,8 @@ impl TextDb<'_> {
         message: Option<&str>,
     ) -> Result<WriteResult> {
         let path = self.store_path_rw(path)?;
-        self.update_content_at(&path, new_content, base_version, author, message).map_err(|e| self.to_view_err(e))
+        let new_content = self.unproject_doc(new_content)?;
+        self.update_content_at(&path, &new_content, base_version, author, message).map_err(|e| self.to_view_err(e))
     }
 
     // The internal `*_at` variants take a path that is **already** a store path, so that one
@@ -1325,6 +1463,11 @@ impl TextDb<'_> {
     /// Strict replace: `old` must occur exactly once in the current content.
     pub fn edit(&self, path: &str, old: &[u8], new: &[u8], author: Option<&str>) -> Result<WriteResult> {
         let path = self.store_path_rw(path)?;
+        // The anchor is matched against the stored text, so it has to be in the store's
+        // namespace before the match is attempted — an account anchoring on a link it can see
+        // would otherwise never find it (#12 E16).
+        let old = &self.unproject_doc(old)?;
+        let new = &self.unproject_doc(new)?;
         self.tx(|db| {
             let n = db.file_by_path(&path)?;
             let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
@@ -1345,6 +1488,7 @@ impl TextDb<'_> {
 
     pub fn append(&self, path: &str, tail: &[u8], author: Option<&str>) -> Result<WriteResult> {
         let path = self.store_path_rw(path)?;
+        let tail = &self.unproject_doc(tail)?;
         self.tx(|db| {
             let n = db.file_by_path(&path)?;
             let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
@@ -1877,6 +2021,7 @@ impl TextDb<'_> {
         message: Option<&str>,
     ) -> Result<WriteResult> {
         let path = self.store_path_rw(path)?;
+        let content = &self.unproject_doc(content)?;
         self.tx(|db| match db.node_by_path(&path)? {
             None => Ok(WriteResult {
                 version: db.create_at(&path, content, author, message)?,
@@ -1917,6 +2062,7 @@ impl TextDb<'_> {
         author: Option<&str>,
     ) -> Result<WriteResult> {
         let path = self.store_path_rw(path)?;
+        let ranges = &self.unproject_ranges(ranges)?;
         let mut sorted: Vec<&(u64, u64, Vec<u8>)> = ranges.iter().collect();
         sorted.sort_by_key(|r| r.0);
         if sorted.is_empty() {

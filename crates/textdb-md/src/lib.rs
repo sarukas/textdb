@@ -135,6 +135,7 @@ pub fn extract(bytes: &[u8]) -> Structure {
             anchor: l.anchor,
             alias: l.alias,
             external: l.external,
+            span: l.range.as_ref().map(|r| (r.start as u64, r.end as u64)),
         })
         .collect();
 

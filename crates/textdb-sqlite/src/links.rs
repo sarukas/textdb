@@ -123,14 +123,15 @@ impl<'c> TextDb<'c> {
             .map_err(sql_err)?
             .execute(params![file_id])
             .map_err(sql_err)?;
-        // Nine parameters a row, under SQLite's default limit of 32766 per statement.
-        for batch in links.chunks(3000) {
-            let rows = vec!["(?,?,?,?,?,?,?,?,?)"; batch.len()].join(",");
+        // Eleven parameters a row, under SQLite's default limit of 32766 per statement.
+        for batch in links.chunks(2900) {
+            let rows = vec!["(?,?,?,?,?,?,?,?,?,?,?)"; batch.len()].join(",");
             let sql = format!(
-                "INSERT INTO {}link(file_id, version, target_path, line, kind, anchor, alias, external, target_name) VALUES {rows}",
+                "INSERT INTO {}link(file_id, version, target_path, line, kind, anchor, alias, external, target_name, span_from, span_to) \
+                 VALUES {rows}",
                 self.p
             );
-            let mut vals: Vec<Value> = Vec::with_capacity(batch.len() * 9);
+            let mut vals: Vec<Value> = Vec::with_capacity(batch.len() * 11);
             for l in batch {
                 let key = (!l.external && !l.target_path.is_empty()).then(|| name_key(&l.target_path));
                 vals.extend([
@@ -143,6 +144,8 @@ impl<'c> TextDb<'c> {
                     l.alias.clone().map_or(Value::Null, Value::Text),
                     (l.external as i64).into(),
                     key.map_or(Value::Null, Value::Text),
+                    l.span.map_or(Value::Null, |(a, _)| Value::Integer(a as i64)),
+                    l.span.map_or(Value::Null, |(_, b)| Value::Integer(b as i64)),
                 ]);
             }
             self.conn

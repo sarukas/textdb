@@ -32,6 +32,13 @@ pub struct Link {
     pub alias: Option<String>,
     /// A URL, email address, query or numbered reference rather than a document.
     pub external: bool,
+    /// The bytes of the target *as written* inside the document, when it is written in place.
+    ///
+    /// `None` for a reference link or an autolink, whose target is not where the link is. This
+    /// is what lets a rewrite — a move, or the link projection of #12 — change a target without
+    /// re-parsing free text, so code spans, fenced blocks, escaped brackets and URLs are left
+    /// alone by construction rather than by a second, weaker parser agreeing with the first.
+    pub span: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
