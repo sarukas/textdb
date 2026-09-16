@@ -1803,6 +1803,11 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             if blocking == 1 { "it" } else { "them" }
         )));
     }
+    // A sync that wrote anything is a bulk load; let the store get ready before the error
+    // checks below can return early, since those still leave the writes in place.
+    if !o.dry_run {
+        crate::settle(sides.st);
+    }
     if rules_stop {
         let n = report.rules.as_ref().map_or(0, |r| r.newly_included.len());
         return Err(StoreError::invalid(format!(

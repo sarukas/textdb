@@ -578,6 +578,10 @@ impl Store for PgStore {
             })
             .collect())
     }
+    fn settle(&mut self) -> Result<()> {
+        self.client.execute("SELECT kb.analyze_store()", &[]).map_err(pg)?;
+        Ok(())
+    }
     fn heading_names(&mut self, prefix: &str, starts: &str, limit: i64) -> Result<Vec<crate::store::HeadingName>> {
         let rows = self
             .client

@@ -518,6 +518,19 @@ pub trait Store {
     fn outline(&mut self, prefix: &str, heading: Option<&str>, mode: &str, max_level: Option<i64>, limit: i64) -> Result<Vec<OutlineRow>>;
     /// Distinct headings under `prefix` starting with `starts`, most-used first.
     fn heading_names(&mut self, prefix: &str, starts: &str, limit: i64) -> Result<Vec<HeadingName>>;
+    /// Called after a bulk load — `import`, `sync` — so the store can get itself ready.
+    ///
+    /// Postgres needs it: a store built in one burst keeps whatever planner statistics
+    /// autovacuum worked out while the tables were nearly empty, because autovacuum's
+    /// threshold is a share of the rows it already knows about. A heading query over 2,000
+    /// notes then plans as a nested loop and takes 74 ms instead of 7.7. SQLite's planner
+    /// does not depend on statistics this way, so its implementation does nothing.
+    ///
+    /// Best effort: a store that will not analyse is slower, not broken, so a failure here
+    /// is reported and the command still succeeds.
+    fn settle(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn write(
         &mut self,
         path: &str,

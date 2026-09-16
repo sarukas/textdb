@@ -1587,6 +1587,16 @@ fn cat(
     out(s.as_bytes())
 }
 
+/// Let the store get ready after a bulk load, and say so if it could not.
+///
+/// A store that will not settle is slower to query, not broken, so this never fails the
+/// command that just succeeded in writing everything.
+pub fn settle(st: &mut dyn Store) {
+    if let Err(e) = st.settle() {
+        eprintln!("note: the store could not refresh its query statistics ({}); queries may plan badly until it does", e.message);
+    }
+}
+
 fn import(
     st: &mut dyn Store,
     dir: &Path,
@@ -1636,6 +1646,7 @@ fn import(
     if interactive {
         eprintln!();
     }
+    settle(st);
     if json {
         return emit_json(&json!({ "dir": dir.display().to_string(), "prefix": prefix, "stats": stats, "seconds": seconds }));
     }
