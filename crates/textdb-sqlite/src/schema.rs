@@ -149,11 +149,17 @@ CREATE TABLE IF NOT EXISTS {p}checkpoint (
 CREATE TABLE IF NOT EXISTS {p}change (
   seq          INTEGER PRIMARY KEY AUTOINCREMENT,
   ts           TEXT    NOT NULL,
-  op           TEXT    NOT NULL,              -- create, commit, mkdir, move, delete, purge
+  op           TEXT    NOT NULL,              -- create, commit, mkdir, move, delete, purge,
+                                             -- and for one account: share, unshare, move
   node_id      INTEGER NOT NULL,
   node_kind    INTEGER NOT NULL,              -- 0 folder, 1 file
   path         TEXT    NOT NULL,              -- the path after the change
   old_path     TEXT    NULL,                  -- move: the path before
+  -- Set when the change is about one account's *view* rather than about the store: a share
+  -- granted, renamed or taken away. Its `path` is already that account's, and nobody else's feed
+  -- carries it — which is how a revocation can be an event for the one account that needs to act
+  -- on it, at the moment it stops being able to see the folder (#12 F7-F9).
+  for_account  TEXT    NULL,
   version      INTEGER NULL,                  -- create, commit: the new version
   base_version INTEGER NULL,                  -- commit: the version the writer started from
   commit_kind  TEXT    NULL,                  -- create, commit: direct, rebased, merged
@@ -309,6 +315,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // Batches: the run (`textdb sql --write`) a commit or change belongs to.
     ("commit", "batch", "TEXT NULL"),
     ("change", "batch", "TEXT NULL"),
+    ("change", "for_account", "TEXT NULL"),
     // Sync: the include rules each base was made with.
     ("sync", "rules", "TEXT"),
     // Structure counts on the node row, and their folder totals.

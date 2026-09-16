@@ -184,6 +184,9 @@ pub struct ChangeRow {
     pub commit_kind: Option<String>,
     pub author: Option<String>,
     pub message: Option<String>,
+    /// Set when the row is about one account's view — a share granted, renamed or taken away —
+    /// rather than about the store. Its `path` is already that account's.
+    pub for_account: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -2253,14 +2256,28 @@ impl TextDb<'_> {
         // is told about at all — not even as a gap, which `--since` already tolerates (#12 F).
         // The filter is on the change's own recorded path, so an event about a node that has
         // since moved still lands in the view it happened in.
+        // Two kinds of row: what happened in the store, filtered to what this account can see;
+        // and what happened to this account's shares, which is already its own and which nobody
+        // else's feed carries. A revocation is the second kind, and has to be — by the time it
+        // lands, the account can no longer see the folder it is about.
+        //
+        // `?1` is `since` and `?2` the limit, so the visible set numbers from 3 and the account
+        // name takes the index after it.
         let (vis_sql, vis_args) = match crate::access::visible_sql(&self.view, "path") {
-            None => ("1".to_string(), Vec::new()),
-            Some((pred, args)) => (crate::access::renumber(&pred, 2), args),
+            None => ("for_account IS NULL".to_string(), Vec::new()),
+            Some((pred, args)) => {
+                let me = 2 + args.len() + 1;
+                (
+                    format!("(for_account IS NULL AND ({})) OR for_account = ?{me}", crate::access::renumber(&pred, 2)),
+                    args,
+                )
+            }
         };
         let mut stmt = self
             .conn
             .prepare_cached(&format!(
-                "SELECT seq, ts, op, node_id, node_kind, path, old_path, version, base_version, commit_kind, author, message \
+                "SELECT seq, ts, op, node_id, node_kind, path, old_path, version, base_version, commit_kind, author, message, \
+                        for_account \
                  FROM {p}change WHERE seq > ?1 AND ({vis}) ORDER BY seq LIMIT ?2",
                 p = self.p,
                 vis = vis_sql,
@@ -2270,7 +2287,11 @@ impl TextDb<'_> {
             rusqlite::types::Value::Integer(since),
             rusqlite::types::Value::Integer(limit.min(i64::MAX as usize) as i64),
         ];
+        let any_vis = !vis_args.is_empty() || !self.view.is_admin();
         args.extend(vis_args.iter().cloned());
+        if any_vis {
+            args.push(rusqlite::types::Value::Text(self.view.name().unwrap_or_default().to_string()));
+        }
         let rows = stmt
             .query_map(rusqlite::params_from_iter(args.iter()), |r| {
                 Ok(ChangeRow {
@@ -2286,6 +2307,7 @@ impl TextDb<'_> {
                     commit_kind: r.get(9)?,
                     author: r.get(10)?,
                     message: r.get(11)?,
+                    for_account: r.get(12)?,
                 })
             })
             .map_err(sql_err)?;
@@ -2293,6 +2315,11 @@ impl TextDb<'_> {
         Ok(rows
             .into_iter()
             .filter_map(|mut c| {
+                // A row about this account's own shares already carries its paths: it is about
+                // the alias, which has no store path to translate from.
+                if c.for_account.is_some() {
+                    return Some(c);
+                }
                 c.path = self.view_path(&c.path)?;
                 // A move whose other end is outside the view reads as what it is from here: the
                 // file arrived, or it left. Only an account that can see both ends sees a move.

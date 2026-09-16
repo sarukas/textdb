@@ -471,6 +471,11 @@ impl Store for SqliteStore {
         };
         let now = textdb_sqlite::SqliteStorage::now();
         acl::insert_grant(&self.conn, DEFAULT_PREFIX, a.id, &g, Some("owner"), &now).map_err(StoreError::from)?;
+        // The account's feed carries this, so a `watch` or a `sync` can act on a share arriving
+        // rather than discovering it by accident on some later listing.
+        let at = if g.alias.is_empty() { "/".to_string() } else { format!("/{}", g.alias) };
+        acl::record_share_event(&self.conn, DEFAULT_PREFIX, account, "share", &at, None, Some("owner"), &now)
+            .map_err(StoreError::from)?;
         Ok(ShareRow {
             account: account.to_string(),
             alias: g.alias.clone(),
@@ -487,6 +492,12 @@ impl Store for SqliteStore {
         let mut grants = acl::grants_of(&self.conn, DEFAULT_PREFIX, id).map_err(StoreError::from)?;
         grants.rename(from, to).map_err(StoreError::invalid)?;
         if acl::rename_grant(&self.conn, DEFAULT_PREFIX, id, from, to).map_err(StoreError::from)? {
+            // A move, not a delete and a create: the account's next sync renames the directory on
+            // disk rather than pulling every file down again.
+            let now = textdb_sqlite::SqliteStorage::now();
+            let (before, after) = (format!("/{from}"), format!("/{to}"));
+            acl::record_share_event(&self.conn, DEFAULT_PREFIX, account, "move", &after, Some(&before), Some("owner"), &now)
+                .map_err(StoreError::from)?;
             Ok(())
         } else {
             Err(StoreError::not_found(format!("'{account}' has no share called '{from}'")))
@@ -498,6 +509,9 @@ impl Store for SqliteStore {
         let id = self.account_id(account)?;
         let now = textdb_sqlite::SqliteStorage::now();
         if acl::revoke_grant(&self.conn, DEFAULT_PREFIX, id, alias, &now).map_err(StoreError::from)? {
+            let at = if alias.is_empty() { "/".to_string() } else { format!("/{alias}") };
+            acl::record_share_event(&self.conn, DEFAULT_PREFIX, account, "unshare", &at, None, Some("owner"), &now)
+                .map_err(StoreError::from)?;
             Ok(())
         } else {
             Err(StoreError::not_found(format!("'{account}' has no share called '{alias}'")))

@@ -556,3 +556,30 @@ pub fn refuse_share_root(view: &View, store_path: &str, what: &str) -> Result<()
         None => Ok(()),
     }
 }
+
+/// Record that an account's set of shares changed, in that account's own feed.
+///
+/// `op` is `share`, `unshare` or `move`; `path` and `old_path` are the account's own — `/contracts`,
+/// not `/legal/contracts`, because a share has no store path from the holder's side and a
+/// revocation has to be legible *after* the folder stops being visible. The row is marked
+/// `for_account`, so nobody else's feed carries it and `sync` can act on it (#12 F7–F9).
+pub fn record_share_event(
+    conn: &Connection,
+    p: &str,
+    account: &str,
+    op: &str,
+    path: &str,
+    old_path: Option<&str>,
+    by: Option<&str>,
+    now: &str,
+) -> Result<i64> {
+    conn.execute(
+        &format!(
+            "INSERT INTO {p}change(ts, op, node_id, node_kind, path, old_path, author, for_account) \
+             VALUES (?1, ?2, 0, 0, ?3, ?4, ?5, ?6)"
+        ),
+        rusqlite::params![now, op, path, old_path, by, account],
+    )
+    .map_err(sql_err)?;
+    Ok(conn.last_insert_rowid())
+}
