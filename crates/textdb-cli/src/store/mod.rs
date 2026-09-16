@@ -145,6 +145,17 @@ pub struct Entry {
     /// `ro` or `rw`, the rights of that share.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rights: Option<String>,
+    /// Only on an account's root row (`kind: "root"`): its shares, in path order. The root is
+    /// not a node, so this is the only place a caller can read what it is made of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shares: Option<Vec<Share>>,
+}
+
+/// One share as a root row lists it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Share {
+    pub alias: String,
+    pub rights: String,
 }
 
 /// One author's commits to a file.

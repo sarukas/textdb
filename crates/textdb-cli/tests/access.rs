@@ -360,7 +360,9 @@ fn a_share_shows_the_shared_folders_children_directly() {
             ok(f.as_(account).args(["ls", "-1", path]), None)
                 .stdout
                 .lines()
-                .map(|l| l.rsplit('/').next().unwrap_or_default().to_string())
+                // `ls -1` marks a folder with a trailing slash, so strip it before taking the
+                // last segment — otherwise every folder reads as an empty name and vanishes.
+                .map(|l| l.trim_end_matches('/').rsplit('/').next().unwrap_or_default().to_string())
                 .filter(|l| !l.is_empty())
                 .collect()
         };

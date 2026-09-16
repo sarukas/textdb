@@ -92,6 +92,8 @@ pub struct Entry {
     /// reaches everything directly.
     pub share: Option<String>,
     pub rights: Option<String>,
+    /// Only on an account's root row: `(alias, rights)` per share, in path order.
+    pub shares: Vec<(String, String)>,
 }
 
 /// One author's commits to a file.
@@ -111,6 +113,9 @@ impl AuthorCount {
 }
 
 impl Entry {
+    /// An aliased account's root: the list of its shares, not a node.
+    pub const ROOT: i64 = 2;
+
     /// The entry as `textdb_ls` columns name it, `authors` as an array.
     pub fn to_json(&self) -> serde_json::Value {
         let file = self.kind == 1;
@@ -118,7 +123,7 @@ impl Entry {
             "id": self.id,
             "name": self.name,
             "path": self.path,
-            "kind": if file { "file" } else { "folder" },
+            "kind": match self.kind { 1 => "file", Entry::ROOT => "root", _ => "folder" },
             "nbytes": self.nbytes,
             "nlines": self.nlines,
             "nwords": self.nwords,
@@ -133,6 +138,8 @@ impl Entry {
             // Only in an account's view; absent for the owner, whose paths are the store's own.
             "share": self.share,
             "rights": self.rights,
+            "shares": (self.kind == Entry::ROOT)
+                .then(|| self.shares.iter().map(|(a, r)| serde_json::json!({"alias": a, "rights": r})).collect::<Vec<_>>()),
         })
     }
 }
@@ -355,6 +362,10 @@ impl<'c> TextDb<'c> {
     /// cannot see is, and for the same reason — otherwise ids would be an oracle for probing the
     /// store one number at a time.
     fn by_id(&self, p: &str) -> Result<Option<String>> {
+        // A leading slash because something normalised it on the way here: `id:4` given on a
+        // command line passes through `normalize_path` in more than one caller, and an id is not
+        // a path, so it comes out as `/id:4`. Accept both rather than chase every caller.
+        let p = p.strip_prefix('/').unwrap_or(p);
         let Some(rest) = p.strip_prefix("id:") else { return Ok(None) };
         let id: i64 = rest
             .trim()
@@ -376,6 +387,27 @@ impl<'c> TextDb<'c> {
             )
             .optional()
             .map_err(sql_err)
+    }
+
+    /// Put the caller's own paths back into an error on its way out.
+    ///
+    /// Errors carry paths too — a conflict payload names the file it is about, and a not-found
+    /// names what was not found. Translating rows but not errors is how a store path leaks to an
+    /// account that must not learn the layout, and it leaks precisely when something went wrong,
+    /// which is when people paste the message somewhere.
+    pub fn to_view_err(&self, e: TextdbError) -> TextdbError {
+        if self.view.is_admin() {
+            return e;
+        }
+        let seen = |p: &str| self.view_path(p).unwrap_or_else(|| "(outside your shares)".to_string());
+        match e {
+            TextdbError::NotFound(p) if p.starts_with('/') => TextdbError::NotFound(seen(&p)),
+            TextdbError::Conflict(mut c) => {
+                c.path = seen(&c.path);
+                TextdbError::Conflict(c)
+            }
+            other => other,
+        }
     }
 
     /// A store path as this caller sees it, or `None` when it sees nothing there.
@@ -494,6 +526,15 @@ impl<'c> TextDb<'c> {
     pub(crate) const NODE_COLS: &'static str =
         "id, parent_id, name, kind, path, root, version, nbytes, nlines, updated_at, updated_by, deleted_at";
 
+    /// The node a *caller's* path names, translating it first.
+    ///
+    /// [`node_by_path`](Self::node_by_path) is the raw lookup and takes a store path; every
+    /// caller outside this module holds a caller path, so this is the one they want.
+    pub fn node_for(&self, path: &str) -> Result<Option<NodeRow>> {
+        let path = self.store_path(path)?;
+        self.node_by_path(&path)
+    }
+
     pub fn node_by_path(&self, path: &str) -> Result<Option<NodeRow>> {
         self.conn
             .prepare_cached(&format!(
@@ -544,7 +585,7 @@ impl<'c> TextDb<'c> {
     /// `mkdir -p`; returns the folder id.
     pub fn ensure_folder(&self, path: &str) -> Result<i64> {
         let path = self.store_path_rw(path)?;
-        self.ensure_folder_at(&path)
+        self.ensure_folder_at(&path).map_err(|e| self.to_view_err(e))
     }
 
     // The internal `*_at` variants take a path that is **already** a store path, so that one
@@ -609,7 +650,7 @@ impl<'c> TextDb<'c> {
     /// Create a file (parents created), commit version 1.
     pub fn create(&self, path: &str, content: &[u8], author: Option<&str>, message: Option<&str>) -> Result<u64> {
         let path = self.store_path_rw(path)?;
-        self.create_at(&path, content, author, message)
+        self.create_at(&path, content, author, message).map_err(|e| self.to_view_err(e))
     }
 
     pub(crate) fn create_at(&self, path: &str, content: &[u8], author: Option<&str>, message: Option<&str>) -> Result<u64> {
@@ -1183,7 +1224,7 @@ impl TextDb<'_> {
         message: Option<&str>,
     ) -> Result<WriteResult> {
         let path = self.store_path_rw(path)?;
-        self.update_content_at(&path, new_content, base_version, author, message)
+        self.update_content_at(&path, new_content, base_version, author, message).map_err(|e| self.to_view_err(e))
     }
 
     // The internal `*_at` variants take a path that is **already** a store path, so that one
@@ -1244,7 +1285,7 @@ impl TextDb<'_> {
         message: Option<&str>,
     ) -> Result<WriteResult> {
         let path = self.store_path_rw(path)?;
-        self.commit_edits_at(&path, edits, base_version, author, message)
+        self.commit_edits_at(&path, edits, base_version, author, message).map_err(|e| self.to_view_err(e))
     }
 
     // The internal `*_at` variants take a path that is **already** a store path, so that one
@@ -1506,7 +1547,10 @@ impl TextDb<'_> {
         let mut e = Entry {
             path: "/".into(),
             name: "/".into(),
-            kind: 0,
+            // Neither file (1) nor folder (0): an aliased account's root is the list of its
+            // shares. Nothing can be written at it and it has no node, so calling it a folder
+            // would be a small lie that every caller would then have to special-case anyway.
+            kind: Entry::ROOT,
             version: None,
             nbytes: 0,
             nlines: 0,
@@ -1530,6 +1574,7 @@ impl TextDb<'_> {
             authors: Vec::new(),
             share: None,
             rights: None,
+            shares: shares.iter().map(|s| (s.name.clone(), s.rights.clone().unwrap_or_default())).collect(),
         };
         for s in &shares {
             e.nbytes += s.nbytes;
@@ -1649,6 +1694,7 @@ impl TextDb<'_> {
                     authors: authors.remove(&id).unwrap_or_default(),
                     share: None,
                     rights: None,
+                    shares: Vec::new(),
                 })
             })
             .map_err(sql_err)?;

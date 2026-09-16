@@ -11,7 +11,7 @@ use textdb_sqlite::{normalize_path, TextDb, DEFAULT_PREFIX};
 
 use super::{
     AccountRow, Author, BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, MovedBack,
-    PathEvent, RestoredFile, Result, RevertOutcome, ShareRow, SqlResult, Store, StoreError, SyncBase, TokenRow, Whoami, Written,
+    PathEvent, RestoredFile, Result, RevertOutcome, Share, ShareRow, SqlResult, Store, StoreError, SyncBase, TokenRow, Whoami, Written,
 };
 
 pub struct SqliteStore {
@@ -88,7 +88,12 @@ fn sql(e: rusqlite::Error) -> StoreError {
 }
 
 fn kind_name(kind: i64) -> String {
-    if kind == 1 { "file" } else { "folder" }.to_string()
+    match kind {
+        1 => "file",
+        textdb_sqlite::db::Entry::ROOT => "root",
+        _ => "folder",
+    }
+    .to_string()
 }
 
 fn lossy(bytes: Vec<u8>) -> String {
@@ -133,6 +138,8 @@ fn entry(e: textdb_sqlite::db::Entry) -> Entry {
         nauthors: e.nauthors,
         share: e.share,
         rights: e.rights,
+        shares: (e.kind == textdb_sqlite::db::Entry::ROOT)
+            .then(|| e.shares.iter().map(|(alias, rights)| Share { alias: alias.clone(), rights: rights.clone() }).collect()),
         authors: e
             .authors
             .into_iter()
@@ -192,6 +199,15 @@ impl SqliteStore {
     /// A store path as this connection sees it, or `None` when it sees nothing there.
     fn seen(&self, store_path: &str) -> Option<String> {
         self.view.to_view(store_path)
+    }
+
+    /// A result on its way out of the binding, with the caller's own paths back in any error.
+    ///
+    /// Rows are translated where they are built; errors carry paths too — a conflict payload
+    /// names its file, a not-found names what was not found — and an untranslated one leaks the
+    /// store's layout exactly when someone is most likely to paste the message somewhere.
+    fn out<T>(&self, r: textdb_core::storage::Result<T>) -> Result<T> {
+        r.map_err(|e| StoreError::from(self.db().to_view_err(e)))
     }
 
 
@@ -529,7 +545,7 @@ impl Store for SqliteStore {
         self.consistent(|db| match v {
             Some(v) => Ok((db.read_version(&path, version(v))?, v)),
             None => {
-                let n = db.node_by_path(&path)?.ok_or_else(|| not_found(&path))?;
+                let n = db.node_for(&path)?.ok_or_else(|| not_found(&path))?;
                 Ok((db.read(&path)?, n.version))
             }
         })
@@ -640,15 +656,15 @@ impl Store for SqliteStore {
         author: Option<&str>,
         message: Option<&str>,
     ) -> Result<Written> {
-        Ok(written(self.db().write(path, content, base_version.map(version), author, message)?))
+        Ok(written(self.out(self.db().write(path, content, base_version.map(version), author, message))?))
     }
 
     fn edit(&mut self, path: &str, old: &[u8], new: &[u8], author: Option<&str>, message: Option<&str>) -> Result<Written> {
-        Ok(written(self.db().with_message(message).edit(path, old, new, author)?))
+        Ok(written(self.out(self.db().with_message(message).edit(path, old, new, author))?))
     }
 
     fn append(&mut self, path: &str, tail: &[u8], author: Option<&str>, message: Option<&str>) -> Result<Written> {
-        Ok(written(self.db().with_message(message).append(path, tail, author)?))
+        Ok(written(self.out(self.db().with_message(message).append(path, tail, author))?))
     }
 
     fn replace_lines(
@@ -661,14 +677,14 @@ impl Store for SqliteStore {
         author: Option<&str>,
         message: Option<&str>,
     ) -> Result<Written> {
-        Ok(written(self.db().with_message(message).replace_lines(
+        Ok(written(self.out(self.db().with_message(message).replace_lines(
             path,
             version(from),
             version(to),
             text,
             base_version.map(version),
             author,
-        )?))
+        ))?))
     }
 
     fn history(&mut self, path: &str) -> Result<Vec<Commit>> {
@@ -739,7 +755,7 @@ impl Store for SqliteStore {
             .into_iter()
             .map(|r| (r.from as u64, r.to as u64, r.text.clone().into_bytes()))
             .collect();
-        Ok(written(self.db().with_message(message).replace_line_ranges(path, &ranges, base_version.map(version), author)?))
+        Ok(written(self.out(self.db().with_message(message).replace_line_ranges(path, &ranges, base_version.map(version), author))?))
     }
 
     fn links(&mut self, path: &str, statuses: &[&str]) -> Result<Vec<super::LinkRow>> {

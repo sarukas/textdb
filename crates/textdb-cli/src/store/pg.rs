@@ -175,6 +175,7 @@ fn entry(r: &Row) -> Entry {
         // the same `entry()` reads rows from queries written before these columns existed.
         share: r.try_get("share").ok().flatten(),
         rights: r.try_get("rights").ok().flatten(),
+        shares: None,
         authors: authors.and_then(|a| serde_json::from_str(&a).ok()).unwrap_or_default(),
     }
 }

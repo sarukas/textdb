@@ -688,12 +688,20 @@ fn run(mut cli: Cli, matches: &ArgMatches) -> Result<()> {
     if cli.path_history.is_some() {
         st.set_session_path_history(cli.path_history)?;
     }
-    // A token session writes as its account, and cannot claim to be someone else (#12 §3).
-    let author_given = matches!(matches.value_source("author"), Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable));
-    if cli.token.is_some() && author_given {
-        return Err(StoreError::forbidden(
-            "--author names someone else; a token session writes as its own account",
-        ));
+    // A token session writes as its account, and cannot claim to be someone else (#12 §3). The
+    // default `cli` is not a claim, so only an author actually given is refused.
+    if cli.token.is_some() {
+        let given = matches!(matches.value_source("author"), Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable));
+        let me = st.whoami()?;
+        if let Some(account) = me.account {
+            if given && cli.author != account {
+                return Err(StoreError::forbidden(format!(
+                    "--author says '{}', but a token session writes as its own account, '{account}'",
+                    cli.author
+                )));
+            }
+            cli.author = account;
+        }
     }
     let author = Some(cli.author.as_str());
     match cli.cmd {
