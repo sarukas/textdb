@@ -75,7 +75,7 @@ enum AccountCmd {
     /// sees it at `/`, which is the shape for an agent that owns exactly one vault.
     Create {
         name: String,
-        #[arg(long, default_value = "agent", value_name = "agent|person")]
+        #[arg(long, default_value = "agent", value_name = "agent|person|admin")]
         kind: String,
         #[arg(long, value_parser = store_path)]
         root: Option<String>,
@@ -86,8 +86,12 @@ enum AccountCmd {
     /// gains a `/<alias>` prefix, so this is announced rather than silent.
     Convert {
         name: String,
+        /// Hold shares under aliases from now on. Spelled out because it changes every path the
+        /// account sees, and a command that does that should say which way it is going.
+        #[arg(long)]
+        multi: bool,
         /// The alias its existing share takes; the folder's own name by default.
-        #[arg(long = "as", value_name = "ALIAS")]
+        #[arg(long = "root-alias", visible_alias = "as", value_name = "ALIAS")]
         alias: Option<String>,
     },
 }
@@ -1354,7 +1358,12 @@ fn account_cmd(st: &mut dyn Store, c: AccountCmd, json: bool) -> Result<()> {
             }
             Ok(())
         }
-        AccountCmd::Convert { name, alias } => {
+        AccountCmd::Convert { name, multi, alias } => {
+            if !multi {
+                return Err(StoreError::invalid(
+                    "say which way: `account convert NAME --multi` moves it to aliased shares, and every path it sees gains a prefix",
+                ));
+            }
             let alias = st.account_convert(&name, alias.as_deref())?;
             if json {
                 emit_json(&json!({ "account": name, "alias": alias }))
@@ -2040,7 +2049,7 @@ fn cat(
     // Echo the path the store knows, not the one the user typed: `cat guides/x.md` used to
     // answer `"path":"guides/x.md"` while every listing said `/guides/x.md`, so a caller
     // keying on `path` saw two spellings of one file.
-    let path = &normalize_path(path)?;
+    let path = &shown_path(st, path)?;
     if json {
         return emit_json(&json!({
             "path": path,
@@ -2063,6 +2072,18 @@ fn cat(
         }
     }
     out(s.as_bytes())
+}
+
+/// The path to echo back for what the caller named.
+///
+/// Normally the normalised argument. An `id:1234` reference names a document without naming a
+/// path, and every view has its own, so that one is asked of the store: echoing `/id:1234` back
+/// would give a caller keying on `path` a spelling that matches no listing.
+fn shown_path(st: &mut dyn Store, path: &str) -> Result<String> {
+    if path.trim_start_matches('/').starts_with("id:") {
+        return Ok(st.stat(path)?.path);
+    }
+    Ok(normalize_path(path)?)
 }
 
 /// Let the store get ready after a bulk load, and say so if it could not.

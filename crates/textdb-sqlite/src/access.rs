@@ -530,3 +530,21 @@ pub fn clear_session(handle: usize) {
     let mut s = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
     s.retain(|(h, _)| *h != handle);
 }
+
+/// Refuse an operation that would move or delete the *root* of a share.
+///
+/// A share root is a folder the account works inside and does not own. Nothing else in the model
+/// needs this: writing inside a share root is ordinary, and only `mv` and `rm` can address the
+/// folder itself. Without it, `rm /contracts` deletes the shared folder — for everyone.
+pub fn refuse_share_root(view: &View, store_path: &str, what: &str) -> Result<()> {
+    if view.is_admin() {
+        return Ok(());
+    }
+    match view.share_root_of(store_path) {
+        Some(g) => Err(TextdbError::Forbidden(format!(
+            "/{} is a share, not a folder of yours to {what}; it is the owner's to move or delete",
+            g.alias
+        ))),
+        None => Ok(()),
+    }
+}

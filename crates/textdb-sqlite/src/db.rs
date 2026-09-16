@@ -1375,6 +1375,7 @@ impl TextDb<'_> {
     /// reach it (rewritten or not).
     pub fn rename_links(&self, from: &str, to: &str, author: Option<&str>) -> Result<Vec<crate::links::LinkChange>> {
         let from = self.store_path_rw(from)?;
+        crate::access::refuse_share_root(&self.view, &from, "move")?;
         let to = self.store_path_rw(to)?;
         self.tx(|db| {
             if from == "/" || to == "/" {
@@ -1447,6 +1448,7 @@ impl TextDb<'_> {
     /// As [`delete`](Self::delete), attributing the change in the feed.
     pub fn delete_by(&self, path: &str, author: Option<&str>) -> Result<()> {
         let path = self.store_path_rw(path)?;
+        crate::access::refuse_share_root(&self.view, &path, "delete")?;
         self.tx(|db| {
             if path == "/" {
                 return Err(TextdbError::InvalidEdit("cannot delete the root".into()));

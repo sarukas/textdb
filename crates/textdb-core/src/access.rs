@@ -117,7 +117,9 @@ impl std::fmt::Display for GrantError {
         match self {
             GrantError::AliasTaken { alias, held_by } => write!(
                 f,
-                "the alias '{alias}' is already this account's name for {held_by}; choose another with --as"
+                "the alias '{alias}' is already this account's name for {held_by}; choose another with --as, \
+                 or --reuse-alias to bind it to a different folder — which is a move for anything that already \
+                 synced it to disk"
             ),
             GrantError::Overlaps { existing, existing_alias } => write!(
                 f,
@@ -129,8 +131,8 @@ impl std::fmt::Display for GrantError {
             }
             GrantError::SingleRoot { root } => write!(
                 f,
-                "this account's root is {root} and it can hold no other share; \
-                 'account convert NAME --multi' makes it a multi-share account, which changes every path it sees"
+                "this is a single-root account: its root is {root} and it can hold no other share. \
+                 `account convert NAME --multi` makes it a multi-share account, which changes every path it sees"
             ),
             GrantError::BadRoot { path, why } => write!(f, "cannot share {path}: {why}"),
             GrantError::BadAlias { alias, why } => write!(f, "'{alias}' cannot be an alias: {why}"),
@@ -462,6 +464,15 @@ impl View {
     /// the answer — no longest-prefix search.
     pub fn grant_for(&self, store_path: &str) -> Option<&Grant> {
         self.grants.iter().find(|g| contains(&g.store_path, store_path))
+    }
+
+    /// The share whose root this store path *is*, if it is one.
+    ///
+    /// A share root is a folder the account works inside and does not own: moving or deleting it
+    /// is the owner's to do, and the account's alias is its name for the share rather than for
+    /// the folder. Writing inside it is ordinary.
+    pub fn share_root_of(&self, store_path: &str) -> Option<&Grant> {
+        self.grants.iter().find(|g| g.store_path == store_path && g.live())
     }
 
     /// Can this account see this store path at all?

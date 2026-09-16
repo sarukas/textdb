@@ -588,8 +588,9 @@ pub struct ShareRow {
     pub alias: String,
     pub rights: String,
     /// The share root's store path. `None` in an account's own `whoami`, where naming it would
-    /// disclose the layout the alias exists to hide.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// disclose the layout the alias exists to hide. Serialised as `path`, the name every other
+    /// row in this CLI gives to "where this is".
+    #[serde(rename = "path", skip_serializing_if = "Option::is_none")]
     pub store_path: Option<String>,
     pub node_id: i64,
     /// The share root is in the trash: the alias is not listed, but the grant is still there.
