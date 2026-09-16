@@ -57,8 +57,11 @@ export function SearchResults({ query, hits, loading, error, onOpen, onBack }: P
                 <span className="hit-loc">
                   <span className="hit-path">{h.path}</span>
                   <span className="hit-line">:{h.line}</span>
+                  {/* The heading the line sits under: what tells two hits in one document apart. */}
+                  {h.section && <span className="hit-section">{h.section}</span>}
                 </span>
-                <span className="hit-snippet">{highlight(h.snippet, query)}</span>
+                <span className="hit-snippet">{highlight(h.text, query)}</span>
+                {h.more > 0 && <span className="hit-more">{h.more} more in this file</span>}
               </button>
             </li>
           ))}

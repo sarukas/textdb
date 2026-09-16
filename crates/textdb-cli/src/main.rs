@@ -890,9 +890,8 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
         }
         Cmd::History { path, versions_only } => {
             let commits = st.history(&path)?;
-            if versions_only && json {
-                return emit_json(&commits);
-            }
+            // `--versions-only` filters the rows; it does not drop the `type` tag that tells
+            // a version from a path event, which used to make one command emit two shapes.
             let events = if versions_only { Vec::new() } else { st.path_history(&path)? };
             let mut items: Vec<HistoryItem> =
                 commits.iter().map(HistoryItem::Version).chain(events.iter().map(HistoryItem::Path)).collect();

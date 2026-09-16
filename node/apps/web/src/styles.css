@@ -2759,3 +2759,16 @@ button.crumb:hover {
     padding-bottom: 8px;
   }
 }
+
+/* A hit's heading path and the count of lines `per_file` held back: both are new columns on
+   the canonical hit row, and both say something the path and line number cannot. */
+.hit-section {
+  color: var(--muted);
+  font-size: 0.85em;
+  margin-left: 0.5em;
+}
+.hit-more {
+  color: var(--muted);
+  font-size: 0.85em;
+  font-style: italic;
+}

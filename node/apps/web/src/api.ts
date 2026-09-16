@@ -11,27 +11,48 @@ export interface Info {
 export type NodeKind = "file" | "folder";
 
 /** A file or folder in a listing. A folder's size, lines, words and versions are totals over every file below it. */
-export interface LsEntry {
-  id: number;
-  name: string;
+/**
+ * A listing row: the canonical record, key for key, from `docs/shapes.md`.
+ *
+ * Declared here rather than imported because this is a browser bundle and the client package
+ * reaches for `node:sqlite`. It drifted from that package's copy — `updated_at` was nullable
+ * on this side only — so the shape test in `api.shape.test.ts` now checks the two agree.
+ */
+export interface Entry {
   path: string;
+  name: string;
   kind: NodeKind;
-  nbytes: number | null;
-  nlines: number | null;
-  nwords: number | null;
-  /** A file's version; a folder's total of versions below it. */
-  versions: number;
-  /** A file's last commit or move; a folder's latest change, to it or anywhere below. */
-  updated_at: string | null;
+  /** A file's current version; null for a folder. */
+  version: number | null;
+  /** A file's own size; a folder's total over the live files below it. */
+  nbytes: number;
+  nlines: number;
+  /** ISO-8601 UTC with milliseconds and `Z`. */
+  updated_at: string;
   updated_by: string | null;
+  id: number;
+  /** The parent folder; null for the root. */
+  dir: string | null;
+  depth: number;
+  ext: string | null;
+  /** Front matter `title`, else the first level-1 heading. */
+  title: string | null;
+  nwords: number;
+  nsections: number;
+  nprops: number;
+  nlinks: number;
+  nlinks_broken: number;
+  versions: number;
   created_at: string;
-  /** Folder: files and folders anywhere below it. */
+  /** Folder: live files and folders anywhere below it. */
   files: number | null;
   folders: number | null;
-  nauthors: number | null;
-  /** File: who committed to it, most commits first. */
+  nauthors: number;
   authors: AuthorCount[];
 }
+
+/** The old name for {@link Entry}, kept so call sites read unchanged. */
+export type LsEntry = Entry;
 
 export interface AuthorCount {
   author: string | null;
@@ -243,11 +264,20 @@ export interface HistoryEntry {
   base_version: number | null;
 }
 
+/** One matching line: the canonical hit row from `docs/shapes.md`. */
 export interface SearchHit {
   path: string;
+  /** The version the line number belongs to. */
+  version: number;
   line: number;
-  snippet: string;
-  rank: number;
+  /** The matching line, windowed around the match when it is long. */
+  text: string;
+  /** The heading path the line sits under. */
+  section: string | null;
+  /** Relevance, higher is better, scaled to (0, 1]. */
+  score: number | null;
+  /** Matching lines in this file held back by `per_file`. */
+  more: number;
 }
 
 export interface WriteResult {
