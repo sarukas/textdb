@@ -14,6 +14,9 @@ import {
   type ListOptions,
   type ListPage,
   type PropertyHit,
+  type HeadingMatch,
+  type HeadingName,
+  type OutlineEntry,
   type PropertyKey,
   type PropertyValue,
   SORT_KEYS,
@@ -398,6 +401,75 @@ export class Corpus {
         options.limit ?? 200,
       )
       .map((r) => ({ key: r.key, docs: r.docs, valuesN: r.values_n, kind: r.kind }));
+  }
+
+  /**
+   * Markdown headings under `path`: one document's outline, everything below a folder, or
+   * the whole store with `/`.
+   *
+   * Each row carries its document's size, line and word counts and last change, so a table
+   * needs no second query per row. `heading` narrows to one heading, matched folded, with
+   * `match` choosing `exact`, `prefix` or `contains`; `level` caps the depth.
+   */
+  outline(
+    path = '/',
+    options: { heading?: string; match?: HeadingMatch; level?: number; limit?: number } = {},
+  ): OutlineEntry[] {
+    return this.sql
+      .all<{
+        path: string;
+        heading: string;
+        heading_path: string;
+        level: number;
+        line_from: number;
+        line_to: number;
+        nwords: number | null;
+        nwords_total: number | null;
+        nbytes: number | null;
+        nlines: number | null;
+        file_nwords: number | null;
+        version: number;
+        updated_at: string;
+        updated_by: string | null;
+      }>(
+        'SELECT path, heading, heading_path, level, line_from, line_to, nwords, nwords_total, ' +
+          'nbytes, nlines, file_nwords, version, updated_at, updated_by FROM textdb_outline(?, ?, ?, ?, ?)',
+        path,
+        options.heading ?? null,
+        options.match ?? 'exact',
+        options.level ?? null,
+        options.limit ?? 1000,
+      )
+      .map((r) => ({
+        path: r.path,
+        heading: r.heading,
+        headingPath: r.heading_path,
+        level: r.level,
+        lineFrom: r.line_from,
+        lineTo: r.line_to,
+        nwords: r.nwords,
+        nwordsTotal: r.nwords_total,
+        nbytes: r.nbytes,
+        nlines: r.nlines,
+        fileNwords: r.file_nwords,
+        version: r.version,
+        updatedAt: r.updated_at,
+        updatedBy: r.updated_by,
+      }));
+  }
+
+  /**
+   * Distinct headings in use, most-used first — the autosuggest call for outlines.
+   *
+   * `starts` is what the user has typed, matched as a folded prefix against an index range.
+   */
+  headingNames(path = '/', options: { starts?: string; limit?: number } = {}): HeadingName[] {
+    return this.sql.all<HeadingName>(
+      'SELECT heading, sections, docs FROM textdb_headings(?, ?, ?)',
+      path,
+      options.starts ?? '',
+      options.limit ?? 100,
+    );
   }
 
   /** The values one property takes, most-used first; `prefix` narrows them as above. */

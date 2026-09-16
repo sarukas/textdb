@@ -550,3 +550,169 @@ fn scalar_functions_work_without_a_virtual_table() {
     conn.close().unwrap();
     std::fs::remove_file(&file).expect("file must be deletable with no table registered either");
 }
+
+/// A vault with a repeated heading, a nested tree, and a document that shares no heading, so
+/// scope, matching and the level filter can each be told apart from the others.
+fn outline_vault() -> Connection {
+    let conn = setup();
+    let docs = [
+        (
+            "/notes/a.md",
+            "---\ntitle: A\n---\n# Alpha\nintro words here\n\n## Goals\nwe want things\n\n### Detail\nfine print\n\n## Next Steps\nship it\n",
+        ),
+        ("/notes/b.md", "# Beta\nbody\n\n## next steps\nlater\n"),
+        ("/other/c.md", "# Gamma\nonly words\n"),
+    ];
+    for (path, body) in docs {
+        conn.execute("INSERT INTO kb(path, content) VALUES (?1, ?2)", params![path, body]).unwrap();
+    }
+    conn
+}
+
+fn headings(conn: &Connection, sql: &str) -> Vec<String> {
+    let mut st = conn.prepare(sql).unwrap();
+    let rows = st
+        .query_map([], |r| Ok(format!("{}:{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .unwrap();
+    rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+}
+
+#[test]
+fn outline_scopes_to_a_document_a_folder_or_the_vault() {
+    let conn = outline_vault();
+    assert_eq!(
+        headings(&conn, "SELECT path, heading FROM textdb_outline('/notes/a.md')"),
+        ["/notes/a.md:Alpha", "/notes/a.md:Goals", "/notes/a.md:Detail", "/notes/a.md:Next Steps"]
+    );
+    // A folder takes everything below it and nothing beside it.
+    assert_eq!(
+        headings(&conn, "SELECT path, heading FROM textdb_outline('/other')"),
+        ["/other/c.md:Gamma"]
+    );
+    // The vault is every document, in path order, and each document in line order.
+    let all = headings(&conn, "SELECT path, heading FROM textdb_outline('/')");
+    assert_eq!(all.len(), 7);
+    assert_eq!(all[0], "/notes/a.md:Alpha");
+    assert_eq!(all[6], "/other/c.md:Gamma");
+}
+
+#[test]
+fn outline_matches_headings_folded_and_by_shape() {
+    let conn = outline_vault();
+    // Exact, ignoring case: "Next Steps" and "next steps" are the same heading.
+    assert_eq!(
+        headings(&conn, "SELECT path, heading FROM textdb_outline('/', 'NEXT STEPS')"),
+        ["/notes/a.md:Next Steps", "/notes/b.md:next steps"]
+    );
+    assert_eq!(
+        headings(&conn, "SELECT path, heading FROM textdb_outline('/', 'next', 'prefix')"),
+        ["/notes/a.md:Next Steps", "/notes/b.md:next steps"]
+    );
+    assert_eq!(
+        headings(&conn, "SELECT path, heading FROM textdb_outline('/', 'tep', 'contains')"),
+        ["/notes/a.md:Next Steps", "/notes/b.md:next steps"]
+    );
+    // A prefix that matches nothing is empty rather than everything.
+    assert!(headings(&conn, "SELECT path, heading FROM textdb_outline('/', 'zzz', 'prefix')").is_empty());
+    // `%` and `_` in a contains pattern mean themselves, not wildcards.
+    assert!(headings(&conn, "SELECT path, heading FROM textdb_outline('/', 'n%t', 'contains')").is_empty());
+}
+
+#[test]
+fn outline_caps_depth_and_carries_file_metadata() {
+    let conn = outline_vault();
+    assert_eq!(
+        headings(&conn, "SELECT path, heading FROM textdb_outline('/', NULL, 'exact', 1)"),
+        ["/notes/a.md:Alpha", "/notes/b.md:Beta", "/other/c.md:Gamma"]
+    );
+    // Every row carries its document's own figures, so a table needs no query per row.
+    let (nbytes, nlines, file_words, version): (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT nbytes, nlines, file_nwords, version FROM textdb_outline('/notes/a.md') LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    let (real_bytes, real_lines): (i64, i64) = conn
+        .query_row("SELECT nbytes, nlines FROM kb WHERE path = '/notes/a.md'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!((nbytes, nlines, version), (real_bytes, real_lines, 1));
+    assert!(file_words > 0);
+}
+
+#[test]
+fn section_word_counts_compose_and_follow_edits() {
+    let conn = outline_vault();
+    let counts = |conn: &Connection| -> Vec<(String, i64, i64)> {
+        let mut st = conn
+            .prepare("SELECT heading, nwords, nwords_total FROM textdb_outline('/notes/a.md')")
+            .unwrap();
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    };
+    let before = counts(&conn);
+    // Alpha's total is its own words plus every nested section's own words.
+    let nested: i64 = before[1..].iter().map(|(_, own, _)| own).sum();
+    assert_eq!(before[0].2, before[0].1 + nested);
+    // A leaf's two figures agree.
+    assert_eq!(before[2].1, before[2].2);
+
+    // A body edit that leaves every heading where it is still refreshes the counts.
+    conn.execute(
+        "UPDATE kb SET content = replace(content, 'ship it', 'ship it and then celebrate') WHERE path = '/notes/a.md'",
+        [],
+    )
+    .unwrap();
+    let after = counts(&conn);
+    assert_eq!(after[3].1, before[3].1 + 3, "Next Steps gained three words");
+    assert_eq!(after[0].2, before[0].2 + 3, "and so did the root's total");
+    // The heading tree itself did not move.
+    let names: Vec<_> = after.iter().map(|(h, _, _)| h.clone()).collect();
+    assert_eq!(names, before.iter().map(|(h, _, _)| h.clone()).collect::<Vec<_>>());
+}
+
+#[test]
+fn heading_names_counts_sections_and_documents() {
+    let conn = outline_vault();
+    let mut st = conn.prepare("SELECT heading, sections, docs FROM textdb_headings('/', 'ne')").unwrap();
+    let rows: Vec<(String, i64, i64)> = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    // The two spellings fold to one entry, counted across both documents.
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].1, rows[0].2), (2, 2));
+    // Folder scope narrows the same call.
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM textdb_headings('/other', '')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn word_count_has_history_the_way_bytes_and_lines_do() {
+    let conn = setup();
+    conn.execute("INSERT INTO kb(path, content) VALUES ('/a.md', 'one two three\n')", []).unwrap();
+    conn.execute("UPDATE kb SET content = 'one two three four five\n' WHERE path = '/a.md'", []).unwrap();
+    let mut st = conn.prepare("SELECT version, nlines, nwords FROM textdb_history('/a.md')").unwrap();
+    let rows: Vec<(i64, i64, i64)> = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows, [(1, 1, 3), (2, 1, 5)]);
+}
+
+#[test]
+fn a_deleted_document_leaves_the_outline() {
+    let conn = outline_vault();
+    conn.execute("DELETE FROM kb WHERE path = '/notes/b.md'", []).unwrap();
+    let all = headings(&conn, "SELECT path, heading FROM textdb_outline('/')");
+    assert!(all.iter().all(|h| !h.starts_with("/notes/b.md")), "{all:?}");
+    // And its heading no longer counts towards the shared one.
+    let docs: i64 = conn
+        .query_row("SELECT docs FROM textdb_headings('/', 'next')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(docs, 1);
+}

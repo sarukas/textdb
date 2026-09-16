@@ -236,3 +236,72 @@ def test_a_malformed_query_raises_naming_where(vault):
     # kb.leaf_hashes has too, not something this query path introduced.
     with pytest.raises(TextdbError, match="ends early"):
         vault.property_find("status:draft AND")
+
+
+@pytest.fixture
+def outline_vault(kb):
+    """Three documents with a heading shared between two of them, under this test's own root.
+
+    As with `vault`, every query names that root: the Postgres fixture shares one database
+    across tests, so an unscoped count would pick up whatever else is in it.
+    """
+    kb.write(
+        P(kb, "/notes/a.md"),
+        "---\ntitle: A\n---\n# Alpha\nintro words here\n\n## Goals\nwe want things\n\n"
+        "### Detail\nfine print\n\n## Next Steps\nship it\n",
+    )
+    kb.write(P(kb, "/notes/b.md"), "# Beta\nbody\n\n## next steps\nlater\n")
+    kb.write(P(kb, "/other/c.md"), "# Gamma\nonly words\n")
+    return kb
+
+
+def test_outline_of_one_document_is_its_table_of_contents(outline_vault):
+    kb = outline_vault
+    rows = kb.outline(P(kb, "/notes/a.md"))
+    assert [(r.heading, r.level) for r in rows] == [
+        ("Alpha", 1),
+        ("Goals", 2),
+        ("Detail", 3),
+        ("Next Steps", 2),
+    ]
+    # The breadcrumb is the nesting; `heading` is its last component.
+    assert rows[2].heading_path == "Alpha / Goals / Detail"
+
+
+def test_outline_scope_and_matching(outline_vault):
+    kb = outline_vault
+    root = getattr(kb, "_root", "")
+    strip = lambda rows: sorted({r.path[len(root):] for r in rows})
+
+    assert strip(kb.outline(P(kb, "/other"))) == ["/other/c.md"]
+    assert len(kb.outline(P(kb, "/") if root else "/")) == 7
+
+    # Folded matching: the two spellings are the same heading.
+    for heading, match in [("NEXT STEPS", "exact"), ("next", "prefix"), ("tep", "contains")]:
+        rows = kb.outline(root or "/", heading=heading, match=match)
+        assert strip(rows) == ["/notes/a.md", "/notes/b.md"], (heading, match)
+    assert kb.outline(root or "/", heading="nothing-here", match="prefix") == []
+
+    # `level` caps the depth.
+    assert sorted(r.heading for r in kb.outline(root or "/", level=1)) == ["Alpha", "Beta", "Gamma"]
+
+
+def test_section_word_counts_compose(outline_vault):
+    kb = outline_vault
+    rows = kb.outline(P(kb, "/notes/a.md"))
+    nested = sum(r.nwords for r in rows[1:])
+    assert rows[0].nwords_total == rows[0].nwords + nested
+    # A leaf's own count and its total are the same number.
+    assert rows[2].nwords == rows[2].nwords_total
+    # Every row carries its document's own figures, so a table needs no query per row.
+    entry = next(e for e in kb.ls(P(kb, "/notes")) if e.path == P(kb, "/notes/a.md"))
+    assert rows[0].nbytes == entry.nbytes
+    assert rows[0].version == 1
+
+
+def test_heading_names_fold_and_count(outline_vault):
+    kb = outline_vault
+    root = getattr(kb, "_root", "")
+    names = kb.heading_names(root or "/", "ne")
+    assert len(names) == 1
+    assert (names[0].sections, names[0].docs) == (2, 2)

@@ -260,6 +260,41 @@ impl Store for SqliteStore {
             .map(|v| crate::store::PropValue { value: v.value, docs: v.docs })
             .collect())
     }
+    fn outline(
+        &mut self,
+        prefix: &str,
+        heading: Option<&str>,
+        mode: &str,
+        max_level: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<crate::store::OutlineRow>> {
+        let m = textdb_sqlite::sections::Match::parse(mode);
+        Ok(textdb_sqlite::sections::outline(&self.conn, DEFAULT_PREFIX, prefix, heading, m, max_level, limit.max(1) as usize)?
+            .into_iter()
+            .map(|r| crate::store::OutlineRow {
+                path: r.path,
+                heading: r.heading,
+                heading_path: r.heading_path,
+                level: r.level,
+                line_from: r.line_from,
+                line_to: r.line_to,
+                nwords: r.nwords,
+                nwords_total: r.nwords_total,
+                nbytes: r.file_nbytes,
+                nlines: r.file_nlines,
+                file_nwords: r.file_nwords,
+                version: r.file_version,
+                updated_at: r.updated_at,
+                updated_by: r.updated_by,
+            })
+            .collect())
+    }
+    fn heading_names(&mut self, prefix: &str, starts: &str, limit: i64) -> Result<Vec<crate::store::HeadingName>> {
+        Ok(textdb_sqlite::sections::heading_names(&self.conn, DEFAULT_PREFIX, prefix, starts, limit.max(1) as usize)?
+            .into_iter()
+            .map(|(heading, sections, docs)| crate::store::HeadingName { heading, sections, docs })
+            .collect())
+    }
     fn property_find(&mut self, query: &str, folder: &str, limit: i64) -> Result<Vec<crate::store::PropHit>> {
         Ok(self
             .db()
@@ -337,6 +372,8 @@ impl Store for SqliteStore {
                 ts: c.ts,
                 message: c.message,
                 nbytes: c.nbytes,
+                nlines: c.nlines,
+                nwords: c.nwords,
                 kind: c.kind,
                 base_version: c.base_version,
             })
@@ -885,7 +922,9 @@ fn sql_views(p: &str) -> String {
          CREATE TEMP VIEW IF NOT EXISTS frontmatter AS
            SELECT n.path, f.data FROM {p}frontmatter f JOIN {p}node n ON n.id = f.file_id AND n.deleted_at IS NULL;
          CREATE TEMP VIEW IF NOT EXISTS sections AS
-           SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to
+           SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to,
+                  s.heading AS title, s.nwords, s.nwords_total,
+                  n.nbytes, n.nlines, n.nwords AS file_nwords, n.version, n.updated_at, n.updated_by
            FROM {p}section s JOIN {p}node n ON n.id = s.file_id AND n.deleted_at IS NULL;
          CREATE TEMP VIEW IF NOT EXISTS links AS
            SELECT n.path, l.target_path AS target, l.line, l.kind, l.anchor, l.alias, l.status,

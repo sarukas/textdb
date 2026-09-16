@@ -52,6 +52,40 @@ class PropertyValue:
 
 
 @dataclass
+class OutlineEntry:
+    """One markdown heading, with its document's own figures alongside."""
+    path: str
+    #: The last component of the heading path, as written.
+    heading: str
+    #: The breadcrumb, ``Parent / Child``.
+    heading_path: str
+    #: 1 for ``#``, 2 for ``##``, and so on.
+    level: int
+    line_from: int
+    line_to: int
+    #: Words in the section's own lines, and in it plus everything nested under it. ``None``
+    #: on a store whose rows predate the counts and has not been rewritten since.
+    nwords: Optional[int]
+    nwords_total: Optional[int]
+    #: The document's own figures, repeated on each of its rows.
+    nbytes: Optional[int]
+    nlines: Optional[int]
+    file_nwords: Optional[int]
+    version: int
+    updated_at: str
+    updated_by: Optional[str]
+
+
+@dataclass
+class HeadingName:
+    """A distinct heading in use across the scope asked about."""
+    heading: str
+    #: Sections carrying it, and documents they are spread over.
+    sections: int
+    docs: int
+
+
+@dataclass
 class PropertyHit:
     """A document matched by a property query."""
     path: str
@@ -221,6 +255,28 @@ class Corpus:
         index range rather than scanning.
         """
         return [PropertyKey(r["key"], r["docs"], r["values"], r["kind"]) for r in self.backend.property_keys(prefix, limit)]
+
+    def outline(
+        self,
+        path: str = "/",
+        *,
+        heading: Optional[str] = None,
+        match: str = "exact",
+        level: Optional[int] = None,
+        limit: int = 1000,
+    ) -> List[OutlineEntry]:
+        """Markdown headings under ``path``: one document's outline, a folder's, or the store's.
+
+        Each entry carries its document's size, counts and last change, so a table needs no
+        second query per row. ``heading`` narrows to one heading, matched ignoring case, with
+        ``match`` one of ``exact``, ``prefix`` or ``contains``; ``level`` caps the depth.
+        """
+        rows = self.backend.outline(normalize(path), heading, match, level, limit)
+        return [OutlineEntry(**r) for r in rows]
+
+    def heading_names(self, path: str = "/", starts: str = "", *, limit: int = 100) -> List[HeadingName]:
+        """Distinct headings in use, most-used first — the autosuggest call for outlines."""
+        return [HeadingName(**r) for r in self.backend.heading_names(normalize(path), starts, limit)]
 
     def property_values(self, key: str, prefix: str = "", *, limit: int = 200) -> List[PropertyValue]:
         """The values one property takes, most-used first; ``prefix`` narrows them as above."""

@@ -125,6 +125,7 @@ environment and its own author name, and the instructions in
 | `meta get PATH [KEY]` | A front matter value: a string as it is, list items one per line; `--json` gives the JSON value. Without `KEY`, the front matter as written (`--json`: the object). A missing key exits 5 |
 | `meta set PATH KEY VALUE… [--list] [--raw] [-m MSG]` | Set a top-level key, replacing only its lines, or add it before the closing `---` (front matter is created when the file has none). One value is a string, quoted only when YAML needs it; several values or `--list` a block list indented like the file's other lists; `--raw` writes YAML as given. Line endings, comments and other keys are untouched. Committed against the version read, so other edits to the file rebase. Values starting with `-` go after `--` |
 | `meta unset PATH KEY [-m MSG]` | Remove a top-level key and its lines; nothing to remove makes no version |
+| `outline [PATH] [--heading H] [--match exact\|prefix\|contains] [--level N] [--names] [--limit N]` | Markdown headings: one document's table of contents, everything under a folder, or the whole store with `/` (the default). Each row carries the section's own word count and its total including nested sections, plus the document's size, counts and last change, so nothing needs a second lookup. `--heading` narrows to one heading, matched ignoring case — `exact` and `prefix` seek the index, `contains` scans. `--level 1` is just `#`. `--names` lists the distinct headings in use with their counts instead, which is the autosuggest call |
 | `meta keys [PREFIX] [--limit N]` | Property names used anywhere in the store, most-used first, with how many documents carry each, how many distinct values it takes, and whether those values are numeric (so you know whether `>` means anything on it). `PREFIX` narrows by what has been typed — this is the autosuggest call |
 | `meta values KEY [PREFIX] [--limit N]` | The values one property takes, most-used first. A property present but empty shows as `(empty)`, because that is a real state rather than a missing row |
 | `meta find [QUERY] [--folder F] [--show A,B] [--limit N]` | Documents matching a property query. `--show` prints those properties as columns beside the path. An empty query lists every document that has front matter. See [Property queries](#property-queries) |
@@ -163,9 +164,9 @@ by path, deleted files left out:
 | `folders` | `id, path, name, parent, depth, files, folders, nbytes, nlines, nwords, versions, updated_at` — totals of everything below |
 | `frontmatter` | `path, data` — a document's YAML front matter as JSON (text in SQLite: `json_extract`, `json_each`; `jsonb` in Postgres) |
 | `properties` | `path, key` (dotted: `project.name`), `value, number` (the value as a number when it is one), `ord` (position in a list). One row per value, so a list is one row per element |
-| `sections` | `path, heading` (`Title / Section / Subsection`), `level, line_from, line_to` |
+| `sections` | `path, heading` (`Title / Section / Subsection`), `level, line_from, line_to, title` (the last component alone), `nwords` (the section's own lines), `nwords_total` (plus everything nested under it), and the document's `nbytes, nlines, file_nwords, version, updated_at, updated_by` |
 | `links` | `path, target` (without `#anchor` or `\|alias`; markdown links decoded), `line, kind` (`wiki`, `embed`, `md`, `image`), `anchor, alias, status` (`ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store`, `external`), `resolved` (the path it points to). SQLite stores; Postgres has `path, target, line` |
-| `commits` | `path, version, author, ts, message, kind, base_version, nbytes, nlines, batch` (`batch` in SQLite: the `sql --write` run that made it) |
+| `commits` | `path, version, author, ts, message, kind, base_version, nbytes, nlines, nwords, batch` (`batch` in SQLite: the `sql --write` run that made it) |
 | `authors` | `path, author, commits, first_ts, last_ts` |
 
 ```sh
@@ -179,8 +180,10 @@ SQL
 textdb sql -p guides/intro.md <<'SQL'
 SELECT path, line FROM links WHERE target = ?1 OR target LIKE '%/' || ?1
 SQL
-textdb sql -p '%/ Next steps' 'SELECT path, line_from FROM sections WHERE heading LIKE ?'
 textdb sql 'SELECT path, nwords FROM files ORDER BY nwords DESC LIMIT 10'
+-- Headings are indexed folded, so prefer textdb_outline over LIKE over the view:
+textdb sql "SELECT path, line_from FROM textdb_outline('/', 'Next steps')"
+textdb sql "SELECT heading, nwords_total FROM textdb_outline('/plan.md') ORDER BY nwords_total DESC"
 ```
 
 Avoid `SELECT content FROM kb` over many files: it reads every document in full. Use the views, or

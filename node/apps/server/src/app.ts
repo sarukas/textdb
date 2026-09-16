@@ -116,6 +116,27 @@ export function createApp(corpus: Corpus, hub: ChangeHub, options: AppOptions): 
     ),
   );
 
+  // Markdown headings: one document's outline, a folder's, or the whole store's. `names` is
+  // the autosuggest call and answers from an index range.
+  app.get('/api/outline', (c) =>
+    c.json(
+      corpus.outline(c.req.query('path') || '/', {
+        heading: c.req.query('heading') || undefined,
+        match: (c.req.query('match') as 'exact' | 'prefix' | 'contains') || 'exact',
+        level: queryInt(c, 'level') ?? undefined,
+        limit: queryInt(c, 'limit') ?? 1000,
+      }),
+    ),
+  );
+  app.get('/api/outline/names', (c) =>
+    c.json(
+      corpus.headingNames(c.req.query('path') || '/', {
+        starts: c.req.query('starts') || '',
+        limit: queryInt(c, 'limit') ?? 100,
+      }),
+    ),
+  );
+
   // Front-matter property discovery. `keys` and `values` are the autosuggest calls and run on
   // every keystroke, so both take a prefix and answer from an index range.
   app.get('/api/meta/keys', (c) =>

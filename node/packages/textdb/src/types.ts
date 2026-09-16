@@ -147,6 +147,40 @@ export interface PropertyHit {
   frontmatter: Record<string, unknown> | null;
 }
 
+/** One markdown heading, with its document's own figures alongside. */
+export interface OutlineEntry {
+  path: string;
+  /** The last component of the heading path, as written. */
+  heading: string;
+  /** The breadcrumb, `Parent / Child`. */
+  headingPath: string;
+  /** 1 for `#`, 2 for `##`, and so on. */
+  level: number;
+  lineFrom: number;
+  lineTo: number;
+  /** Words in the section's own lines. */
+  nwords: number | null;
+  /** Words in the section and everything nested under it. */
+  nwordsTotal: number | null;
+  /** The document's own figures, repeated on each of its rows. */
+  nbytes: number | null;
+  nlines: number | null;
+  fileNwords: number | null;
+  version: number;
+  updatedAt: string;
+  updatedBy: string | null;
+}
+
+/** A distinct heading in use across the scope asked about. */
+export interface HeadingName {
+  heading: string;
+  sections: number;
+  docs: number;
+}
+
+/** How `outline` matches the heading it is given. */
+export type HeadingMatch = 'exact' | 'prefix' | 'contains';
+
 export interface WriteResult {
   version: number;
   kind: WriteKind;

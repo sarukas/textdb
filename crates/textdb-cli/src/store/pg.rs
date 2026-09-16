@@ -37,7 +37,9 @@ CREATE OR REPLACE TEMP VIEW properties AS
   SELECT n.path, r.key, r.val_txt AS value, r.val_num AS number, r.ord
   FROM kb.property r JOIN kb.node n ON n.id = r.file_id AND n.deleted_at IS NULL;
 CREATE OR REPLACE TEMP VIEW sections AS
-  SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to
+  SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to,
+         s.heading AS title, s.nwords, s.nwords_total,
+         n.nbytes, n.nlines, n.nwords AS file_nwords, n.version, n.updated_at, n.updated_by
   FROM kb.section s JOIN kb.node n ON n.id = s.file_id AND n.deleted_at IS NULL;
 CREATE OR REPLACE TEMP VIEW links AS
   SELECT n.path, l.target_path AS target, l.line, l.kind, l.anchor, l.alias, l.status,
@@ -536,6 +538,60 @@ impl Store for PgStore {
             })
             .collect())
     }
+    fn outline(
+        &mut self,
+        prefix: &str,
+        heading: Option<&str>,
+        mode: &str,
+        max_level: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<crate::store::OutlineRow>> {
+        // `updated_at` comes back as text so the two engines print the same thing: the SQLite
+        // binding stores the ISO-8601 string, and Postgres would otherwise render its own.
+        let rows = self
+            .client
+            .query(
+                "SELECT path, heading, heading_path, level, line_from, line_to, nwords, nwords_total, \
+                        nbytes, nlines, file_nwords, version, \
+                        to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), updated_by \
+                   FROM kb.outline($1, $2, $3, $4, $5)",
+                &[&prefix, &heading, &mode, &max_level, &limit.max(1)],
+            )
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::store::OutlineRow {
+                path: r.get(0),
+                heading: r.get(1),
+                heading_path: r.get(2),
+                level: r.get(3),
+                line_from: r.get(4),
+                line_to: r.get(5),
+                nwords: r.get(6),
+                nwords_total: r.get(7),
+                nbytes: r.get(8),
+                nlines: r.get(9),
+                file_nwords: r.get(10),
+                version: r.get(11),
+                updated_at: r.get(12),
+                updated_by: r.get(13),
+            })
+            .collect())
+    }
+    fn heading_names(&mut self, prefix: &str, starts: &str, limit: i64) -> Result<Vec<crate::store::HeadingName>> {
+        let rows = self
+            .client
+            .query("SELECT heading, sections, docs FROM kb.headings($1, $2, $3)", &[&prefix, &starts, &limit.max(1)])
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::store::HeadingName {
+                heading: r.get(0),
+                sections: r.get(1),
+                docs: r.get(2),
+            })
+            .collect())
+    }
     fn search(&mut self, query: &str, prefix: &str, limit: i64) -> Result<Vec<Hit>> {
         let rows = self
             .client
@@ -616,7 +672,10 @@ impl Store for PgStore {
     fn history(&mut self, path: &str) -> Result<Vec<Commit>> {
         let rows = self
             .client
-            .query("SELECT version, author, ts::text, message, kind, base_version, nbytes FROM kb.history($1)", &[&path])
+            .query(
+                "SELECT version, author, ts::text, message, kind, base_version, nbytes, nlines, nwords FROM kb.history($1)",
+                &[&path],
+            )
             .map_err(pg)?;
         Ok(rows
             .iter()
@@ -626,6 +685,8 @@ impl Store for PgStore {
                 ts: r.get(2),
                 message: r.get(3),
                 nbytes: r.get(6),
+                nlines: r.get(7),
+                nwords: r.get(8),
                 kind: r.get(4),
                 base_version: r.get(5),
             })

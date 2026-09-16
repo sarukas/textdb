@@ -542,3 +542,57 @@ fn properties_are_indexed_and_queryable_on_postgres() {
         .collect();
     assert_eq!(vals, vec![("cvm", 0), ("telco", 1)]);
 }
+
+#[test]
+fn outlines_list_headings_and_count_words_on_postgres() {
+    let Some(db) = database() else { return };
+    ok(
+        textdb(&db).args(["write", "/notes/a.md"]),
+        Some("---\ntitle: A\n---\n# Alpha\nintro words here\n\n## Goals\nwe want things\n\n### Detail\nfine print\n\n## Next Steps\nship it\n"),
+    );
+    ok(textdb(&db).args(["write", "/notes/b.md"]), Some("# Beta\nbody\n\n## next steps\nlater\n"));
+    ok(textdb(&db).args(["write", "/other/c.md"]), Some("# Gamma\nonly words\n"));
+
+    let rows = ok(textdb(&db).args(["--json", "outline", "/notes/a.md"]), None).json();
+    let rows = rows.as_array().unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r["heading"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["Alpha", "Goals", "Detail", "Next Steps"]);
+    assert_eq!(rows[2]["heading_path"], "Alpha / Goals / Detail");
+
+    // A parent's total is its own words plus every descendant's own.
+    let own = |i: usize| rows[i]["nwords"].as_i64().unwrap();
+    let nested: i64 = (1..rows.len()).map(own).sum();
+    assert_eq!(rows[0]["nwords_total"].as_i64().unwrap(), own(0) + nested);
+    // Each row carries its document's figures, so a table needs no query per row.
+    assert!(rows[0]["nbytes"].as_i64().unwrap() > 0);
+    assert_eq!(rows[0]["version"], 1);
+
+    // A folder takes what is below it and nothing beside it.
+    let other = ok(textdb(&db).args(["--json", "outline", "/other"]), None).json();
+    assert_eq!(other.as_array().unwrap().len(), 1);
+
+    // Folded matching finds both spellings of the shared heading, in all three shapes.
+    for (h, m) in [("NEXT STEPS", "exact"), ("next", "prefix"), ("tep", "contains")] {
+        let hits = ok(textdb(&db).args(["--json", "outline", "/", "--heading", h, "--match", m]), None).json();
+        let paths: Vec<&str> = hits.as_array().unwrap().iter().map(|r| r["path"].as_str().unwrap()).collect();
+        assert_eq!(paths, vec!["/notes/a.md", "/notes/b.md"], "{h} as {m}");
+    }
+
+    // `--level` caps the depth.
+    let tops = ok(textdb(&db).args(["--json", "outline", "/", "--level", "1"]), None).json();
+    let names: Vec<&str> = tops.as_array().unwrap().iter().map(|r| r["heading"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["Alpha", "Beta", "Gamma"]);
+
+    // `--names` folds the two spellings into one suggestion with its counts.
+    let sugg = ok(textdb(&db).args(["--json", "outline", "/", "--names", "--heading", "ne"]), None).json();
+    let sugg = sugg.as_array().unwrap();
+    assert_eq!(sugg.len(), 1);
+    assert_eq!((sugg[0]["sections"].as_i64(), sugg[0]["docs"].as_i64()), (Some(2), Some(2)));
+
+    // Word count has history the way bytes and lines do.
+    ok(textdb(&db).args(["edit", "/notes/a.md", "--old", "ship it", "--new", "ship it now"]), None);
+    let hist = ok(textdb(&db).args(["--json", "history", "/notes/a.md"]), None).json();
+    let words: Vec<i64> = hist.as_array().unwrap().iter().map(|r| r["nwords"].as_i64().unwrap()).collect();
+    assert_eq!(words.len(), 2);
+    assert_eq!(words[1], words[0] + 1);
+}

@@ -187,6 +187,20 @@ class SqliteBackend(Backend):
         return [dict(value=r[0], docs=r[1]) for r in rows]
 
     @_wrap
+    def outline(self, prefix: str, heading, mode: str, max_level, limit: int):
+        rows = self.conn.execute(
+            "SELECT path, heading, heading_path, level, line_from, line_to, nwords, nwords_total, nbytes, nlines, file_nwords, version, updated_at, updated_by FROM textdb_outline(?, ?, ?, ?, ?)", (prefix, heading, mode, max_level, limit)
+        ).fetchall()
+        return [dict(path=r[0], heading=r[1], heading_path=r[2], level=r[3], line_from=r[4], line_to=r[5],
+                     nwords=r[6], nwords_total=r[7], nbytes=r[8], nlines=r[9], file_nwords=r[10],
+                     version=r[11], updated_at=r[12], updated_by=r[13]) for r in rows]
+
+    @_wrap
+    def heading_names(self, prefix: str, starts: str, limit: int):
+        rows = self.conn.execute("SELECT heading, sections, docs FROM textdb_headings(?, ?, ?)", (prefix, starts, limit)).fetchall()
+        return [dict(heading=r[0], sections=r[1], docs=r[2]) for r in rows]
+
+    @_wrap
     def property_find(self, query: str, folder: str, limit: int):
         rows = self.conn.execute(
             "SELECT path, nbytes, updated_at, frontmatter FROM textdb_prop_find(?, ?, ?)", (query, folder, limit)

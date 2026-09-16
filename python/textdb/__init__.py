@@ -9,12 +9,14 @@
         print(hit.path, hit.line, hit.snippet)
 """
 
-from .corpus import PropertyHit, PropertyKey, PropertyValue, Corpus, Entry, Hit, Commit
+from .corpus import HeadingName, OutlineEntry, PropertyHit, PropertyKey, PropertyValue, Corpus, Entry, Hit, Commit
 from .errors import TextdbError, Conflict, Contention, NotFound, InvalidEdit
 
 __all__ = [
     "PropertyKey",
     "PropertyValue",
+    "HeadingName",
+    "OutlineEntry",
     "PropertyHit",
     "Corpus", "Entry", "Hit", "Commit",
     "TextdbError", "Conflict", "Contention", "NotFound", "InvalidEdit",

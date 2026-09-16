@@ -134,6 +134,10 @@ pub struct Commit {
     pub ts: String,
     pub message: Option<String>,
     pub nbytes: Option<i64>,
+    /// Lines and words as of this version. `nwords` is absent on commits written before the
+    /// column existed.
+    pub nlines: Option<i64>,
+    pub nwords: Option<i64>,
     pub kind: Option<String>,
     pub base_version: Option<i64>,
 }
@@ -459,6 +463,36 @@ pub struct PropHit {
     pub frontmatter: Option<serde_json::Value>,
 }
 
+/// One heading, with its document's own figures alongside.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OutlineRow {
+    pub path: String,
+    /// The last component, as written.
+    pub heading: String,
+    /// The breadcrumb, `Parent / Child`.
+    pub heading_path: String,
+    pub level: i64,
+    pub line_from: i64,
+    pub line_to: i64,
+    /// Words in the section's own lines, and in it plus everything nested under it.
+    pub nwords: Option<i64>,
+    pub nwords_total: Option<i64>,
+    pub nbytes: Option<i64>,
+    pub nlines: Option<i64>,
+    pub file_nwords: Option<i64>,
+    pub version: i64,
+    pub updated_at: String,
+    pub updated_by: Option<String>,
+}
+
+/// A distinct heading in use, for autosuggest.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HeadingName {
+    pub heading: String,
+    pub sections: i64,
+    pub docs: i64,
+}
+
 pub trait Store {
     fn backend(&self) -> &'static str;
     /// Make the store usable: create what is missing, upgrade what is old.
@@ -479,6 +513,11 @@ pub trait Store {
     fn property_values(&mut self, key: &str, prefix: &str, limit: i64) -> Result<Vec<PropValue>>;
     /// Documents matching a property query, under `folder`.
     fn property_find(&mut self, query: &str, folder: &str, limit: i64) -> Result<Vec<PropHit>>;
+    /// Headings under `prefix`, in document order. `heading` narrows to one, matched folded;
+    /// `mode` is `exact`, `prefix` or `contains`. `max_level` caps the depth.
+    fn outline(&mut self, prefix: &str, heading: Option<&str>, mode: &str, max_level: Option<i64>, limit: i64) -> Result<Vec<OutlineRow>>;
+    /// Distinct headings under `prefix` starting with `starts`, most-used first.
+    fn heading_names(&mut self, prefix: &str, starts: &str, limit: i64) -> Result<Vec<HeadingName>>;
     fn write(
         &mut self,
         path: &str,

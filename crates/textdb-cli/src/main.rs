@@ -29,6 +29,7 @@ mod assets;
 mod git;
 mod links;
 mod meta;
+mod outline;
 mod portable;
 mod search;
 mod sql_query;
@@ -382,6 +383,27 @@ enum Cmd {
     Backlinks {
         #[arg(value_parser = store_path)]
         path: String,
+    },
+    /// List markdown headings: one file's outline, or every heading under a folder or the
+    /// whole store, with each document's own size and last change alongside.
+    Outline {
+        /// A file, a folder, or `/` for everything. Default `/`.
+        #[arg(value_parser = store_path, default_value = "/")]
+        path: String,
+        /// Only headings matching this, ignoring case.
+        #[arg(long)]
+        heading: Option<String>,
+        /// How `--heading` matches: the whole heading, its start, or anywhere in it.
+        #[arg(long, value_parser = ["exact", "prefix", "contains"], default_value = "exact")]
+        match_: String,
+        /// Only headings this deep or shallower (`1` is `#`, `2` is `##`).
+        #[arg(long)]
+        level: Option<i64>,
+        /// Distinct headings in use with their counts, rather than the headings themselves.
+        #[arg(long)]
+        names: bool,
+        #[arg(long, default_value_t = 1000)]
+        limit: i64,
     },
     /// Read or change front matter, one top-level key at a time; the other lines of the file are
     /// left exactly as they are.
@@ -750,6 +772,14 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
                 json,
             ),
         },
+        Cmd::Outline {
+            path,
+            heading,
+            match_,
+            level,
+            names,
+            limit,
+        } => outline::run(st, &path, heading.as_deref(), &match_, level, names, limit, json),
         Cmd::Meta { op } => match op {
             MetaOp::Get { path, key } => meta::get(st, &path, key.as_deref(), json),
             MetaOp::Keys { prefix, limit } => meta::keys(st, prefix.as_deref().unwrap_or(""), limit, json),
