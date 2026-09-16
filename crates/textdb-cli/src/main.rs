@@ -82,6 +82,15 @@ enum AccountCmd {
     },
     /// Every account, with how many shares it holds.
     Ls,
+    /// Stop an account: its tokens stop working. Its shares stay, so `account enable` is one
+    /// command rather than granting everything again.
+    Disable {
+        name: String,
+    },
+    /// Let a disabled account work again.
+    Enable {
+        name: String,
+    },
     /// Turn a single-root account into one that holds shares under aliases. Every path it sees
     /// gains a `/<alias>` prefix, so this is announced rather than silent.
     Convert {
@@ -600,6 +609,11 @@ enum Cmd {
         #[arg(long)]
         keep_empty_folders: bool,
     },
+    /// Create a folder, and any parents it needs. Already there is not an error.
+    Mkdir {
+        #[arg(value_parser = store_path)]
+        path: String,
+    },
     /// Who this connection is, and what it can see.
     Whoami,
     /// Accounts that hold shares of this store (owner only).
@@ -619,6 +633,9 @@ enum Cmd {
     },
     /// Changes after a sequence number, oldest first.
     Log {
+        /// Only changes under this folder.
+        #[arg(long, short = 'p', default_value = "/", value_parser = store_path)]
+        prefix: String,
         #[arg(long, default_value_t = 0)]
         since: i64,
         #[arg(long, default_value_t = 100)]
@@ -718,6 +735,15 @@ fn run(mut cli: Cli, matches: &ArgMatches) -> Result<()> {
                 emit_json(&json!({ "store": shown, "backend": st.backend(), "last_seq": seq }))
             } else {
                 line(format!("{} store ready: {shown} (last change #{seq})", st.backend()))
+            }
+        }
+        Cmd::Mkdir { path } => {
+            st.mkdir(&path)?;
+            let shown = shown_path(st, &path)?;
+            if json {
+                emit_json(&json!({ "path": shown, "kind": "folder" }))
+            } else {
+                line(shown)
             }
         }
         Cmd::Whoami => whoami(st, json),
@@ -1230,8 +1256,16 @@ fn run(mut cli: Cli, matches: &ArgMatches) -> Result<()> {
             };
             line(format!("{key}  {shown}{session}"))
         }
-        Cmd::Log { since, limit } => {
-            let changes = st.feed(since, limit)?;
+        Cmd::Log { prefix, since, limit } => {
+            // Scoped after the fact rather than in the query: the feed is ordered by `seq` and
+            // its rows carry the path a change was made at, so filtering here keeps one feed
+            // implementation for both engines and cannot drop a change into a `seq` gap that
+            // `--since` would then skip past.
+            let changes: Vec<_> = st
+                .feed(since, limit)?
+                .into_iter()
+                .filter(|c| prefix == "/" || c.path == prefix || c.path.starts_with(&format!("{prefix}/")))
+                .collect();
             if json {
                 return emit_json(&changes);
             }
@@ -1358,6 +1392,8 @@ fn account_cmd(st: &mut dyn Store, c: AccountCmd, json: bool) -> Result<()> {
             }
             Ok(())
         }
+        AccountCmd::Disable { name } => account_switch(st, &name, true, json),
+        AccountCmd::Enable { name } => account_switch(st, &name, false, json),
         AccountCmd::Convert { name, multi, alias } => {
             if !multi {
                 return Err(StoreError::invalid(
@@ -1373,6 +1409,17 @@ fn account_cmd(st: &mut dyn Store, c: AccountCmd, json: bool) -> Result<()> {
                 ))
             }
         }
+    }
+}
+
+fn account_switch(st: &mut dyn Store, name: &str, off: bool, json: bool) -> Result<()> {
+    st.account_disable(name, off)?;
+    if json {
+        emit_json(&json!({ "account": name, "disabled": off }))
+    } else if off {
+        line(format!("{name} is disabled; its tokens stop working and its shares are kept"))
+    } else {
+        line(format!("{name} works again"))
     }
 }
 

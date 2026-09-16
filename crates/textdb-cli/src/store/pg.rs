@@ -454,6 +454,13 @@ impl Store for PgStore {
         Ok(())
     }
 
+    fn account_disable(&mut self, name: &str, disabled: bool) -> Result<()> {
+        self.client
+            .query_one("SELECT kb.account_disable($1, $2)", &[&name, &disabled])
+            .map_err(pg)?;
+        Ok(())
+    }
+
     fn account_ls(&mut self) -> Result<Vec<AccountRow>> {
         let rows = self
             .client
@@ -626,6 +633,11 @@ impl Store for PgStore {
             .query(&format!("SELECT {} FROM kb.ls($1, $2) e", entry_cols()), &[&path, &recursive])
             .map_err(pg)?;
         Ok(rows.iter().map(entry).collect())
+    }
+
+    fn mkdir(&mut self, path: &str) -> Result<()> {
+        self.client.query_one("SELECT kb.mkdir($1)", &[&path]).map_err(pg)?;
+        Ok(())
     }
 
     fn stat(&mut self, path: &str) -> Result<Entry> {

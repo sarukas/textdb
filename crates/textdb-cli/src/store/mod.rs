@@ -658,6 +658,9 @@ pub trait Store {
 
     fn account_create(&mut self, name: &str, kind: &str, root: Option<&str>) -> Result<()>;
     fn account_ls(&mut self) -> Result<Vec<AccountRow>>;
+    /// Stop an account without forgetting it: its tokens stop working and its grants stay, so
+    /// enabling it again is one command rather than a re-grant of everything it held.
+    fn account_disable(&mut self, name: &str, disabled: bool) -> Result<()>;
     /// Turn a single-root account into a multi-share one, keeping its share under `alias`. An
     /// explicit change: every path the account sees gains a `/<alias>` prefix.
     fn account_convert(&mut self, name: &str, alias: Option<&str>) -> Result<String>;
@@ -716,6 +719,8 @@ pub trait Store {
     fn outline(&mut self, prefix: &str, heading: Option<&str>, mode: &str, max_level: Option<i64>, limit: i64) -> Result<Vec<OutlineRow>>;
     /// Distinct headings under `prefix` starting with `starts`, most-used first.
     fn heading_names(&mut self, prefix: &str, starts: &str, limit: i64) -> Result<Vec<HeadingName>>;
+    /// Create a folder and any missing parents; returns without complaint if it is already there.
+    fn mkdir(&mut self, path: &str) -> Result<()>;
     /// Called after a bulk load — `import`, `sync` — so the store can get itself ready.
     ///
     /// Postgres needs it: a store built in one burst keeps whatever planner statistics

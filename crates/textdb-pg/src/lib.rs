@@ -3528,6 +3528,29 @@ mod kb {
         TableIterator::new(rows)
     }
 
+
+    /// `mkdir -p`, for a caller's path. `kb._mkdir` is the internal one and takes a store path.
+    #[pg_extern]
+    fn mkdir(path: &str) -> i64 {
+        let path = ok(normalize_path(path));
+        let path = resolve(&path, true);
+        _mkdir(&path)
+    }
+
+    /// Stop an account without forgetting it: its tokens stop working and its grants stay, so
+    /// enabling it again is one command rather than re-granting everything it held.
+    #[pg_extern]
+    fn account_disable(name: &str, disabled: default!(bool, "true")) -> bool {
+        admin_only("disable accounts");
+        let id = account_id_of(name);
+        Spi::run_with_args(
+            "UPDATE kb.account SET disabled_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1",
+            &[id.into(), disabled.into()],
+        )
+        .unwrap_or_else(|e| fail(spi_err(e)));
+        true
+    }
+
     #[allow(dead_code)]
     fn _unused(_: DatumWithOid) {}
 }

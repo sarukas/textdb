@@ -336,6 +336,20 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn account_disable(&mut self, name: &str, disabled: bool) -> Result<()> {
+        self.admin_only("disable accounts")?;
+        let id = self.account_id(name)?;
+        let now = textdb_sqlite::SqliteStorage::now();
+        let at = disabled.then_some(now);
+        self.conn
+            .execute(
+                &format!("UPDATE {DEFAULT_PREFIX}account SET disabled_at = ?2 WHERE id = ?1"),
+                rusqlite::params![id, at],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
     fn account_ls(&mut self) -> Result<Vec<AccountRow>> {
         self.admin_only("list accounts")?;
         let mut out = Vec::new();
@@ -534,6 +548,10 @@ impl Store for SqliteStore {
 
     fn ls(&mut self, path: &str, recursive: bool) -> Result<Vec<Entry>> {
         Ok(self.db().list(path, recursive)?.into_iter().map(entry).collect())
+    }
+
+    fn mkdir(&mut self, path: &str) -> Result<()> {
+        self.out(self.db().ensure_folder(path).map(|_| ()))
     }
 
     fn stat(&mut self, path: &str) -> Result<Entry> {

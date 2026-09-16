@@ -9,7 +9,7 @@ use textdb_core::path::{parse_switch, PathOp, PATH_HISTORY_DEFAULT, PATH_HISTORY
 use textdb_core::storage::Result;
 use textdb_core::TextdbError;
 
-use crate::db::{normalize_path, subtree_bounds, NodeRow, TextDb};
+use crate::db::{subtree_bounds, NodeRow, TextDb};
 use crate::links::{LinkUpdates, LINK_UPDATES_SETTING};
 use crate::storage::sql_err;
 
@@ -170,9 +170,27 @@ impl<'c> TextDb<'c> {
     /// Renames, moves and deletes of the file or folder at `path` (the live one, else the one
     /// most recently deleted there), oldest first.
     pub fn path_history(&self, path: &str) -> Result<Vec<PathEventRow>> {
-        let path = normalize_path(path)?;
-        let n = self.node_by_path_any(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
-        self.path_history_of(n.id)
+        let store_path = self.store_path(path)?;
+        let n = self
+            .node_by_path_any(&store_path)?
+            .ok_or_else(|| TextdbError::NotFound(path.to_string()))?;
+        let rows = self.path_history_of(n.id)?;
+        // The events are recorded in store paths, as everything in the store is. An account sees
+        // its own; a move whose other end is outside its shares is a move it can only see one end
+        // of, so that end is named and the other is not.
+        Ok(rows
+            .into_iter()
+            .map(|mut e| {
+                if !self.view.is_admin() {
+                    // A path outside the account's shares is named as what it is to them:
+                    // nowhere. The event still shows, because the end they *can* see moved.
+                    let seen = |p: &String| self.view_path(p).unwrap_or_else(|| "(outside your shares)".into());
+                    e.old_path = seen(&e.old_path);
+                    e.new_path = e.new_path.map(|p| self.view_path(&p).unwrap_or_else(|| "(outside your shares)".into()));
+                }
+                e
+            })
+            .collect())
     }
 
     /// As [`path_history`](Self::path_history), for the node with id `node_id` — how a trashed
