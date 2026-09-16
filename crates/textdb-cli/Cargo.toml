@@ -32,6 +32,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# The sync-base test stands in for another machine by writing to the store directly.
+rusqlite = { workspace = true }
 
 # The lock tests hold the sync lock the way a running sync does.
 [target.'cfg(unix)'.dev-dependencies]

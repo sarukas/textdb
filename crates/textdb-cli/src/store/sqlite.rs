@@ -770,6 +770,10 @@ impl Store for SqliteStore {
         // Compare-and-swap: the row must still be at the generation this sync read, or another
         // one replaced the base meanwhile and this run's view of both sides is stale. `WHERE` on
         // a conflicting upsert makes the row come back empty rather than overwritten.
+        //
+        // The base is saved last, after the store and disk writes, so this does not stop them —
+        // what it stops is a stale base overwriting the one the other process recorded, which
+        // would make the *next* sync take this run's view as the agreed state and miss theirs.
         let id: Option<i64> = tx
             .query_row(
                 &format!(
@@ -800,7 +804,9 @@ impl Store for SqliteStore {
             .map_err(sql)?;
         let Some(id) = id else {
             return Err(StoreError::contention(format!(
-                "{} and {} were synced by another process while this sync was running; nothing was written — run again",
+                "{} and {} were synced by another process while this one was running, so this run's base was not \
+                 recorded. What it wrote is in the store and on disk; run sync again to reconcile against the base \
+                 that process left",
                 base.prefix, base.dir
             )));
         };

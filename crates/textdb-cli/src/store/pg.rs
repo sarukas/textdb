@@ -1139,6 +1139,8 @@ impl Store for PgStore {
         let mut tx = self.client.transaction().map_err(pg)?;
         // Compare-and-swap, as on SQLite: the row must still be at the generation this sync read.
         // `WHERE` on the conflict clause makes a stale save return no row rather than overwrite.
+        // As there, this runs after the writes: it protects the next sync's starting point, not
+        // this one's output.
         let id: i64 = tx
             .query_opt(
                 "INSERT INTO kb.sync(prefix, dir, seq, author, git_commit, git_branch, git_remote, git_clean, rules, generation, dir_id) \
@@ -1153,7 +1155,9 @@ impl Store for PgStore {
             .map_err(pg)?
             .ok_or_else(|| {
                 StoreError::contention(format!(
-                    "{} and {} were synced by another process while this sync was running; nothing was written — run again",
+                    "{} and {} were synced by another process while this one was running, so this run's base was \
+                     not recorded. What it wrote is in the store and on disk; run sync again to reconcile against \
+                     the base that process left",
                     base.prefix, base.dir
                 ))
             })?

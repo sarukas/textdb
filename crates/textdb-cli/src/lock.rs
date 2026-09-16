@@ -95,6 +95,10 @@ pub fn acquire(dir: &Path, timeout: Duration) -> Result<Lock> {
         if try_lock(&file) {
             let mut lock = Lock { file, path };
             lock.record()?;
+            // Holding the lock means no other sync of this directory is running, so anything in
+            // its staging directory is from a run that is gone — a sync a hook timed out on, say.
+            // Nothing else would ever remove them, and they are whole documents, not scraps.
+            clear_staging(dir);
             return Ok(lock);
         }
         if Instant::now() >= deadline {
@@ -165,4 +169,17 @@ fn unlock(_file: &File) {}
 #[cfg(not(unix))]
 fn alive(pid: u32) -> bool {
     pid != 0 && crate::assets::driver::process_running(pid)
+}
+
+
+/// Remove what a dead run left in `.textdb/tmp`. Best effort: a file that cannot be removed is
+/// not worth failing a sync over, and the next one will try again.
+fn clear_staging(dir: &Path) {
+    let staging = dir.join(".textdb").join("tmp");
+    let Ok(entries) = std::fs::read_dir(&staging) else { return };
+    for entry in entries.flatten() {
+        if entry.path().extension().is_some_and(|e| e == "tdbtmp") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }

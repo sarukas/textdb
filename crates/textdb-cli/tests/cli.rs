@@ -2882,3 +2882,162 @@ fn a_directory_that_moves_keeps_its_sync_base() {
     let bases = ok(textdb(&db).args(["--json", "sql", "SELECT dir FROM kb_sync"]), None).json();
     assert_eq!(bases["rows"].as_array().unwrap().len(), 1, "{bases}");
 }
+
+/// The sync base is a compare-and-swap, so a run that another machine sharing the folder
+/// overtook does not record its own base over theirs.
+///
+/// The directory lock covers one computer; this is the case it cannot see. The base is written
+/// last, after the store and disk writes, so what the overtaken run wrote stays — it is versioned
+/// in the store and present on disk. What the check buys is the *next* sync's starting point: it
+/// reconciles against the base the other machine left rather than taking the overtaken run's view
+/// as the agreed state.
+#[test]
+fn a_sync_another_machine_overtook_does_not_record_its_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..200 {
+        std::fs::write(dir.join(format!("n{i}.md")), format!("# N {i}\n\nbody\n")).unwrap();
+    }
+    ok(textdb(&db).args(["sync", "/v"]).arg(&dir), None);
+
+    let generation = |label: &str| -> i64 {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.query_row("SELECT generation FROM kb_sync", [], |r| r.get(0)).unwrap_or_else(|e| panic!("{label}: {e}"))
+    };
+    // One sync, one generation: the mechanism is live rather than stuck at zero.
+    assert_eq!(generation("after the first sync"), 1);
+
+    // Enough new work that the run takes long enough for the other machine to land inside it.
+    for i in 200..1400 {
+        std::fs::write(dir.join(format!("n{i}.md")), format!("# N {i}\n\nbody\n")).unwrap();
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bumping = {
+        let (db, stop) = (db.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(30)).unwrap();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = conn.execute("UPDATE kb_sync SET generation = generation + 1", []);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })
+    };
+    let overtaken = run(textdb(&db).args(["sync", "/v"]).arg(&dir), None);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    bumping.join().unwrap();
+
+    assert_eq!(overtaken.status, 4, "stdout: {}\nstderr: {}", overtaken.stdout, overtaken.stderr);
+    assert!(overtaken.stderr.contains("were synced by another process"), "{}", overtaken.stderr);
+    // The message says what is true: the writes landed, only the base did not.
+    assert!(overtaken.stderr.contains("is in the store and on disk"), "{}", overtaken.stderr);
+    let files = ok(textdb(&db).args(["--json", "sql", "SELECT count(*) AS n FROM files"]), None).json();
+    assert_eq!(files["rows"][0]["n"], 1400, "the run's work is in the store: {files}");
+
+    // And a following sync succeeds, leaving both sides agreeing.
+    let again = ok(textdb(&db).args(["sync", "/v"]).arg(&dir), None);
+    assert!(again.stdout.contains("1400 unchanged"), "{}", again.stdout);
+}
+
+/// A sync killed while it is writing leaves every file whole: the old bytes or the new ones,
+/// never a truncated one.
+///
+/// `write_disk` used to open the target with `truncate(true)` and write into it, so a sync a hook
+/// timed out on — or any kill — left an empty note where a document had been. The bytes now go to
+/// `.textdb/tmp` and are renamed over the target, which no reader can see half of.
+#[test]
+fn a_killed_sync_leaves_no_half_written_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Big enough that writing them all takes long enough to be interrupted part-way.
+    let old: String = (0..600).map(|i| format!("old line {i}\n")).collect();
+    let new: String = (0..600).map(|i| format!("new line {i}\n")).collect();
+    for i in 0..60 {
+        std::fs::write(dir.join(format!("n{i}.md")), &old).unwrap();
+    }
+    ok(textdb(&db).args(["sync", "/v"]).arg(&dir), None);
+
+    // Change every document in the store, so the next sync has to rewrite every file on disk.
+    ok(
+        textdb(&db).args(["sql", "--write", "UPDATE kb SET content = replace(content, 'old line', 'new line')"]),
+        None,
+    );
+
+    let mut child = textdb(&db)
+        .args(["sync", "/v"])
+        .arg(&dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sync");
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Whatever it managed, every file is one of the two whole texts.
+    let mut newly = 0;
+    for i in 0..60 {
+        let text = std::fs::read_to_string(dir.join(format!("n{i}.md"))).unwrap();
+        if text == new {
+            newly += 1;
+        } else {
+            assert_eq!(text, old, "n{i}.md is neither the old text nor the new one ({} bytes)", text.len());
+        }
+    }
+
+    // The staging files of a run that was killed do not pile up: the next sync holds the lock, so
+    // anything left in .textdb/tmp is from a run that is gone, and it clears them.
+    ok(textdb(&db).args(["sync", "/v"]).arg(&dir), None);
+    let staging = dir.join(".textdb").join("tmp");
+    let left: Vec<_> = std::fs::read_dir(&staging).map(|d| d.flatten().collect()).unwrap_or_default();
+    assert!(left.is_empty(), "staging files left behind: {left:?}");
+}
+
+/// Discovery walks up, and the two ways of stopping it work.
+///
+/// A synced directory above the one you are in would otherwise pair your command with a store it
+/// knows nothing about — which is how a misfired test came to sync this repository once, and why
+/// the harness pins `TEXTDB_CEILING_DIRECTORIES`.
+#[test]
+fn discovery_stops_where_it_is_told_to() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let outer = tmp.path().join("outer");
+    let inner = outer.join("a").join("b");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::write(outer.join("top.md"), "top\n").unwrap();
+    ok(textdb(&db).args(["sync", "/outer"]).arg(&outer), None);
+
+    // From inside, with nothing said: the pairing above is found.
+    let sync_from = |at: &std::path::Path, env: &[(&str, &std::ffi::OsStr)]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_textdb"));
+        cmd.current_dir(at)
+            .env_remove("TEXTDB_STORE")
+            .env_remove("TEXTDB_DIR")
+            .env("TEXTDB_CONFIG_DIR", tmp.path().join("config"));
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        cmd.arg("sync");
+        run(&mut cmd, None)
+    };
+    let found = sync_from(&inner, &[("TEXTDB_CEILING_DIRECTORIES", std::ffi::OsStr::new(""))]);
+    assert_eq!(found.status, 0, "{}", found.stderr);
+    assert!(found.stdout.contains("/outer with"), "{}", found.stdout);
+
+    // A ceiling at the directory you are in stops the walk before it starts, so nothing is found
+    // and the current directory is what gets synced — with its own folder, not the one above.
+    let stopped = sync_from(&inner, &[("TEXTDB_CEILING_DIRECTORIES", inner.as_os_str())]);
+    assert_eq!(stopped.status, 0, "{}", stopped.stderr);
+    assert!(stopped.stdout.contains(inner.to_str().unwrap()), "{}", stopped.stdout);
+    assert!(!stopped.stdout.contains("/outer with"), "{}", stopped.stdout);
+
+    // TEXTDB_DIR names one outright, from anywhere.
+    let named = sync_from(tmp.path(), &[("TEXTDB_DIR", outer.as_os_str())]);
+    assert_eq!(named.status, 0, "{}", named.stderr);
+    assert!(named.stdout.contains("/outer with"), "{}", named.stdout);
+}
