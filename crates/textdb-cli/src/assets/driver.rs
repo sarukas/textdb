@@ -295,7 +295,7 @@ pub(crate) fn beside(path: &str, sha256: &str, n: u32) -> String {
 }
 
 /// This computer's name as one word of a file name.
-pub(crate) fn host_word() -> String {
+pub fn host_word() -> String {
     super::host().chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect()
 }
 

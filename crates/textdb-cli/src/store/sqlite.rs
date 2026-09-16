@@ -767,14 +767,19 @@ impl Store for SqliteStore {
         let p = DEFAULT_PREFIX;
         let git = base.git.as_ref();
         let tx = self.conn.transaction().map_err(sql)?;
-        let id: i64 = tx
+        // Compare-and-swap: the row must still be at the generation this sync read, or another
+        // one replaced the base meanwhile and this run's view of both sides is stale. `WHERE` on
+        // a conflicting upsert makes the row come back empty rather than overwritten.
+        let id: Option<i64> = tx
             .query_row(
                 &format!(
-                    "INSERT INTO {p}sync(prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean, rules) \
-                     VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4, ?5, ?6, ?7, ?8, ?9) \
+                    "INSERT INTO {p}sync(prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean, rules, generation) \
+                     VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4, ?5, ?6, ?7, ?8, ?9, ?10 + 1) \
                      ON CONFLICT(prefix, dir) DO UPDATE SET seq = excluded.seq, synced_at = excluded.synced_at, \
                      author = excluded.author, git_commit = excluded.git_commit, git_branch = excluded.git_branch, \
-                     git_remote = excluded.git_remote, git_clean = excluded.git_clean, rules = excluded.rules RETURNING id"
+                     git_remote = excluded.git_remote, git_clean = excluded.git_clean, rules = excluded.rules, \
+                     generation = {p}sync.generation + 1 \
+                     WHERE {p}sync.generation = ?10 RETURNING id"
                 ),
                 rusqlite::params![
                     base.prefix,
@@ -786,10 +791,18 @@ impl Store for SqliteStore {
                     git.and_then(|g| g.remote.as_deref()),
                     git.map(|g| g.clean),
                     base.rules,
+                    base.generation,
                 ],
                 |r| r.get(0),
             )
+            .optional()
             .map_err(sql)?;
+        let Some(id) = id else {
+            return Err(StoreError::contention(format!(
+                "{} and {} were synced by another process while this sync was running; nothing was written — run again",
+                base.prefix, base.dir
+            )));
+        };
         // A sync that changed nothing still arrives here with the whole base, and rewriting it
         // meant a DELETE and an INSERT per file — hundreds of statements and their WAL records
         // for a run whose answer was "nothing to do". Read the rows first and skip the rewrite
@@ -1010,7 +1023,7 @@ fn run_sql(conn: &Connection, query: &str, params: &[String], author: Option<&st
     })
 }
 
-const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean, rules";
+const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean, rules, generation";
 
 fn sync_row(r: &rusqlite::Row) -> rusqlite::Result<(i64, SyncBase)> {
     let clean: Option<bool> = r.get(9)?;
@@ -1025,6 +1038,7 @@ fn sync_row(r: &rusqlite::Row) -> rusqlite::Result<(i64, SyncBase)> {
             author: r.get(5)?,
             git: clean.map(|clean| GitState { commit, branch, remote, clean }),
             rules: r.get(10)?,
+            generation: r.get(11)?,
             files: Vec::new(),
         },
     ))

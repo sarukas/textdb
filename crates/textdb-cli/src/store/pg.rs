@@ -61,9 +61,10 @@ CREATE TABLE IF NOT EXISTS kb.sync_file (
   conflict boolean NOT NULL DEFAULT false,
   PRIMARY KEY (sync_id, rel)
 );
-ALTER TABLE kb.sync ADD COLUMN IF NOT EXISTS rules text;";
+ALTER TABLE kb.sync ADD COLUMN IF NOT EXISTS rules text;
+ALTER TABLE kb.sync ADD COLUMN IF NOT EXISTS generation bigint NOT NULL DEFAULT 0;";
 
-const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at::text, author, git_commit, git_branch, git_remote, git_clean, rules";
+const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at::text, author, git_commit, git_branch, git_remote, git_clean, rules, generation";
 
 /// The asset store table, as the extension defines it, for stores installed before it was.
 const ASSET_TABLES: &str = "\
@@ -89,6 +90,7 @@ fn sync_row(r: &Row) -> (i64, SyncBase) {
                 clean,
             }),
             rules: r.get(10),
+            generation: r.get(11),
             files: Vec::new(),
         },
     )
@@ -1133,16 +1135,25 @@ impl Store for PgStore {
         );
         let clean = git.map(|g| g.clean);
         let mut tx = self.client.transaction().map_err(pg)?;
+        // Compare-and-swap, as on SQLite: the row must still be at the generation this sync read.
+        // `WHERE` on the conflict clause makes a stale save return no row rather than overwrite.
         let id: i64 = tx
-            .query_one(
-                "INSERT INTO kb.sync(prefix, dir, seq, author, git_commit, git_branch, git_remote, git_clean, rules) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+            .query_opt(
+                "INSERT INTO kb.sync(prefix, dir, seq, author, git_commit, git_branch, git_remote, git_clean, rules, generation) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::bigint + 1) \
                  ON CONFLICT (prefix, dir) DO UPDATE SET seq = excluded.seq, synced_at = now(), author = excluded.author, \
                  git_commit = excluded.git_commit, git_branch = excluded.git_branch, git_remote = excluded.git_remote, \
-                 git_clean = excluded.git_clean, rules = excluded.rules RETURNING id",
-                &[&base.prefix, &base.dir, &base.seq, &base.author, &commit, &branch, &remote, &clean, &base.rules],
+                 git_clean = excluded.git_clean, rules = excluded.rules, generation = kb.sync.generation + 1 \
+                 WHERE kb.sync.generation = $10::bigint RETURNING id",
+                &[&base.prefix, &base.dir, &base.seq, &base.author, &commit, &branch, &remote, &clean, &base.rules, &base.generation],
             )
             .map_err(pg)?
+            .ok_or_else(|| {
+                StoreError::contention(format!(
+                    "{} and {} were synced by another process while this sync was running; nothing was written — run again",
+                    base.prefix, base.dir
+                ))
+            })?
             .get(0);
         // As in the SQLite store: a sync that changed nothing still arrives with the whole
         // base, and rewriting it cost a DELETE and an INSERT of every row for a run whose

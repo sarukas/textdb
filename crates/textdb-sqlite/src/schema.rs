@@ -200,6 +200,7 @@ CREATE TABLE IF NOT EXISTS {p}sync (
   git_remote TEXT,
   git_clean  INTEGER,                       -- 1: no uncommitted changes; NULL: not a git checkout
   rules      TEXT,                          -- the include rules of that sync, as JSON (sync.rs Rules)
+  generation INTEGER NOT NULL DEFAULT 0,    -- bumped on every save; a sync saves against the one it read
   UNIQUE (prefix, dir)
 );
 -- Each file both sides agreed on at that sync: its version in the store, the git blob id of its
@@ -250,6 +251,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("link", "target_name", "TEXT"),
     ("link", "resolved_id", "INTEGER"),
     ("link", "status", "TEXT"),
+    // The sync base's compare-and-swap counter, for two machines sharing one folder: the
+    // directory lock is local, so only this catches a sync that landed from elsewhere.
+    ("sync", "generation", "INTEGER NOT NULL DEFAULT 0"),
     // Batches: the run (`textdb sql --write`) a commit or change belongs to.
     ("commit", "batch", "TEXT NULL"),
     ("change", "batch", "TEXT NULL"),

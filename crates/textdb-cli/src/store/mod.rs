@@ -46,6 +46,12 @@ impl StoreError {
         Self::new("TX001", message)
     }
 
+    /// Someone else holds what this needs right now, and retrying shortly is the answer.
+    /// Exit 4, which a hook can branch on without parsing the message.
+    pub fn contention(message: impl std::fmt::Display) -> Self {
+        Self::new("TX002", message)
+    }
+
     /// Process exit status, distinct per code so a script can branch without parsing output.
     pub fn exit_code(&self) -> i32 {
         match self.code.as_str() {
@@ -445,6 +451,11 @@ pub struct SyncBase {
     pub git: Option<GitState>,
     /// The include rules the sync used, as JSON; `None` for a base an older build saved.
     pub rules: Option<String>,
+    /// What this base was at when it was read. Saving checks it and bumps it, so a sync that
+    /// started from a base another one has since replaced aborts instead of overwriting it.
+    /// The directory lock is local; this is what catches a second machine sharing the folder.
+    #[serde(skip)]
+    pub generation: i64,
     #[serde(skip)]
     pub files: Vec<BaseFile>,
 }

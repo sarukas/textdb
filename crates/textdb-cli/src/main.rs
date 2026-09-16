@@ -28,6 +28,7 @@ type Result<T> = std::result::Result<T, StoreError>;
 mod assets;
 mod git;
 mod links;
+mod lock;
 mod meta;
 mod outline;
 mod portable;
@@ -152,6 +153,14 @@ enum Cmd {
         /// asset_pull setting is `all`.
         #[arg(long)]
         pull: bool,
+        /// Seconds to wait for another sync of the same directory to finish. Two syncs at once
+        /// would each compute both sides from the same base and land one edit twice, so the
+        /// second waits. On timeout it exits 4 naming the holder.
+        #[arg(long, value_name = "SECONDS", default_value_t = 10)]
+        lock_timeout: u64,
+        /// Do not wait for another sync of the same directory: exit 4 at once if one is running.
+        #[arg(long, conflicts_with = "lock_timeout")]
+        no_wait: bool,
     },
     /// When a store folder was last synced, what changed in it since, and how it compares with a
     /// git commit (by git blob id).
@@ -582,6 +591,8 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             prune_empty_dirs,
             push,
             pull,
+            lock_timeout,
+            no_wait,
         } => sync::sync(
             st,
             sync::Options {
@@ -595,6 +606,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
                 store: config::redact(&cli.store),
                 accept_rules,
                 prune_empty_dirs,
+                lock_wait: if no_wait { Duration::ZERO } else { Duration::from_secs(lock_timeout) },
                 assets: match (push, pull) {
                     (true, true) => Some("both".to_string()),
                     (true, false) => Some("push".to_string()),

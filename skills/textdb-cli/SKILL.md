@@ -60,6 +60,8 @@ To keep a folder reconciled with a git checkout both ways, use `sync` rather tha
 ```sh
 textdb sync guides ~/src/repo/guides --dry-run   # changes each way, merges, conflicts
 textdb sync guides ~/src/repo/guides --commit    # apply; commit what changed on disk (Textdb-* trailers)
+# One sync of a directory at a time: a second waits up to --lock-timeout (10s), then exits 4.
+# Safe to run from turn-start and turn-end hooks; --no-wait to skip rather than queue.
 textdb git-status guides ~/src/repo/guides       # last synced commit; store vs HEAD by blob id
 ```
 
@@ -217,7 +219,7 @@ three-way merge was clean), `unchanged` (nothing to do).
 | Exit status | Meaning | Do this |
 |---|---|---|
 | 3 | Conflict: someone changed the same lines since your version | Read the payload (stderr, or `--json` stdout): `theirs` is the current text of those lines and `current_version` the version it belongs to. Rebuild your change on `theirs` and retry with `-b <current_version>`. Do not retry the same command blindly |
-| 4 | Contention on a very hot file | Wait a moment and retry |
+| 4 | Contention on a very hot file, or another sync holds the directory | Wait a moment and retry |
 | 5 | Not found | Check the path with `ls` / `tree`; it may have moved (`textdb log`) |
 | 6 | Invalid edit: `--old` text missing or not unique, line range outside the file, empty content | Re-read (`cat -n`) and choose a unique anchor or a valid range |
 | 2 | Usage error, including a path mangled into `C:/…` by the shell | Drop the leading slash or set `MSYS_NO_PATHCONV=1` |

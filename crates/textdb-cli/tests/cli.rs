@@ -2597,3 +2597,116 @@ fn tree_counts_folders_and_prints_a_file_plainly() {
     assert!(!one.contains("0 files"), "{one}");
     assert!(one.contains("one.md"), "{one}");
 }
+
+/// Two syncs of one directory at once, which a turn-end hook in one agent and a turn-start hook
+/// in another produce. Without the directory lock each computed both sides from the same base and
+/// committed, so one appended line landed twice on disk and three times in the store, and both
+/// runs reported success.
+#[test]
+fn concurrent_syncs_do_not_duplicate_an_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 1..=20 {
+        std::fs::write(dir.join(format!("note-{i}.md")), format!("# Note {i}\n\nbody line\n")).unwrap();
+    }
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+
+    // One line appended on disk, then both syncs started as close together as possible.
+    let note = dir.join("note-5.md");
+    std::fs::write(&note, "# Note 5\n\nbody line\n- appended\n").unwrap();
+    let mut both: Vec<_> = (0..2)
+        .map(|_| {
+            textdb(&db)
+                .args(["sync", "/"])
+                .arg(&dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn sync")
+        })
+        .collect();
+    let outs: Vec<i32> = both.iter_mut().map(|c| c.wait().unwrap().code().unwrap_or(-1)).collect();
+    // Either both queue and succeed, or the loser reports contention (exit 4). Never a silent
+    // success that wrote twice, and never a conflict (3) from a race with itself.
+    assert!(outs.iter().all(|c| matches!(c, 0 | 4)), "{outs:?}");
+
+    let on_disk = std::fs::read_to_string(&note).unwrap();
+    let in_store = ok(textdb(&db).args(["cat", "/note-5.md"]), None).stdout;
+    assert_eq!(on_disk, "# Note 5\n\nbody line\n- appended\n", "disk");
+    assert_eq!(in_store, on_disk, "the store and disk agree");
+    assert!(!on_disk.contains("<<<<<<<") && !on_disk.contains(">>>>>>>"), "no markers: {on_disk}");
+
+    // One disk edit is one new version, whatever the two syncs did.
+    let history = ok(textdb(&db).args(["--json", "history", "/note-5.md", "--versions-only"]), None).json();
+    assert_eq!(history.as_array().unwrap().len(), 2, "{history}");
+}
+
+/// A sync will not start while another holds the directory, and says so rather than proceeding.
+#[test]
+fn a_second_sync_waits_or_reports_the_holder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.md"), "one\n").unwrap();
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+
+    // Hold the lock the way a running sync does, from this process.
+    let lock = dir.join(".textdb").join("lock");
+    let held = std::fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    }
+
+    let refused = run(textdb(&db).args(["sync", "/"]).arg(&dir).arg("--no-wait"), None);
+    assert_eq!(refused.status, 4, "stdout: {}\nstderr: {}", refused.stdout, refused.stderr);
+    assert!(refused.stderr.contains("being synced by another process"), "{}", refused.stderr);
+
+    // Released, and the next sync goes through.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
+    }
+    drop(held);
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+}
+
+/// A dry run reads only, so it neither takes the lock nor queues behind a sync that holds it.
+#[test]
+fn a_dry_run_does_not_queue_behind_a_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.md"), "one\n").unwrap();
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+
+    let lock = dir.join(".textdb").join("lock");
+    let held = std::fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    }
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir).args(["--dry-run", "--no-wait"]), None);
+}
+
+/// `.textdb` keeps a checkout clean on its own, so nothing textdb writes beside a directory shows
+/// up as untracked and the user's `.gitignore` needs no entry for it.
+#[test]
+fn the_textdb_directory_ignores_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.md"), "one\n").unwrap();
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+
+    let ignore = std::fs::read_to_string(dir.join(".textdb").join(".gitignore")).unwrap();
+    assert!(ignore.contains('*'), "{ignore}");
+}

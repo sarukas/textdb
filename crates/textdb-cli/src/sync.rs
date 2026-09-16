@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -55,6 +55,8 @@ pub struct Options {
     /// What to do with assets besides listing them: `push`, `pull` or `both`; `None` for what the
     /// store's `asset_sync` setting says.
     pub assets: Option<String>,
+    /// How long to wait for another sync of the same directory. Zero is `--no-wait`.
+    pub lock_wait: Duration,
 }
 
 /// What a sync takes in from disk, recorded with its base so the next sync can tell when it
@@ -463,6 +465,28 @@ fn walk(root: &Path, tracked_dirs: &HashSet<String>) -> Result<Walk> {
     Ok(w)
 }
 
+/// `DIR/.textdb`, created if it is not there, ignoring itself.
+///
+/// Everything textdb keeps beside a synced directory lives here: the lock, the staging files and
+/// the trash. It carries a `.gitignore` of `*` so a checkout stays clean without the user adding
+/// anything to theirs — the same trick git's own tooling uses for generated directories.
+pub fn textdb_dir(root: &Path) -> std::io::Result<PathBuf> {
+    let dir = root.join(".textdb");
+    std::fs::create_dir_all(&dir)?;
+    let ignore = dir.join(".gitignore");
+    if !ignore.exists() {
+        // Best effort: a read-only directory is not a reason to fail the sync.
+        let _ = std::fs::write(&ignore, "# textdb's own files; not yours to track.\n*\n");
+    }
+    Ok(dir)
+}
+
+/// Write `rel` whole, or not at all.
+///
+/// The bytes go to a staging file and are renamed over the target, as git does with its `.lock`
+/// files: a reader never sees half a note, and a sync killed mid-write — a hook that timed out,
+/// say — leaves the old content rather than an empty file. Truncating in place was worth one
+/// thing, that the file kept its permissions; those are copied onto the staging file instead.
 fn write_disk(root: &Path, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
     refuse_protected(rel)?;
     refuse_link(root, rel)?;
@@ -471,9 +495,26 @@ fn write_disk(root: &Path, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Truncated in place rather than replaced, so the file keeps its permissions.
-    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&target)?;
-    file.write_all(bytes)
+    let staging = textdb_dir(root)?.join("tmp");
+    std::fs::create_dir_all(&staging)?;
+    // Unique per process and call: two syncs of different directories may share a root, and one
+    // sync writes many files.
+    let tmp = staging.join(format!("{}-{}.tdbtmp", std::process::id(), now_ns()));
+    let done = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        // Durable before the rename, so a crash cannot leave the name pointing at empty bytes.
+        file.sync_all()?;
+        drop(file);
+        if let Ok(meta) = std::fs::metadata(&target) {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, &target)
+    })();
+    if done.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    done
 }
 
 /// Delete a file, then the directories it leaves empty (never `root`).
@@ -1078,6 +1119,11 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     if !o.dir.exists() && !o.dry_run {
         std::fs::create_dir_all(&o.dir).map_err(|e| StoreError::other(format!("{}: {e}", o.dir.display())))?;
     }
+    // Held for the whole run, before anything is read: two syncs of one directory each compute
+    // both sides from the same base and commit, so one disk edit lands twice — which is what a
+    // turn-end hook in one agent and a turn-start hook in another produce. A dry run reads only,
+    // so it does not queue behind a real one.
+    let _lock = if o.dry_run { None } else { Some(crate::lock::acquire(&o.dir, o.lock_wait)?) };
     let key = dir_key(&o.dir);
     let repo = git::repo(&o.dir);
     if o.commit && repo.is_none() {
@@ -1095,6 +1141,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             "{prefix} has been synced with {key} before and has a base already; --base is for the first sync only"
         )));
     }
+    let generation = stored.as_ref().map_or(0, |b| b.generation);
     let heads = heads_by_rel(st, &prefix)?;
     let mut report = Report {
         prefix: prefix.clone(),
@@ -1754,7 +1801,20 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         }
     }
     if !report.stopped && !report.stopped_by_rules && !o.dry_run {
-        apply(&mut sides, &o, &plan, &base, &stored_rows, &heads, &changes, &key, from_commit.as_deref(), &mut report, &rules)?;
+        apply(
+            &mut sides,
+            &o,
+            &plan,
+            &base,
+            &stored_rows,
+            &heads,
+            &changes,
+            &key,
+            from_commit.as_deref(),
+            &mut report,
+            &rules,
+            generation,
+        )?;
     }
     if !report.stopped && !report.stopped_by_rules {
         sync_assets(&mut *sides.st, &o, &prefix, &plan, attrs_changed, has_pointers, has_copies, &mut report);
@@ -1848,6 +1908,8 @@ fn apply(
     from_commit: Option<&str>,
     report: &mut Report,
     rules: &Rules,
+    // What the base was at when this sync read it; saving checks it has not moved since.
+    generation: i64,
 ) -> Result<()> {
     let prefix = sides.prefix.clone();
     let dir = o.dir.as_path();
@@ -2086,6 +2148,7 @@ fn apply(
             clean: r.clean,
         }),
         rules: serde_json::to_string(rules).ok(),
+        generation,
         files: rows.into_values().collect(),
     })
 }
