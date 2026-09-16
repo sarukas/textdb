@@ -719,11 +719,19 @@ Together, over 2,000 notes:
 | `outline_match_prefix` | 18.89 ms | 15.72 ms | 1.20x |
 | `outline_vault` | 42.35 ms | 36.32 ms | 1.17x |
 
-**Where the rest of it goes, and why it stops here.** The server executes the prefix query in
-4.1 ms of the 15.7 ms measured — about 3 us per row of SPI materialisation, the same overhead
-already recorded for chunk fetches. Fixing it needs streaming instead of a better plan, which
-`TableIterator` over an SPI result does not give. SQLite is unchanged throughout: its plans
-were already right and its costs are proportional to the rows returned (~2 us/row).
+**Where the rest of it goes, and why it stops here.** On both engines what is left is moving
+rows, not finding them, and the same measurement says so twice:
+
+- Postgres executes the prefix query server-side in 4.1 ms of the 15.7 ms measured — about
+  3 us per row of SPI materialisation, the overhead already recorded for chunk fetches.
+- SQLite runs the vault query, all fourteen columns, aggregated so no row crosses the
+  boundary, in 3.5 ms over 7,201 section rows. The same query through the virtual table
+  returns ~10,000 rows in 20.8 ms. Scaled, roughly 4.9 ms is the query and 16 ms is the
+  cursor materialising `Vec<Vec<Value>>`.
+
+Neither is a plan to fix or an index to add: both want a streaming cursor instead of a
+materialised result, which is a different piece of work from this pass. SQLite's plans were
+already right throughout and were not touched.
 
 ### The section index: a composite that was never used as one
 
