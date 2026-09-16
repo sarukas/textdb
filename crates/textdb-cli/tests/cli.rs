@@ -2420,3 +2420,121 @@ fn property_columns_and_the_sql_view() {
         .collect();
     assert_eq!(vals, vec![("cvm", 0), ("telco", 1)], "a list keeps its order in `ord`");
 }
+
+/// The canonical listing record on SQLite: the same twenty-four keys, in the same order,
+/// from `ls`, `stat` and `tree`, and identical to what Postgres returns (`cli_pg.rs`).
+#[test]
+fn every_listing_surface_returns_the_same_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kb.db");
+    ok(
+        textdb(&db).args(["write", "/g/api/index.md"]),
+        Some("---\ntitle: API Guide\nstatus: draft\n---\n# API Guide\n\nSee [limits](limits.md) and [gone](missing.md).\n\n## Errors\ntext\n"),
+    );
+    ok(textdb(&db).args(["write", "/g/api/limits.md"]), Some("# Limits\n\nrate limit is 100.\n"));
+
+    const KEYS: [&str; 24] = [
+        "path", "name", "kind", "version", "nbytes", "nlines", "updated_at", "updated_by", "id", "dir", "depth", "ext",
+        "title", "nwords", "nsections", "nprops", "nlinks", "nlinks_broken", "versions", "created_at", "files",
+        "folders", "nauthors", "authors",
+    ];
+    let keys_of = |v: &Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
+
+    let stat = ok(textdb(&db).args(["--json", "stat", "/g/api/index.md"]), None).json();
+    assert_eq!(keys_of(&stat), KEYS, "stat");
+    let ls = ok(textdb(&db).args(["--json", "ls", "/g/api"]), None).json();
+    assert_eq!(keys_of(&ls[0]), KEYS, "ls");
+    let tree = ok(textdb(&db).args(["--json", "tree", "/g"]), None).json();
+    assert_eq!(keys_of(&tree[0]), KEYS, "tree");
+    // The same file through three commands is the same record, byte for byte.
+    let from_ls = ls.as_array().unwrap().iter().find(|e| e["path"] == "/g/api/index.md").unwrap().clone();
+    assert_eq!(from_ls, stat);
+
+    assert_eq!(stat["title"], "API Guide");
+    assert_eq!((stat["nsections"].as_i64(), stat["nprops"].as_i64()), (Some(2), Some(2)));
+    assert_eq!((stat["nlinks"].as_i64(), stat["nlinks_broken"].as_i64()), (Some(2), Some(1)));
+    assert_eq!((stat["ext"].as_str(), stat["dir"].as_str()), (Some("md"), Some("/g/api")));
+
+    // A folder has totals and no version; both used to be null or meaningless (`v0`).
+    let folder = ok(textdb(&db).args(["--json", "stat", "/g/api"]), None).json();
+    assert!(folder["version"].is_null());
+    assert_eq!(folder["nsections"], 3);
+    assert_eq!(folder["nlinks_broken"], 1);
+    assert!(folder["nbytes"].as_i64().unwrap() > 0);
+
+    // `ls FILE` lists that one file rather than nothing, and `-1` marks folders.
+    let one = ok(textdb(&db).args(["--json", "ls", "/g/api/index.md"]), None).json();
+    assert_eq!(one.as_array().unwrap().len(), 1);
+    let paths = ok(textdb(&db).args(["ls", "-1", "/g"]), None).stdout;
+    assert!(paths.contains("/g/api/\n"), "a folder keeps its marker in -1: {paths:?}");
+}
+
+/// Creating a link's target fixes the count without a commit to the file holding the link.
+#[test]
+fn broken_link_counts_follow_the_target_not_the_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kb.db");
+    ok(textdb(&db).args(["write", "/a.md"]), Some("# A\n\n[later](later.md)\n"));
+    let before = ok(textdb(&db).args(["--json", "stat", "/a.md"]), None).json();
+    assert_eq!(before["nlinks_broken"], 1);
+
+    // Nothing writes to /a.md here; the link starts resolving because its target appears.
+    ok(textdb(&db).args(["write", "/later.md"]), Some("# Later\n"));
+    let after = ok(textdb(&db).args(["--json", "stat", "/a.md"]), None).json();
+    assert_eq!(after["nlinks_broken"], 0, "the link resolves now");
+    assert_eq!(after["version"], before["version"], "and /a.md was not rewritten");
+    // The folder total followed it down.
+    let root = ok(textdb(&db).args(["--json", "stat", "/"]), None).json();
+    assert_eq!(root["nlinks_broken"], 0);
+}
+
+/// `search` and `grep` return one row shape, and a `line` always has a `version`.
+#[test]
+fn search_and_grep_share_one_row_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kb.db");
+    ok(
+        textdb(&db).args(["write", "/s/doc.md"]),
+        Some("# Guide\n\nintro\n\n## Errors\n\nthe rate limit is 100 per minute.\n"),
+    );
+    const KEYS: [&str; 7] = ["path", "version", "line", "text", "section", "score", "more"];
+    let keys_of = |v: &Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
+
+    let hits = ok(textdb(&db).args(["--json", "search", "rate", "limit"]), None).json();
+    let hits = hits.as_array().unwrap();
+    assert_eq!(keys_of(&hits[0]), KEYS, "search");
+    assert_eq!(hits[0]["version"], 1);
+    assert_eq!(hits[0]["section"], "Guide / Errors");
+    assert!(hits[0]["score"].as_f64().unwrap() > 0.0, "higher is better");
+
+    let greps = ok(textdb(&db).args(["--json", "grep", "rate"]), None).json();
+    assert_eq!(keys_of(&greps.as_array().unwrap()[0]), KEYS, "grep");
+    assert!(greps[0]["score"].is_null(), "grep ranks nothing");
+
+    // `-l` and `-c` filter rows on both commands without changing the row type.
+    for flag in ["-l", "-c"] {
+        for cmd in ["search", "grep"] {
+            let rows = ok(textdb(&db).args(["--json", cmd, flag, "rate"]), None).json();
+            assert_eq!(keys_of(&rows.as_array().unwrap()[0]), ["path", "version", "matches"], "{cmd} {flag}");
+        }
+    }
+
+    // `--per-file` truncation is visible in JSON, which it never was.
+    ok(textdb(&db).args(["write", "/s/many.md"]), Some("rate\nrate\nrate\nrate\n"));
+    let capped = ok(textdb(&db).args(["--json", "search", "--per-file", "2", "rate"]), None).json();
+    let many = capped.as_array().unwrap().iter().find(|h| h["path"] == "/s/many.md").unwrap();
+    assert_eq!(many["more"], 2, "two lines were held back and the row says so");
+}
+
+/// A path echoed back is the path the store knows, whatever the caller typed.
+#[test]
+fn paths_come_back_normalized() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kb.db");
+    ok(textdb(&db).args(["write", "/n/a.md"]), Some("one\n"));
+    ok(textdb(&db).args(["write", "/n/a.md"]), Some("two\n"));
+    for args in [vec!["--json", "cat", "n/a.md"], vec!["--json", "diff", "n/a.md", "1", "2"]] {
+        let v = ok(textdb(&db).args(&args), None).json();
+        assert_eq!(v["path"], "/n/a.md", "{args:?}");
+    }
+}

@@ -28,6 +28,33 @@ def _wrap(fn):
     return inner
 
 
+_ENTRY_KEYS = (
+    "path", "name", "kind", "version", "nbytes", "nlines", "updated_at", "updated_by", "id", "dir", "depth", "ext",
+    "title", "nwords", "nsections", "nprops", "nlinks", "nlinks_broken", "versions", "created_at", "files", "folders",
+    "nauthors", "authors",
+)
+
+
+def _utc(col):
+    """A timestamp as ISO-8601 UTC, rendered in SQL.
+
+    Left to the driver it would come back a ``datetime`` in the session's time zone: a
+    different type *and* a different spelling of the same field from the SQLite backend's.
+    """
+    return "to_char(" + col + " AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')"
+
+
+#: The canonical ``Entry`` columns of ``kb.entry``, in order.
+_ENTRY_COLS = ", ".join(
+    _utc("e." + k) if k in ("updated_at", "created_at") else ("e.authors::text" if k == "authors" else "e." + k)
+    for k in _ENTRY_KEYS
+)
+
+
+def _entry(row):
+    return dict(zip(_ENTRY_KEYS, row))
+
+
 class PostgresBackend(Backend):
     name = "postgres"
 
@@ -56,15 +83,13 @@ class PostgresBackend(Backend):
     # namespace ---------------------------------------------------------------
     @_wrap
     def ls(self, path: str, recursive: bool = False):
-        # Timestamps rendered to ISO-8601 UTC in SQL rather than left to the driver, so both
-        # backends hand the same string back and `updated_at` is one type, not two.
-        rows = self._rows("SELECT e.path, e.name, e.kind, e.version, e.nbytes, e.nlines, to_char(e.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'), e.updated_by, e.id, e.dir, e.depth, e.ext, e.title, e.nwords, e.nsections, e.nprops, e.nlinks, e.nlinks_broken, e.versions, to_char(e.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'), e.files, e.folders, e.nauthors, e.authors::text FROM kb.ls(%s, %s) e", (path, recursive))
-        return [dict(path=r[0], name=r[1], kind=r[2], version=r[3], nbytes=r[4], nlines=r[5], updated_at=r[6], updated_by=r[7], id=r[8], dir=r[9], depth=r[10], ext=r[11], title=r[12], nwords=r[13], nsections=r[14], nprops=r[15], nlinks=r[16], nlinks_broken=r[17], versions=r[18], created_at=r[19], files=r[20], folders=r[21], nauthors=r[22], authors=r[23]) for r in rows]
+        rows = self._rows(f"SELECT {_ENTRY_COLS} FROM kb.ls(%s, %s) e", (path, recursive))
+        return [_entry(r) for r in rows]
 
     @_wrap
     def entry(self, path: str):
-        rows = self._rows("SELECT e.path, e.name, e.kind, e.version, e.nbytes, e.nlines, to_char(e.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'), e.updated_by, e.id, e.dir, e.depth, e.ext, e.title, e.nwords, e.nsections, e.nprops, e.nlinks, e.nlinks_broken, e.versions, to_char(e.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'), e.files, e.folders, e.nauthors, e.authors::text FROM kb.entry e WHERE e.path = %s", (path,))
-        return [dict(path=r[0], name=r[1], kind=r[2], version=r[3], nbytes=r[4], nlines=r[5], updated_at=r[6], updated_by=r[7], id=r[8], dir=r[9], depth=r[10], ext=r[11], title=r[12], nwords=r[13], nsections=r[14], nprops=r[15], nlinks=r[16], nlinks_broken=r[17], versions=r[18], created_at=r[19], files=r[20], folders=r[21], nauthors=r[22], authors=r[23]) for r in rows]
+        rows = self._rows(f"SELECT {_ENTRY_COLS} FROM kb.entry e WHERE e.path = %s", (path,))
+        return [_entry(r) for r in rows]
 
     @_wrap
     def list_files(self, prefix: str):

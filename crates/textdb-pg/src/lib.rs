@@ -311,12 +311,6 @@ extension_sql!(
 ALTER TABLE kb.chunk ADD COLUMN tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', kb.chunk_text(bytes))) STORED;
 CREATE INDEX chunk_tsv ON kb.chunk USING gin(tsv);
 
-CREATE VIEW kb.folder AS
-  -- The full listing record, folders only. `n_children` and `nbytes_total` are gone: a folder
-  -- row now carries `files`, `folders` and `nbytes` like every other listing surface, and the
-  -- totals come off the node row rather than a subtree scan per row.
-  SELECT * FROM kb.entry WHERE kind = 'folder' AND path <> '/';
-
 CREATE VIEW kb.file AS
   -- The minimal listing tier plus what only a file has: its content and parsed front matter.
   -- `parent_path` is now `dir`, the one name for it across every surface.
@@ -385,10 +379,16 @@ CREATE VIEW kb.entry AS
   ) d ON n.kind = 0
   WHERE n.deleted_at IS NULL;
 
+CREATE VIEW kb.folder AS
+  -- The full listing record, folders only. `n_children` and `nbytes_total` are gone: a folder
+  -- row now carries `files`, `folders` and `nbytes` like every other listing surface, and the
+  -- totals come off the node row rather than a subtree scan per row.
+  SELECT * FROM kb.entry WHERE kind = 'folder' AND path <> '/';
+
 -- The files and folders in the folder `path`, by name; with `recursive`, everything below it, by path.
 CREATE FUNCTION kb.ls(path text, recursive boolean DEFAULT false) RETURNS SETOF kb.entry LANGUAGE sql STABLE AS $$
   SELECT e.* FROM kb.node d JOIN kb.entry e
-    ON CASE WHEN recursive THEN e.path <> '/' AND (d.path = '/' OR e.path LIKE kb._subtree_like(d.path)) ELSE e.parent_id = d.id END
+    ON CASE WHEN recursive THEN e.path <> '/' AND (d.path = '/' OR e.path LIKE kb._subtree_like(d.path)) ELSE e.dir IS NOT DISTINCT FROM d.path END
   WHERE d.id = kb._node_id($1)   -- $1: `path` alone would be the tables' columns
   ORDER BY CASE WHEN recursive THEN e.path ELSE e.name END
 $$;

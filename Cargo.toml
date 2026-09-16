@@ -24,7 +24,10 @@ blake3 = "1.8"
 thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order`: JSON objects keep the order their fields were written in, so a listing
+# row reads in the canonical Entry order rather than alphabetically, and front matter keeps
+# the key order the document had.
+serde_json = { version = "1", features = ["preserve_order"] }
 proptest = "1.11"
 rand = "0.8"
 rusqlite = { version = "0.40", features = ["bundled", "vtab", "functions"] }

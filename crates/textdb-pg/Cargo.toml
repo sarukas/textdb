@@ -17,7 +17,7 @@ pg_test = []
 pgrx = "=0.18.1"
 textdb-core = { path = "../textdb-core" }
 textdb-md = { path = "../textdb-md" }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [dev-dependencies]
 pgrx-tests = "=0.18.1"

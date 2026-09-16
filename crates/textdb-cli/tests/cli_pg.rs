@@ -596,3 +596,92 @@ fn outlines_list_headings_and_count_words_on_postgres() {
     assert_eq!(words.len(), 2);
     assert_eq!(words[1], words[0] + 1);
 }
+
+/// The canonical listing record: the same twenty-four keys, in the same order, with the same
+/// values, from `ls`, `stat` and `tree` — and on this backend as on SQLite.
+#[test]
+fn every_listing_surface_returns_the_same_entry_on_postgres() {
+    let Some(db) = database() else { return };
+    ok(
+        textdb(&db).args(["write", "/g/api/index.md"]),
+        Some("---\ntitle: API Guide\nstatus: draft\n---\n# API Guide\n\nSee [limits](limits.md) and [gone](missing.md).\n\n## Errors\ntext\n"),
+    );
+    ok(textdb(&db).args(["write", "/g/api/limits.md"]), Some("# Limits\n\nrate limit is 100.\n"));
+
+    const KEYS: [&str; 24] = [
+        "path", "name", "kind", "version", "nbytes", "nlines", "updated_at", "updated_by", "id", "dir", "depth", "ext",
+        "title", "nwords", "nsections", "nprops", "nlinks", "nlinks_broken", "versions", "created_at", "files",
+        "folders", "nauthors", "authors",
+    ];
+    let keys_of = |v: &Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
+
+    let stat = ok(textdb(&db).args(["--json", "stat", "/g/api/index.md"]), None).json();
+    assert_eq!(keys_of(&stat), KEYS, "stat");
+    let ls = ok(textdb(&db).args(["--json", "ls", "/g/api"]), None).json();
+    assert_eq!(keys_of(&ls[0]), KEYS, "ls");
+    // `tree --json` used to return six keys with null folder totals — less than `tree` printed.
+    let tree = ok(textdb(&db).args(["--json", "tree", "/g"]), None).json();
+    assert_eq!(keys_of(&tree[0]), KEYS, "tree");
+
+    // The same file through three commands is the same record.
+    let from_ls = ls.as_array().unwrap().iter().find(|e| e["path"] == "/g/api/index.md").unwrap().clone();
+    assert_eq!(from_ls, stat);
+
+    // The structural counts the store has always indexed and never exposed.
+    assert_eq!(stat["title"], "API Guide");
+    assert_eq!(stat["nsections"], 2);
+    assert_eq!(stat["nprops"], 2);
+    assert_eq!((stat["nlinks"].as_i64(), stat["nlinks_broken"].as_i64()), (Some(2), Some(1)));
+    assert_eq!(stat["ext"], "md");
+    assert_eq!(stat["dir"], "/g/api");
+    assert_eq!(stat["depth"], 3);
+    assert_eq!(stat["version"], 1);
+
+    // A folder carries totals, never nulls, and no version of its own.
+    let folder = ok(textdb(&db).args(["--json", "stat", "/g/api"]), None).json();
+    assert_eq!(folder["kind"], "folder");
+    assert!(folder["version"].is_null(), "a folder has no version");
+    assert_eq!(folder["files"], 2);
+    assert_eq!(folder["nsections"], 3, "2 in index.md + 1 in limits.md");
+    assert_eq!(folder["nlinks_broken"], 1);
+    assert!(folder["nbytes"].as_i64().unwrap() > 0, "folder size is the total below it");
+
+    // Timestamps are ISO-8601 UTC with milliseconds and Z, not the session's time zone.
+    let ts = stat["updated_at"].as_str().unwrap();
+    assert!(ts.ends_with('Z') && ts.contains('T'), "{ts}");
+}
+
+/// Search and grep return the same seven keys, and `line` belongs to a version.
+#[test]
+fn search_and_grep_share_one_row_shape_on_postgres() {
+    let Some(db) = database() else { return };
+    ok(
+        textdb(&db).args(["write", "/s/doc.md"]),
+        Some("# Guide\n\nintro\n\n## Errors\n\nthe rate limit is 100 per minute.\n"),
+    );
+    const KEYS: [&str; 7] = ["path", "version", "line", "text", "section", "score", "more"];
+    let keys_of = |v: &Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
+
+    let hits = ok(textdb(&db).args(["--json", "search", "rate", "limit"]), None).json();
+    let hits = hits.as_array().unwrap();
+    assert!(!hits.is_empty());
+    assert_eq!(keys_of(&hits[0]), KEYS, "search");
+    assert_eq!(hits[0]["version"], 1, "the version the line number belongs to");
+    assert_eq!(hits[0]["section"], "Guide / Errors", "the heading the line sits under");
+    assert!(hits[0]["score"].as_f64().unwrap() > 0.0, "higher is better");
+
+    let greps = ok(textdb(&db).args(["--json", "grep", "rate"]), None).json();
+    let greps = greps.as_array().unwrap();
+    assert_eq!(keys_of(&greps[0]), KEYS, "grep");
+    assert!(greps[0]["score"].is_null(), "grep ranks nothing");
+    assert_eq!(greps[0]["line"], hits[0]["line"], "both name the same line");
+
+    // `-l` and `-c` filter rows; they do not change the row type.
+    for flag in ["-l", "-c"] {
+        for cmd in ["search", "grep"] {
+            let rows = ok(textdb(&db).args(["--json", cmd, flag, "rate"]), None).json();
+            let rows = rows.as_array().unwrap();
+            assert_eq!(keys_of(&rows[0]), ["path", "version", "matches"], "{cmd} {flag}");
+        }
+    }
+}

@@ -2,6 +2,7 @@
   - SQLite when the loadable extension can be found (TEXTDB_SQLITE_EXT or target/release)
   - Postgres when TEXTDB_TEST_PG (a URL to a database with `CREATE EXTENSION textdb_pg`) is set
 """
+import dataclasses
 import os
 import uuid
 
@@ -305,3 +306,47 @@ def test_heading_names_fold_and_count(outline_vault):
     names = kb.heading_names(root or "/", "ne")
     assert len(names) == 1
     assert (names[0].sections, names[0].docs) == (2, 2)
+
+
+ENTRY_KEYS = [
+    "path", "name", "kind", "version", "nbytes", "nlines", "updated_at", "updated_by", "id", "dir", "depth", "ext",
+    "title", "nwords", "nsections", "nprops", "nlinks", "nlinks_broken", "versions", "created_at", "files", "folders",
+    "nauthors", "authors",
+]
+HIT_KEYS = ["path", "version", "line", "text", "section", "score", "more"]
+
+
+def test_entry_is_the_same_record_from_ls_and_entry(kb):
+    """The full twenty-four-key listing row, identical from both calls and on both backends."""
+    kb.write(P(kb, "/g/api/index.md"),
+             "---\ntitle: API Guide\nstatus: draft\n---\n# API Guide\n\n"
+             "See [limits](limits.md) and [gone](missing.md).\n\n## Errors\ntext\n")
+    kb.write(P(kb, "/g/api/limits.md"), "# Limits\n\nrate limit is 100.\n")
+
+    e = kb.entry(P(kb, "/g/api/index.md"))
+    assert [f.name for f in dataclasses.fields(e)] == ENTRY_KEYS
+    listed = next(x for x in kb.ls(P(kb, "/g/api")) if x.path == P(kb, "/g/api/index.md"))
+    assert listed == e
+
+    # The structural counts, which the store indexed and no SDK ever showed.
+    assert e.title == "API Guide"
+    assert (e.nsections, e.nprops, e.nlinks, e.nlinks_broken) == (2, 2, 2, 1)
+    assert (e.ext, e.depth, e.version) == ("md", P(kb, "/g/api/index.md").count("/"), 1)
+
+    # A folder has totals and no version of its own.
+    f = kb.entry(P(kb, "/g/api"))
+    assert f.version is None and f.files == 2 and f.nsections == 3
+
+    # One timestamp format on both backends: ISO-8601 UTC as a string, never a datetime.
+    assert isinstance(e.updated_at, str) and e.updated_at.endswith("Z") and "T" in e.updated_at
+
+
+def test_search_returns_lines_with_the_version_they_belong_to(kb):
+    kb.write(P(kb, "/s/doc.md"), "# Guide\n\nintro\n\n## Errors\n\nthe rate limit is 100 per minute.\n")
+    hits = kb.search("rate limit", prefix=P(kb, "/s"))
+    assert hits, "the phrase is on one line"
+    assert [f.name for f in dataclasses.fields(hits[0])] == HIT_KEYS
+    assert hits[0].version == 1
+    assert hits[0].section == "Guide / Errors"
+    assert hits[0].score > 0
+    assert hits[0].more == 0
