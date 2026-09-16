@@ -24,6 +24,9 @@ pub struct Config {
     /// This directory's own name for itself, so the sync base survives a move.
     pub id: String,
     pub created: String,
+    /// The extensions the last sync took in, so `textdb sync` on its own uses the same ones.
+    /// `None` for a config written before this was recorded.
+    pub ext: Option<String>,
 }
 
 const FILE: &str = "config";
@@ -86,7 +89,8 @@ impl Config {
                 path.display()
             )));
         }
-        Ok(Some(Config { store, prefix, id: get("id"), created: get("created") }))
+        let ext = get("ext");
+        Ok(Some(Config { store, prefix, id: get("id"), created: get("created"), ext: Some(ext).filter(|e| !e.is_empty()) }))
     }
 
     /// Write the config, creating `.textdb/` if it is not there.
@@ -100,8 +104,12 @@ impl Config {
         let text = format!(
             "# Written by `textdb sync`. It pairs this directory with a folder in a store, so\n\
              # `textdb sync` from anywhere inside the tree knows what to sync with what.\n\
-             store = \"{}\"\nprefix = \"{}\"\nid = \"{}\"\ncreated = \"{}\"\n",
-            self.store, self.prefix, self.id, self.created
+             store = \"{}\"\nprefix = \"{}\"\nid = \"{}\"\ncreated = \"{}\"\next = \"{}\"\n",
+            self.store,
+            self.prefix,
+            self.id,
+            self.created,
+            self.ext.as_deref().unwrap_or_default()
         );
         std::fs::write(&path, text).map_err(|e| StoreError::other(format!("{}: {e}", path.display())))
     }
@@ -157,6 +165,8 @@ pub fn resolve(
     force: bool,
     store: &mut String,
     store_given: bool,
+    ext: &mut String,
+    ext_given: bool,
 ) -> Result<()> {
     let here = std::env::current_dir().map_err(|e| StoreError::other(format!("current directory: {e}")))?;
     // Both arguments are optional now, so a lone one is the folder in the store. A lone one that
@@ -204,6 +214,14 @@ pub fn resolve(
         }
         if !store_given {
             *store = paired;
+        }
+        // The include rules are part of the pairing. Without this, `textdb sync` on its own fell
+        // back to the default extensions, so a directory taken in with `--ext rs,ts,toml` stopped
+        // seeing its own source files — and the hook form is exactly the one with no arguments.
+        if !ext_given {
+            if let Some(recorded) = c.ext.as_deref().filter(|e| !e.is_empty()) {
+                *ext = recorded.to_string();
+            }
         }
     } else if prefix.is_none() {
         // A directory nobody has synced: the whole store with the directory as it stands, which

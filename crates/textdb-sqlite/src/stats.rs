@@ -66,8 +66,10 @@ impl Totals {
 }
 
 impl TextDb<'_> {
-    /// Add `t` to the totals of every live folder above `path` and mark them changed at `ts`.
-    pub(crate) fn add_to_ancestors(&self, path: &str, t: &Totals, ts: &str) -> Result<()> {
+    /// Add `t` to the totals of every live folder above `path` and mark them changed at `ts` by
+    /// `t.updated_by`. The author is carried the same way the timestamp is: it only sticks on the
+    /// folders where this change is the newest one below them.
+    pub(crate) fn add_to_ancestors(&self, path: &str, t: &Totals, ts: &str, by: Option<&str>) -> Result<()> {
         let list = serde_json::to_string(&ancestors(path)).expect("paths serialize");
         self.conn
             .prepare_cached(&format!(
@@ -75,13 +77,15 @@ impl TextDb<'_> {
                  t_lines = t_lines + ?5, t_words = t_words + ?6, t_versions = t_versions + ?7, \
                  t_sections = t_sections + ?9, t_props = t_props + ?10, t_links = t_links + ?11, \
                  t_links_broken = t_links_broken + ?12, \
+                 t_updated_by = CASE WHEN ?8 >= coalesce(t_updated_at, '') THEN ?13 ELSE t_updated_by END, \
                  t_updated_at = max(coalesce(t_updated_at, ''), ?8) \
                  WHERE path IN (SELECT value FROM json_each(?1)) AND deleted_at IS NULL",
                 self.p
             ))
             .map_err(sql_err)?
             .execute(params![
-                list, t.files, t.folders, t.bytes, t.lines, t.words, t.versions, ts, t.sections, t.props, t.links, t.links_broken
+                list, t.files, t.folders, t.bytes, t.lines, t.words, t.versions, ts, t.sections, t.props, t.links,
+                t.links_broken, by
             ])
             .map_err(sql_err)?;
         Ok(())

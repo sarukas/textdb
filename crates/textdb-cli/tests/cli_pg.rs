@@ -694,3 +694,31 @@ fn search_and_grep_share_one_row_shape_on_postgres() {
         }
     }
 }
+
+
+/// As `a_folder_carries_the_authors_below_it` on SQLite: a folder names who changed something
+/// below it, and how many people have. Postgres keeps folder totals in a journal, so the author
+/// rides with the timestamp through the pending rows as well as the folded ones.
+#[test]
+fn a_folder_carries_the_authors_below_it_on_postgres() {
+    let Some(db) = database() else { return };
+    let write = |author: &str, path: &str, text: &str| {
+        ok(textdb(&db).args(["-a", author, "write", path]), Some(text));
+    };
+    write("alice", "/notes/a/x.md", "one\n");
+    write("bob", "/notes/a/y.md", "two\n");
+    write("alice", "/notes/b/z.md", "three\n");
+
+    let row = |path: &str| -> serde_json::Value { ok(textdb(&db).args(["--json", "stat", path]), None).json() };
+    assert_eq!((row("/notes/a")["nauthors"].as_i64(), row("/notes/a")["updated_by"].as_str()), (Some(2), Some("bob")));
+    assert_eq!((row("/notes/b")["nauthors"].as_i64(), row("/notes/b")["updated_by"].as_str()), (Some(1), Some("alice")));
+    assert_eq!(row("/")["nauthors"].as_i64(), Some(2));
+
+    write("carol", "/notes/a/x.md", "one again\n");
+    assert_eq!((row("/notes/a")["nauthors"].as_i64(), row("/notes/a")["updated_by"].as_str()), (Some(3), Some("carol")));
+
+    // The same answer once the journal is folded into the node rows.
+    ok(textdb(&db).args(["sql", "--write", "SELECT kb.compact_folder_totals()"]), None);
+    assert_eq!((row("/notes/a")["nauthors"].as_i64(), row("/notes/a")["updated_by"].as_str()), (Some(3), Some("carol")));
+    assert_eq!(row("/")["nauthors"].as_i64(), Some(3));
+}

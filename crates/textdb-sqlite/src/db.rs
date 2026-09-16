@@ -490,7 +490,7 @@ impl<'c> TextDb<'c> {
                 folders: missing.len() as i64,
                 ..Totals::default()
             };
-            self.add_to_ancestors(top, &added, &now)?;
+            self.add_to_ancestors(top, &added, &now, None)?;
         }
         Ok(parent)
     }
@@ -654,7 +654,7 @@ impl<'c> TextDb<'c> {
             // found; it rolls its own delta up so this one stays about the content.
             ..Totals::default()
         };
-        self.add_to_ancestors(path, &change, &now)?;
+        self.add_to_ancestors(path, &change, &now, author)?;
         // Reverse index for search: chunk → file, recorded once per (chunk, file).
         //
         // One statement per new chunk meant 652 of them for a 1 MiB document. Batched into
@@ -753,7 +753,7 @@ impl<'c> TextDb<'c> {
             ..Totals::default()
         };
         if change != Totals::default() {
-            self.add_to_ancestors(path, &change, now)?;
+            self.add_to_ancestors(path, &change, now, None)?;
         }
         Ok(())
     }
@@ -1209,7 +1209,7 @@ impl TextDb<'_> {
                 db.links_into(&before)?
             };
             let moved = db.subtree_totals(src.id)?;
-            db.add_to_ancestors(&from, &moved.neg(), &now)?;
+            db.add_to_ancestors(&from, &moved.neg(), &now, None)?;
             let seq = db.record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, db.message.as_deref())?;
             if db.path_history_enabled()? {
                 db.record_path_events(PathOp::classify(&from, &to), &src, Some(&to), author, seq, &now)?;
@@ -1233,7 +1233,7 @@ impl TextDb<'_> {
                 .map_err(sql_err)?
                 .execute(params![to, name_of(&to), parent, now, src.id])
                 .map_err(sql_err)?;
-            db.add_to_ancestors(&to, &moved, &now)?;
+            db.add_to_ancestors(&to, &moved, &now, None)?;
             if linked {
                 // The same files with the same ids under the new prefix: exactly the
                 // substitution the UPDATE above performed. Asking the database to list the
@@ -1266,7 +1266,7 @@ impl TextDb<'_> {
             let linked = db.has_links()?;
             let files = if linked { db.files_at(&path)? } else { Vec::new() };
             let gone = db.subtree_totals(n.id)?;
-            db.add_to_ancestors(&path, &gone.neg(), &now)?;
+            db.add_to_ancestors(&path, &gone.neg(), &now, None)?;
             let seq = db.record_change("delete", n.id, n.kind, &path, None, None, None, None, author, db.message.as_deref())?;
             if db.path_history_enabled()? {
                 db.record_path_events(PathOp::Delete, &n, None, author, seq, &now)?;
@@ -1348,16 +1348,22 @@ impl TextDb<'_> {
                  CASE kind WHEN 1 THEN coalesce(nlines, 0) ELSE t_lines END, \
                  CASE kind WHEN 1 THEN coalesce(nwords, 0) ELSE t_words END, \
                  CASE kind WHEN 1 THEN version ELSE t_versions END, \
-                 CASE WHEN kind = 0 AND t_updated_at > updated_at THEN t_updated_at ELSE updated_at END, \
-                 updated_by, created_at, CASE kind WHEN 0 THEN t_files END, CASE kind WHEN 0 THEN t_folders END, \
+                 CASE WHEN kind = 0 AND t_updated_at >= updated_at THEN t_updated_at ELSE updated_at END, \
+                 -- `>=`, not `>`: a folder is created and its first file committed in the same
+                 -- operation, so the two stamps tie and the folder would name nobody.
+                 CASE WHEN kind = 0 AND t_updated_at >= updated_at THEN t_updated_by ELSE updated_by END, created_at, CASE kind WHEN 0 THEN t_files END, CASE kind WHEN 0 THEN t_folders END, \
                  CASE kind WHEN 1 THEN version END, title, \
                  CASE kind WHEN 1 THEN nsections ELSE t_sections END, \
                  CASE kind WHEN 1 THEN nprops ELSE t_props END, \
                  CASE kind WHEN 1 THEN nlinks ELSE t_links END, \
                  CASE kind WHEN 1 THEN nlinks_broken ELSE t_links_broken END, \
-                 coalesce(nauthors, 0) \
-                 FROM {}node WHERE deleted_at IS NULL AND {scope} ORDER BY {order}",
-                self.p
+                 CASE kind WHEN 1 THEN coalesce(nauthors, 0) ELSE ( \
+                   SELECT count(DISTINCT a.author) FROM {p}file_author a JOIN {p}node f ON f.id = a.file_id \
+                    WHERE f.deleted_at IS NULL AND f.kind = 1 \
+                      AND f.path >= CASE {p}node.path WHEN '/' THEN '/' ELSE {p}node.path || '/' END \
+                      AND f.path < CASE {p}node.path WHEN '/' THEN '0' ELSE {p}node.path || '0' END) END \
+                 FROM {p}node WHERE deleted_at IS NULL AND {scope} ORDER BY {order}",
+                p = self.p
             ))
             .map_err(sql_err)?;
         let rows = stmt

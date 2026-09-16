@@ -222,7 +222,7 @@ impl<'c> TextDb<'c> {
             links_broken: now - before,
             ..Default::default()
         };
-        self.add_to_ancestors(path, &change, &Self::now())
+        self.add_to_ancestors(path, &change, &Self::now(), None)
     }
 
     /// Resolve again every link that could point to a file named one of `names`, or points to

@@ -571,12 +571,15 @@ fn run(mut cli: Cli, matches: &ArgMatches) -> Result<()> {
     // A synced directory records the store and folder it is paired with, so `textdb sync` on its
     // own works from anywhere inside the tree. Resolved before the store is opened, since which
     // store to open is part of what the directory remembers.
-    if let Cmd::Sync { prefix, dir, force, .. } = &mut cli.cmd {
-        let given = matches!(matches.value_source("store"), Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable));
-        let (mut p, mut d, f) = (prefix.take(), dir.take(), *force);
-        root::resolve(&mut p, &mut d, f, &mut cli.store, given)?;
-        if let Cmd::Sync { prefix, dir, .. } = &mut cli.cmd {
-            (*prefix, *dir) = (p, d);
+    if let Cmd::Sync { prefix, dir, force, ext, .. } = &mut cli.cmd {
+        let from_args = |id: &str| {
+            matches!(matches.subcommand().and_then(|(_, m)| m.value_source(id)), Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable))
+        };
+        let store_given = matches!(matches.value_source("store"), Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable));
+        let (mut p, mut d, f, mut e) = (prefix.take(), dir.take(), *force, std::mem::take(ext));
+        root::resolve(&mut p, &mut d, f, &mut cli.store, store_given, &mut e, from_args("ext"))?;
+        if let Cmd::Sync { prefix, dir, ext, .. } = &mut cli.cmd {
+            (*prefix, *dir, *ext) = (p, d, e);
         }
     }
     let mut store = store::open(&cli.store)?;

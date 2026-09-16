@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS {p}node (
   t_props        INTEGER NOT NULL DEFAULT 0,
   t_links        INTEGER NOT NULL DEFAULT 0,
   t_links_broken INTEGER NOT NULL DEFAULT 0,
-  t_updated_at TEXT    NULL                   -- the last change anywhere below
+  t_updated_at TEXT    NULL,                  -- the last change anywhere below
+  t_updated_by TEXT    NULL                   -- and who made it, so a folder row names an author
 );
 CREATE UNIQUE INDEX IF NOT EXISTS {p}node_path ON {p}node(path) WHERE deleted_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS {p}node_parent_name ON {p}node(parent_id, name) WHERE deleted_at IS NULL;
@@ -244,6 +245,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("node", "t_words", "INTEGER NOT NULL DEFAULT 0"),
     ("node", "t_versions", "INTEGER NOT NULL DEFAULT 0"),
     ("node", "t_updated_at", "TEXT NULL"),
+    ("node", "t_updated_by", "TEXT NULL"),
     // Links: how each is written and what it resolves to (links.rs).
     ("link", "kind", "TEXT"),
     ("link", "anchor", "TEXT"),

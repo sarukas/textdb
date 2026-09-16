@@ -84,6 +84,11 @@ pub struct Rules {
     /// are none); `None` for a base an older build saved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gitattributes: Option<String>,
+    /// A digest of the files this sync walked past, so the next one can say so only when the set
+    /// changed. `Rules::same` does not look at it: a new `.csv` on disk is not a rules change, it
+    /// is something to mention once. `None` for a base an older build saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_out: Option<String>,
 }
 
 impl Rules {
@@ -143,6 +148,16 @@ pub fn parse_exts(ext: &str) -> Vec<String> {
         .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
         .filter(|e| !e.is_empty())
         .collect()
+}
+
+/// One id for the set of files a sync walked past, so the next one can tell whether it changed.
+///
+/// The paths themselves, not a count: the same number of different files is a different set, and
+/// that is what a reader wants told.
+fn left_out_digest(left_out: &BTreeMap<String, Vec<String>>) -> String {
+    let mut flat: Vec<&str> = left_out.values().flatten().map(String::as_str).collect();
+    flat.sort_unstable();
+    blob_id(flat.join("\n").as_bytes())
 }
 
 /// Git's blob id of `bytes`: the SHA-1 of `blob <size>\0` and the bytes.
@@ -1570,8 +1585,16 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             ignore_text: ignore_text.clone(),
             ignore_seeded,
             gitattributes: Some(gitattributes_id(&o.dir, &walked)),
+            left_out: Some(left_out_digest(&report.left_out)),
         }
     };
+    // Say what was walked past when the set has changed — a `.csv` added after the first sync
+    // must not go unmentioned — and not on every run of a hook over a code directory, where the
+    // same 1200 files are left out every time and the line is pure noise.
+    let said_before = stored.as_ref().and_then(|b| b.rules.as_deref()).and_then(|r| serde_json::from_str::<Rules>(r).ok());
+    if said_before.as_ref().and_then(|r| r.left_out.clone()).as_deref() == rules.left_out.as_deref() {
+        report.left_out.clear();
+    }
     // A file gone from disk and an identical new one elsewhere is a move: the store moves the
     // file, keeping its history.
     let mut by_blob: HashMap<String, Vec<String>> = HashMap::new();
@@ -2258,9 +2281,11 @@ fn apply(
         prefix: prefix.clone(),
         id: dir_id.to_string(),
         created: crate::assets::driver::stamp(SystemTime::now()),
+        // Normalised, so it round-trips through `parse_exts` unchanged.
+        ext: Some(o.exts.join(",")),
     };
     match crate::root::Config::read(dir)? {
-        Some(before) if before.store == paired.store && before.prefix == paired.prefix => Ok(()),
+        Some(before) if before.store == paired.store && before.prefix == paired.prefix && before.ext == paired.ext => Ok(()),
         Some(before) => crate::root::Config { id: before.id, created: before.created, ..paired }.write(dir),
         None => paired.write(dir),
     }

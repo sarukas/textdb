@@ -1750,13 +1750,18 @@ fn sync_stops_when_its_include_rules_changed_and_honours_textdbignore() {
     assert_eq!(first.status, 0, "{}", first.stderr);
     assert_eq!(first.json()["to_textdb"]["new"], serde_json::json!([".claude/rules.md", "a.md"]));
 
-    // Wider extensions would take in notes.txt: the sync stops and lists it.
-    let wider = sync(&[]);
+    // A bare sync keeps the rules the pairing recorded, so it is not a widening.
+    let same = sync(&[]);
+    assert_eq!(same.status, 0, "{}", same.stderr);
+    assert!(same.json().get("rules").is_none(), "{}", same.stdout);
+
+    // Wider extensions, asked for: the sync stops and lists what they would take in.
+    let wider = sync(&["--ext", "md,txt"]);
     assert_eq!(wider.status, 6, "{}", wider.stdout);
     let w = wider.json();
     assert_eq!((w["stopped_by_rules"].as_bool(), &w["rules"]["newly_included"]), (Some(true), &serde_json::json!(["notes.txt"])));
     assert_eq!(run(textdb(&store).args(["stat", "/notes.txt"]), None).status, 5);
-    let accepted = sync(&["--accept-rules"]);
+    let accepted = sync(&["--ext", "md,txt", "--accept-rules"]);
     assert_eq!(accepted.status, 0, "{}", accepted.stderr);
     assert_eq!(accepted.json()["to_textdb"]["new"], serde_json::json!(["notes.txt"]));
     let quiet = sync(&[]).json();
@@ -2906,8 +2911,17 @@ fn sync_says_what_it_left_out_and_can_keep_quiet() {
     std::fs::write(dir.join("b.md"), "two\n").unwrap();
     let quiet = ok(textdb(&db).args(["sync", "/"]).arg(&dir).arg("--quiet"), None);
     assert!(!quiet.stdout.contains("textdb new"), "{}", quiet.stdout);
-    assert!(quiet.stdout.contains("left out"), "{}", quiet.stdout);
     assert_eq!(quiet.stdout.lines().filter(|l| l.starts_with("synced:")).count(), 1, "{}", quiet.stdout);
+    // The same two files are still left out, so it does not say so again: on a code directory
+    // that line was the whole output of every hook run.
+    assert!(!quiet.stdout.contains("left out"), "{}", quiet.stdout);
+
+    // A third one appears, and it says so once.
+    std::fs::write(dir.join("more.csv"), "a,b\n").unwrap();
+    let changed = ok(textdb(&db).args(["sync", "/"]).arg(&dir).arg("--quiet"), None);
+    assert!(changed.stdout.contains("left out        3 files by extension"), "{}", changed.stdout);
+    let settled = ok(textdb(&db).args(["sync", "/"]).arg(&dir).arg("--quiet"), None);
+    assert!(!settled.stdout.contains("left out"), "{}", settled.stdout);
 }
 
 /// Two directories per folder is the normal state — a person's vault and an agent's checkout —
@@ -3130,4 +3144,38 @@ fn discovery_stops_where_it_is_told_to() {
     let named = sync_from(tmp.path(), &[("TEXTDB_DIR", outer.as_os_str())]);
     assert_eq!(named.status, 0, "{}", named.stderr);
     assert!(named.stdout.contains("/outer with"), "{}", named.stdout);
+}
+
+/// A folder names who changed something below it, and how many people have.
+///
+/// Both were the contract in `docs/shapes.md` and neither was true: `nauthors` came back 0 for
+/// every folder, because the column only ever holds a file's own count, and `updated_by` was the
+/// folder row's own author, which nothing sets.
+#[test]
+fn a_folder_carries_the_authors_below_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let write = |author: &str, path: &str, text: &str| {
+        ok(textdb(&db).args(["-a", author, "write", path]), Some(text));
+    };
+    write("alice", "/notes/a/x.md", "one\n");
+    write("bob", "/notes/a/y.md", "two\n");
+    write("alice", "/notes/b/z.md", "three\n");
+
+    let row = |path: &str| -> serde_json::Value {
+        ok(textdb(&db).args(["--json", "stat", path]), None).json()
+    };
+    assert_eq!((row("/notes/a")["nauthors"].as_i64(), row("/notes/a")["updated_by"].as_str()), (Some(2), Some("bob")));
+    assert_eq!((row("/notes/b")["nauthors"].as_i64(), row("/notes/b")["updated_by"].as_str()), (Some(1), Some("alice")));
+    // The root counts each author once, not once per file.
+    assert_eq!(row("/")["nauthors"].as_i64(), Some(2));
+
+    // A later commit by a third author moves both.
+    write("carol", "/notes/a/x.md", "one again\n");
+    assert_eq!((row("/notes/a")["nauthors"].as_i64(), row("/notes/a")["updated_by"].as_str()), (Some(3), Some("carol")));
+    assert_eq!(row("/")["nauthors"].as_i64(), Some(3));
+    // `ls` says the same as `stat`, on the same row.
+    let ls = ok(textdb(&db).args(["--json", "ls", "/notes"]), None).json();
+    let a = ls.as_array().unwrap().iter().find(|e| e["path"] == "/notes/a").unwrap();
+    assert_eq!((a["nauthors"].as_i64(), a["updated_by"].as_str()), (Some(3), Some("carol")));
 }

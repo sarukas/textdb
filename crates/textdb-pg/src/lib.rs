@@ -57,7 +57,8 @@ CREATE TABLE kb.node (
   t_props        bigint NOT NULL DEFAULT 0,
   t_links        bigint NOT NULL DEFAULT 0,
   t_links_broken bigint NOT NULL DEFAULT 0,
-  t_updated_at timestamptz NULL
+  t_updated_at timestamptz NULL,
+  t_updated_by text NULL                      -- and who made that change, so a folder names an author
 );
 CREATE UNIQUE INDEX node_path ON kb.node(path text_pattern_ops) WHERE deleted_at IS NULL;
 CREATE UNIQUE INDEX node_parent_name ON kb.node(parent_id, name) WHERE deleted_at IS NULL;
@@ -192,7 +193,8 @@ CREATE TABLE kb.folder_delta (
   props         bigint NOT NULL DEFAULT 0,
   links         bigint NOT NULL DEFAULT 0,
   links_broken  bigint NOT NULL DEFAULT 0,
-  ts        timestamptz NOT NULL DEFAULT now()
+  ts        timestamptz NOT NULL DEFAULT now(),
+  updated_by text NULL                        -- the author of this change, carried with its ts
 );
 CREATE INDEX folder_delta_folder ON kb.folder_delta(folder_id);
 -- textdb sync (the CLI): what a store folder and a directory held when they were last
@@ -344,7 +346,12 @@ CREATE VIEW kb.entry AS
          CASE n.kind WHEN 1 THEN coalesce(n.nbytes, 0) ELSE n.t_bytes + coalesce(d.bytes, 0) END AS nbytes,
          CASE n.kind WHEN 1 THEN coalesce(n.nlines, 0) ELSE n.t_lines + coalesce(d.lines, 0) END AS nlines,
          CASE n.kind WHEN 1 THEN n.updated_at ELSE greatest(n.updated_at, n.t_updated_at, d.ts) END AS updated_at,
-         n.updated_by,
+         -- Whoever made the newest change below the folder: the journal's newest row, the folded
+         -- total, or the folder's own row, in that order of recency.
+         CASE WHEN n.kind = 1 THEN n.updated_by
+              WHEN d.updated_by IS NOT NULL AND d.ts >= greatest(n.updated_at, coalesce(n.t_updated_at, n.updated_at)) THEN d.updated_by
+              WHEN n.t_updated_at IS NOT NULL AND n.t_updated_at >= n.updated_at THEN n.t_updated_by
+              ELSE n.updated_by END AS updated_by,
          n.id,
          -- One name for the parent, on both engines and every surface.
          CASE WHEN n.path = '/' THEN NULL
@@ -363,7 +370,11 @@ CREATE VIEW kb.entry AS
          n.created_at,
          CASE n.kind WHEN 0 THEN n.t_files + coalesce(d.files, 0) END AS files,
          CASE n.kind WHEN 0 THEN n.t_folders + coalesce(d.folders, 0) END AS folders,
-         CASE n.kind WHEN 1 THEN coalesce(n.nauthors, 0) ELSE 0 END AS nauthors,
+         CASE n.kind WHEN 1 THEN coalesce(n.nauthors, 0) ELSE (
+           SELECT count(DISTINCT a.author) FROM kb.file_author a JOIN kb.node f ON f.id = a.file_id
+            WHERE f.deleted_at IS NULL AND f.kind = 1
+              AND f.path >= CASE n.path WHEN '/' THEN '/' ELSE n.path || '/' END
+              AND f.path < CASE n.path WHEN '/' THEN '0' ELSE n.path || '0' END) END AS nauthors,
          CASE n.kind WHEN 1 THEN coalesce(
            (SELECT jsonb_agg(jsonb_build_object('author', nullif(a.author, ''), 'commits', a.commits, 'first_ts', a.first_ts, 'last_ts', a.last_ts)
                              ORDER BY a.commits DESC, a.last_ts DESC)
@@ -374,7 +385,8 @@ CREATE VIEW kb.entry AS
     SELECT sum(x.files)::bigint AS files, sum(x.folders)::bigint AS folders, sum(x.bytes)::bigint AS bytes,
            sum(x.lines)::bigint AS lines, sum(x.words)::bigint AS words, sum(x.versions)::bigint AS versions,
            sum(x.sections)::bigint AS sections, sum(x.props)::bigint AS props, sum(x.links)::bigint AS links,
-           sum(x.links_broken)::bigint AS links_broken, max(x.ts) AS ts
+           sum(x.links_broken)::bigint AS links_broken, max(x.ts) AS ts,
+           (array_agg(x.updated_by ORDER BY x.ts DESC) FILTER (WHERE x.updated_by IS NOT NULL))[1] AS updated_by
     FROM kb.folder_delta x WHERE x.folder_id = n.id
   ) d ON n.kind = 0
   WHERE n.deleted_at IS NULL;
@@ -400,12 +412,15 @@ CREATE FUNCTION kb.compact_folder_totals() RETURNS bigint LANGUAGE sql VOLATILE 
   WITH gone AS (DELETE FROM kb.folder_delta RETURNING *),
        s AS (SELECT folder_id, sum(files) AS files, sum(folders) AS folders, sum(bytes) AS bytes, sum(lines) AS lines,
                     sum(words) AS words, sum(versions) AS versions, sum(sections) AS sections, sum(props) AS props,
-                    sum(links) AS links, sum(links_broken) AS links_broken, max(ts) AS ts, count(*) AS n
+                    sum(links) AS links, sum(links_broken) AS links_broken, max(ts) AS ts, count(*) AS n,
+                    (array_agg(updated_by ORDER BY ts DESC) FILTER (WHERE updated_by IS NOT NULL))[1] AS updated_by
              FROM gone GROUP BY folder_id),
        u AS (UPDATE kb.node f SET t_files = f.t_files + s.files, t_folders = f.t_folders + s.folders, t_bytes = f.t_bytes + s.bytes,
                                   t_lines = f.t_lines + s.lines, t_words = f.t_words + s.words, t_versions = f.t_versions + s.versions,
                                   t_sections = f.t_sections + s.sections, t_props = f.t_props + s.props,
                                   t_links = f.t_links + s.links, t_links_broken = f.t_links_broken + s.links_broken,
+                                  t_updated_by = CASE WHEN s.ts >= coalesce(f.t_updated_at, s.ts)
+                                                      THEN coalesce(s.updated_by, f.t_updated_by) ELSE f.t_updated_by END,
                                   t_updated_at = greatest(f.t_updated_at, s.ts)
              FROM s WHERE f.id = s.folder_id RETURNING s.n)
   SELECT coalesce(sum(n), 0)::bigint FROM u
@@ -684,6 +699,7 @@ mod kb {
                 folders: 1,
                 ..Totals::default()
             },
+            None,
         )?;
         Ok(id)
     }
@@ -724,11 +740,15 @@ mod kb {
     }
 
     /// Record `t` against every live folder above `path`, as kb.folder_delta rows.
-    fn add_to_ancestors(path: &str, t: &Totals) -> Result<(), TextdbError> {
+    ///
+    /// `by` rides along with the timestamp, so a folder row can name who made the newest change
+    /// below it without a query over the subtree. `None` where there is no author to name — a
+    /// folder created, a move, a delete, a link status re-resolved.
+    fn add_to_ancestors(path: &str, t: &Totals, by: Option<&str>) -> Result<(), TextdbError> {
         let list = serde_json::to_string(&ancestors(path)).expect("paths serialize");
         Spi::run_with_args(
-            "INSERT INTO kb.folder_delta(folder_id, files, folders, bytes, lines, words, versions, sections, props, links, links_broken) \
-             SELECT n.id, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11 FROM kb.node n \
+            "INSERT INTO kb.folder_delta(folder_id, files, folders, bytes, lines, words, versions, sections, props, links, links_broken, updated_by) \
+             SELECT n.id, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12 FROM kb.node n \
              WHERE n.path IN (SELECT jsonb_array_elements_text($1::jsonb)) AND n.deleted_at IS NULL",
             &[
                 list.as_str().into(),
@@ -742,6 +762,7 @@ mod kb {
                 t.props.into(),
                 t.links.into(),
                 t.links_broken.into(),
+                by.into(),
             ],
         )
         .map_err(storage_err)?;
@@ -945,7 +966,7 @@ mod kb {
             // extractor found; it rolls its own delta up so this one stays about content.
             ..Totals::default()
         };
-        ok(add_to_ancestors(path, &change));
+        ok(add_to_ancestors(path, &change, author));
         let mut seen = std::collections::HashSet::new();
         for h in &c.new_chunks {
             if !seen.insert(*h) {
@@ -1009,7 +1030,7 @@ mod kb {
             links_broken: broken - old.3,
             ..Totals::default()
         };
-        add_to_ancestors(path, &change)
+        add_to_ancestors(path, &change, None)
     }
 
     /// Recount `file_id`'s broken links, store the number and move the folders above it.
@@ -1035,6 +1056,7 @@ mod kb {
                 links_broken: now - before,
                 ..Totals::default()
             },
+            None,
         )
     }
 
@@ -1590,7 +1612,7 @@ mod kb {
             _ => crate::links::links_into(&before)?,
         };
         let moved = subtree_totals(src.id)?;
-        add_to_ancestors(&from, &moved.neg())?;
+        add_to_ancestors(&from, &moved.neg(), None)?;
         let seq = record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, message);
         if path_history_enabled()? {
             record_path_events(PathOp::classify(&from, &to), &src, Some(&to), author, seq)?;
@@ -1605,7 +1627,7 @@ mod kb {
             &[to.as_str().into(), name_of(&to).into(), parent.into(), src.id.into()],
         )
         .map_err(storage_err)?;
-        add_to_ancestors(&to, &moved)?;
+        add_to_ancestors(&to, &moved, None)?;
         let after = crate::links::files_at(&to)?;
         let names = crate::links::names_of(&before.iter().chain(&after).cloned().collect::<Vec<_>>());
         crate::links::relink(&names, &after.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
@@ -1651,7 +1673,7 @@ mod kb {
         let n = node_by_path(&path).ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let files = crate::links::files_at(&path)?;
         let gone = subtree_totals(n.id)?;
-        add_to_ancestors(&path, &gone.neg())?;
+        add_to_ancestors(&path, &gone.neg(), None)?;
         let seq = record_change("delete", n.id, n.kind, &path, None, None, None, None, author, message);
         if path_history_enabled()? {
             record_path_events(PathOp::Delete, &n, None, author, seq)?;
