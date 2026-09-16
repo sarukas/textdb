@@ -867,23 +867,63 @@ fn batch_change(i: textdb_sqlite::bulk::BatchItem) -> BatchChange {
 
 fn sql_views(p: &str) -> String {
     format!(
-        "CREATE TEMP VIEW IF NOT EXISTS files AS
-           SELECT id, path, name,
-                  CASE WHEN length(path) = length(name) + 1 THEN '/' ELSE substr(path, 1, length(path) - length(name) - 1) END AS dir,
-                  length(path) - length(replace(path, '/', '')) AS depth,
-                  CASE WHEN name GLOB '?*.*' THEN lower(substr(name, length(rtrim(name, replace(name, '.', ''))) + 1)) ELSE '' END AS ext,
-                  version, nbytes, nlines, nwords, nauthors, created_at, updated_at, updated_by
+        "-- `files` and `folders` are the canonical listing record filtered by kind: the same
+         -- columns in the same order as textdb_ls, textdb_entry and kb.entry. `folders.parent`
+         -- is `dir` now, the one name for it on every surface.
+         CREATE TEMP VIEW IF NOT EXISTS files AS
+           SELECT
+                  path, name,
+                  CASE kind WHEN 1 THEN 'file' ELSE 'folder' END AS kind,
+                  CASE kind WHEN 1 THEN version END AS version,
+                  CASE kind WHEN 1 THEN coalesce(nbytes, 0) ELSE t_bytes END AS nbytes,
+                  CASE kind WHEN 1 THEN coalesce(nlines, 0) ELSE t_lines END AS nlines,
+                  CASE WHEN kind = 0 AND t_updated_at > updated_at THEN t_updated_at ELSE updated_at END AS updated_at,
+                  updated_by, id,
+                  CASE WHEN path = '/' THEN NULL WHEN length(path) = length(name) + 1 THEN '/'
+                       ELSE substr(path, 1, length(path) - length(name) - 1) END AS dir,
+                  CASE WHEN path = '/' THEN 0 ELSE length(path) - length(replace(path, '/', '')) END AS depth,
+                  CASE WHEN kind = 1 AND name GLOB '?*.*'
+                       THEN lower(substr(name, length(rtrim(name, replace(name, '.', ''))) + 1)) END AS ext,
+                  title,
+                  CASE kind WHEN 1 THEN coalesce(nwords, 0) ELSE t_words END AS nwords,
+                  CASE kind WHEN 1 THEN nsections ELSE t_sections END AS nsections,
+                  CASE kind WHEN 1 THEN nprops ELSE t_props END AS nprops,
+                  CASE kind WHEN 1 THEN nlinks ELSE t_links END AS nlinks,
+                  CASE kind WHEN 1 THEN nlinks_broken ELSE t_links_broken END AS nlinks_broken,
+                  CASE kind WHEN 1 THEN version ELSE t_versions END AS versions,
+                  created_at,
+                  CASE kind WHEN 0 THEN t_files END AS files,
+                  CASE kind WHEN 0 THEN t_folders END AS folders,
+                  coalesce(nauthors, 0) AS nauthors
            FROM {p}node WHERE kind = 1 AND deleted_at IS NULL
            -- No limit really, but a view with one is not flattened into a query with a WHERE: without
            -- it SQLite may call `textdb_content(path)` in that WHERE on folder rows, which fails.
            LIMIT -1;
          CREATE TEMP VIEW IF NOT EXISTS folders AS
-           SELECT id, path, name,
+           SELECT
+                  path, name,
+                  CASE kind WHEN 1 THEN 'file' ELSE 'folder' END AS kind,
+                  CASE kind WHEN 1 THEN version END AS version,
+                  CASE kind WHEN 1 THEN coalesce(nbytes, 0) ELSE t_bytes END AS nbytes,
+                  CASE kind WHEN 1 THEN coalesce(nlines, 0) ELSE t_lines END AS nlines,
+                  CASE WHEN kind = 0 AND t_updated_at > updated_at THEN t_updated_at ELSE updated_at END AS updated_at,
+                  updated_by, id,
                   CASE WHEN path = '/' THEN NULL WHEN length(path) = length(name) + 1 THEN '/'
-                       ELSE substr(path, 1, length(path) - length(name) - 1) END AS parent,
+                       ELSE substr(path, 1, length(path) - length(name) - 1) END AS dir,
                   CASE WHEN path = '/' THEN 0 ELSE length(path) - length(replace(path, '/', '')) END AS depth,
-                  t_files AS files, t_folders AS folders, t_bytes AS nbytes, t_lines AS nlines,
-                  t_words AS nwords, t_versions AS versions, t_updated_at AS updated_at
+                  CASE WHEN kind = 1 AND name GLOB '?*.*'
+                       THEN lower(substr(name, length(rtrim(name, replace(name, '.', ''))) + 1)) END AS ext,
+                  title,
+                  CASE kind WHEN 1 THEN coalesce(nwords, 0) ELSE t_words END AS nwords,
+                  CASE kind WHEN 1 THEN nsections ELSE t_sections END AS nsections,
+                  CASE kind WHEN 1 THEN nprops ELSE t_props END AS nprops,
+                  CASE kind WHEN 1 THEN nlinks ELSE t_links END AS nlinks,
+                  CASE kind WHEN 1 THEN nlinks_broken ELSE t_links_broken END AS nlinks_broken,
+                  CASE kind WHEN 1 THEN version ELSE t_versions END AS versions,
+                  created_at,
+                  CASE kind WHEN 0 THEN t_files END AS files,
+                  CASE kind WHEN 0 THEN t_folders END AS folders,
+                  coalesce(nauthors, 0) AS nauthors
            FROM {p}node WHERE kind = 0 AND deleted_at IS NULL;
          CREATE TEMP VIEW IF NOT EXISTS frontmatter AS
            SELECT n.path, f.data FROM {p}frontmatter f JOIN {p}node n ON n.id = f.file_id AND n.deleted_at IS NULL;

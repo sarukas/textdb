@@ -47,7 +47,7 @@ textdb export guides ./checkout --dry-run # what writing /guides to disk would c
 ```
 
 `search` uses the full-text index (case and accents ignored) and prints nothing on stdout when
-nothing matches (`no matches` on stderr, exit 0). Treat its lines as candidates: read the lines
+nothing matches (`no matches for X under /` on stderr, exit 0). Treat its lines as candidates: read the lines
 with `cat -n --lines` before editing. Use `grep` for exact case, punctuation or regular
 expressions; it reads every file under the folder, so narrow it with `-p`.
 
@@ -88,15 +88,17 @@ textdb --json sql 'SELECT path, nwords FROM files ORDER BY nwords DESC LIMIT 10'
 
 | View | Columns |
 |---|---|
-| `files` | `path, name, dir, depth, ext, version, nbytes, nlines, nwords, created_at, updated_at, updated_by` |
-| `folders` | `path, name, parent, depth, files, folders, nbytes, nwords, versions, updated_at` (totals below) |
+| `files`, `folders` | the canonical listing record, filtered by kind: `path, name, kind, version, nbytes, nlines, updated_at, updated_by, id, dir, depth, ext, title, nwords, nsections, nprops, nlinks, nlinks_broken, versions, created_at, files, folders, nauthors`. A folder's figures are totals over everything below it; `version`, `ext` and the author list are null for one. See `docs/shapes.md` |
 | `frontmatter` | `path, data` — YAML front matter as JSON: `json_extract(data, '$.key')`, `json_each(data, '$.list')` |
-| `sections` | `path, heading` (`Title / Section`), `level, line_from, line_to` — feed `line_from` to `cat --lines` |
+| `sections` | `path, heading` (`Title / Section`), `level, line_from, line_to, title` (the last component), `nwords` (the section's own lines), `nwords_total` (plus everything nested), and the document's `nbytes, nlines, file_nwords, version, updated_at, updated_by` — feed `line_from` to `cat --lines` |
 | `links` | `path, target` (without `#anchor`/`|alias`), `line, kind` (`wiki`, `embed`, `md`, `image`), `anchor, alias, status` (`ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store`, `external`), `resolved` (the file it points to; for an asset, the asset's path), `asset` (it resolves to an asset's pointer) |
-| `commits` | `path, version, author, ts, message, kind, batch` |
+| `commits` | `path, version, author, ts, message, kind, base_version, nbytes, nlines, nwords, batch` |
 | `authors` | `path, author, commits, first_ts, last_ts` |
 
-Also `textdb_search(query, prefix)`, `textdb_ls(dir, recursive)`, `textdb_content(path)`. Do not
+Also `textdb_search(query, prefix, limit, per_file)` → `path, version, line, text, section, score, more`
+(one row per matching line), `textdb_ls(dir, recursive)` and `textdb_entry(path)` → the full record above,
+`textdb_outline(path, heading, match, level, limit)`, `textdb_headings(path, starts, limit)`,
+`textdb_content(path)`. Do not
 select `content` from `kb` across many files: it reads every document in full.
 
 - **Output for scripts:** `--format lines` prints one value per line (one column), `--format tsv`

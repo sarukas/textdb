@@ -94,7 +94,7 @@ Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./
 | `GET /api/search?q=…[&prefix=/][&limit=50]` | | `[{ path, line, snippet, rank }]` |
 | `PUT /api/file` | `{ path, content, base_version?, author?, message? }` | `{ version, kind }` — rebased over concurrent commits; 409 with `conflict` when the same lines changed |
 | `POST /api/replace-lines` | `{ path, from, to, text, base_version?, author? }` | `{ version, kind }` |
-| `GET /api/stat?path=…` | | `{ path, kind, files, folders, nbytes }` — for a folder, everything below it (`folders` does not count the folder itself) |
+| `GET /api/stat?path=…`, `GET /api/entry?path=…` | | one full listing record (`docs/shapes.md`); `stat` is an alias of `entry`. A folder's figures are totals over everything below it |
 | `POST /api/move` | `{ from, to, author? }` | `{ from, to }` — a file or a whole folder; one `move` change for the moved node |
 | `POST /api/delete` | `{ path, author? }` | `{ path }` — a file or a whole folder; one `delete` change for the deleted node |
 | `GET /api/path-history?path=…` or `?id=…` | | `[{ id, ts, op, old_path, new_path, via, version, author }]`, see `textdb_path_history` |
@@ -106,6 +106,12 @@ Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./
 | `POST /api/trash/purge` | `{ id, author? }` | `{ items, files, folders, versions, chunks, tree_nodes, bytes }` |
 | `POST /api/trash/empty` | `{ author? }` | the same, for the whole trash |
 | `POST /api/import` | `{ files: [{ path, content }], author? }` (at most 5000 files) | `{ created, updated, unchanged, failed, failures: [{ path, code, message }] }` — one transaction, message `import`; unchanged files make no version; a refused file is listed and the rest still land |
+| `GET /api/outline?path=…[&heading=…&match=…&level=…&limit=…]` | | markdown headings under a path, with each document's own figures; see `docs/outlines.md` |
+| `GET /api/outline/names?path=…[&starts=…&limit=…]` | | the distinct headings in use, for autosuggest |
+| `GET /api/meta/keys[?prefix=…&limit=…]` | | front-matter property names in use, most-used first |
+| `GET /api/meta/values?key=…[&prefix=…&limit=…]` | | the values one property takes |
+| `GET /api/meta/find?q=…[&folder=…&limit=…]` | | documents matching a property query; see `docs/properties.md` |
+| `GET /api/trash/entry?id=…` | | one trash entry |
 | `GET /api/events[?since=seq]` | `Last-Event-ID` honoured | Server-sent events, see below |
 
 ### `GET /api/events`

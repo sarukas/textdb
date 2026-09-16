@@ -63,11 +63,13 @@ textdb meta find "status:draft tags:telco" --show status,tags,priority
 textdb meta find "priority:>3" --folder /notes --limit 50
 ```
 
-`meta keys` reports how many documents carry each property, how many distinct values it takes,
+`meta keys` returns `key, docs, values_n, kind` — how many documents carry each property, how many distinct values it takes,
 and whether those values are numeric — the last so a reader knows whether `>` will mean
 anything on it.
 
-**SQL** — the `properties` view (path, key, value, number, ord), and the functions underneath:
+**SQL** — the `properties` view (path, key, value, number, ord) and the functions underneath. The view is a
+`TEMP VIEW` the CLI creates on its own connection, so it exists inside `textdb sql` and not in the store
+itself; a client connecting directly calls the functions:
 
 ```sql
 SELECT * FROM textdb_prop_keys('', 20);              -- SQLite

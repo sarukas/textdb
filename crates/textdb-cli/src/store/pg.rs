@@ -18,19 +18,12 @@ use super::{
 /// The views `textdb sql` offers, as in SQLite: the live store by path. Temporary, so they live
 /// in this session only.
 const SQL_VIEWS: &str = "\
+-- `files` and `folders` are the canonical listing record filtered by kind, the same columns
+-- in the same order as kb.entry and SQLite's. `folders.parent` is `dir` now.
 CREATE OR REPLACE TEMP VIEW files AS
-  SELECT id, path, name,
-         CASE WHEN length(path) = length(name) + 1 THEN '/' ELSE left(path, length(path) - length(name) - 1) END AS dir,
-         length(path) - length(replace(path, '/', '')) AS depth,
-         CASE WHEN name ~ '^.+\\.[^.]*$' THEN lower(substring(name from '\\.([^.]*)$')) ELSE '' END AS ext,
-         version, nbytes, nlines, nwords, nauthors, created_at, updated_at, updated_by
-  FROM kb.node WHERE kind = 1 AND deleted_at IS NULL;
+  SELECT * FROM kb.entry WHERE kind = 'file';
 CREATE OR REPLACE TEMP VIEW folders AS
-  SELECT id, path, name,
-         CASE WHEN path = '/' THEN NULL WHEN length(path) = length(name) + 1 THEN '/'
-              ELSE left(path, length(path) - length(name) - 1) END AS parent,
-         CASE WHEN path = '/' THEN 0 ELSE length(path) - length(replace(path, '/', '')) END AS depth,
-         files, folders, nbytes, nlines, nwords, versions, updated_at FROM kb.entry WHERE kind = 'folder';
+  SELECT * FROM kb.entry WHERE kind = 'folder';
 CREATE OR REPLACE TEMP VIEW frontmatter AS
   SELECT n.path, f.data FROM kb.frontmatter f JOIN kb.node n ON n.id = f.file_id AND n.deleted_at IS NULL;
 CREATE OR REPLACE TEMP VIEW properties AS
