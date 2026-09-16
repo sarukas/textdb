@@ -879,6 +879,18 @@ pub fn is_root_link(kind: &str, target: &str, resolved: &str) -> bool {
     want == resolved || format!("{want}.md") == resolved
 }
 
+/// Is this target written as a position rather than as a name or a root path?
+///
+/// A relative markdown target (`../policies/nda.md`) and a wiki target that matched deeper
+/// (`[[2026/q3]]`) both mean "from here", which is the same document in every namespace.
+fn is_positional(kind: &str, target: &str, resolved: &str) -> bool {
+    let md = kind == "md" || kind == "image";
+    if md {
+        return !target.starts_with('/');
+    }
+    target.contains('/') && !is_root_link(kind, target, resolved)
+}
+
 /// The word a link target reads as: its last segment, without `.md`.
 fn display_name(target: &str) -> String {
     let last = target.trim_end_matches('/').rsplit('/').next().unwrap_or(target);
@@ -949,6 +961,14 @@ pub fn project(view: &View, text: &[u8], links: &[TargetSpan]) -> (Vec<u8>, Vec<
             // document and cannot see it. `textdb:13` is not a path and cannot collide with one.
             None => {
                 let Some(id) = l.resolved_id else { continue };
+                // A target written as a position — a relative path, or a wiki path matching
+                // deeper — means the same thing in every namespace and is the author's own
+                // text, so it keeps its bytes even when what it reaches is hidden. Only a name
+                // or a root path is rewritten: a name would read as broken here when it is not,
+                // and a root path is the store's layout (#12 E5, E14, E15).
+                if is_positional(&l.kind, &l.target, resolved) {
+                    continue;
+                }
                 acts[i] = Projected::Hidden;
                 // A wiki link renders its target, so an id on its own would read as a number
                 // where a word was. The name the link was written with becomes the alias — it is

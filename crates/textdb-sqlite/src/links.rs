@@ -119,7 +119,45 @@ impl<'c> TextDb<'c> {
         anchor: Option<&str>,
         external: bool,
     ) -> Result<(Option<i64>, &'static str)> {
+        if !external && self.names_no_share(kind, target) {
+            return Ok((None, "broken"));
+        }
         resolve(self, source_id, source, kind, target, anchor, external)
+    }
+
+    /// Is this a root path written in the account's own namespace that names no share it holds?
+    ///
+    /// Such a link is nonsense: the account meant a folder it does not have. Its bytes are kept
+    /// as written (#12 §3.4) — the text is the author's — but it must not then be resolved
+    /// against the store's root, which would let `[[hr/salaries]]` reach a document the account
+    /// cannot see and put a link into it in everyone else's backlinks. It is broken, for
+    /// everyone, which is what it means.
+    ///
+    /// A target that *did* un-project is a store path by the time it is indexed, so the account
+    /// can see it and this says no. The check is therefore on the text as stored, and needs no
+    /// record of what the writer meant.
+    ///
+    /// Re-resolution later, by someone whose view does contain the path, resolves it: `relink`
+    /// runs under whoever triggered it. That only happens when the target itself moves, and the
+    /// answer then is the one that account would get for text written now.
+    fn names_no_share(&self, kind: &str, target: &str) -> bool {
+        use textdb_core::access::Resolved;
+        if self.view.is_admin() || target.is_empty() {
+            return false;
+        }
+        let md = kind == "md" || kind == "image";
+        let looks_root = if md { target.starts_with('/') } else { target.contains('/') };
+        if !looks_root {
+            return false;
+        }
+        let local = format!("/{}", target.trim_start_matches('/'));
+        // Visible as written: it un-projected, and it is the store's path for a share.
+        if self.view.to_view(&local).is_some() {
+            return false;
+        }
+        // Addressable but not there: an ordinary broken link inside a share, which the resolver
+        // should answer for itself.
+        !matches!(self.view.to_store(&local), Resolved::In { .. } | Resolved::Root)
     }
 
     /// Replace the link rows of a file (resolution follows with [`TextDb::relink_where`]).
