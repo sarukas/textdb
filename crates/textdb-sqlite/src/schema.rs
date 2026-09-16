@@ -19,6 +19,15 @@ CREATE TABLE IF NOT EXISTS {p}node (
   deleted_at  TEXT    NULL,
   nwords      INTEGER,                        -- file: words, as wc -w counts them
   nauthors    INTEGER,                        -- file: distinct commit authors (file_author rows)
+  -- What the structure extractor found, counted once at commit and stored here so a listing
+  -- can say "12 headings, 4 properties, 2 links, 1 broken" without a query per row. Zero for
+  -- a file with no structure; the `title` is the front matter's, else the first level-1
+  -- heading, else NULL.
+  title           TEXT,
+  nsections       INTEGER NOT NULL DEFAULT 0,
+  nprops          INTEGER NOT NULL DEFAULT 0,
+  nlinks          INTEGER NOT NULL DEFAULT 0,
+  nlinks_broken   INTEGER NOT NULL DEFAULT 0,
   -- Folder: totals of every live node below it, kept current by each commit, mkdir, move and
   -- delete. Zero on files; a file's own figures are nbytes, nlines, nwords and version.
   t_files      INTEGER NOT NULL DEFAULT 0,
@@ -27,6 +36,10 @@ CREATE TABLE IF NOT EXISTS {p}node (
   t_lines      INTEGER NOT NULL DEFAULT 0,
   t_words      INTEGER NOT NULL DEFAULT 0,
   t_versions   INTEGER NOT NULL DEFAULT 0,
+  t_sections     INTEGER NOT NULL DEFAULT 0,
+  t_props        INTEGER NOT NULL DEFAULT 0,
+  t_links        INTEGER NOT NULL DEFAULT 0,
+  t_links_broken INTEGER NOT NULL DEFAULT 0,
   t_updated_at TEXT    NULL                   -- the last change anywhere below
 );
 CREATE UNIQUE INDEX IF NOT EXISTS {p}node_path ON {p}node(path) WHERE deleted_at IS NULL;
@@ -242,6 +255,16 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("change", "batch", "TEXT NULL"),
     // Sync: the include rules each base was made with.
     ("sync", "rules", "TEXT"),
+    // Structure counts on the node row, and their folder totals.
+    ("node", "title", "TEXT"),
+    ("node", "nsections", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "nprops", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "nlinks", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "nlinks_broken", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "t_sections", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "t_props", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "t_links", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "t_links_broken", "INTEGER NOT NULL DEFAULT 0"),
     // Counts: words per version, and the size of each section (words.rs).
     ("commit", "nwords", "INTEGER"),
     ("section", "nwords", "INTEGER"),

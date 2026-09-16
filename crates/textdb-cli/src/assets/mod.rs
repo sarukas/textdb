@@ -869,7 +869,7 @@ fn push_one(
     // Checked before the upload as well as before the commit, so a push that lost the race to
     // another leaves the asset store alone.
     let pointer_path = format!("{}{SUFFIX}", item.path);
-    if st.stat(&pointer_path).ok().map(|s| s.version) != item.version {
+    if st.stat(&pointer_path).ok().and_then(|s| s.version) != item.version {
         return Outcome::Conflict(format!("{}: its pointer changed in the store since this directory was scanned; run it again", item.path));
     }
     let d = match drivers.get(&store) {
@@ -925,7 +925,7 @@ fn push_one(
         extra: old.map(|p| p.extra.clone()).unwrap_or_default(),
     };
     // The bytes are in the asset store and checked; now the pointer, unless another push got there first.
-    if st.stat(&pointer_path).ok().map(|s| s.version) != item.version {
+    if st.stat(&pointer_path).ok().and_then(|s| s.version) != item.version {
         return Outcome::Conflict(format!(
             "{}: its pointer changed in the store during this push; run it again (the uploaded bytes stay in the asset store unused, and anything they replaced is in its trash)",
             item.path

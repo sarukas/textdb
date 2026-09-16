@@ -17,6 +17,15 @@ use textdb_md::resolve::{line_of_offset, resolve, rewritten_target, Lookup};
 use crate::db::{subtree_bounds, to_hash, TextDb};
 use crate::storage::sql_err;
 
+/// Does this status mean the link does not reach a document?
+///
+/// `external` is not broken — a URL is not this store's to resolve — and `not-in-store` means
+/// the target is deliberately outside it. What counts is a link that meant to reach something
+/// here and does not.
+pub(crate) fn is_broken(status: Option<&str>) -> bool {
+    matches!(status, Some("broken") | Some("anchor-missing") | Some("ambiguous"))
+}
+
 /// Ids or names per `IN (...)` statement.
 ///
 /// Fixed so the statement text repeats and the cache can hold it: a chunk sized to whatever
@@ -165,6 +174,10 @@ impl<'c> TextDb<'c> {
                 .map_err(sql_err)?;
             it.collect::<rusqlite::Result<_>>().map_err(sql_err)?
         };
+        // A link breaking is the one structure count that moves without a commit, so the files
+        // whose broken total changed are collected here and rolled up once at the end rather
+        // than recomputed per row.
+        let mut touched: std::collections::BTreeMap<i64, String> = Default::default();
         for (rowid, file_id, path, kind, target, anchor, external, had_id, had_status) in rows {
             let (id, status) = self.resolve_link(file_id, &path, &kind, &target, anchor.as_deref(), external)?;
             // Most re-resolutions confirm what the row already said — a folder rename moves a
@@ -173,13 +186,43 @@ impl<'c> TextDb<'c> {
             if had_id == id && had_status.as_deref() == Some(status) {
                 continue;
             }
+            if is_broken(had_status.as_deref()) != is_broken(Some(status)) {
+                touched.insert(file_id, path.clone());
+            }
             self.conn
                 .prepare_cached(&format!("UPDATE {}link SET resolved_id = ?1, status = ?2 WHERE rowid = ?3", self.p))
                 .map_err(sql_err)?
                 .execute(params![id, status, rowid])
                 .map_err(sql_err)?;
         }
+        for (file_id, path) in touched {
+            self.refresh_broken_links(file_id, &path)?;
+        }
         Ok(())
+    }
+
+    /// Recount `file_id`'s broken links, store the number and move the folders above it.
+    fn refresh_broken_links(&self, file_id: i64, path: &str) -> Result<()> {
+        let now = self.broken_links_of(file_id)?;
+        let before: i64 = self
+            .conn
+            .prepare_cached(&format!("SELECT nlinks_broken FROM {}node WHERE id = ?1", self.p))
+            .map_err(sql_err)?
+            .query_row(params![file_id], |r| r.get(0))
+            .map_err(sql_err)?;
+        if now == before {
+            return Ok(());
+        }
+        self.conn
+            .prepare_cached(&format!("UPDATE {}node SET nlinks_broken = ?1 WHERE id = ?2", self.p))
+            .map_err(sql_err)?
+            .execute(params![now, file_id])
+            .map_err(sql_err)?;
+        let change = crate::stats::Totals {
+            links_broken: now - before,
+            ..Default::default()
+        };
+        self.add_to_ancestors(path, &change, &Self::now())
     }
 
     /// Resolve again every link that could point to a file named one of `names`, or points to

@@ -12,7 +12,7 @@ use textdb_sqlite::normalize_path;
 
 use super::{
     BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, LineRange, LinkRow, MovedBack, MovedLink,
-    PathEvent, RestoredFile, Result, RevertOutcome, SqlResult, Stat, Store, StoreError, SyncBase, Written,
+    PathEvent, RestoredFile, Result, RevertOutcome, SqlResult, Store, StoreError, SyncBase, Written,
 };
 
 /// The views `textdb sql` offers, as in SQLite: the live store by path. Temporary, so they live
@@ -143,38 +143,57 @@ fn written(json: &str) -> Result<Written> {
     serde_json::from_str(json).map_err(|e| StoreError::other(format!("unexpected write result {json}: {e}")))
 }
 
+/// One `kb.entry` row selected with [`ENTRY_COLS`], as the CLI's `Entry`.
+///
+/// One conversion for every listing path, matching the SQLite store's, so the twenty-four
+/// keys mean the same thing on either backend.
 fn entry(r: &Row) -> Entry {
+    let authors: Option<String> = r.get(23);
     Entry {
         path: r.get(0),
         name: r.get(1),
         kind: r.get(2),
-        nbytes: r.get(3),
-        nlines: r.get(4),
-        updated_at: r.get(5),
-        ..Entry::default()
-    }
-}
-
-const ENTRY_COLS: &str =
-    "n.path, n.name, CASE n.kind WHEN 1 THEN 'file' ELSE 'folder' END, n.nbytes, n.nlines, n.updated_at::text";
-
-/// A row of `kb.entry` selected with [`LISTING_COLS`].
-fn listed(r: &Row) -> Entry {
-    let authors: Option<String> = r.get(12);
-    Entry {
-        nwords: r.get(6),
-        versions: r.get(7),
-        created_at: r.get(8),
-        updated_by: r.get(9),
-        files: r.get(10),
-        folders: r.get(11),
+        version: r.get(3),
+        nbytes: r.get(4),
+        nlines: r.get(5),
+        updated_at: r.get(6),
+        updated_by: r.get(7),
+        id: r.get(8),
+        dir: r.get(9),
+        depth: r.get(10),
+        ext: r.get(11),
+        title: r.get(12),
+        nwords: r.get(13),
+        nsections: r.get(14),
+        nprops: r.get(15),
+        nlinks: r.get(16),
+        nlinks_broken: r.get(17),
+        versions: r.get(18),
+        created_at: r.get(19),
+        files: r.get(20),
+        folders: r.get(21),
+        nauthors: r.get(22),
         authors: authors.and_then(|a| serde_json::from_str(&a).ok()).unwrap_or_default(),
-        ..entry(r)
     }
 }
 
-const LISTING_COLS: &str = "e.path, e.name, e.kind, e.nbytes, e.nlines, e.updated_at::text, e.nwords, e.versions, \
-     e.created_at::text, e.updated_by, e.files, e.folders, e.authors::text";
+/// Timestamps are rendered to ISO-8601 UTC in SQL rather than left to `::text`, which would
+/// give `2026-09-16 05:08:32.033+00` in the session's time zone — a different spelling of the
+/// same field from the one the SQLite backend returns.
+pub(crate) fn utc(col: &str) -> String {
+    format!("to_char({col} AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')")
+}
+
+/// The canonical `Entry` columns of `kb.entry`, in order.
+fn entry_cols() -> String {
+    format!(
+        "e.path, e.name, e.kind, e.version, e.nbytes, e.nlines, {upd}, e.updated_by, e.id, e.dir, e.depth, e.ext, \
+         e.title, e.nwords, e.nsections, e.nprops, e.nlinks, e.nlinks_broken, e.versions, {cre}, e.files, e.folders, \
+         e.nauthors, e.authors::text",
+        upd = utc("e.updated_at"),
+        cre = utc("e.created_at"),
+    )
+}
 
 impl PgStore {
     pub fn connect(url: &str) -> Result<Self> {
@@ -414,17 +433,8 @@ impl Store for PgStore {
         if prefix != "/" {
             self.stat(&prefix)?;
         }
-        let rows = self
-            .client
-            .query(
-                &format!(
-                    "SELECT {ENTRY_COLS} FROM kb.node n WHERE n.deleted_at IS NULL AND n.path <> '/' \
-                     AND ($1 = '/' OR n.path LIKE kb._subtree_like($1) OR (n.path = $1 AND n.kind = 1))"
-                ),
-                &[&prefix],
-            )
-            .map_err(pg)?;
-        Ok(rows.iter().map(entry).collect())
+        // The same query `ls -R` runs, so every listing command returns the same row.
+        self.ls(&prefix, true)
     }
 
     fn ls(&mut self, path: &str, recursive: bool) -> Result<Vec<Entry>> {
@@ -432,31 +442,19 @@ impl Store for PgStore {
         self.stat(&path)?;
         let rows = self
             .client
-            .query(&format!("SELECT {LISTING_COLS} FROM kb.ls($1, $2) e"), &[&path, &recursive])
+            .query(&format!("SELECT {} FROM kb.ls($1, $2) e", entry_cols()), &[&path, &recursive])
             .map_err(pg)?;
-        Ok(rows.iter().map(listed).collect())
+        Ok(rows.iter().map(entry).collect())
     }
 
-    fn stat(&mut self, path: &str) -> Result<Stat> {
+    fn stat(&mut self, path: &str) -> Result<Entry> {
         let path = normalize_path(path)?;
         let row = self
             .client
-            .query_opt(
-                "SELECT path, CASE kind WHEN 1 THEN 'file' ELSE 'folder' END, version, nbytes, nlines, \
-                 updated_at::text, updated_by FROM kb.node WHERE path = $1 AND deleted_at IS NULL",
-                &[&path],
-            )
+            .query_opt(&format!("SELECT {} FROM kb.entry e WHERE e.path = $1", entry_cols()), &[&path])
             .map_err(pg)?
             .ok_or_else(|| StoreError::not_found(format!("not found: {path}")))?;
-        Ok(Stat {
-            path: row.get(0),
-            kind: row.get(1),
-            version: row.get(2),
-            nbytes: row.get(3),
-            nlines: row.get(4),
-            updated_at: row.get(5),
-            updated_by: row.get(6),
-        })
+        Ok(entry(&row))
     }
 
     fn read(&mut self, path: &str, version: Option<i64>) -> Result<(Vec<u8>, i64)> {
@@ -596,23 +594,37 @@ impl Store for PgStore {
             })
             .collect())
     }
-    fn search(&mut self, query: &str, prefix: &str, limit: i64) -> Result<Vec<Hit>> {
+    fn search(&mut self, query: &str, prefix: &str, limit: i64, per_file: i64) -> Result<Vec<Hit>> {
         let rows = self
             .client
             .query(
-                "SELECT path, line, snippet, rank::float8 FROM kb.search($1, $2, $3)",
-                &[&query, &prefix, &limit.max(1)],
+                "SELECT path, version, line, text, section, score::float8, more FROM kb.search($1, $2, $3, $4)",
+                &[&query, &prefix, &limit.max(1), &per_file.max(1)],
             )
             .map_err(pg)?;
         Ok(rows
             .iter()
             .map(|r| Hit {
                 path: r.get(0),
-                line: r.get(1),
-                snippet: r.get(2),
-                rank: r.get(3),
+                version: r.get(1),
+                line: r.get(2),
+                text: r.get(3),
+                section: r.get(4),
+                score: r.get(5),
+                more: r.get(6),
             })
             .collect())
+    }
+
+    fn sections_of(&mut self, path: &str) -> Result<Vec<(i64, i64, String)>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT line_from, line_to, heading_path FROM kb.outline($1, NULL, 'exact', NULL, 10000)",
+                &[&path],
+            )
+            .map_err(pg)?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect())
     }
 
     fn write(

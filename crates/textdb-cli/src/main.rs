@@ -277,12 +277,18 @@ enum Cmd {
         query: Vec<String>,
         #[arg(long, short = 'p', default_value = "/", value_parser = store_path)]
         prefix: String,
-        /// Documents to list at most.
-        #[arg(long, default_value_t = 50)]
-        limit: i64,
-        /// Matching lines to list per document.
+        /// Rows to return at most — matching lines, as on `grep`.
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Matching lines to list per document; the rest are reported as `more`.
         #[arg(long, default_value_t = 10)]
         per_file: usize,
+        /// List only the paths of documents that matched.
+        #[arg(long, short = 'l', conflicts_with = "count")]
+        files_with_matches: bool,
+        /// List each matching document and how many of its lines matched.
+        #[arg(long, short = 'c')]
+        count: bool,
     },
     /// Lines matching a regular expression in every file under a folder; case-sensitive
     /// unless -i. Reads the files, so it is slower than `search` on a large folder.
@@ -296,11 +302,17 @@ enum Cmd {
         #[arg(long, short = 'F')]
         fixed_strings: bool,
         /// List only the paths of files with a match.
-        #[arg(long, short = 'l')]
+        #[arg(long, short = 'l', conflicts_with = "count")]
         files_with_matches: bool,
-        /// Matching lines to list at most.
-        #[arg(long, default_value_t = 500)]
+        /// List each matching file and how many of its lines matched.
+        #[arg(long, short = 'c')]
+        count: bool,
+        /// Rows to return at most — matching lines, as on `search`.
+        #[arg(long, default_value_t = 200)]
         limit: usize,
+        /// Matching lines to list per file; the rest are reported as `more`.
+        #[arg(long, default_value_t = 10)]
+        per_file: usize,
     },
     /// Create a file or replace its content, from --file or stdin.
     Write {
@@ -647,25 +659,13 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
         }
         Cmd::Tree { path, depth, dirs } => tree(st, &path, depth, dirs, json),
         Cmd::Stat { path } => {
-            let s = st.stat(&path)?;
+            let e = st.stat(&path)?;
             if json {
-                return emit_json(&s);
+                return emit_json(&e);
             }
-            let mut text = format!("{} {} v{}", s.path, s.kind, s.version);
-            if s.kind == "file" {
-                text.push_str(&format!(
-                    " · {} · {} lines",
-                    human_bytes(s.nbytes.unwrap_or(0)),
-                    s.nlines.unwrap_or(0)
-                ));
-            }
-            if let Some(at) = &s.updated_at {
-                text.push_str(&format!(" · updated {at}"));
-            }
-            if let Some(by) = &s.updated_by {
-                text.push_str(&format!(" by {by}"));
-            }
-            line(text)
+            // One key per line: `stat` is the "what is this" command, and an agent reaching
+            // for it first should see everything the store knows rather than seven fields.
+            line(stat_text(&e))
         }
         Cmd::Cat { path, number, lines, at, section } => cat(st, &path, number, lines.as_deref(), at, section.as_deref(), json),
         Cmd::Search {
@@ -673,23 +673,40 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             prefix,
             limit,
             per_file,
-        } => search::search(st, &query.join(" "), &prefix, limit, per_file, json),
+            files_with_matches,
+            count,
+        } => search::search(
+            st,
+            &query.join(" "),
+            &prefix,
+            search::Options {
+                mode: mode_of(files_with_matches, count),
+                limit,
+                per_file,
+                ignore_case: false,
+                fixed: false,
+            },
+            json,
+        ),
         Cmd::Grep {
             pattern,
             prefix,
             ignore_case,
             fixed_strings,
             files_with_matches,
+            count,
             limit,
+            per_file,
         } => search::grep(
             st,
             &pattern,
             &prefix,
-            search::GrepOptions {
+            search::Options {
+                mode: mode_of(files_with_matches, count),
+                limit,
+                per_file,
                 ignore_case,
                 fixed: fixed_strings,
-                files_only: files_with_matches,
-                limit,
             },
             json,
         ),
@@ -712,7 +729,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
                     Ok(s) => {
                         return Err(StoreError::invalid(format!(
                             "{} exists already (v{}); --create only makes new files",
-                            s.path, s.version
+                            s.path, s.version.unwrap_or(0)
                         )))
                     }
                     Err(e) if e.code == "TX003" => {}
@@ -882,7 +899,8 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
         Cmd::Diff { path, v1, v2 } => {
             let v2 = match v2 {
                 Some(v) => v,
-                None => st.stat(&path)?.version,
+                // A folder has no version, and neither command accepts one, so this is a file.
+                None => st.stat(&path)?.version.unwrap_or(0),
             };
             let diff = st.diff(&path, v1, v2)?;
             if json {
@@ -894,7 +912,8 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
         Cmd::Hunks { path, v1, v2 } => {
             let v2 = match v2 {
                 Some(v) => v,
-                None => st.stat(&path)?.version,
+                // A folder has no version, and neither command accepts one, so this is a file.
+                None => st.stat(&path)?.version.unwrap_or(0),
             };
             let v1 = v1.unwrap_or(v2 - 1).max(0);
             let hunks = st.hunks(&path, v1, v2)?;
@@ -1253,7 +1272,7 @@ fn export(st: &mut dyn Store, prefix: &str, dir: &Path, dry_run: bool, json: boo
             Ok(meta) => {
                 let disk_len = std::fs::metadata(&target).map(|m| m.len()).ok();
                 let same = disk_len.is_some()
-                    && disk_len == f.nbytes.map(|n| n as u64)
+                    && disk_len == Some(f.nbytes as u64)
                     && std::fs::read(&target).ok() == Some(st.read(&f.path, None)?.0);
                 if same {
                     report.unchanged += 1;
@@ -1387,6 +1406,66 @@ fn sort_entries(entries: &mut [Entry], key: SortKey, reverse: bool, recursive: b
     });
 }
 
+/// `stat` as one key per line: the full `Entry`, with the values that do not apply omitted
+/// from the *text* (the JSON still carries every key as `null`).
+fn stat_text(e: &Entry) -> String {
+    let mut out = Vec::new();
+    let mut add = |k: &str, v: String| out.push(format!("{k:<14} {v}"));
+    add("path", e.path.clone());
+    add("name", e.name.clone());
+    add("kind", e.kind.clone());
+    if let Some(v) = e.version {
+        add("version", format!("v{v}"));
+    }
+    add("nbytes", format!("{} ({})", e.nbytes, human_bytes(e.nbytes)));
+    add("nlines", e.nlines.to_string());
+    add("nwords", e.nwords.to_string());
+    add("updated_at", e.updated_at.clone());
+    if let Some(by) = &e.updated_by {
+        add("updated_by", by.clone());
+    }
+    add("created_at", e.created_at.clone());
+    if let Some(d) = &e.dir {
+        add("dir", d.clone());
+    }
+    add("depth", e.depth.to_string());
+    if let Some(x) = &e.ext {
+        add("ext", x.clone());
+    }
+    if let Some(t) = &e.title {
+        add("title", t.clone());
+    }
+    add("nsections", e.nsections.to_string());
+    add("nprops", e.nprops.to_string());
+    add("nlinks", format!("{} ({} broken)", e.nlinks, e.nlinks_broken));
+    add("versions", e.versions.to_string());
+    if e.kind == "folder" {
+        add("files", e.files.unwrap_or(0).to_string());
+        add("folders", e.folders.unwrap_or(0).to_string());
+    }
+    add("nauthors", e.nauthors.to_string());
+    if !e.authors.is_empty() {
+        let who: Vec<String> =
+            e.authors.iter().map(|a| format!("{} ({})", a.author.as_deref().unwrap_or("-"), a.commits)).collect();
+        add("authors", who.join(", "));
+    }
+    add("id", e.id.to_string());
+    out.join("\n")
+}
+
+/// `-l` and `-c` pick the same two modes on both commands.
+fn mode_of(files_only: bool, count: bool) -> search::Mode {
+    match (files_only, count) {
+        (true, _) => search::Mode::Files,
+        (_, true) => search::Mode::Count,
+        _ => search::Mode::Lines,
+    }
+}
+
+/// The short listing is the minimal tier: size, lines, the version, and the name.
+///
+/// The version is there because every line-numbered edit needs one, and without it a short
+/// listing was not enough to start one.
 fn ls_text(entries: &[Entry], long: bool, recursive: bool) -> String {
     let name = |e: &Entry| {
         let n = if recursive { &e.path } else { &e.name };
@@ -1399,22 +1478,27 @@ fn ls_text(entries: &[Entry], long: bool, recursive: bool) -> String {
     let mut s = String::new();
     if !long {
         for e in entries {
-            let (size, lines) = if e.kind == "folder" {
-                (String::new(), String::new())
-            } else {
-                (human_bytes(e.nbytes.unwrap_or(0)), format!("{}L", e.nlines.unwrap_or(0)))
-            };
-            s.push_str(&format!("{size:>9}  {lines:>7}  {}\n", name(e)));
+            let version = e.version.map_or(String::new(), |v| format!("v{v}"));
+            s.push_str(&format!(
+                "{:>9}  {:>7}  {:>4}  {}\n",
+                human_bytes(e.nbytes),
+                format!("{}L", e.nlines),
+                version,
+                name(e)
+            ));
         }
         return s;
     }
+    // The full tier. `LINKS` is total/broken; `UPDATED` keeps the seconds and the `Z` rather
+    // than a 16-character cut that read as local time to anyone not in UTC.
     s.push_str(&format!(
-        "{:>9} {:>8} {:>9} {:>5}  {:<16}  {:<28}  {}\n",
-        "SIZE", "LINES", "WORDS", "VERS", "UPDATED", "AUTHORS / CONTAINS", "NAME"
+        "{:>9} {:>7} {:>8} {:>5} {:>6} {:>7} {:>5}  {:<24}  {:<28}  {}\n",
+        "SIZE", "LINES", "WORDS", "SECT", "PROPS", "LINKS", "VERS", "UPDATED", "BY / CONTAINS", "NAME"
     ));
     for e in entries {
         let who = if e.kind == "folder" {
-            format!("{} files, {} folders", e.files.unwrap_or(0), e.folders.unwrap_or(0))
+            let n = |v: i64, w: &str| if v == 1 { format!("1 {w}") } else { format!("{v} {w}s") };
+            format!("{}, {}", n(e.files.unwrap_or(0), "file"), n(e.folders.unwrap_or(0), "folder"))
         } else {
             let mut names: Vec<String> =
                 e.authors.iter().take(2).map(|a| format!("{} ({})", a.author.as_deref().unwrap_or("-"), a.commits)).collect();
@@ -1423,14 +1507,21 @@ fn ls_text(entries: &[Entry], long: bool, recursive: bool) -> String {
             }
             names.join(", ")
         };
-        let updated: String = e.updated_at.as_deref().unwrap_or("").replace('T', " ").chars().take(16).collect();
+        let links = if e.nlinks_broken > 0 {
+            format!("{}/{}", e.nlinks, e.nlinks_broken)
+        } else {
+            e.nlinks.to_string()
+        };
         s.push_str(&format!(
-            "{:>9} {:>8} {:>9} {:>5}  {:<16}  {:<28}  {}\n",
-            human_bytes(e.nbytes.unwrap_or(0)),
-            e.nlines.unwrap_or(0),
-            e.nwords.unwrap_or(0),
-            e.versions.unwrap_or(0),
-            updated,
+            "{:>9} {:>7} {:>8} {:>5} {:>6} {:>7} {:>5}  {:<24}  {:<28}  {}\n",
+            human_bytes(e.nbytes),
+            e.nlines,
+            e.nwords,
+            e.nsections,
+            e.nprops,
+            links,
+            e.versions,
+            e.updated_at,
             who,
             name(e)
         ));
@@ -2059,7 +2150,7 @@ fn tree(st: &mut dyn Store, path: &str, depth: Option<usize>, dirs_only: bool, j
             top.children.insert(e.name.clone(), TreeNode { entry: Some(e), ..Default::default() });
             continue;
         }
-        let size = if e.kind == "file" { e.nbytes.unwrap_or(0) } else { 0 };
+        let size = if e.kind == "file" { e.nbytes } else { 0 };
         let is_file = e.kind == "file";
         let mut node = &mut top;
         for seg in rel.split('/') {
@@ -2095,7 +2186,7 @@ fn render_tree(node: &TreeNode, indent: &str, depth: Option<usize>, dirs_only: b
             let indent = format!("{indent}{}", if last { "    " } else { "│   " });
             render_tree(kid, &indent, depth.map(|d| d - 1), dirs_only, s);
         } else {
-            let size = kid.entry.as_ref().and_then(|e| e.nbytes).unwrap_or(0);
+            let size = kid.entry.as_ref().map_or(0, |e| e.nbytes);
             s.push_str(&format!("{indent}{branch}{name}  {}\n", human_bytes(size)));
         }
     }

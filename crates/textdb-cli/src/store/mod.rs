@@ -78,31 +78,48 @@ impl From<std::io::Error> for StoreError {
     }
 }
 
+/// One listing row, the same twenty-four keys on every surface and in this order.
+///
+/// Every key is always present: a value that does not apply is `null`, never omitted. The
+/// old shape skipped `nwords`, `versions`, `authors` and others when absent, which left a
+/// consumer unable to tell "not applicable" from "this build does not have it".
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Entry {
+    // The minimal tier: what every surface carries, whatever the command or format.
     pub path: String,
     pub name: String,
     /// `file` or `folder`.
     pub kind: String,
-    /// In `ls`, a folder's size, lines, words and versions are totals over every file below it.
-    pub nbytes: Option<i64>,
-    pub nlines: Option<i64>,
-    pub updated_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nwords: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub versions: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// A file's current version — what `cat -n` shows and `--base-version` takes. `null` for
+    /// a folder, which has no version of its own.
+    pub version: Option<i64>,
+    /// A file's own size; a folder's total over the live files below it.
+    pub nbytes: i64,
+    pub nlines: i64,
+    pub updated_at: String,
     pub updated_by: Option<String>,
-    /// Folder: files and folders anywhere below it.
-    #[serde(skip_serializing_if = "Option::is_none")]
+
+    // The rest of the full tier.
+    pub id: i64,
+    /// The parent folder; `null` for the root.
+    pub dir: Option<String>,
+    pub depth: i64,
+    /// Lower case, no dot; `null` for a folder or a name without one.
+    pub ext: Option<String>,
+    /// Front matter `title`, else the first level-1 heading, else `null`.
+    pub title: Option<String>,
+    pub nwords: i64,
+    pub nsections: i64,
+    pub nprops: i64,
+    pub nlinks: i64,
+    pub nlinks_broken: i64,
+    pub versions: i64,
+    pub created_at: String,
+    /// Folder: live files and folders anywhere below it; `null` for a file.
     pub files: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub folders: Option<i64>,
-    /// File: who committed to it, most commits first.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub nauthors: i64,
+    /// Who committed to it, most commits first. Empty for a folder.
     pub authors: Vec<Author>,
 }
 
@@ -116,16 +133,6 @@ pub struct Author {
     pub last_ts: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct Stat {
-    pub path: String,
-    pub kind: String,
-    pub version: i64,
-    pub nbytes: Option<i64>,
-    pub nlines: Option<i64>,
-    pub updated_at: Option<String>,
-    pub updated_by: Option<String>,
-}
 
 #[derive(Debug, Serialize)]
 pub struct Commit {
@@ -159,12 +166,37 @@ pub struct PathEvent {
     pub author: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+/// One matching line, the same seven keys from `search`, `grep` and the SQL functions.
+///
+/// One row per matching *line* on every surface. `search` used to return one row per document
+/// with a best-guess line on three of the four surfaces that carried the same column name.
+#[derive(Debug, Clone, Serialize)]
 pub struct Hit {
     pub path: String,
+    /// The version the line number belongs to — what `--base-version` takes. Without it a
+    /// caller that searched and then edited by line had nothing to pass.
+    pub version: i64,
     pub line: i64,
-    pub snippet: String,
-    pub rank: f64,
+    /// The whole matching line, cut at one length everywhere. Replaces `snippet` on `search`
+    /// and `text` on `grep`, which were the same thing under two names and two cuts.
+    pub text: String,
+    /// The heading path the line sits under (`API Guide / Errors`), so a caller can jump
+    /// with `cat --section`. `None` outside any heading, or in a file with none.
+    pub section: Option<String>,
+    /// Relevance, higher is better, `None` for `grep`. Replaces `rank`, whose sign was raw
+    /// engine output and flipped between SQLite and Postgres.
+    pub score: Option<f64>,
+    /// Matching lines in this file not listed because of `--per-file`; 0 otherwise. Makes
+    /// truncation visible to a JSON consumer, which only ever saw it on stderr.
+    pub more: i64,
+}
+
+/// One document a search matched, for the paths-only and count modes.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileHit {
+    pub path: String,
+    pub version: i64,
+    pub matches: i64,
 }
 
 /// A link that pointed at what a move took elsewhere and no longer reaches it.
@@ -502,11 +534,16 @@ pub trait Store {
     /// The folder's entries by name, or with `recursive` everything below it by path. A folder's
     /// size, lines, words and versions are totals over the files below it.
     fn ls(&mut self, path: &str, recursive: bool) -> Result<Vec<Entry>>;
-    fn stat(&mut self, path: &str) -> Result<Stat>;
+    /// One full `Entry` for one path — the same record `ls` returns for it.
+    fn stat(&mut self, path: &str) -> Result<Entry>;
     /// Content at `version` (HEAD when `None`) and the version it is.
     fn read(&mut self, path: &str, version: Option<i64>) -> Result<(Vec<u8>, i64)>;
     fn section(&mut self, path: &str, heading: &str) -> Result<Option<Vec<u8>>>;
-    fn search(&mut self, query: &str, prefix: &str, limit: i64) -> Result<Vec<Hit>>;
+    /// Matching lines, at most `per_file` from any one document. `limit` counts rows.
+    fn search(&mut self, query: &str, prefix: &str, limit: i64, per_file: i64) -> Result<Vec<Hit>>;
+    /// A file's heading spans as `(line_from, line_to, heading_path)`, for naming the section
+    /// a line falls in. Empty for a file with no headings.
+    fn sections_of(&mut self, path: &str) -> Result<Vec<(i64, i64, String)>>;
     /// Front-matter property names in use, most-used first; `prefix` narrows them.
     fn property_keys(&mut self, prefix: &str, limit: i64) -> Result<Vec<PropKey>>;
     /// The values one property takes, most-used first.

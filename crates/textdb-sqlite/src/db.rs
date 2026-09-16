@@ -42,23 +42,51 @@ pub struct NodeRow {
 /// totals over every live file below it.
 #[derive(Clone, Debug)]
 pub struct Entry {
-    pub id: i64,
-    pub name: String,
+    // The minimal tier, in order: what every surface carries whatever the command, format,
+    // backend or SDK. It is the set an agent needs to find a file, read it, and then edit it
+    // safely — `version` most of all, because every line-numbered edit needs one.
     pub path: String,
+    pub name: String,
+    /// 0 folder, 1 file.
     pub kind: i64,
-    pub nbytes: Option<i64>,
-    pub nlines: Option<i64>,
-    pub nwords: Option<i64>,
-    /// A file's version; a folder's total of versions below it.
-    pub versions: i64,
-    /// A file's last commit or move; for a folder the latest change to it or anywhere below.
+    /// A file's current version — what `cat -n` shows and `--base-version` takes. `None` for
+    /// a folder, which has no version of its own.
+    pub version: Option<i64>,
+    /// A file's own size; a folder's total over the live files below it. Never null.
+    pub nbytes: i64,
+    pub nlines: i64,
+    /// A file's last commit or move; a folder's latest change anywhere below.
     pub updated_at: String,
     pub updated_by: Option<String>,
+
+    // The rest of the full tier.
+    pub id: i64,
+    /// The parent folder's path; `None` for the root. One name for what used to be spelled
+    /// `parent_path`, `dir`, `parent` and `parent_id` depending on the surface.
+    pub dir: Option<String>,
+    /// `/a.md` is 1; the root is 0.
+    pub depth: i64,
+    /// Lower case, no dot; `None` for a folder or a name without one.
+    pub ext: Option<String>,
+    /// Front matter `title`, else the first level-1 heading, else `None`.
+    pub title: Option<String>,
+    pub nwords: i64,
+    /// Headings, top-level front matter keys, links written in the file, and of those the
+    /// ones that do not reach a document. Folder rows are totals below.
+    pub nsections: i64,
+    pub nprops: i64,
+    pub nlinks: i64,
+    pub nlinks_broken: i64,
+    /// A file's version count (equal to `version`, kept so one sort key works for both
+    /// kinds); a folder's sum of the versions below it.
+    pub versions: i64,
     pub created_at: String,
     /// Folder only: live files and folders anywhere below it.
     pub files: Option<i64>,
     pub folders: Option<i64>,
-    /// File only: everyone who committed to it, most commits first.
+    /// Distinct authors: of the file, or of everything below the folder.
+    pub nauthors: i64,
+    /// Everyone who committed to it, most commits first. Empty for a folder.
     pub authors: Vec<AuthorCount>,
 }
 
@@ -145,11 +173,22 @@ pub struct ChangeRow {
 }
 
 #[derive(Clone, Debug)]
+/// One matching line. The store returns lines, not documents with a guessed line.
 pub struct Hit {
     pub path: String,
+    /// The version the line number belongs to.
+    pub version: i64,
     pub line: i64,
-    pub snippet: String,
-    pub rank: f64,
+    /// The whole matching line, cut to `terms::LINE_CUT`.
+    pub text: String,
+    /// The heading path the line sits under; `None` outside any heading.
+    pub section: Option<String>,
+    /// Relevance, higher is better, scaled to `(0, 1]` against the best hit of this query.
+    /// The raw engine number was negative on SQLite and positive on Postgres for the same
+    /// meaning, so nothing could compare them.
+    pub score: f64,
+    /// Matching lines in this file not returned because of `per_file`.
+    pub more: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -611,6 +650,9 @@ impl<'c> TextDb<'c> {
             lines: nlines as i64 - old_lines.unwrap_or(0),
             words: nwords - old_words.unwrap_or(0),
             versions: 1,
+            // The structure counts move in `write_structure`, which knows what the extractor
+            // found; it rolls its own delta up so this one stays about the content.
+            ..Totals::default()
         };
         self.add_to_ancestors(path, &change, &now)?;
         // Reverse index for search: chunk → file, recorded once per (chunk, file).
@@ -651,6 +693,7 @@ impl<'c> TextDb<'c> {
                 let doc = st.document(&c.root)?.0;
                 let s = ex.extract(&doc);
                 self.write_structure(file_id, c.version as i64, &s)?;
+                self.write_structure_counts(file_id, path, &s, &now)?;
             }
         }
         if c.version == 1 {
@@ -658,6 +701,73 @@ impl<'c> TextDb<'c> {
             self.relink(&[crate::links::name_key(path)], &[])?;
         }
         Ok(())
+    }
+
+    /// Store what the extractor found on the node row, and roll the change into the folders.
+    ///
+    /// The same pattern the word count uses: counted once here from lists the extractor has
+    /// already built, so a listing reads "12 headings, 4 properties, 2 links" off the row
+    /// instead of running three queries per file. `nlinks_broken` starts from what the link
+    /// rows say now; `relink` keeps it current afterwards, since a link breaks when its
+    /// target is deleted rather than when this file is written.
+    fn write_structure_counts(
+        &self,
+        file_id: i64,
+        path: &str,
+        s: &textdb_core::structure::Structure,
+        now: &str,
+    ) -> Result<()> {
+        let title = document_title(s);
+        let sections = s.sections.len() as i64;
+        // Top-level front matter keys: `project.name` and `project.phase` are one property to
+        // a reader, the way `meta get project` shows it.
+        let props = s
+            .frontmatter
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .map_or(0, |o| o.len()) as i64;
+        let links = s.links.len() as i64;
+        let broken = self.broken_links_of(file_id)?;
+        let old: (i64, i64, i64, i64) = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT nsections, nprops, nlinks, nlinks_broken FROM {}node WHERE id = ?1",
+                self.p
+            ))
+            .map_err(sql_err)?
+            .query_row(params![file_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(sql_err)?;
+        self.conn
+            .prepare_cached(&format!(
+                "UPDATE {}node SET title = ?1, nsections = ?2, nprops = ?3, nlinks = ?4, nlinks_broken = ?5 WHERE id = ?6",
+                self.p
+            ))
+            .map_err(sql_err)?
+            .execute(params![title, sections, props, links, broken, file_id])
+            .map_err(sql_err)?;
+        let change = Totals {
+            sections: sections - old.0,
+            props: props - old.1,
+            links: links - old.2,
+            links_broken: broken - old.3,
+            ..Totals::default()
+        };
+        if change != Totals::default() {
+            self.add_to_ancestors(path, &change, now)?;
+        }
+        Ok(())
+    }
+
+    /// Links of `file_id` whose status means the link does not reach a document.
+    pub(crate) fn broken_links_of(&self, file_id: i64) -> Result<i64> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT count(*) FROM {}link WHERE file_id = ?1 AND status IN ('broken', 'anchor-missing', 'ambiguous')",
+                self.p
+            ))
+            .map_err(sql_err)?
+            .query_row(params![file_id], |r| r.get(0))
+            .map_err(sql_err)
     }
 
     /// Replace a file's structure rows, writing nothing when they already say the same thing.
@@ -1230,10 +1340,18 @@ impl TextDb<'_> {
             .conn
             .prepare_cached(&format!(
                 "SELECT id, name, path, kind, \
-                 CASE kind WHEN 1 THEN nbytes ELSE t_bytes END, CASE kind WHEN 1 THEN nlines ELSE t_lines END, \
-                 CASE kind WHEN 1 THEN nwords ELSE t_words END, CASE kind WHEN 1 THEN version ELSE t_versions END, \
+                 CASE kind WHEN 1 THEN coalesce(nbytes, 0) ELSE t_bytes END, \
+                 CASE kind WHEN 1 THEN coalesce(nlines, 0) ELSE t_lines END, \
+                 CASE kind WHEN 1 THEN coalesce(nwords, 0) ELSE t_words END, \
+                 CASE kind WHEN 1 THEN version ELSE t_versions END, \
                  CASE WHEN kind = 0 AND t_updated_at > updated_at THEN t_updated_at ELSE updated_at END, \
-                 updated_by, created_at, CASE kind WHEN 0 THEN t_files END, CASE kind WHEN 0 THEN t_folders END \
+                 updated_by, created_at, CASE kind WHEN 0 THEN t_files END, CASE kind WHEN 0 THEN t_folders END, \
+                 CASE kind WHEN 1 THEN version END, title, \
+                 CASE kind WHEN 1 THEN nsections ELSE t_sections END, \
+                 CASE kind WHEN 1 THEN nprops ELSE t_props END, \
+                 CASE kind WHEN 1 THEN nlinks ELSE t_links END, \
+                 CASE kind WHEN 1 THEN nlinks_broken ELSE t_links_broken END, \
+                 coalesce(nauthors, 0) \
                  FROM {}node WHERE deleted_at IS NULL AND {scope} ORDER BY {order}",
                 self.p
             ))
@@ -1241,20 +1359,32 @@ impl TextDb<'_> {
         let rows = stmt
             .query_map(rusqlite::params_from_iter(args.iter()), |r| {
                 let id: i64 = r.get(0)?;
+                let path: String = r.get(2)?;
+                let kind: i64 = r.get(3)?;
                 Ok(Entry {
-                    id,
+                    path: path.clone(),
                     name: r.get(1)?,
-                    path: r.get(2)?,
-                    kind: r.get(3)?,
+                    kind,
+                    version: r.get(13)?,
                     nbytes: r.get(4)?,
                     nlines: r.get(5)?,
-                    nwords: r.get(6)?,
-                    versions: r.get(7)?,
                     updated_at: r.get(8)?,
                     updated_by: r.get(9)?,
+                    id,
+                    dir: dir_of(&path),
+                    depth: depth_of(&path),
+                    ext: (kind == 1).then(|| ext_of(&path)).flatten(),
+                    title: r.get(14)?,
+                    nwords: r.get(6)?,
+                    nsections: r.get(15)?,
+                    nprops: r.get(16)?,
+                    nlinks: r.get(17)?,
+                    nlinks_broken: r.get(18)?,
+                    versions: r.get(7)?,
                     created_at: r.get(10)?,
                     files: r.get(11)?,
                     folders: r.get(12)?,
+                    nauthors: r.get(19)?,
                     authors: authors.remove(&id).unwrap_or_default(),
                 })
             })
@@ -1620,8 +1750,17 @@ impl TextDb<'_> {
     /// phrase; `foo*` is a prefix. Each term is looked up in the chunk FTS index, chunk hits
     /// are mapped to files through `chunk_ref`, and the per-term file sets are intersected.
     pub fn search(&self, query: &str, prefix: &str, limit: usize) -> Result<Vec<Hit>> {
+        self.search_lines(query, prefix, limit, usize::MAX)
+    }
+
+    /// Matching lines, at most `per_file` of them from any one document.
+    ///
+    /// `limit` counts rows, not documents: one meaning for the word on every surface.
+    pub fn search_lines(&self, query: &str, prefix: &str, limit: usize, per_file: usize) -> Result<Vec<Hit>> {
+        // Candidates are found with a generous window: `limit` rows may all come from one
+        // document, so the number of documents to consider is not the number of rows wanted.
         let (terms, candidates) = self.search_candidates(query, prefix, limit)?;
-        self.resolve_hits(&terms, candidates, limit)
+        self.resolve_hits(&terms, candidates, limit, per_file)
     }
 
     /// The documents a query matches, best first, without resolving a line or a snippet.
@@ -1698,69 +1837,85 @@ impl TextDb<'_> {
         Ok((terms, candidates))
     }
 
-    /// Turn candidates into hits: each one's path, the line its best chunk starts at, and a
-    /// snippet around the term. The line and the snippet come from one scan of the same
-    /// bytes, so they are not separable — what this costs over `search_paths` is the whole
-    /// of hit resolution, not snippet rendering alone.
-    fn resolve_hits(&self, terms: &[String], candidates: Vec<(i64, i64, f64)>, limit: usize) -> Result<Vec<Hit>> {
+    /// Turn candidates into hit rows: every line of each matching document that actually
+    /// holds one of the query's terms.
+    ///
+    /// The index works on chunks, so on its own it can say which documents match and only
+    /// guess at the line. This reads each candidate and lists the lines, which is what makes
+    /// `line` a fact rather than a hint — and drops a document whose words only ever appear
+    /// apart, which document-level AND would otherwise report with a line holding none of
+    /// them.
+    fn resolve_hits(&self, terms: &[String], candidates: Vec<(i64, i64, f64)>, limit: usize, per_file: usize) -> Result<Vec<Hit>> {
         let st = self.storage();
-        let mut hits = Vec::new();
+        let parsed = textdb_core::terms::parse(terms.to_vec());
+        if parsed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let per_file = per_file.max(1);
         let mut node_stmt = self
             .conn
-            .prepare_cached(&format!("SELECT path, root FROM {}node WHERE id = ?1 AND deleted_at IS NULL", self.p))
+            .prepare_cached(&format!(
+                "SELECT path, root, version FROM {}node WHERE id = ?1 AND deleted_at IS NULL",
+                self.p
+            ))
             .map_err(sql_err)?;
-        let mut chunk_stmt = self
-            .conn
-            .prepare_cached(&format!("SELECT hash, bytes FROM {}chunk WHERE id = ?1", self.p))
-            .map_err(sql_err)?;
-        for (file_id, chunk_id, rank) in candidates {
-            let (path, root): (String, Vec<u8>) = match node_stmt
-                .query_row(params![file_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        // Ranked best first already; the best absolute value scales the rest into (0, 1].
+        // bm25 is negative and lower is better, so the sign is flipped here once rather than
+        // left for every caller to discover.
+        let best = candidates.iter().map(|(_, _, r)| -r).fold(f64::MIN, f64::max);
+        let scale = if best > 0.0 { best } else { 1.0 };
+        let mut hits: Vec<Hit> = Vec::new();
+        for (file_id, _chunk_id, rank) in candidates {
+            if hits.len() >= limit {
+                break;
+            }
+            let (path, root, version): (String, Vec<u8>, i64) = match node_stmt
+                .query_row(params![file_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
                 .optional()
                 .map_err(sql_err)?
             {
                 Some(x) => x,
                 None => continue,
             };
-            let (hash, bytes): (Vec<u8>, Vec<u8>) = chunk_stmt
-                .query_row(params![chunk_id], |r| Ok((r.get(0)?, r.get(1)?)))
-                .map_err(sql_err)?;
-            let root = to_hash(&root)?;
-            let hash = to_hash(&hash)?;
-            // Verify the chunk is still part of HEAD (chunk_ref is append-only) and get its line.
-            let leaf = match textdb_core::tree::find_leaf(&st, &root, &hash)? {
-                Some(l) => l,
-                None => {
-                    // The chunk left this file; fall back to a HEAD scan for the terms.
-                    let body = (*st.document(&root)?.0).clone();
-                    let (line, snippet) = textdb_core::snippet::locate_terms(&body, &terms);
-                    if snippet.is_empty() {
-                        continue;
-                    }
-                    hits.push(Hit {
-                        path,
-                        line: line as i64 + 1,
-                        snippet,
-                        rank,
-                    });
-                    if hits.len() >= limit {
-                        break;
-                    }
-                    continue;
-                }
+            let body = st.document(&to_hash(&root)?)?.0;
+            let body = String::from_utf8_lossy(&body);
+            let Some(lines) = textdb_core::terms::matching_lines(&parsed, &body) else {
+                continue;
             };
-            let (line_in_chunk, snippet) = textdb_core::snippet::locate_terms(&bytes, &terms);
-            hits.push(Hit {
-                path,
-                line: leaf.line_off as i64 + line_in_chunk as i64 + 1,
-                snippet,
-                rank,
-            });
-            if hits.len() >= limit {
-                break;
+            let shown = lines.len().min(per_file);
+            let more = (lines.len() - shown) as i64;
+            let sections = self.section_spans(file_id)?;
+            for (n, line) in lines.into_iter().take(per_file) {
+                if hits.len() >= limit {
+                    break;
+                }
+                hits.push(Hit {
+                    path: path.clone(),
+                    version,
+                    line: n as i64,
+                    text: textdb_core::terms::show(line, &parsed),
+                    section: section_at(&sections, n as i64),
+                    score: (-rank / scale).clamp(0.0, 1.0),
+                    more,
+                });
             }
         }
         Ok(hits)
+    }
+
+    /// A file's heading spans, deepest last, for naming the section a line falls in.
+    fn section_spans(&self, file_id: i64) -> Result<Vec<(i64, i64, String)>> {
+        let mut st = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT line_from, line_to, heading_path FROM {}section WHERE file_id = ?1 ORDER BY line_from, level",
+                self.p
+            ))
+            .map_err(sql_err)?;
+        let rows = st
+            .query_map(params![file_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
     }
 
     pub fn export(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
@@ -1860,6 +2015,66 @@ pub fn fts5_term(t: &str) -> String {
     } else {
         format!("\"{}\"", t.replace('"', "\"\""))
     }
+}
+
+/// The parent folder of an absolute path; `None` for the root.
+///
+/// Spelled `dir` on every surface now — it used to be `parent_path` on the `kb` table, `dir`
+/// on the `files` view, `parent` on `folders` and `parent_id` on Postgres.
+pub fn dir_of(path: &str) -> Option<String> {
+    if path == "/" {
+        return None;
+    }
+    Some(parent_of(path).to_string())
+}
+
+/// How deep a path sits: the root is 0, `/a.md` is 1, `/a/b.md` is 2.
+pub fn depth_of(path: &str) -> i64 {
+    if path == "/" {
+        return 0;
+    }
+    path.matches('/').count() as i64
+}
+
+/// A file's extension, lower case and without the dot; `None` when the name has none.
+///
+/// A leading dot is not an extension: `.gitignore` is a name, not an extension of nothing.
+pub fn ext_of(path: &str) -> Option<String> {
+    let name = name_of(path);
+    let (stem, ext) = name.rsplit_once('.')?;
+    (!stem.is_empty() && !ext.is_empty()).then(|| ext.to_ascii_lowercase())
+}
+
+/// The heading path a line falls under: the deepest span that contains it.
+///
+/// Spans are nested — a level-3 heading's range sits inside its parent's — so the last one
+/// that contains the line is the most specific, which is the one a reader means.
+fn section_at(spans: &[(i64, i64, String)], line: i64) -> Option<String> {
+    spans
+        .iter()
+        .filter(|(from, to, _)| *from <= line && line <= *to)
+        .next_back()
+        .map(|(_, _, h)| h.clone())
+}
+
+/// A document's title: its front matter `title`, else its first level-1 heading, else none.
+///
+/// Front matter wins because it is the one a writer set deliberately; the heading is what a
+/// reader sees when they did not. Anything else — a level-2 heading, the file name — would be
+/// guessing, so it stays `NULL` and a caller can fall back to `name` itself.
+fn document_title(s: &textdb_core::structure::Structure) -> Option<String> {
+    let from_meta = s
+        .frontmatter
+        .as_ref()
+        .and_then(|v| v.get("title"))
+        .and_then(|t| match t {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Null => None,
+            other => Some(other.to_string()),
+        })
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    from_meta.or_else(|| s.sections.iter().find(|x| x.level == 1).map(|x| x.heading.clone()))
 }
 
 /// FTS5 syntax for a whole query (terms ANDed within one document row).

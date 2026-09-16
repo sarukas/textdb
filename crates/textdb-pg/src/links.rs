@@ -122,16 +122,28 @@ fn relink_where(cond: &str, arg: Option<&str>) -> Result<()> {
         }
         Ok::<_, TextdbError>(out)
     })?;
+    // A link breaking is the one structure count that moves without a commit, so the files it
+    // touched are collected and their totals refreshed once at the end.
+    let mut touched: std::collections::BTreeMap<i64, String> = Default::default();
     for (id, file_id, path, kind, target, anchor, external) in rows {
         let (to, status) = resolve(&PgLookup, file_id, &path, &kind, &target, anchor.as_deref(), external)?;
         // Only rows whose outcome changed are written: a commit then locks no other file's rows
         // it leaves as they were, so writers to files that link to each other do not deadlock.
-        Spi::run_with_args(
-            "UPDATE kb.link SET resolved_id = $1, status = $2 \
-             WHERE id = $3 AND (resolved_id IS DISTINCT FROM $1 OR status IS DISTINCT FROM $2)",
+        let changed = Spi::get_one_with_args::<i64>(
+            "WITH u AS (UPDATE kb.link SET resolved_id = $1, status = $2 \
+                         WHERE id = $3 AND (resolved_id IS DISTINCT FROM $1 OR status IS DISTINCT FROM $2) \
+                         RETURNING 1) \
+             SELECT count(*) FROM u",
             &[to.into(), status.into(), id.into()],
         )
-        .map_err(err)?;
+        .map_err(err)?
+        .unwrap_or(0);
+        if changed > 0 {
+            touched.insert(file_id, path);
+        }
+    }
+    for (file_id, path) in touched {
+        crate::kb::refresh_broken_links(file_id, &path)?;
     }
     Ok(())
 }

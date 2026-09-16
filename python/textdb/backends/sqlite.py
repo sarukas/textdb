@@ -81,9 +81,14 @@ class SqliteBackend(Backend):
 
     # namespace ---------------------------------------------------------------
     @_wrap
-    def ls(self, path: str):
-        rows = self.conn.execute("SELECT name, kind, nbytes, nlines, updated_at, path FROM textdb_ls(?)", (path,)).fetchall()
-        return [dict(name=r[0], kind=r[1], nbytes=r[2], nlines=r[3], updated_at=r[4], path=r[5]) for r in rows]
+    def ls(self, path: str, recursive: bool = False):
+        rows = self.conn.execute("SELECT path, name, kind, version, nbytes, nlines, updated_at, updated_by, id, dir, depth, ext, title, nwords, nsections, nprops, nlinks, nlinks_broken, versions, created_at, files, folders, nauthors, authors FROM textdb_ls(?, ?)", (path, 1 if recursive else 0)).fetchall()
+        return [dict(path=r[0], name=r[1], kind=r[2], version=r[3], nbytes=r[4], nlines=r[5], updated_at=r[6], updated_by=r[7], id=r[8], dir=r[9], depth=r[10], ext=r[11], title=r[12], nwords=r[13], nsections=r[14], nprops=r[15], nlinks=r[16], nlinks_broken=r[17], versions=r[18], created_at=r[19], files=r[20], folders=r[21], nauthors=r[22], authors=r[23]) for r in rows]
+
+    @_wrap
+    def entry(self, path: str):
+        rows = self.conn.execute("SELECT path, name, kind, version, nbytes, nlines, updated_at, updated_by, id, dir, depth, ext, title, nwords, nsections, nprops, nlinks, nlinks_broken, versions, created_at, files, folders, nauthors, authors FROM textdb_entry(?)", (path,)).fetchall()
+        return [dict(path=r[0], name=r[1], kind=r[2], version=r[3], nbytes=r[4], nlines=r[5], updated_at=r[6], updated_by=r[7], id=r[8], dir=r[9], depth=r[10], ext=r[11], title=r[12], nwords=r[13], nsections=r[14], nprops=r[15], nlinks=r[16], nlinks_broken=r[17], versions=r[18], created_at=r[19], files=r[20], folders=r[21], nauthors=r[22], authors=r[23]) for r in rows]
 
     @_wrap
     def list_files(self, prefix: str):
@@ -172,14 +177,17 @@ class SqliteBackend(Backend):
         return self._one("SELECT textdb_diff(?, ?, ?)", (path, v1, v2)) or ""
 
     @_wrap
-    def search(self, query: str, prefix: str, limit: int):
-        rows = self.conn.execute("SELECT path, line, snippet, rank FROM textdb_search(?, ?, ?)", (query, prefix, limit)).fetchall()
-        return [dict(path=r[0], line=r[1], snippet=r[2], rank=r[3]) for r in rows]
+    def search(self, query: str, prefix: str, limit: int, per_file: int):
+        rows = self.conn.execute(
+            "SELECT path, version, line, text, section, score, more FROM textdb_search(?, ?, ?, ?)",
+            (query, prefix, limit, per_file),
+        ).fetchall()
+        return [dict(path=r[0], version=r[1], line=r[2], text=r[3], section=r[4], score=r[5], more=r[6]) for r in rows]
 
     @_wrap
     def property_keys(self, prefix: str, limit: int):
         rows = self.conn.execute("SELECT key, docs, values_n, kind FROM textdb_prop_keys(?, ?)", (prefix, limit)).fetchall()
-        return [dict(key=r[0], docs=r[1], values=r[2], kind=r[3]) for r in rows]
+        return [dict(key=r[0], docs=r[1], values_n=r[2], kind=r[3]) for r in rows]
 
     @_wrap
     def property_values(self, key: str, prefix: str, limit: int):

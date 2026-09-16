@@ -48,6 +48,7 @@ pub fn register(conn: &Connection, prefix: &str) -> Result<()> {
         ("textdb_prop_find", FnKind::PropFind),
         ("textdb_outline", FnKind::Outline),
         ("textdb_headings", FnKind::Headings),
+        ("textdb_entry", FnKind::Entry),
     ] {
         conn.create_module(
             name,

@@ -22,6 +22,17 @@ pub(crate) struct Totals {
     pub lines: i64,
     pub words: i64,
     pub versions: i64,
+    /// Structure counts, maintained the same way the word count is: computed once at commit
+    /// from what the extractor already returned, stored on the node row, rolled up here. They
+    /// are what makes a listing able to say "12 headings, 4 properties, 2 links, 1 broken"
+    /// without a query per row.
+    pub sections: i64,
+    pub props: i64,
+    pub links: i64,
+    /// Links whose status is `broken`, `anchor-missing` or `ambiguous`. The one counter that
+    /// moves without a commit — a link breaks when its target is deleted — so it is also
+    /// updated by the pass that re-resolves link statuses.
+    pub links_broken: i64,
 }
 
 impl Totals {
@@ -33,6 +44,10 @@ impl Totals {
             lines: -self.lines,
             words: -self.words,
             versions: -self.versions,
+            sections: -self.sections,
+            props: -self.props,
+            links: -self.links,
+            links_broken: -self.links_broken,
         }
     }
 
@@ -43,6 +58,10 @@ impl Totals {
         self.lines += o.lines;
         self.words += o.words;
         self.versions += o.versions;
+        self.sections += o.sections;
+        self.props += o.props;
+        self.links += o.links;
+        self.links_broken += o.links_broken;
     }
 }
 
@@ -54,12 +73,16 @@ impl TextDb<'_> {
             .prepare_cached(&format!(
                 "UPDATE {}node SET t_files = t_files + ?2, t_folders = t_folders + ?3, t_bytes = t_bytes + ?4, \
                  t_lines = t_lines + ?5, t_words = t_words + ?6, t_versions = t_versions + ?7, \
+                 t_sections = t_sections + ?9, t_props = t_props + ?10, t_links = t_links + ?11, \
+                 t_links_broken = t_links_broken + ?12, \
                  t_updated_at = max(coalesce(t_updated_at, ''), ?8) \
                  WHERE path IN (SELECT value FROM json_each(?1)) AND deleted_at IS NULL",
                 self.p
             ))
             .map_err(sql_err)?
-            .execute(params![list, t.files, t.folders, t.bytes, t.lines, t.words, t.versions, ts])
+            .execute(params![
+                list, t.files, t.folders, t.bytes, t.lines, t.words, t.versions, ts, t.sections, t.props, t.links, t.links_broken
+            ])
             .map_err(sql_err)?;
         Ok(())
     }
@@ -71,7 +94,11 @@ impl TextDb<'_> {
             .prepare_cached(&format!(
                 "SELECT CASE kind WHEN 1 THEN 1 ELSE t_files END, CASE kind WHEN 1 THEN 0 ELSE t_folders + 1 END, \
                  CASE kind WHEN 1 THEN coalesce(nbytes, 0) ELSE t_bytes END, CASE kind WHEN 1 THEN coalesce(nlines, 0) ELSE t_lines END, \
-                 CASE kind WHEN 1 THEN coalesce(nwords, 0) ELSE t_words END, CASE kind WHEN 1 THEN version ELSE t_versions END \
+                 CASE kind WHEN 1 THEN coalesce(nwords, 0) ELSE t_words END, CASE kind WHEN 1 THEN version ELSE t_versions END, \
+                 CASE kind WHEN 1 THEN coalesce(nsections, 0) ELSE t_sections END, \
+                 CASE kind WHEN 1 THEN coalesce(nprops, 0) ELSE t_props END, \
+                 CASE kind WHEN 1 THEN coalesce(nlinks, 0) ELSE t_links END, \
+                 CASE kind WHEN 1 THEN coalesce(nlinks_broken, 0) ELSE t_links_broken END \
                  FROM {}node WHERE id = ?1",
                 self.p
             ))
@@ -84,6 +111,10 @@ impl TextDb<'_> {
                     lines: r.get(3)?,
                     words: r.get(4)?,
                     versions: r.get(5)?,
+                    sections: r.get(6)?,
+                    props: r.get(7)?,
+                    links: r.get(8)?,
+                    links_broken: r.get(9)?,
                 })
             })
             .map_err(sql_err)

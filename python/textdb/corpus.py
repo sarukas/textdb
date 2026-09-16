@@ -9,27 +9,77 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 from .backends import open_backend
 from .backends.base import Bytes, to_text
-from .errors import Conflict, TextdbError
+from .errors import Conflict, NotFound, TextdbError
 
 DEFAULT_INCLUDE: Tuple[str, ...] = ("*.md", "*.markdown", "*.txt", "*.rst", "*.adoc", "*.org", "*.csv", "*.json", "*.yaml", "*.yml", "*.toml")
 
 
 @dataclass
 class Entry:
+    """One listing row: the same twenty-four keys as every other surface, in this order.
+
+    Every field is always present; one that does not apply is ``None``. This used to be six
+    of them, so ``ls`` could not tell you the words, versions or authors the docs advertised.
+    """
+    # The minimal tier: what every surface carries.
     path: str
     name: str
+    #: ``file`` or ``folder``.
     kind: str
-    nbytes: Optional[int]
-    nlines: Optional[int]
-    updated_at: Any
+    #: A file's current version — what ``cat -n`` shows and ``base_version`` takes. ``None``
+    #: for a folder, which has no version of its own.
+    version: Optional[int]
+    #: A file's own size; a folder's total over the live files below it.
+    nbytes: int
+    nlines: int
+    #: ISO-8601 UTC with milliseconds and ``Z``, a ``str`` on both backends.
+    updated_at: str
+    updated_by: Optional[str]
+
+    # The rest of the full tier.
+    id: int
+    #: The parent folder; ``None`` for the root.
+    dir: Optional[str]
+    depth: int
+    #: Lower case, no dot; ``None`` for a folder or a name without one.
+    ext: Optional[str]
+    #: Front matter ``title``, else the first level-1 heading, else ``None``.
+    title: Optional[str]
+    nwords: int
+    #: Headings, top-level front matter keys, links, and links that reach nothing.
+    nsections: int
+    nprops: int
+    nlinks: int
+    nlinks_broken: int
+    versions: int
+    created_at: str
+    #: Folder only: live files and folders anywhere below it.
+    files: Optional[int]
+    folders: Optional[int]
+    nauthors: int
+    #: ``[{"author", "commits", "first_ts", "last_ts"}]``, most commits first.
+    authors: List[Dict[str, Any]]
 
 
 @dataclass
 class Hit:
+    """One matching line — the same seven keys as the CLI and the SQL functions.
+
+    One row per matching *line*. This used to be one row per document with the best chunk's
+    best line, so ``line`` was a hint here and a fact in the CLI under the same name.
+    """
     path: str
+    #: The version the line number belongs to; pass it as ``base_version`` when editing.
+    version: int
     line: int
-    snippet: str
-    rank: float
+    #: The matching line, windowed around the match when it is longer than the cut.
+    text: str
+    #: The heading path the line sits under, for ``section()``; ``None`` outside any heading.
+    section: Optional[str]
+    #: Relevance, higher is better, scaled to ``(0, 1]``; ``None`` when nothing ranked.
+    score: Optional[float]
+    #: Matching lines in this file not returned because of ``per_file``.
+    more: int
 
 
 @dataclass
@@ -39,7 +89,10 @@ class PropertyKey:
     #: Documents carrying it — a note with three tags counts once.
     docs: int
     #: Distinct values it takes.
-    values: int
+    #:
+    #: Spelled ``values_n`` and not ``values`` on every surface: ``values`` is a reserved word
+    #: in SQL, so a column named that would have to be quoted in every query that touched it.
+    values_n: int
     #: ``number``, ``text`` or ``mixed``; a UI offers ``>`` only where it means something.
     kind: str
 
@@ -149,8 +202,20 @@ class Corpus:
         self.close()
 
     # ------------------------------------------------------------------ namespace
-    def ls(self, path: str = "/") -> List[Entry]:
-        return [Entry(r["path"], r["name"], r["kind"], r["nbytes"], r["nlines"], r["updated_at"]) for r in self.backend.ls(normalize(path))]
+    def ls(self, path: str = "/", *, recursive: bool = False) -> List[Entry]:
+        """Everything in a folder, or with ``recursive`` everything below it.
+
+        Each row is the full twenty-four-key :class:`Entry`, the same record every other
+        surface returns.
+        """
+        return [Entry(**r) for r in self.backend.ls(normalize(path), recursive)]
+
+    def entry(self, path: str) -> Entry:
+        """One path's listing row — what ``textdb stat`` prints."""
+        rows = self.backend.entry(normalize(path))
+        if not rows:
+            raise NotFound(f"not found: {path}")
+        return Entry(**rows[0])
 
     def list(self, prefix: str = "/") -> List[str]:
         return [r["path"] for r in self.backend.list_files(normalize(prefix))]
@@ -244,9 +309,13 @@ class Corpus:
     def diff(self, path: str, v1: int, v2: int) -> str:
         return self.backend.diff(normalize(path), v1, v2)
 
-    def search(self, query: str, prefix: str = "/", *, limit: int = 100) -> List[Hit]:
-        """Terms are ANDed per document; "quoted phrase"; prefix*. Hits carry the first matching line."""
-        return [Hit(r["path"], r["line"], r["snippet"], r["rank"]) for r in self.backend.search(query, normalize(prefix), limit)]
+    def search(self, query: str, prefix: str = "/", *, limit: int = 200, per_file: int = 10) -> List[Hit]:
+        """Matching lines. Terms are ANDed per document; ``"quoted phrase"``; ``prefix*``.
+
+        One row per matching line, not per document: ``limit`` counts rows and ``per_file``
+        caps how many come from any one document, with the rest reported as ``more``.
+        """
+        return [Hit(**r) for r in self.backend.search(query, normalize(prefix), limit, per_file)]
 
     def property_keys(self, prefix: str = "", *, limit: int = 200) -> List[PropertyKey]:
         """Property names in use, most-used first.
@@ -254,7 +323,7 @@ class Corpus:
         ``prefix`` is what the user has typed: this is the autosuggest call, so it reads an
         index range rather than scanning.
         """
-        return [PropertyKey(r["key"], r["docs"], r["values"], r["kind"]) for r in self.backend.property_keys(prefix, limit)]
+        return [PropertyKey(**r) for r in self.backend.property_keys(prefix, limit)]
 
     def outline(
         self,

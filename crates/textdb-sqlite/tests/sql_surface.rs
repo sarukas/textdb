@@ -19,7 +19,7 @@ fn create_read_update_history_diff() {
     .unwrap();
     let (content, version, kind, parent): (String, i64, String, String) = conn
         .query_row(
-            "SELECT content, version, kind, parent_path FROM kb WHERE path = '/notes/a.md'",
+            "SELECT content, version, kind, dir FROM kb WHERE path = '/notes/a.md'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
@@ -169,7 +169,7 @@ fn folders_rename_delete_ls_export_search() {
     );
     // Search: 2-term AND, prefix-restricted.
     let hits: Vec<(String, i64, String)> = conn
-        .prepare("SELECT path, line, snippet FROM textdb_search('quick fox', '/a/sub1')")
+        .prepare("SELECT path, line, text FROM textdb_search('quick fox', '/a/sub1')")
         .unwrap()
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .unwrap()
@@ -743,7 +743,7 @@ fn a_hit_found_through_folding_shows_the_line_that_matched() {
     ] {
         let (line, snippet): (i64, String) = conn
             .query_row(
-                "SELECT line, snippet FROM textdb_search(?1, '/', 10)",
+                "SELECT line, text FROM textdb_search(?1, '/', 10)",
                 params![query],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -764,14 +764,14 @@ fn a_snippet_shows_the_match_however_the_query_was_written() {
     .unwrap();
 
     let hit = |q: &str| -> (i64, String) {
-        conn.query_row("SELECT line, snippet FROM textdb_search(?1, '/', 5)", params![q], |r| {
+        conn.query_row("SELECT line, text FROM textdb_search(?1, '/', 5)", params![q], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })
         .unwrap_or_else(|e| panic!("{q}: {e}"))
     };
 
-    // A match past the first 200 characters of a long line is still shown: the snippet is a
-    // window around it, not the head of the line, and says so at the end it cut.
+    // A match past the cut length of a long line is still shown: the text is a window around
+    // it, not the head of the line, and says so at the end it cut.
     let (line, snippet) = hit("needle");
     assert_eq!(line, 6);
     assert!(snippet.contains("NEEDLE appears late"), "{snippet:?}");

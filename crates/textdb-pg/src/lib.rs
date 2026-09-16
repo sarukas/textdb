@@ -38,6 +38,13 @@ CREATE TABLE kb.node (
   deleted_at  timestamptz NULL,
   nwords      bigint,                       -- file: words, as wc -w counts them
   nauthors    bigint,                       -- file: distinct commit authors (kb.file_author rows)
+  -- What the structure extractor found, counted once at commit so a listing can say
+  -- "12 headings, 4 properties, 2 links, 1 broken" without a query per row.
+  title           text,
+  nsections       bigint NOT NULL DEFAULT 0,
+  nprops          bigint NOT NULL DEFAULT 0,
+  nlinks          bigint NOT NULL DEFAULT 0,
+  nlinks_broken   bigint NOT NULL DEFAULT 0,
   -- Folder: totals of every live node below it, as of the last kb.compact_folder_totals();
   -- kb.folder_delta holds the changes since. Zero on files.
   t_files      bigint NOT NULL DEFAULT 0,
@@ -46,6 +53,10 @@ CREATE TABLE kb.node (
   t_lines      bigint NOT NULL DEFAULT 0,
   t_words      bigint NOT NULL DEFAULT 0,
   t_versions   bigint NOT NULL DEFAULT 0,
+  t_sections     bigint NOT NULL DEFAULT 0,
+  t_props        bigint NOT NULL DEFAULT 0,
+  t_links        bigint NOT NULL DEFAULT 0,
+  t_links_broken bigint NOT NULL DEFAULT 0,
   t_updated_at timestamptz NULL
 );
 CREATE UNIQUE INDEX node_path ON kb.node(path text_pattern_ops) WHERE deleted_at IS NULL;
@@ -177,6 +188,10 @@ CREATE TABLE kb.folder_delta (
   lines     bigint NOT NULL,
   words     bigint NOT NULL,
   versions  bigint NOT NULL,
+  sections      bigint NOT NULL DEFAULT 0,
+  props         bigint NOT NULL DEFAULT 0,
+  links         bigint NOT NULL DEFAULT 0,
+  links_broken  bigint NOT NULL DEFAULT 0,
   ts        timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX folder_delta_folder ON kb.folder_delta(folder_id);
@@ -297,21 +312,24 @@ ALTER TABLE kb.chunk ADD COLUMN tsv tsvector GENERATED ALWAYS AS (to_tsvector('s
 CREATE INDEX chunk_tsv ON kb.chunk USING gin(tsv);
 
 CREATE VIEW kb.folder AS
-  SELECT n.id, n.path, n.name, p.path AS parent_path,
-         (SELECT count(*) FROM kb.node c WHERE c.parent_id = n.id AND c.deleted_at IS NULL) AS n_children,
-         (SELECT coalesce(sum(f.nbytes), 0) FROM kb.node f WHERE f.kind = 1 AND f.deleted_at IS NULL AND f.path LIKE kb._subtree_like(n.path)) AS nbytes_total,
-         n.updated_at
-  FROM kb.node n LEFT JOIN kb.node p ON p.id = n.parent_id
-  WHERE n.kind = 0 AND n.deleted_at IS NULL AND n.path <> '/';
+  -- The full listing record, folders only. `n_children` and `nbytes_total` are gone: a folder
+  -- row now carries `files`, `folders` and `nbytes` like every other listing surface, and the
+  -- totals come off the node row rather than a subtree scan per row.
+  SELECT * FROM kb.entry WHERE kind = 'folder' AND path <> '/';
 
 CREATE VIEW kb.file AS
-  SELECT n.id, n.path, n.name, p.path AS parent_path,
-         kb._materialize(n.root) AS content,
-         n.version, n.nbytes, n.nlines,
-         (SELECT fm.data FROM kb.frontmatter fm WHERE fm.file_id = n.id AND fm.version = n.version) AS frontmatter,
+  -- The minimal listing tier plus what only a file has: its content and parsed front matter.
+  -- `parent_path` is now `dir`, the one name for it across every surface.
+  SELECT n.path, n.name, 'file'::text AS kind, n.version,
+         coalesce(n.nbytes, 0) AS nbytes, coalesce(n.nlines, 0) AS nlines,
          n.updated_at, n.updated_by,
+         n.id,
+         CASE WHEN strpos(reverse(n.path), '/') = length(n.path) THEN '/'
+              ELSE left(n.path, length(n.path) - strpos(reverse(n.path), '/')) END AS dir,
+         kb._materialize(n.root) AS content,
+         (SELECT fm.data FROM kb.frontmatter fm WHERE fm.file_id = n.id AND fm.version = n.version) AS frontmatter,
          NULL::bigint AS base_version
-  FROM kb.node n LEFT JOIN kb.node p ON p.id = n.parent_id
+  FROM kb.node n
   WHERE n.kind = 1 AND n.deleted_at IS NULL;
 
 CREATE VIEW kb.file_version AS
@@ -324,17 +342,34 @@ CREATE VIEW kb.file_version AS
 -- totals over every live file below it: its node row plus the kb.folder_delta rows not yet
 -- folded in. `authors`: a file's committers, most commits first.
 CREATE VIEW kb.entry AS
-  SELECT n.id, n.parent_id, n.path, n.name,
+  -- The canonical listing record: the same twenty-four columns in the same order as
+  -- textdb_ls and textdb_entry on SQLite, so one query text reads on either engine.
+  SELECT n.path, n.name,
          CASE n.kind WHEN 1 THEN 'file' ELSE 'folder' END AS kind,
-         CASE n.kind WHEN 1 THEN n.nbytes ELSE n.t_bytes + coalesce(d.bytes, 0) END AS nbytes,
-         CASE n.kind WHEN 1 THEN n.nlines ELSE n.t_lines + coalesce(d.lines, 0) END AS nlines,
-         CASE n.kind WHEN 1 THEN n.nwords ELSE n.t_words + coalesce(d.words, 0) END AS nwords,
-         CASE n.kind WHEN 1 THEN n.version ELSE n.t_versions + coalesce(d.versions, 0) END AS versions,
+         CASE n.kind WHEN 1 THEN n.version END AS version,
+         CASE n.kind WHEN 1 THEN coalesce(n.nbytes, 0) ELSE n.t_bytes + coalesce(d.bytes, 0) END AS nbytes,
+         CASE n.kind WHEN 1 THEN coalesce(n.nlines, 0) ELSE n.t_lines + coalesce(d.lines, 0) END AS nlines,
          CASE n.kind WHEN 1 THEN n.updated_at ELSE greatest(n.updated_at, n.t_updated_at, d.ts) END AS updated_at,
-         n.updated_by, n.created_at,
+         n.updated_by,
+         n.id,
+         -- One name for the parent, on both engines and every surface.
+         CASE WHEN n.path = '/' THEN NULL
+              WHEN strpos(reverse(n.path), '/') = length(n.path) THEN '/'
+              ELSE left(n.path, length(n.path) - strpos(reverse(n.path), '/')) END AS dir,
+         CASE WHEN n.path = '/' THEN 0 ELSE length(n.path) - length(replace(n.path, '/', '')) END::bigint AS depth,
+         CASE WHEN n.kind = 1 AND strpos(reverse(n.name), '.') > 1 AND strpos(reverse(n.name), '.') < length(n.name)
+              THEN lower(right(n.name, strpos(reverse(n.name), '.') - 1)) END AS ext,
+         n.title,
+         CASE n.kind WHEN 1 THEN coalesce(n.nwords, 0) ELSE n.t_words + coalesce(d.words, 0) END AS nwords,
+         CASE n.kind WHEN 1 THEN n.nsections ELSE n.t_sections + coalesce(d.sections, 0) END AS nsections,
+         CASE n.kind WHEN 1 THEN n.nprops ELSE n.t_props + coalesce(d.props, 0) END AS nprops,
+         CASE n.kind WHEN 1 THEN n.nlinks ELSE n.t_links + coalesce(d.links, 0) END AS nlinks,
+         CASE n.kind WHEN 1 THEN n.nlinks_broken ELSE n.t_links_broken + coalesce(d.links_broken, 0) END AS nlinks_broken,
+         CASE n.kind WHEN 1 THEN n.version ELSE n.t_versions + coalesce(d.versions, 0) END AS versions,
+         n.created_at,
          CASE n.kind WHEN 0 THEN n.t_files + coalesce(d.files, 0) END AS files,
          CASE n.kind WHEN 0 THEN n.t_folders + coalesce(d.folders, 0) END AS folders,
-         CASE n.kind WHEN 1 THEN n.nauthors END AS nauthors,
+         CASE n.kind WHEN 1 THEN coalesce(n.nauthors, 0) ELSE 0 END AS nauthors,
          CASE n.kind WHEN 1 THEN coalesce(
            (SELECT jsonb_agg(jsonb_build_object('author', nullif(a.author, ''), 'commits', a.commits, 'first_ts', a.first_ts, 'last_ts', a.last_ts)
                              ORDER BY a.commits DESC, a.last_ts DESC)
@@ -343,7 +378,9 @@ CREATE VIEW kb.entry AS
   FROM kb.node n
   LEFT JOIN LATERAL (
     SELECT sum(x.files)::bigint AS files, sum(x.folders)::bigint AS folders, sum(x.bytes)::bigint AS bytes,
-           sum(x.lines)::bigint AS lines, sum(x.words)::bigint AS words, sum(x.versions)::bigint AS versions, max(x.ts) AS ts
+           sum(x.lines)::bigint AS lines, sum(x.words)::bigint AS words, sum(x.versions)::bigint AS versions,
+           sum(x.sections)::bigint AS sections, sum(x.props)::bigint AS props, sum(x.links)::bigint AS links,
+           sum(x.links_broken)::bigint AS links_broken, max(x.ts) AS ts
     FROM kb.folder_delta x WHERE x.folder_id = n.id
   ) d ON n.kind = 0
   WHERE n.deleted_at IS NULL;
@@ -362,10 +399,13 @@ $$;
 CREATE FUNCTION kb.compact_folder_totals() RETURNS bigint LANGUAGE sql VOLATILE AS $$
   WITH gone AS (DELETE FROM kb.folder_delta RETURNING *),
        s AS (SELECT folder_id, sum(files) AS files, sum(folders) AS folders, sum(bytes) AS bytes, sum(lines) AS lines,
-                    sum(words) AS words, sum(versions) AS versions, max(ts) AS ts, count(*) AS n
+                    sum(words) AS words, sum(versions) AS versions, sum(sections) AS sections, sum(props) AS props,
+                    sum(links) AS links, sum(links_broken) AS links_broken, max(ts) AS ts, count(*) AS n
              FROM gone GROUP BY folder_id),
        u AS (UPDATE kb.node f SET t_files = f.t_files + s.files, t_folders = f.t_folders + s.folders, t_bytes = f.t_bytes + s.bytes,
                                   t_lines = f.t_lines + s.lines, t_words = f.t_words + s.words, t_versions = f.t_versions + s.versions,
+                                  t_sections = f.t_sections + s.sections, t_props = f.t_props + s.props,
+                                  t_links = f.t_links + s.links, t_links_broken = f.t_links_broken + s.links_broken,
                                   t_updated_at = greatest(f.t_updated_at, s.ts)
              FROM s WHERE f.id = s.folder_id RETURNING s.n)
   SELECT coalesce(sum(n), 0)::bigint FROM u
@@ -379,11 +419,15 @@ BEGIN
   DELETE FROM kb.folder_delta;
   UPDATE kb.node f SET t_files = coalesce(s.files, 0), t_folders = coalesce(s.folders, 0), t_bytes = coalesce(s.bytes, 0),
                        t_lines = coalesce(s.lines, 0), t_words = coalesce(s.words, 0), t_versions = coalesce(s.versions, 0),
+                       t_sections = coalesce(s.sections, 0), t_props = coalesce(s.props, 0),
+                       t_links = coalesce(s.links, 0), t_links_broken = coalesce(s.links_broken, 0),
                        t_updated_at = s.ts
   FROM kb.node f2 LEFT JOIN LATERAL (
     SELECT count(*) FILTER (WHERE n.kind = 1) AS files, count(*) FILTER (WHERE n.kind = 0) AS folders,
            sum(n.nbytes) FILTER (WHERE n.kind = 1) AS bytes, sum(n.nlines) FILTER (WHERE n.kind = 1) AS lines,
            sum(n.nwords) FILTER (WHERE n.kind = 1) AS words, sum(n.version) FILTER (WHERE n.kind = 1) AS versions,
+           sum(n.nsections) FILTER (WHERE n.kind = 1) AS sections, sum(n.nprops) FILTER (WHERE n.kind = 1) AS props,
+           sum(n.nlinks) FILTER (WHERE n.kind = 1) AS links, sum(n.nlinks_broken) FILTER (WHERE n.kind = 1) AS links_broken,
            max(n.updated_at) AS ts
     FROM kb.node n
     WHERE n.deleted_at IS NULL AND n.path <> '/' AND (f2.path = '/' OR n.path LIKE kb._subtree_like(f2.path))
@@ -653,6 +697,13 @@ mod kb {
         lines: i64,
         words: i64,
         versions: i64,
+        /// Structure counts, maintained like the word count: computed at commit from what the
+        /// extractor returned, stored on the node row, rolled up here. `links_broken` is the
+        /// one that also moves without a commit, when a link's target is deleted.
+        sections: i64,
+        props: i64,
+        links: i64,
+        links_broken: i64,
     }
 
     impl Totals {
@@ -664,6 +715,10 @@ mod kb {
                 lines: -self.lines,
                 words: -self.words,
                 versions: -self.versions,
+                sections: -self.sections,
+                props: -self.props,
+                links: -self.links,
+                links_broken: -self.links_broken,
             }
         }
     }
@@ -672,8 +727,8 @@ mod kb {
     fn add_to_ancestors(path: &str, t: &Totals) -> Result<(), TextdbError> {
         let list = serde_json::to_string(&ancestors(path)).expect("paths serialize");
         Spi::run_with_args(
-            "INSERT INTO kb.folder_delta(folder_id, files, folders, bytes, lines, words, versions) \
-             SELECT n.id, $2, $3, $4, $5, $6, $7 FROM kb.node n \
+            "INSERT INTO kb.folder_delta(folder_id, files, folders, bytes, lines, words, versions, sections, props, links, links_broken) \
+             SELECT n.id, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11 FROM kb.node n \
              WHERE n.path IN (SELECT jsonb_array_elements_text($1::jsonb)) AND n.deleted_at IS NULL",
             &[
                 list.as_str().into(),
@@ -683,6 +738,10 @@ mod kb {
                 t.lines.into(),
                 t.words.into(),
                 t.versions.into(),
+                t.sections.into(),
+                t.props.into(),
+                t.links.into(),
+                t.links_broken.into(),
             ],
         )
         .map_err(storage_err)?;
@@ -696,7 +755,8 @@ mod kb {
             let rows = client
                 .select(
                     "SELECT CASE kind WHEN 'file' THEN 1 ELSE files END::bigint, CASE kind WHEN 'file' THEN 0 ELSE folders + 1 END::bigint, \
-                     coalesce(nbytes, 0)::bigint, coalesce(nlines, 0)::bigint, coalesce(nwords, 0)::bigint, versions::bigint \
+                     coalesce(nbytes, 0)::bigint, coalesce(nlines, 0)::bigint, coalesce(nwords, 0)::bigint, versions::bigint, \
+                     nsections::bigint, nprops::bigint, nlinks::bigint, nlinks_broken::bigint \
                      FROM kb.entry WHERE id = $1",
                     None,
                     &[id.into()],
@@ -711,6 +771,10 @@ mod kb {
                     lines: get(4)?,
                     words: get(5)?,
                     versions: get(6)?,
+                    sections: get(7)?,
+                    props: get(8)?,
+                    links: get(9)?,
+                    links_broken: get(10)?,
                 });
             }
             Err(TextdbError::NotFound(format!("node {}", id)))
@@ -877,6 +941,9 @@ mod kb {
             lines: nlines as i64 - old_lines.unwrap_or(0),
             words: nwords - old_words.unwrap_or(0),
             versions: 1,
+            // The structure counts move in `write_structure_counts`, which knows what the
+            // extractor found; it rolls its own delta up so this one stays about content.
+            ..Totals::default()
         };
         ok(add_to_ancestors(path, &change));
         let mut seen = std::collections::HashSet::new();
@@ -895,11 +962,108 @@ mod kb {
             let bytes = ok(materialize_all(&st, &c.root));
             let s = MarkdownExtractor.extract(&bytes);
             ok(write_structure(file_id, c.version as i64, &s));
+            ok(write_structure_counts(file_id, path, &s));
         }
         if c.version == 1 {
             // Links elsewhere may have been waiting for a file of this name.
             ok(crate::links::relink(&[textdb_md::resolve::name_key(path)], &[]));
         }
+    }
+
+    /// Store what the extractor found on the node row and roll the change into the folders.
+    ///
+    /// The same pattern the word count uses, so a listing reads "12 headings, 4 properties,
+    /// 2 links" off the row rather than running three queries per file.
+    fn write_structure_counts(file_id: i64, path: &str, s: &textdb_core::structure::Structure) -> Result<(), TextdbError> {
+        let title = document_title(s);
+        let sections = s.sections.len() as i64;
+        // Top-level front matter keys: `project.name` and `project.phase` are one property to
+        // a reader, the way `meta get project` shows it.
+        let props = s.frontmatter.as_ref().and_then(|v| v.as_object()).map_or(0, |o| o.len()) as i64;
+        let links = s.links.len() as i64;
+        let broken = broken_links_of(file_id)?;
+        let old = Spi::connect(|client| {
+            let rows = client
+                .select(
+                    "SELECT nsections, nprops, nlinks, nlinks_broken FROM kb.node WHERE id = $1",
+                    None,
+                    &[file_id.into()],
+                )
+                .map_err(storage_err)?;
+            let mut out = (0i64, 0i64, 0i64, 0i64);
+            for r in rows {
+                let g = |i: usize| r.get::<i64>(i).unwrap_or(None).unwrap_or(0);
+                out = (g(1), g(2), g(3), g(4));
+            }
+            Ok::<_, TextdbError>(out)
+        })?;
+        Spi::run_with_args(
+            "UPDATE kb.node SET title = $1, nsections = $2, nprops = $3, nlinks = $4, nlinks_broken = $5 WHERE id = $6",
+            &[title.as_deref().into(), sections.into(), props.into(), links.into(), broken.into(), file_id.into()],
+        )
+        .map_err(storage_err)?;
+        let change = Totals {
+            sections: sections - old.0,
+            props: props - old.1,
+            links: links - old.2,
+            links_broken: broken - old.3,
+            ..Totals::default()
+        };
+        add_to_ancestors(path, &change)
+    }
+
+    /// Recount `file_id`'s broken links, store the number and move the folders above it.
+    ///
+    /// Called after a relink rather than at commit, because a link breaks when its *target*
+    /// is deleted — nothing about the file holding it has changed.
+    pub(crate) fn refresh_broken_links(file_id: i64, path: &str) -> Result<(), TextdbError> {
+        let now = broken_links_of(file_id)?;
+        let before = Spi::get_one_with_args::<i64>("SELECT nlinks_broken FROM kb.node WHERE id = $1", &[file_id.into()])
+            .map_err(storage_err)?
+            .unwrap_or(0);
+        if now == before {
+            return Ok(());
+        }
+        Spi::run_with_args(
+            "UPDATE kb.node SET nlinks_broken = $1 WHERE id = $2",
+            &[now.into(), file_id.into()],
+        )
+        .map_err(storage_err)?;
+        add_to_ancestors(
+            path,
+            &Totals {
+                links_broken: now - before,
+                ..Totals::default()
+            },
+        )
+    }
+
+    /// Links of `file_id` whose status means the link does not reach a document.
+    fn broken_links_of(file_id: i64) -> Result<i64, TextdbError> {
+        Ok(Spi::get_one_with_args::<i64>(
+            "SELECT count(*) FROM kb.link WHERE file_id = $1 AND status IN ('broken', 'anchor-missing', 'ambiguous')",
+            &[file_id.into()],
+        )
+        .map_err(storage_err)?
+        .unwrap_or(0))
+    }
+
+    /// A document's title: its front matter `title`, else its first level-1 heading, else none.
+    ///
+    /// Front matter wins because it is the one a writer set deliberately; the heading is what
+    /// a reader sees when they did not.
+    fn document_title(s: &textdb_core::structure::Structure) -> Option<String> {
+        s.frontmatter
+            .as_ref()
+            .and_then(|v| v.get("title"))
+            .and_then(|t| match t {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Null => None,
+                other => Some(other.to_string()),
+            })
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .or_else(|| s.sections.iter().find(|x| x.level == 1).map(|x| x.heading.clone()))
     }
 
     /// Replace a file's HEAD-only structure rows (ADR 0007) and resolve its links. When the
@@ -2307,6 +2471,40 @@ mod kb {
         TableIterator::new(rows)
     }
 
+    /// A file's heading spans, for naming the section a hit line falls in.
+    fn section_spans(file_id: i64) -> Vec<(i64, i64, String)> {
+        Spi::connect(|client| {
+            let rows = client
+                .select(
+                    "SELECT line_from, line_to, heading_path FROM kb.section WHERE file_id = $1 ORDER BY line_from, level",
+                    None,
+                    &[file_id.into()],
+                )
+                .map_err(storage_err)?;
+            let mut out = Vec::new();
+            for r in rows {
+                let a: Option<i64> = r.get(1).map_err(storage_err)?;
+                let b: Option<i64> = r.get(2).map_err(storage_err)?;
+                let h: Option<String> = r.get(3).map_err(storage_err)?;
+                if let (Some(a), Some(b), Some(h)) = (a, b, h) {
+                    out.push((a, b, h));
+                }
+            }
+            Ok::<_, TextdbError>(out)
+        })
+        .unwrap_or_default()
+    }
+
+    /// The deepest heading span containing `line`; spans nest, so the last match is the most
+    /// specific, which is the one a reader means.
+    fn section_at(spans: &[(i64, i64, String)], line: i64) -> Option<String> {
+        spans
+            .iter()
+            .filter(|(from, to, _)| *from <= line && line <= *to)
+            .next_back()
+            .map(|(_, _, h)| h.clone())
+    }
+
     /// Full-text search: terms ANDed at document level, `"a b"` phrase, `foo*` prefix.
     /// Chunk hits → `chunk_ref` → live files under `prefix` → line via the tree.
     #[pg_extern(stable)]
@@ -2314,7 +2512,19 @@ mod kb {
         query: &str,
         prefix: default!(&str, "'/'"),
         lim: default!(i64, 100),
-    ) -> TableIterator<'static, (name!(path, String), name!(line, i64), name!(snippet, String), name!(rank, f32))> {
+        per_file: default!(i64, 10),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(path, String),
+            name!(version, i64),
+            name!(line, i64),
+            name!(text, String),
+            name!(section, Option<String>),
+            name!(score, f64),
+            name!(more, i64),
+        ),
+    > {
         let prefix = ok(normalize_path(prefix));
         let terms = query_terms(query);
         if terms.is_empty() {
@@ -2351,43 +2561,63 @@ mod kb {
             .collect();
         candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         let st = SpiStorage::new();
+        let parsed = textdb_core::terms::parse(terms.clone());
+        if parsed.is_empty() {
+            return TableIterator::new(Vec::new());
+        }
+        let per_file = per_file.max(1) as usize;
+        // Ranked best first already; the best value scales the rest into (0, 1]. `ts_rank` is
+        // positive and bm25 is negative for the same meaning, so both are normalised here
+        // rather than left for a caller to discover which engine it is talking to.
+        let best = candidates.iter().map(|(_, _, r)| *r as f64).fold(f64::MIN, f64::max);
+        let scale = if best > 0.0 { best } else { 1.0 };
         let mut hits = Vec::new();
-        for (file_id, chunk_id, rank) in candidates {
-            let (path, root) = match Spi::get_two_with_args::<String, Vec<u8>>(
-                "SELECT path, root FROM kb.node WHERE id = $1 AND deleted_at IS NULL",
-                &[file_id.into()],
-            )
-            .unwrap_or_else(|e| spi_err(e))
-            {
-                (Some(p), Some(r)) => (p, r),
-                _ => continue,
-            };
-            let (hash, bytes) = match Spi::get_two_with_args::<Vec<u8>, Vec<u8>>("SELECT hash, bytes FROM kb.chunk WHERE id = $1", &[chunk_id.into()])
-                .unwrap_or_else(|e| spi_err(e))
-            {
-                (Some(h), Some(b)) => (h, b),
-                _ => continue,
-            };
-            let root = ok(to_hash(&root));
-            let hash = ok(to_hash(&hash));
-            let leaf = ok(leaves(&st, &root)).into_iter().find(|l| l.hash == hash);
-            let (line, snippet) = match leaf {
-                Some(l) => {
-                    let (li, sn) = locate_terms(&bytes, &terms);
-                    (l.line_off as i64 + li as i64 + 1, sn)
-                }
-                None => {
-                    let body = ok(materialize_all(&st, &root));
-                    let (li, sn) = locate_terms(&body, &terms);
-                    if sn.is_empty() {
-                        continue;
-                    }
-                    (li as i64 + 1, sn)
-                }
-            };
-            hits.push((path, line, snippet, rank));
+        for (file_id, _chunk_id, rank) in candidates {
             if hits.len() >= limit {
                 break;
+            }
+            let (path, root, version) = match Spi::connect(|client| {
+                let rows = client
+                    .select(
+                        "SELECT path, root, version FROM kb.node WHERE id = $1 AND deleted_at IS NULL",
+                        None,
+                        &[file_id.into()],
+                    )
+                    .map_err(storage_err)?;
+                let mut out = None;
+                for r in rows {
+                    let p: Option<String> = r.get(1).map_err(storage_err)?;
+                    let rt: Option<Vec<u8>> = r.get(2).map_err(storage_err)?;
+                    let v: Option<i64> = r.get(3).map_err(storage_err)?;
+                    if let (Some(p), Some(rt), Some(v)) = (p, rt, v) {
+                        out = Some((p, rt, v));
+                    }
+                }
+                Ok::<_, TextdbError>(out)
+            }) {
+                Ok(Some(x)) => x,
+                _ => continue,
+            };
+            let body = ok(materialize_all(&st, &ok(to_hash(&root))));
+            let body = String::from_utf8_lossy(&body);
+            let Some(lines) = textdb_core::terms::matching_lines(&parsed, &body) else {
+                continue;
+            };
+            let more = lines.len().saturating_sub(per_file) as i64;
+            let spans = section_spans(file_id);
+            for (n, line) in lines.into_iter().take(per_file) {
+                if hits.len() >= limit {
+                    break;
+                }
+                hits.push((
+                    path.clone(),
+                    version,
+                    n as i64,
+                    textdb_core::terms::show(line, &parsed),
+                    section_at(&spans, n as i64),
+                    ((rank as f64) / scale).clamp(0.0, 1.0),
+                    more,
+                ));
             }
         }
         TableIterator::new(hits)

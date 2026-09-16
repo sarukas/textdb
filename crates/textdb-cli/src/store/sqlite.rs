@@ -9,7 +9,7 @@ use textdb_sqlite::{normalize_path, NodeRow, TextDb, DEFAULT_PREFIX};
 
 use super::{
     Author, BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, MovedBack, PathEvent,
-    RestoredFile, Result, RevertOutcome, SqlResult, Stat, Store, StoreError, SyncBase, Written,
+    RestoredFile, Result, RevertOutcome, SqlResult, Store, StoreError, SyncBase, Written,
 };
 
 pub struct SqliteStore {
@@ -71,15 +71,44 @@ fn written(r: textdb_sqlite::WriteResult) -> Written {
     }
 }
 
-fn entry(n: NodeRow) -> Entry {
+/// The binding's listing row as the CLI's, field for field.
+///
+/// One conversion for every listing path — `ls`, `tree`, `stat`, `export` — so the twenty-four
+/// keys cannot drift between commands the way they used to.
+fn entry(e: textdb_sqlite::db::Entry) -> Entry {
     Entry {
-        path: n.path,
-        name: n.name,
-        kind: kind_name(n.kind),
-        nbytes: n.nbytes,
-        nlines: n.nlines,
-        updated_at: Some(n.updated_at),
-        ..Entry::default()
+        path: e.path,
+        name: e.name,
+        kind: kind_name(e.kind),
+        version: e.version,
+        nbytes: e.nbytes,
+        nlines: e.nlines,
+        updated_at: e.updated_at,
+        updated_by: e.updated_by,
+        id: e.id,
+        dir: e.dir,
+        depth: e.depth,
+        ext: e.ext,
+        title: e.title,
+        nwords: e.nwords,
+        nsections: e.nsections,
+        nprops: e.nprops,
+        nlinks: e.nlinks,
+        nlinks_broken: e.nlinks_broken,
+        versions: e.versions,
+        created_at: e.created_at,
+        files: e.files,
+        folders: e.folders,
+        nauthors: e.nauthors,
+        authors: e
+            .authors
+            .into_iter()
+            .map(|a| Author {
+                author: a.author,
+                commits: a.commits,
+                last_ts: Some(a.last_ts),
+            })
+            .collect(),
     }
 }
 
@@ -137,91 +166,18 @@ impl Store for SqliteStore {
     }
 
     fn nodes(&mut self, prefix: &str) -> Result<Vec<Entry>> {
-        let prefix = normalize_path(prefix)?;
-        if prefix != "/" {
-            let n = self.db().node_by_path(&prefix)?.ok_or_else(|| not_found(&prefix))?;
-            if n.kind == 1 {
-                return Ok(vec![entry(n)]);
-            }
-        }
-        let cols = "path, name, kind, nbytes, nlines, updated_at";
-        let map = |r: &rusqlite::Row| -> rusqlite::Result<Entry> {
-            Ok(Entry {
-                path: r.get(0)?,
-                name: r.get(1)?,
-                kind: kind_name(r.get(2)?),
-                nbytes: r.get(3)?,
-                nlines: r.get(4)?,
-                updated_at: r.get(5)?,
-                ..Entry::default()
-            })
-        };
-        let rows = match subtree_bounds(&prefix) {
-            None => self
-                .conn
-                .prepare_cached(&format!(
-                    "SELECT {cols} FROM {DEFAULT_PREFIX}node WHERE deleted_at IS NULL AND path <> '/'"
-                ))
-                .map_err(sql)?
-                .query_map([], map)
-                .map_err(sql)?
-                .collect::<rusqlite::Result<Vec<_>>>(),
-            Some((lo, hi)) => self
-                .conn
-                .prepare_cached(&format!(
-                    "SELECT {cols} FROM {DEFAULT_PREFIX}node WHERE deleted_at IS NULL AND path >= ?1 AND path < ?2"
-                ))
-                .map_err(sql)?
-                .query_map([lo, hi], map)
-                .map_err(sql)?
-                .collect::<rusqlite::Result<Vec<_>>>(),
-        };
-        rows.map_err(sql)
+        // The same query `ls -R` runs, so every listing command returns the same row. This
+        // used to be a six-column projection, which is why `tree --json` returned less than
+        // `tree` printed.
+        Ok(self.db().list(prefix, true)?.into_iter().map(entry).collect())
     }
 
     fn ls(&mut self, path: &str, recursive: bool) -> Result<Vec<Entry>> {
-        Ok(self
-            .db()
-            .list(path, recursive)?
-            .into_iter()
-            .map(|e| Entry {
-                path: e.path,
-                name: e.name,
-                kind: kind_name(e.kind),
-                nbytes: e.nbytes,
-                nlines: e.nlines,
-                updated_at: Some(e.updated_at),
-                nwords: e.nwords,
-                versions: Some(e.versions),
-                created_at: Some(e.created_at),
-                updated_by: e.updated_by,
-                files: e.files,
-                folders: e.folders,
-                authors: e
-                    .authors
-                    .into_iter()
-                    .map(|a| Author {
-                        author: a.author,
-                        commits: a.commits,
-                        last_ts: Some(a.last_ts),
-                    })
-                    .collect(),
-            })
-            .collect())
+        Ok(self.db().list(path, recursive)?.into_iter().map(entry).collect())
     }
 
-    fn stat(&mut self, path: &str) -> Result<Stat> {
-        let path = normalize_path(path)?;
-        let n = self.db().node_by_path(&path)?.ok_or_else(|| not_found(&path))?;
-        Ok(Stat {
-            path: n.path,
-            kind: kind_name(n.kind),
-            version: n.version,
-            nbytes: n.nbytes,
-            nlines: n.nlines,
-            updated_at: Some(n.updated_at),
-            updated_by: n.updated_by,
-        })
+    fn stat(&mut self, path: &str) -> Result<Entry> {
+        Ok(entry(self.db().entry(path)?))
     }
 
     fn read(&mut self, path: &str, v: Option<i64>) -> Result<(Vec<u8>, i64)> {
@@ -308,17 +264,27 @@ impl Store for SqliteStore {
             })
             .collect())
     }
-    fn search(&mut self, query: &str, prefix: &str, limit: i64) -> Result<Vec<Hit>> {
+    fn search(&mut self, query: &str, prefix: &str, limit: i64, per_file: i64) -> Result<Vec<Hit>> {
         Ok(self
             .db()
-            .search(query, prefix, limit.max(1) as usize)?
+            .search_lines(query, prefix, limit.max(1) as usize, per_file.max(1) as usize)?
             .into_iter()
             .map(|h| Hit {
                 path: h.path,
+                version: h.version,
                 line: h.line,
-                snippet: h.snippet,
-                rank: h.rank,
+                text: h.text,
+                section: h.section,
+                score: Some(h.score),
+                more: h.more,
             })
+            .collect())
+    }
+
+    fn sections_of(&mut self, path: &str) -> Result<Vec<(i64, i64, String)>> {
+        Ok(textdb_sqlite::sections::outline(&self.conn, DEFAULT_PREFIX, path, None, textdb_sqlite::sections::Match::Exact, None, 10_000)?
+            .into_iter()
+            .map(|r| (r.line_from, r.line_to, r.heading_path))
             .collect())
     }
 

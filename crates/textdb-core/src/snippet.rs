@@ -70,17 +70,24 @@ pub fn locate_terms(bytes: &[u8], terms: &[String]) -> (usize, String) {
     }
 
     let line = raw.lines().nth(best_line).unwrap_or("");
+    (best_line, window(line, best_at, WIDTH, LEAD))
+}
+
+/// `line` if it fits in `width` characters, else a window of it around character `at`.
+///
+/// The elided ends are marked. A blind prefix would be simpler and was what this did: on a
+/// long line — which is most lines in a real document — the match fell off the end and the
+/// reader saw text that had nothing to do with the query.
+pub fn window(line: &str, at: usize, width: usize, lead: usize) -> String {
     let total = line.chars().count();
-    let snippet = if total <= WIDTH {
-        line.to_string()
-    } else {
-        let from = best_at.saturating_sub(LEAD).min(total.saturating_sub(WIDTH));
-        let body: String = line.chars().skip(from).take(WIDTH).collect();
-        let head = if from > 0 { "…" } else { "" };
-        let tail = if from + WIDTH < total { "…" } else { "" };
-        format!("{head}{body}{tail}")
-    };
-    (best_line, snippet)
+    if total <= width {
+        return line.to_string();
+    }
+    let from = at.saturating_sub(lead).min(total.saturating_sub(width));
+    let body: String = line.chars().skip(from).take(width).collect();
+    let head = if from > 0 { "…" } else { "" };
+    let tail = if from + width < total { "…" } else { "" };
+    format!("{head}{body}{tail}")
 }
 
 #[cfg(test)]

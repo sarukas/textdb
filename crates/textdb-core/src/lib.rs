@@ -15,6 +15,7 @@ pub mod node;
 pub mod path;
 pub mod snippet;
 pub mod storage;
+pub mod terms;
 pub mod structure;
 pub mod tree;
 pub mod words;

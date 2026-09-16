@@ -70,11 +70,15 @@ fn ref_i64(v: ValueRef<'_>) -> Option<i64> {
 // kb virtual table
 // ---------------------------------------------------------------------------
 
-const KB_SCHEMA: &CStr = c"CREATE TABLE x(id INTEGER, path TEXT, name TEXT, parent_path TEXT, kind TEXT, content TEXT, version INTEGER, nbytes INTEGER, nlines INTEGER, updated_at TEXT, updated_by TEXT, base_version INTEGER HIDDEN, author TEXT HIDDEN, message TEXT HIDDEN)";
+/// The minimal listing tier plus what only the writable table has: `id`, `dir` and the
+/// content itself. `parent_path` is spelled `dir` here as everywhere else.
+const KB_SCHEMA: &CStr = c"CREATE TABLE x(path TEXT, name TEXT, kind TEXT, version INTEGER, nbytes INTEGER, nlines INTEGER, updated_at TEXT, updated_by TEXT, id INTEGER, dir TEXT, content TEXT, base_version INTEGER HIDDEN, author TEXT HIDDEN, message TEXT HIDDEN)";
 
 const COL_ID: c_int = 0;
-const COL_PATH: c_int = 1;
-const COL_CONTENT: c_int = 5;
+// Indexes into KB_SCHEMA. They moved when the table took the canonical column order, so they
+// are derived from that list rather than written twice.
+const COL_PATH: c_int = 0;
+const COL_CONTENT: c_int = 10;
 const COL_BASE_VERSION: usize = 11;
 const COL_AUTHOR: usize = 12;
 const COL_MESSAGE: usize = 13;
@@ -358,6 +362,10 @@ struct KbRow {
     nlines: Option<i64>,
     updated_at: String,
     updated_by: Option<String>,
+    /// A folder's totals below it, so its `nbytes`/`nlines` are numbers here too rather than
+    /// the NULLs this table used to give a row `textdb_ls` measured.
+    t_bytes: i64,
+    t_lines: i64,
 }
 
 #[repr(C)]
@@ -371,7 +379,7 @@ pub struct KbCursor<'vtab> {
 unsafe impl VTabCursor for KbCursor<'_> {
     fn filter(&mut self, idx_num: c_int, _idx_str: Option<&str>, args: &Filters<'_>) -> Result<()> {
         let prefix = &self.tab.prefix;
-        let cols = "id, path, name, kind, root, version, nbytes, nlines, updated_at, updated_by";
+        let cols = "id, path, name, kind, root, version, nbytes, nlines, updated_at, updated_by, t_bytes, t_lines";
         let (sql, params): (String, Vec<Value>) = match idx_num {
             IDX_PATH_EQ => (
                 format!("SELECT {} FROM {}node WHERE path = ?1 AND deleted_at IS NULL", cols, prefix),
@@ -428,6 +436,8 @@ unsafe impl VTabCursor for KbCursor<'_> {
                 nlines: r.get(7)?,
                 updated_at: r.get(8)?,
                 updated_by: r.get(9)?,
+                t_bytes: r.get(10)?,
+                t_lines: r.get(11)?,
             })
         };
         self.rows = stmt
@@ -449,12 +459,19 @@ unsafe impl VTabCursor for KbCursor<'_> {
     fn column(&self, ctx: &mut Context, i: c_int) -> Result<()> {
         let r = &self.rows[self.i];
         match i {
-            0 => ctx.set_result(&r.id),
-            1 => ctx.set_result(&r.path),
-            2 => ctx.set_result(&r.name),
-            3 => ctx.set_result(&parent_of(&r.path)),
-            4 => ctx.set_result(&if r.kind == 1 { "file" } else { "folder" }),
-            5 => {
+            0 => ctx.set_result(&r.path),
+            1 => ctx.set_result(&r.name),
+            2 => ctx.set_result(&if r.kind == 1 { "file" } else { "folder" }),
+            3 => ctx.set_result(&(r.kind == 1).then_some(r.version)),
+            // A folder's size and lines are the totals below it, as on every other listing
+            // surface; they used to be NULL here while `textdb_ls` gave the same row a number.
+            4 => ctx.set_result(&if r.kind == 1 { r.nbytes.unwrap_or(0) } else { r.t_bytes }),
+            5 => ctx.set_result(&if r.kind == 1 { r.nlines.unwrap_or(0) } else { r.t_lines }),
+            6 => ctx.set_result(&r.updated_at),
+            7 => ctx.set_result(&r.updated_by),
+            8 => ctx.set_result(&r.id),
+            9 => ctx.set_result(&crate::db::dir_of(&r.path)),
+            10 => {
                 if ctx.no_change() {
                     return Ok(());
                 }
@@ -462,9 +479,9 @@ unsafe impl VTabCursor for KbCursor<'_> {
                     Some(root) if r.kind == 1 => {
                         let st = crate::storage::SqliteStorage::new(self.tab.conn(), &self.tab.prefix);
                         let (bytes, utf8) = st.document(&root).map_err(map_err)?;
-                        // The UTF-8 check already ran for exactly these bytes, and the
-                        // root hash they are keyed by is derived from them, so the answer
-                        // cannot belong to different content.
+                        // The UTF-8 check already ran for exactly these bytes, and the root
+                        // hash they are keyed by is derived from them, so the answer cannot
+                        // belong to different content.
                         ctx.set_result(&if utf8 {
                             Value::Text(unsafe { String::from_utf8_unchecked(bytes.to_vec()) })
                         } else {
@@ -474,11 +491,6 @@ unsafe impl VTabCursor for KbCursor<'_> {
                     _ => ctx.set_result(&Value::Null),
                 }
             }
-            6 => ctx.set_result(&r.version),
-            7 => ctx.set_result(&r.nbytes),
-            8 => ctx.set_result(&r.nlines),
-            9 => ctx.set_result(&r.updated_at),
-            10 => ctx.set_result(&r.updated_by),
             _ => ctx.set_result(&Value::Null),
         }
     }
@@ -509,6 +521,7 @@ pub enum FnKind {
     PropFind,
     Outline,
     Headings,
+    Entry,
 }
 
 pub struct FnSpec {
@@ -519,8 +532,8 @@ pub struct FnSpec {
 impl FnKind {
     fn schema(self) -> &'static CStr {
         match self {
-            FnKind::Ls => c"CREATE TABLE x(name TEXT, kind TEXT, nbytes INTEGER, nlines INTEGER, updated_at TEXT, path TEXT, nwords INTEGER, versions INTEGER, created_at TEXT, updated_by TEXT, nauthors INTEGER, authors TEXT, files INTEGER, folders INTEGER, id INTEGER, dir TEXT HIDDEN, recursive INTEGER HIDDEN)",
-            FnKind::Search => c"CREATE TABLE x(path TEXT, line INTEGER, snippet TEXT, rank REAL, query TEXT HIDDEN, prefix TEXT HIDDEN, lim INTEGER HIDDEN)",
+            FnKind::Ls => c"CREATE TABLE x(path TEXT, name TEXT, kind TEXT, version INTEGER, nbytes INTEGER, nlines INTEGER, updated_at TEXT, updated_by TEXT, id INTEGER, dir TEXT, depth INTEGER, ext TEXT, title TEXT, nwords INTEGER, nsections INTEGER, nprops INTEGER, nlinks INTEGER, nlinks_broken INTEGER, versions INTEGER, created_at TEXT, files INTEGER, folders INTEGER, nauthors INTEGER, authors TEXT, dir_arg TEXT HIDDEN, recursive INTEGER HIDDEN)",
+            FnKind::Search => c"CREATE TABLE x(path TEXT, version INTEGER, line INTEGER, text TEXT, section TEXT, score REAL, more INTEGER, query TEXT HIDDEN, prefix TEXT HIDDEN, lim INTEGER HIDDEN, per_file INTEGER HIDDEN)",
             FnKind::History => c"CREATE TABLE x(version INTEGER, author TEXT, ts TEXT, message TEXT, nbytes INTEGER, kind TEXT, base_version INTEGER, nlines INTEGER, nwords INTEGER, path TEXT HIDDEN)",
             FnKind::Export => c"CREATE TABLE x(path TEXT, content TEXT, prefix TEXT HIDDEN)",
             FnKind::Feed => c"CREATE TABLE x(seq INTEGER, ts TEXT, op TEXT, path TEXT, old_path TEXT, node_kind TEXT, version INTEGER, base_version INTEGER, commit_kind TEXT, author TEXT, message TEXT, since INTEGER HIDDEN, lim INTEGER HIDDEN)",
@@ -531,14 +544,15 @@ impl FnKind {
             FnKind::PropFind => c"CREATE TABLE x(path TEXT, nbytes INTEGER, updated_at TEXT, frontmatter TEXT, query TEXT HIDDEN, folder TEXT HIDDEN, lim INTEGER HIDDEN)",
             FnKind::Outline => c"CREATE TABLE x(path TEXT, heading TEXT, heading_path TEXT, level INTEGER, line_from INTEGER, line_to INTEGER, nwords INTEGER, nwords_total INTEGER, nbytes INTEGER, nlines INTEGER, file_nwords INTEGER, version INTEGER, updated_at TEXT, updated_by TEXT, prefix TEXT HIDDEN, heading_match TEXT HIDDEN, mode TEXT HIDDEN, max_level INTEGER HIDDEN, lim INTEGER HIDDEN)",
             FnKind::Headings => c"CREATE TABLE x(heading TEXT, sections INTEGER, docs INTEGER, prefix TEXT HIDDEN, starts TEXT HIDDEN, lim INTEGER HIDDEN)",
+            FnKind::Entry => c"CREATE TABLE x(path TEXT, name TEXT, kind TEXT, version INTEGER, nbytes INTEGER, nlines INTEGER, updated_at TEXT, updated_by TEXT, id INTEGER, dir TEXT, depth INTEGER, ext TEXT, title TEXT, nwords INTEGER, nsections INTEGER, nprops INTEGER, nlinks INTEGER, nlinks_broken INTEGER, versions INTEGER, created_at TEXT, files INTEGER, folders INTEGER, nauthors INTEGER, authors TEXT, path_arg TEXT HIDDEN)",
             FnKind::PathHistory => c"CREATE TABLE x(id INTEGER, ts TEXT, op TEXT, old_path TEXT, new_path TEXT, via TEXT, version INTEGER, author TEXT, path TEXT HIDDEN, node_id INTEGER HIDDEN)",
         }
     }
     /// Number of visible columns; hidden argument columns follow.
     fn visible(self) -> c_int {
         match self {
-            FnKind::Ls => 15,
-            FnKind::Search => 4,
+            FnKind::Ls => 24,
+            FnKind::Search => 7,
             FnKind::History => 9,
             FnKind::Export => 2,
             FnKind::Feed => 11,
@@ -550,12 +564,13 @@ impl FnKind {
             FnKind::PropFind => 4,
             FnKind::Outline => 14,
             FnKind::Headings => 3,
+            FnKind::Entry => 24,
         }
     }
     fn n_hidden(self) -> c_int {
         match self {
             FnKind::Ls => 2,
-            FnKind::Search => 3,
+            FnKind::Search => 4,
             FnKind::History => 1,
             FnKind::Export => 1,
             FnKind::Feed => 2,
@@ -567,8 +582,45 @@ impl FnKind {
             FnKind::PropFind => 3,
             FnKind::Outline => 5,
             FnKind::Headings => 3,
+            FnKind::Entry => 1,
         }
     }
+}
+
+/// One `Entry` as the canonical column order, shared by `textdb_ls` and `textdb_entry`.
+///
+/// One function so the two cannot drift: a caller that learns the shape from either knows it
+/// for both, and adding a column is one edit rather than two.
+fn entry_row(e: crate::db::Entry) -> Vec<Value> {
+    let int = |v: Option<i64>| v.map_or(Value::Null, Value::Integer);
+    let text = |v: Option<String>| v.map_or(Value::Null, Value::Text);
+    let authors: Vec<_> = e.authors.iter().map(crate::db::AuthorCount::to_json).collect();
+    vec![
+        Value::Text(e.path),
+        Value::Text(e.name),
+        Value::Text(if e.kind == 1 { "file".into() } else { "folder".into() }),
+        int(e.version),
+        Value::Integer(e.nbytes),
+        Value::Integer(e.nlines),
+        Value::Text(e.updated_at),
+        text(e.updated_by),
+        Value::Integer(e.id),
+        text(e.dir),
+        Value::Integer(e.depth),
+        text(e.ext),
+        text(e.title),
+        Value::Integer(e.nwords),
+        Value::Integer(e.nsections),
+        Value::Integer(e.nprops),
+        Value::Integer(e.nlinks),
+        Value::Integer(e.nlinks_broken),
+        Value::Integer(e.versions),
+        Value::Text(e.created_at),
+        int(e.files),
+        int(e.folders),
+        Value::Integer(e.nauthors),
+        Value::Text(serde_json::Value::Array(authors).to_string()),
+    ]
 }
 
 /// A hidden argument as an integer, accepting the text form a bound parameter can arrive in.
@@ -704,44 +756,31 @@ unsafe impl VTabCursor for FnCursor<'_> {
             FnKind::Ls => {
                 let dir = s(&hidden[0]).unwrap_or_else(|| "/".into());
                 let recursive = hidden_i64(&hidden[1]).unwrap_or(0) != 0;
-                let int = |v: Option<i64>| v.map_or(Value::Null, Value::Integer);
-                db.list(&dir, recursive)
-                    .map_err(map_err)?
-                    .into_iter()
-                    .map(|e| {
-                        let file = e.kind == 1;
-                        let authors: Vec<_> = e.authors.iter().map(crate::db::AuthorCount::to_json).collect();
-                        vec![
-                            Value::Text(e.name),
-                            Value::Text(if file { "file".into() } else { "folder".into() }),
-                            int(e.nbytes),
-                            int(e.nlines),
-                            Value::Text(e.updated_at),
-                            Value::Text(e.path),
-                            int(e.nwords),
-                            Value::Integer(e.versions),
-                            Value::Text(e.created_at),
-                            e.updated_by.map_or(Value::Null, Value::Text),
-                            if file { Value::Integer(authors.len() as i64) } else { Value::Null },
-                            Value::Text(serde_json::Value::Array(authors).to_string()),
-                            int(e.files),
-                            int(e.folders),
-                            Value::Integer(e.id),
-                        ]
-                    })
-                    .collect()
+                db.list(&dir, recursive).map_err(map_err)?.into_iter().map(entry_row).collect()
+            }
+            FnKind::Entry => {
+                let path = s(&hidden[0]).unwrap_or_else(|| "/".into());
+                vec![entry_row(db.entry(&path).map_err(map_err)?)]
             }
             FnKind::Search => {
                 let q = s(&hidden[0]).unwrap_or_default();
                 let prefix = s(&hidden[1]).unwrap_or_else(|| "/".into());
-                let lim = match hidden_i64(&hidden[2]) {
-                    Some(i) => i.max(0) as usize,
-                    _ => 100,
-                };
-                db.search(&q, &prefix, lim)
+                let lim = hidden_i64(&hidden[2]).map_or(100, |i| i.max(0) as usize);
+                let per_file = hidden_i64(&hidden[3]).map_or(usize::MAX, |i| i.max(1) as usize);
+                db.search_lines(&q, &prefix, lim, per_file)
                     .map_err(map_err)?
                     .into_iter()
-                    .map(|h| vec![Value::Text(h.path), Value::Integer(h.line), Value::Text(h.snippet), Value::Real(h.rank)])
+                    .map(|h| {
+                        vec![
+                            Value::Text(h.path),
+                            Value::Integer(h.version),
+                            Value::Integer(h.line),
+                            Value::Text(h.text),
+                            h.section.map_or(Value::Null, Value::Text),
+                            Value::Real(h.score),
+                            Value::Integer(h.more),
+                        ]
+                    })
                     .collect()
             }
             FnKind::Outline => {
