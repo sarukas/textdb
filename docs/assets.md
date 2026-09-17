@@ -68,6 +68,11 @@ item: 1AbCdEf…
 - `store`: the name of an asset store configured in the textdb store. `item`: the provider's
   stable item id; for a local-folder store, the store path the bytes were put at, so a pointer
   moved in the store still finds them until a push or stage 2's sync moves them too.
+- `item-path` (only where `item` is a provider's id): the store path the bytes were last put at, so
+  a file someone moved in the store is told from an asset moved in textdb. No part of identity, and
+  nothing finds bytes by it -- `item` does that. A pointer written before this key existed simply
+  has none, and then which side moved cannot be told: both places are reported and neither blamed,
+  until its next push records one.
 - Later stages add provider metadata lines (`provider-hash`, `provider-version`) for cheap
   change detection; they are not part of identity.
 - The real file is the pointer's path without `.tdbasset`. The pointer changes only when the
@@ -89,6 +94,16 @@ from a pointer changed elsewhere:
 | no | a copy a keep-both conflict left, `NAME (conflict HOST DATE).ext` | `conflict-copy` (never pushed or paired; compare it, then delete or rename it) |
 | no | where this directory had an asset whose pointer was moved or deleted in the store | `orphan` (sync moves it after its pointer or trashes it; never pushed but with `push --force`) |
 | yes | same sha256, but its store keeps the file somewhere other than the asset's own path | `moved-here` (the asset moved in textdb and its file stayed: `assets relocate` moves the file to it, or `mv` the pointer back) |
+| yes | its store keeps the file somewhere else, and not where the pointer's `item-path` last recorded | `moved-in-store` (someone moved it there; a pull still fetches it by id, `assets relocate` brings it back to the asset) |
+| yes | its store holds other bytes in that very file | `changed-in-store` (someone replaced them there; a pull takes them as the pointer's new version, the copy here going to `.textdb/trash/`) |
+| yes | its store keeps the file in the provider's own trash | `trashed-in-store` (a pull still fetches it, until the provider empties it) |
+| yes | its store holds two files at that path (Google Drive allows it) | `ambiguous` (which one the pointer names cannot be said, so neither is read or written over) |
+| yes | its store has no file of that item at all | `invalid-item` (purged from the store's trash, or a file outside the store, which textdb never touches) |
+
+A store-side state goes over `ok` alone: what the bytes here say comes first, so a `modified`,
+`outdated` or `conflict` asset keeps that state and is told of the store's answer as well. The one
+exception is bytes changed on both sides -- `changed-in-store` over a `modified` file -- which is a
+`conflict`.
 
 A file whose name differs from a pointer's only in case is that asset (on Windows and macOS it
 is the same file); a second file differing only in case is a `conflict`. A pointer whose path
@@ -146,7 +161,14 @@ in letter case. What it fetches and what it leaves alone:
 Each file is downloaded to a partial name beside where it is going, hashed there against the
 pointer's `sha256` and size, and only then renamed into place. Bytes that are not the ones the
 pointer names therefore never appear under the real name: that asset fails, the partial file goes,
-and the message names `textdb assets verify`. Nothing is written through a symbolic link or junction
+and the message names `textdb assets verify`. The one exception is an asset whose store holds other
+bytes in that very file (`changed-in-store`): there the point is that they are not the pointer's,
+and a pull takes them as its new version. It commits the pointer naming them -- the only write a
+pull makes -- before putting the bytes in place, so a commit that fails leaves the vault as it was;
+the old copy goes to `.textdb/trash/` as an `outdated` one does, and the new pointer is written to
+disk and recorded in this directory's sync base, as a push does. A pull never creates a pointer the
+store has not got, and never writes one this directory has not caught up with: those are reported
+and left for a sync. Nothing is written through a symbolic link or junction
 already in the directory, whose target may be anywhere outside the vault. On a Google Drive store
 the download goes by the file's id, so an asset someone renamed, moved to another folder, or sent to
 Drive's trash is still found and fetched.
@@ -289,13 +311,15 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
     back to is refused the same way when the drive holds two files of it, and a file Drive returns
     no id for fails the push rather than being read by its name. A push leaves a path the drive holds two files of alone
     (Drive allows that): which of them it would replace is not textdb's to guess. Bytes that are
-    not the ones replaced are kept, and the upload goes beside them, as today. Until sprint 4's
-    fallback to the trash copy, a pointer naming older bytes than its file now holds (a push whose
-    pointer was not committed, say) is `differs` and cannot be pulled, though the bytes are in
-    `.textdb-trash`.
+    not the ones replaced are kept, and the upload goes beside them, as today.
   - *Pull downloads by id* (`rclone backend copyid`) to its partial file and checks the hash, so
     an asset renamed or moved in the drive, or in Drive's trash, is still found. A pointer naming
-    older bytes than its id holds now is fetched from the trash copy with its SHA-256.
+    older bytes than its file now holds is `changed-in-store`, and a pull takes the drive's bytes as
+    the pointer's new version rather than hunting for the old ones in `.textdb-trash`: what someone
+    put in the drive is what the drive holds, and the copy here goes to the vault's own trash. (The
+    replaced bytes stay in the store's `.textdb-trash` for a pointer that still names them, but
+    nothing fetches them from there: the design's earlier fallback was dropped for this, since
+    taking the older bytes would quietly undo what was done in the drive.)
   - *Pointers moved in textdb* leave the file in the drive where it was: `mv` moves where the
     pointer sits and touches no drive, and nothing moves a person's drive about on its own. The
     asset is then `moved-here`, `assets status` says where its file actually is, and every sync says

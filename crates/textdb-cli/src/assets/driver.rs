@@ -34,6 +34,23 @@ pub struct AssetStore {
 
 pub const DRIVERS: &[&str] = &["local", "rclone"];
 
+/// What a store knows of the file an item names, from the one look a command makes at it.
+pub struct Found {
+    /// Where the store keeps it now, as a store path.
+    pub path: String,
+    /// Of the bytes there, where the provider keeps a SHA-256 of them (Google Drive does).
+    pub sha256: Option<String>,
+    /// Of the bytes there: what tells a file replaced in the store where the provider keeps no
+    /// SHA-256 of it (an old upload), which no hash could then reveal.
+    pub size: u64,
+    /// In the provider's own trash rather than among its live files (Google Drive keeps it there
+    /// for thirty days, and a pull by id still finds it).
+    pub trashed: bool,
+    /// The store holds two live files of that path, which Google Drive allows: which of them an
+    /// item means is not textdb's to guess, and nothing is written over either.
+    pub two_of_a_name: bool,
+}
+
 pub trait Driver {
     /// Where the asset at store path `path` is kept, for messages.
     fn location(&self, path: &str) -> String;
@@ -54,11 +71,11 @@ pub trait Driver {
     fn put(&self, path: &str, src: &Path, sha256: &str, replaces: Option<&str>) -> Result<(Option<String>, Held)>;
     /// Copy the stored file to `dest`, which must not exist.
     fn get(&self, path: &str, item: Option<&str>, dest: &Path) -> Result<()>;
-    /// Where the store keeps the file the item `item` names, as a store path, when it can tell: a
-    /// provider whose items are ids of its own knows it wherever the file was moved to in the
-    /// provider. `None` where there is nothing to tell -- the item is a path already -- or no file
-    /// of that item is there.
-    fn at(&self, _item: &str) -> Result<Option<String>> {
+    /// What the store knows of the file the item `item` names, from one look: a provider whose items
+    /// are ids of its own knows it wherever the file was moved to in the provider, and in the
+    /// provider's own trash. `None` where there is nothing to tell -- the item is a path already --
+    /// or the store has no file of that item at all, live or trashed.
+    fn found(&self, _item: &str) -> Result<Option<Found>> {
         Ok(None)
     }
     /// Move the file the item `item` names to the store path `to`, keeping the provider's own file

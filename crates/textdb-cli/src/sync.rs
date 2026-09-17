@@ -962,7 +962,7 @@ fn sync_assets(st: &mut dyn Store, o: &Options, prefix: &str, plan: &Plan, attrs
                     Some(linked)
                 })
             };
-            match linked.and_then(|linked| assets::pull_run(st, &v, &[], linked.as_ref(), false)) {
+            match linked.and_then(|linked| assets::pull_run(st, &v, &[], linked.as_ref(), Some(&o.author), false)) {
                 Ok(r) => {
                     a.pulled = r.pulled.iter().filter_map(|p| p["path"].as_str().map(str::to_string)).collect();
                     a.notes.extend(r.kept);

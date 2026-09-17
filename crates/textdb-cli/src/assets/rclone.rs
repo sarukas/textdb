@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
-use super::driver::{beside, host_word, lock_name, partial_name, partial_pid, process_running, stamp, Driver, Held, LOCK_WAIT, TRASH};
+use super::driver::{beside, host_word, lock_name, partial_name, partial_pid, process_running, stamp, Driver, Found, Held, LOCK_WAIT, TRASH};
 use crate::store::{Result, StoreError};
 
 /// The rclone to run: `TEXTDB_RCLONE`, else the one next to this program (a vault's
@@ -1085,23 +1085,22 @@ impl Driver for RcloneDriver {
         Ok((Some(l.id), held))
     }
 
-    fn at(&self, item: &str) -> Result<Option<String>> {
-        // Items that are paths are where they say; a drive knows where the file of an id is now,
-        // from the one listing this command makes of the store's live files.
+    fn found(&self, item: &str) -> Result<Option<Found>> {
+        // Items that are paths are where they say; a drive knows where the file of an id is now.
         if item.starts_with('/') || !is_drive_id(item) || !self.is_drive() {
             return Ok(None);
         }
-        // The live files only, never Drive's trash: an id that is not among them (one someone
-        // trashed, one purged, one of another drive) is nothing this has to tell of, and listing the
-        // trash to find that out would cost every command that asks a listing of its own.
-        self.ensure_listed()?;
-        Ok(self
+        // The store's live files, and its trash only when an id is not among them: one listing of
+        // each per command, however many assets ask after it.
+        let Some(e) = self.find_id(item)? else { return Ok(None) };
+        // Drive keeps two files of one name apart; which of them an item means cannot be said, so
+        // that is told of rather than guessed at.
+        let two = self
             .listing
             .borrow()
             .as_ref()
-            .and_then(|l| l.by_id.get(item))
-            .filter(|e| !e.trashed)
-            .map(|e| e.path.clone()))
+            .is_some_and(|l| l.by_id.values().filter(|other| !other.trashed && other.path == e.path).count() > 1);
+        Ok(Some(Found { path: e.path, sha256: e.sha256, size: e.size, trashed: e.trashed, two_of_a_name: two }))
     }
 
     fn move_to(&self, item: &str, to: &str) -> Result<Option<String>> {

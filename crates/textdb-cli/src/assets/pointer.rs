@@ -28,6 +28,11 @@ pub struct Pointer {
     /// The provider's id of the stored file; absent where files are addressed by path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item: Option<String>,
+    /// The store path the bytes were last put at, where the store addresses its files by an id of
+    /// its own: what tells a file someone moved in the store from an asset moved in textdb. No part
+    /// of identity, and nothing finds bytes by it -- `item` does that.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_path: Option<String>,
     /// Keys this build does not know, kept in order.
     #[serde(skip)]
     pub extra: Vec<(String, String)>,
@@ -65,11 +70,11 @@ impl Pointer {
             Some(("textdb-asset", v)) => return Err(format!("pointer format {v}: this build reads format {FORMAT}")),
             _ => return Err("not an asset pointer: the first line is not `textdb-asset: 1`".into()),
         }
-        let mut known: [Option<&str>; 6] = [None; 6];
+        let mut known: [Option<&str>; 7] = [None; 7];
         let mut extra = Vec::new();
         for line in lines {
             let (k, v) = split(line).ok_or_else(|| format!("not a `key: value` line: {line}"))?;
-            let slot = ["id", "sha256", "size", "type", "store", "item"].iter().position(|n| *n == k);
+            let slot = ["id", "sha256", "size", "type", "store", "item", "item-path"].iter().position(|n| *n == k);
             match slot {
                 Some(i) if known[i].is_some() => return Err(format!("`{k}` is given twice")),
                 Some(i) => known[i] = Some(v),
@@ -97,6 +102,7 @@ impl Pointer {
             media_type: known[3].unwrap_or("application/octet-stream").to_string(),
             store: store.to_string(),
             item: known[5].filter(|s| !s.is_empty()).map(str::to_string),
+            item_path: known[6].filter(|s| !s.is_empty()).map(str::to_string),
             extra,
         })
     }
@@ -109,6 +115,9 @@ impl Pointer {
         );
         if let Some(item) = &self.item {
             s.push_str(&format!("item: {item}\n"));
+        }
+        if let Some(path) = &self.item_path {
+            s.push_str(&format!("item-path: {path}\n"));
         }
         for (k, v) in &self.extra {
             s.push_str(&format!("{k}: {v}\n"));
@@ -208,6 +217,7 @@ mod tests {
             media_type: "image/png".into(),
             store: "team-drive".into(),
             item: Some("1AbCdEf".into()),
+            item_path: Some("/accounts/acme/arch.png".into()),
             extra: vec![],
         }
     }
@@ -219,7 +229,7 @@ mod tests {
         let crlf = p.to_text().replace('\n', "\r\n") + "provider-version: 7\r\n";
         let read = Pointer::parse(crlf.as_bytes()).unwrap();
         assert_eq!(read.extra, [("provider-version".to_string(), "7".to_string())]);
-        assert!(read.to_text().ends_with("item: 1AbCdEf\nprovider-version: 7\n"));
+        assert!(read.to_text().ends_with("item: 1AbCdEf\nitem-path: /accounts/acme/arch.png\nprovider-version: 7\n"));
         assert!(is_uuid(&new_id()) && new_id() != new_id());
     }
 
