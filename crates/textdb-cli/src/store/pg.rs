@@ -131,6 +131,14 @@ fn pg(e: postgres::Error) -> StoreError {
     }
 }
 
+/// The statuses a `links` call asked for, when it asked for more than the one `kb.links` takes.
+fn keep_statuses(rows: Vec<LinkRow>, statuses: &[&str]) -> Vec<LinkRow> {
+    if statuses.len() < 2 {
+        return rows;
+    }
+    rows.into_iter().filter(|l| l.status.as_deref().is_some_and(|s| statuses.contains(&s))).collect()
+}
+
 /// Postgres stores content as `text`.
 fn utf8<'a>(path: &str, bytes: &'a [u8]) -> Result<&'a str> {
     std::str::from_utf8(bytes)
@@ -229,34 +237,39 @@ impl PgStore {
         Ok(())
     }
 
-    /// Links of live files matching `cond` (over `n`, the file written in, `l` and `r`, the file
-    /// resolved to), in path and line order.
-    fn link_rows(&mut self, cond: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<LinkRow>> {
+    /// Links as `kb.links` or `kb.backlinks` reports them, in path and line order.
+    ///
+    /// Through the extension, never over `kb.link` and `kb.node`: those hold the store's own paths
+    /// and no view of them, so a hand-written join here answered an account in the store's paths
+    /// and reported a hidden target by naming it. The header's rule again — every operation is a
+    /// call into `kb.*`.
+    fn link_rows(&mut self, incoming: bool, path: &str, statuses: &[&str]) -> Result<Vec<LinkRow>> {
+        let which = if incoming { "kb.backlinks" } else { "kb.links" };
+        // `kb.links` takes one status; the rest of the set is a filter here, as it is on SQLite.
+        let one = statuses.first().copied().unwrap_or("");
         let rows = self
             .client
             .query(
                 &format!(
-                    "SELECT n.path, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status, r.path, n.version \
-                     FROM kb.link l JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL \
-                     LEFT JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL \
-                     WHERE {cond} ORDER BY n.path COLLATE \"C\", l.line, l.id"
+                    "SELECT path, version, line, kind, target, anchor, alias, status, resolved, asset \
+                     FROM {which}($1, $2) ORDER BY path COLLATE \"C\", line"
                 ),
-                params,
+                &[&path, &one],
             )
             .map_err(pg)?;
         Ok(rows
             .iter()
             .map(|r| LinkRow {
                 path: r.get(0),
-                version: r.get(8),
-                line: r.get(1),
-                kind: r.get(2),
-                target: r.get(3),
-                anchor: r.get(4),
-                alias: r.get(5),
-                status: r.get(6),
-                resolved: r.get(7),
-                asset: false,
+                version: r.get(1),
+                line: r.get(2),
+                kind: r.get(3),
+                target: r.get(4),
+                anchor: r.get(5),
+                alias: r.get(6),
+                status: r.get(7),
+                resolved: r.get(8),
+                asset: r.get(9),
                 resolved_id: None,
             })
             .map(super::asset_link)
@@ -1024,19 +1037,13 @@ impl Store for PgStore {
 
     fn links(&mut self, path: &str, statuses: &[&str]) -> Result<Vec<LinkRow>> {
         let path = normalize_path(path)?;
-        let statuses: Vec<&str> = statuses.to_vec();
-        self.link_rows(
-            "($1 = '/' OR n.path = $1 OR n.path LIKE kb._subtree_like($1)) AND (cardinality($2::text[]) = 0 OR l.status = ANY($2::text[]))",
-            &[&path, &statuses],
-        )
+        let rows = self.link_rows(false, &path, statuses)?;
+        Ok(keep_statuses(rows, statuses))
     }
 
     fn backlinks(&mut self, path: &str) -> Result<Vec<LinkRow>> {
         let path = normalize_path(path)?;
-        self.link_rows(
-            "l.target_path <> '' AND r.kind = 1 AND ($1 = '/' OR r.path = $1 OR r.path = $1 || '.tdbasset' OR r.path LIKE kb._subtree_like($1))",
-            &[&path],
-        )
+        self.link_rows(true, &path, &[])
     }
 
     /// A move that leaves links as they are (a sync's move follows one made on disk).
@@ -1106,11 +1113,14 @@ impl Store for PgStore {
 
     fn file_heads(&mut self, prefix: &str) -> Result<Vec<FileHead>> {
         let prefix = normalize_path(prefix)?;
+        // `kb.entry`, not `kb.node`: the raw table holds the store's paths, and a sync reconciles
+        // the caller's. Reading the table here gave a checkout the store's layout — `legal/` as a
+        // top-level directory — and then failed to read back what it had just written.
         let rows = self
             .client
             .query(
-                "SELECT path, version, updated_by FROM kb.node \
-                 WHERE deleted_at IS NULL AND kind = 1 AND ($1 = '/' OR path LIKE kb._subtree_like($1))",
+                "SELECT path, version, updated_by FROM kb.entry \
+                 WHERE kind = 'file' AND ($1 = '/' OR path = $1 OR path LIKE kb._subtree_like($1))",
                 &[&prefix],
             )
             .map_err(pg)?;

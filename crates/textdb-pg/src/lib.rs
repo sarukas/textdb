@@ -399,8 +399,16 @@ END $$;
 
 -- Custom SQLSTATEs (spec §7.2): TX001 conflict, TX002 contention, TX003 not found, TX004 invalid edit,
 -- TX005 forbidden (#12): it is in your view and you may not do this, as distinct from not being there.
+-- Raise with textdb's own SQLSTATE, and with the code in front of the message as well.
+--
+-- An error raised here and caught on the way out of a `#[pg_extern]` — which is every refusal
+-- that reaches a caller through one of the Rust functions — keeps its message and arrives as
+-- `XX000`: SPI re-raises it and the SQLSTATE does not survive. A client that read only the
+-- SQLSTATE therefore saw every refusal as an internal error: exit 1 where a rights refusal is 7
+-- and a bad path is 5. The prefix is what it reads instead, and the CLI strips it once it has it.
+-- The SQLite binding does the same for an error raised through a virtual table.
 CREATE FUNCTION kb._raise(code text, msg text, detail text) RETURNS void LANGUAGE plpgsql AS $$
-BEGIN RAISE EXCEPTION USING ERRCODE = code, MESSAGE = msg, DETAIL = coalesce(detail, ''); END $$;
+BEGIN RAISE EXCEPTION USING ERRCODE = code, MESSAGE = code || ' ' || msg, DETAIL = coalesce(detail, ''); END $$;
 
 -- LIKE pattern matching every path strictly under the folder `p`.
 --

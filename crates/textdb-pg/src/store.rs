@@ -18,10 +18,10 @@ pub fn spi_err(e: pgrx::spi::Error) -> ! {
 /// through a virtual table. Where the SQLSTATE *does* survive — `kb._raise` called from SQL — the
 /// client prefers it and the prefix is stripped.
 pub fn raise(code: &str, msg: &str, detail: &str) -> ! {
-    let tagged = format!("{code} {msg}");
-    // The SPI call itself raises; if it somehow returns, fall back to a plain error.
-    let _ = Spi::run_with_args("SELECT kb._raise($1, $2, $3)", &[code.into(), tagged.as_str().into(), detail.into()]);
-    pgrx::error!("{}", tagged);
+    // The SPI call itself raises, and `kb._raise` is where the code goes in front of the message;
+    // if it somehow returns, fall back to a plain error that says the same thing.
+    let _ = Spi::run_with_args("SELECT kb._raise($1, $2, $3)", &[code.into(), msg.into(), detail.into()]);
+    pgrx::error!("{} {}", code, msg);
 }
 
 pub fn to_hash(v: &[u8]) -> Result<Hash> {
