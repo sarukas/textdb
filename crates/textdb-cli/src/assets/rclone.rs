@@ -80,14 +80,19 @@ struct Listed {
 
 /// What rclone said went wrong, without its log prefix.
 fn failure(what: &str, out: &Output) -> StoreError {
-    let text = String::from_utf8_lossy(&out.stderr);
-    let said = text.lines().rev().map(str::trim).find(|l| !l.is_empty()).map(|l| {
-        let rest = l.split_once(" : ").or_else(|| l.split_once(": ")).map_or(l, |(_, rest)| rest);
-        rest.trim().to_string()
-    });
-    StoreError::other(match said {
+    let last = |text: &str| {
+        text.lines().rev().map(str::trim).find(|l| !l.is_empty()).map(|l| {
+            let rest = l.split_once(" : ").or_else(|| l.split_once(": ")).map_or(l, |(_, rest)| rest);
+            rest.trim().to_string()
+        })
+    };
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // What it said on stderr; failing that whatever it printed, since a command stopped from
+    // outside it can exit with a code alone, and a message of only a number says nothing at all.
+    StoreError::other(match last(&stderr).or_else(|| last(&stdout)) {
         Some(said) => format!("{what}: {said}"),
-        None => format!("{what}: rclone exited with {}", out.status),
+        None => format!("{what}: rclone exited with {} and said nothing", out.status),
     })
 }
 
@@ -210,16 +215,22 @@ impl RcloneDriver {
     /// Whether the store is on Google Drive: the type of its remote in the rclone configuration,
     /// or a `:drive` connection string.
     fn is_drive(&self) -> bool {
+        // Nothing here may run an rclone command through `command`, `run` or `ok`: they ask this
+        // again, and a cell being set cannot be set again (it panics).
         *self.drive.get_or_init(|| {
             let name = remote_name(&self.root);
             if let Some(backend) = name.strip_prefix(':') {
                 return backend.split(',').next() == Some("drive");
             }
             let name = name.split(',').next().unwrap_or("");
-            // Through the bare command: the flags for a drive are what this answer decides.
-            let listed = self.bare_command().args(["listremotes", "--long"]).stdin(Stdio::null()).output();
+            // Through the bare command: the flags for a drive are what this answer decides. Asked
+            // only for a root that names a remote at all, so a plain folder costs nothing.
             !name.is_empty()
-                && listed
+                && self
+                    .bare_command()
+                    .args(["listremotes", "--long"])
+                    .stdin(Stdio::null())
+                    .output()
                     .ok()
                     .filter(|o| o.status.success())
                     .and_then(|o| remote_type(&String::from_utf8_lossy(&o.stdout), name))
@@ -243,16 +254,23 @@ impl RcloneDriver {
     /// listed once per command (each rclone run costs seconds), Drive's trash only when an id is
     /// not among the live files. An id anywhere else, in another drive the person running textdb
     /// can reach, say, is `None`: nothing outside the store is read, moved or trashed by id.
+    /// List the store's live files once for this command, when that has not been done yet.
+    fn ensure_listed(&self) -> Result<()> {
+        if self.listing.borrow().is_some() {
+            return Ok(());
+        }
+        let mut l = Listing::default();
+        l.add(&self.list_all(false)?, false)?;
+        *self.listing.borrow_mut() = Some(l);
+        Ok(())
+    }
+
     fn find_id(&self, id: &str) -> Result<Option<Entry>> {
         if !is_drive_id(id) {
             return Ok(None);
         }
+        self.ensure_listed()?;
         let mut cached = self.listing.borrow_mut();
-        if cached.is_none() {
-            let mut l = Listing::default();
-            l.add(&self.list_all(false)?, false)?;
-            *cached = Some(l);
-        }
         let l = cached.as_mut().expect("listed above");
         if !l.by_id.contains_key(id) && !l.trash_read {
             l.add(&self.list_all(true)?, true)?;
@@ -285,10 +303,10 @@ impl RcloneDriver {
 
     /// The store path where `location` (a path, or a Drive file id) is now, for a push to lock and
     /// replace.
-    fn live_path(&self, location: &str) -> Result<String> {
+    fn live_path(&self, location: &str) -> Result<(String, Option<String>)> {
         match self.resolve(location)? {
-            Resolved::Path(p) => Ok(p),
-            Resolved::File(_, e) if !e.trashed => Ok(e.path),
+            Resolved::Path(p) => Ok((p, None)),
+            Resolved::File(id, e) if !e.trashed => Ok((e.path, Some(id))),
             Resolved::File(id, e) => Err(StoreError::invalid(format!(
                 "its file (Drive id {id}, {}) went to Drive's trash meanwhile: push again",
                 self.remote(&e.path).unwrap_or_default()
@@ -305,7 +323,18 @@ impl RcloneDriver {
     /// The SHA-256 of the Drive file `id`, downloaded by its id to a temporary file.
     fn hash_by_id(&self, id: &str) -> Result<String> {
         static N: AtomicU64 = AtomicU64::new(0);
-        let tmp = std::env::temp_dir().join(format!("textdb-hash-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        // A name claimed here and nowhere else, so what is hashed is what rclone downloaded and
+        // not a file something else on this computer left or put there.
+        let mut claimed = None;
+        for _ in 0..8 {
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+            let at = std::env::temp_dir().join(format!("textdb-hash-{}-{}-{nanos}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+            if std::fs::OpenOptions::new().write(true).create_new(true).open(&at).is_ok() {
+                claimed = Some(at);
+                break;
+            }
+        }
+        let tmp = claimed.ok_or_else(|| StoreError::other("no name for a temporary copy was free".to_string()))?;
         let dest = local_arg(&tmp)?;
         let hashed = self
             .ok(&format!("downloading Drive id {id} to hash it"), &["--inplace", "backend", "copyid", "--", &self.backend_remote(), id, &dest])
@@ -316,20 +345,22 @@ impl RcloneDriver {
 
     /// Whether the root is a folder rclone reaches, giving up on a remote that does not answer.
     pub fn check(&self) -> Result<()> {
-        // Known before anything else runs, so every command on a Google Drive store skips shortcuts.
-        self.is_drive();
         let mut last = None;
-        for attempt in 0..2 {
+        for attempt in 0..3 {
+            // Longer each time: a drive busy with this computer's own other commands has needed
+            // more than one short wait before it answers for the store again.
             if attempt > 0 {
-                std::thread::sleep(Duration::from_secs(2));
+                std::thread::sleep(Duration::from_secs(if attempt == 1 { 2 } else { 5 }));
             }
             let out = self.run(&["--contimeout", "15s", "--timeout", "30s", "--retries", "1", "--low-level-retries", "2", "lsjson", "--stat", "--no-mimetype", "--", &self.root])?;
             match out.status.code() {
                 Some(0) if serde_json::from_slice::<Listed>(&out.stdout).is_ok_and(|l| l.is_dir) => return Ok(()),
                 Some(0) => return Err(StoreError::invalid(format!("{} is a file, not a folder", self.root))),
                 Some(3 | 4) => return Err(StoreError::invalid(format!("the folder {} is not there (rclone mkdir {} makes it)", self.root, self.root))),
-                // A moment's trouble reaching the provider (one busy with this computer's own
-                // other commands, say) is looked at again before a store counts as unreachable.
+                // A moment's trouble reaching the provider (one busy with this computer's own other
+                // commands, say) is looked at again before a store counts as unreachable. Every
+                // code but the two above: a drive under load has answered this very command with
+                // exit 1, the code for a usage error, which the fixed arguments here cannot be.
                 _ => last = Some(failure(&format!("reaching {}", self.root), &out)),
             }
         }
@@ -608,7 +639,7 @@ impl RcloneDriver {
     }
 
     /// [`Driver::put`] at the store path `path`; the item returned is the path the bytes are at.
-    fn put_at(&self, path: &str, src: &Path, sha256: &str, replaces: Option<&str>) -> Result<(Option<String>, Held)> {
+    fn put_at(&self, path: &str, src: &Path, sha256: &str, replaces: Option<&str>, named: Option<&str>) -> Result<(Option<String>, Held)> {
         self.remote(path)?;
         if self.is_drive() {
             self.refuse_two_of_a_name(path)?;
@@ -622,7 +653,7 @@ impl RcloneDriver {
                 // On Google Drive the bytes are replaced in the file that is there, so its id, and
                 // every link people made to it, stay; elsewhere a checked copy is moved into place.
                 let replaced = match self.is_drive() {
-                    true => self.place_over(path, src, sha256, expected)?,
+                    true => self.place_over(path, src, sha256, expected, named)?,
                     false => self.place(path, src, sha256, replaces)?,
                 };
                 match replaced {
@@ -650,10 +681,16 @@ impl RcloneDriver {
     }
 
     /// A push leaves a path Drive holds two files of alone: which of them it would replace, and
-    /// which a pointer names, is not textdb's to guess.
+    /// which a pointer names, is not textdb's to guess. Counted in the one listing this command
+    /// makes of the store, so a push of many assets asks nothing more.
     fn refuse_two_of_a_name(&self, path: &str) -> Result<()> {
-        let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
-        if self.names_in(dir)?.iter().filter(|n| *n == name).count() > 1 {
+        self.ensure_listed()?;
+        let two = self
+            .listing
+            .borrow()
+            .as_ref()
+            .is_some_and(|l| l.by_id.values().filter(|e| !e.trashed && e.path == path).count() > 1);
+        if two {
             return Err(StoreError::invalid(format!(
                 "{} is two files of one name in the drive: keep one of them there, then push again",
                 self.remote(path)?
@@ -667,13 +704,21 @@ impl RcloneDriver {
     /// and must hash to `replace` (not bytes put there some other way); then `src` is uploaded onto
     /// the same file, which readers see whole or not at all, and what is there is hashed. `false`
     /// when what was there turned out to be other bytes: nothing is uploaded.
-    fn place_over(&self, path: &str, src: &Path, sha256: &str, replace: &str) -> Result<bool> {
+    fn place_over(&self, path: &str, src: &Path, sha256: &str, replace: &str, named: Option<&str>) -> Result<bool> {
         let dest = self.remote(path)?;
         // The file this push replaces, to be the same file afterwards: its id is what the pointer
         // names and what the drive's links point at.
         let Some(before) = self.stat(path, false)? else {
             return Err(StoreError::other(format!("putting {dest} in place: nothing is there any more")));
         };
+        // A pointer's own file, not another of that name someone moved into its place in the drive.
+        if let Some(named) = named {
+            if named != before.id {
+                return Err(StoreError::invalid(format!(
+                    "the file the pointer names (Drive id {named}) is not the one at {dest} any more: sync, then push again"
+                )));
+            }
+        }
         let copy = self.trash_for(path);
         let copied = self
             .ok(&format!("copying {dest} to the trash"), &["copyto", "--ignore-times", "--", &dest, &self.remote(&copy)?])
@@ -739,6 +784,9 @@ impl RcloneDriver {
         let sha = match l.hashes.get("sha256").filter(|h| h.len() == 64) {
             Some(sha) => sha.to_ascii_lowercase(),
             None if is_drive_id(&l.id) => self.hash_by_id(&l.id)?,
+            // On a Drive store a file without an id is one textdb cannot tell from another of its
+            // name, and reading it by path is what the id is there to avoid.
+            None if self.is_drive() => return Err(StoreError::other(format!("{}: Drive gave no file id for it", self.remote(path)?))),
             None => match self.hash(path, None)? {
                 Some((sha, _)) => sha,
                 None => return Ok(None),
@@ -754,6 +802,9 @@ impl RcloneDriver {
         loop {
             let alt = beside(path, sha256, n);
             let lock = self.lock_remote(&alt)?;
+            if self.is_drive() {
+                self.refuse_two_of_a_name(&alt)?;
+            }
             match self.hash(&alt, None)? {
                 Some((sha, _)) if sha == sha256 => return Ok((Some(alt), Held::of(lock))),
                 Some(_) => n += 1,
@@ -902,13 +953,13 @@ impl Driver for RcloneDriver {
     }
 
     fn lock(&self, path: &str) -> Result<Held> {
-        let path = self.live_path(path)?;
+        let (path, _) = self.live_path(path)?;
         Ok(Held::of(self.lock_remote(&path)?))
     }
 
     fn put(&self, path: &str, src: &Path, sha256: &str, replaces: Option<&str>) -> Result<(Option<String>, Held)> {
-        let path = self.live_path(path)?;
-        let (at, held) = self.put_at(&path, src, sha256, replaces)?;
+        let (path, named) = self.live_path(path)?;
+        let (at, held) = self.put_at(&path, src, sha256, replaces, named.as_deref())?;
         if !self.is_drive() {
             return Ok((at, held));
         }
@@ -1172,10 +1223,19 @@ mod tests {
         assert!(!tmp.join("short.png").exists());
 
         // A path the drive holds two files of is left to be sorted out there, never half replaced.
-        rc(&["backend", "copyid", &format!("{}:", remote_name(&base)), &id, &format!("{}:{}/img/", remote_name(&base), inside_remote(&root))]);
+        std::fs::write(&src, b"a name of two files").unwrap();
+        let sha3 = hash_file(&src).unwrap().0;
         let d = RcloneDriver::new(exe.clone(), root.clone());
         d.check().unwrap();
-        match d.put("/img/a.png", &src, &sha2, Some(&sha2)) {
+        let twin = d.put("/dup/a.png", &src, &sha3, None).unwrap().0.unwrap();
+        rc(&["backend", "copyid", &format!("{}:", remote_name(&base)), &twin, &format!("{}:{}/dup/", remote_name(&base), inside_remote(&root))]);
+        let listed = rc(&["lsjson", &format!("{root}/dup")]);
+        assert_eq!(listed.matches("\"Name\":\"a.png\"").count(), 2, "the drive does not hold two files of that name: {listed}");
+        std::fs::write(&src, b"a name of two files, other bytes").unwrap();
+        let sha4 = hash_file(&src).unwrap().0;
+        let d = RcloneDriver::new(exe.clone(), root.clone());
+        d.check().unwrap();
+        match d.put("/dup/a.png", &src, &sha4, Some(&sha3)) {
             Err(e) => assert!(e.message.contains("two files of one name"), "{}", e.message),
             Ok(_) => panic!("a push went ahead with two files of one name in the drive"),
         }

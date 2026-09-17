@@ -215,7 +215,10 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
     same file (its id) holding the upload's bytes, read through by id where Drive keeps no SHA-256.
     Anything else fails the push, and what was there goes back only onto its own file, empty then or
     holding those bytes still; otherwise the trash copy is named and left, since bytes textdb did
-    not write are not its to overwrite. A push leaves a path the drive holds two files of alone
+    not write are not its to overwrite. A file the drive cannot be asked about after an upload
+    rclone reported done counts as placed, and the push's own last look records the id and the bytes
+    it finds there. A push replaces the file its pointer names, not another of that name moved into
+    its place in the drive. A push leaves a path the drive holds two files of alone
     (Drive allows that): which of them it would replace is not textdb's to guess. Bytes that are
     not the ones replaced are kept, and the upload goes beside them, as today. Until sprint 4's
     fallback to the trash copy, a pointer naming older bytes than its file now holds (a push whose
