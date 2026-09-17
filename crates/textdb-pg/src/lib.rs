@@ -508,6 +508,15 @@ $$ SELECT replace(replace(replace(p, '\', '\\'), '%', '\%'), '_', '\_') || '/%' 
 --
 -- `path` is the **store's** path and `vp` the caller's; a surface built on this answers in `vp`.
 -- `kb.my_grant` already tells an account its shares' store paths, so this exposes nothing new.
+-- A store path under a share, as the account sees it: the prefix swap and nothing else.
+--
+-- IMMUTABLE and taking the grant as arguments, so a caller that has already joined `kb.my_grant`
+-- does the arithmetic inline instead of calling `kb.to_view`, which looks the grant up again.
+CREATE FUNCTION kb._as_view(p text, alias text, store_path text) RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT CASE WHEN alias = '' THEN coalesce(nullif(substr(p, length(store_path) + 1), ''), '/')
+              ELSE '/' || alias || substr(p, length(store_path) + 1) END
+$$;
+
 CREATE VIEW kb.my_node AS
   -- The owner, who has no view: every live node, at its own path, through no share. An InitPlan,
   -- so a store that delegates nothing plans as though none of the rest of this were here.
@@ -515,10 +524,7 @@ CREATE VIEW kb.my_node AS
     FROM kb.node n
    WHERE n.deleted_at IS NULL AND (SELECT kb.current_account()) IS NULL
   UNION ALL
-  SELECT n.*, g.alias AS share, g.rights AS rights,
-         CASE WHEN g.alias = ''
-              THEN coalesce(nullif(substr(n.path, length(g.store_path) + 1), ''), '/')
-              ELSE '/' || g.alias || substr(n.path, length(g.store_path) + 1) END AS vp
+  SELECT n.*, g.alias AS share, g.rights AS rights, kb._as_view(n.path, g.alias, g.store_path) AS vp
     FROM kb.my_grant g
     JOIN kb.node n
       ON n.path ~>=~ g.store_path AND n.path ~<~ (g.store_path || '0')
@@ -1346,12 +1352,12 @@ mod kb {
         }
     }
 
-    /// This connection's view of the store, or `None` for the owner, who has no translation to do.
+    /// This connection's view of the store, or `None` for the owner, who has no translation to
+    /// do — cached for the transaction that asked for it.
     ///
     /// The same `View` the SQLite binding builds, from the same three tables, so link projection
     /// is one algorithm over two persistences rather than two implementations that have to be
     /// kept agreeing (#12 part 2).
-    /// This connection's view, cached for the transaction that asked for it.
     ///
     /// Building one costs two queries — the account row and its grants — and it is asked for
     /// per *row*: once per projected document, once per search hit, once per translated path.
@@ -2870,20 +2876,38 @@ mod kb {
         // `x` is the whole of the projection: one branch per shape a stored row can take here.
         // A folder moves as a single row, so a subtree crossing the edge is expanded to its files
         // — a sync told only "the folder is gone" has nothing to match its own files against.
+        // **The grants are read once, not per row.** Written with `kb.to_view` and `kb.visible`
+        // in the target list and the `WHERE`, this asked the grant table — which asks the token
+        // table — up to five times for every change row it considered, and a watcher catching up
+        // over a few thousand changes took 884 ms against the owner's 5. The set is one row in
+        // the ordinary case; materialised and joined, the same projection is arithmetic.
+        //
+        // `kb.visible(p)` and `kb.to_view(p) IS NOT NULL` are the same question over live grants,
+        // which is why the filter reads off the join below rather than being asked again.
         const ACCOUNT: &str = "\
-            WITH c AS (
+            WITH g AS MATERIALIZED (
+              SELECT node_id, alias, store_path FROM kb.my_grant WHERE NOT dormant
+            ), me AS MATERIALIZED (SELECT kb.current_account() AS id),
+            c AS (
               SELECT ch.seq, ch.ts, ch.op, ch.node_id, ch.node_kind, ch.path, ch.old_path, ch.version,
                      ch.base_version, ch.commit_kind, ch.author, ch.message, ch.for_account,
-                     kb.to_view(ch.path) AS v_new,
-                     CASE WHEN ch.old_path IS NULL THEN NULL ELSE kb.to_view(ch.old_path) END AS v_old,
+                     vn.p AS v_new, vo.p AS v_old,
                      -- The share root itself moving changes none of this account's paths, so its
                      -- feed says nothing about it.
-                     EXISTS (SELECT 1 FROM kb.my_grant g WHERE g.node_id = ch.node_id) AS is_root
+                     EXISTS (SELECT 1 FROM g WHERE g.node_id = ch.node_id) AS is_root
                 FROM kb.change ch
+                LEFT JOIN LATERAL (
+                       SELECT kb._as_view(ch.path, g.alias, g.store_path) AS p FROM g
+                        WHERE ch.path = g.store_path OR ch.path LIKE kb._subtree_like(g.store_path) LIMIT 1
+                     ) vn ON true
+                LEFT JOIN LATERAL (
+                       SELECT kb._as_view(ch.old_path, g.alias, g.store_path) AS p FROM g
+                        WHERE ch.old_path IS NOT NULL
+                          AND (ch.old_path = g.store_path OR ch.old_path LIKE kb._subtree_like(g.store_path)) LIMIT 1
+                     ) vo ON true
                WHERE ch.seq > $1
-                 AND ((ch.for_account IS NULL
-                       AND (kb.visible(ch.path) OR (ch.old_path IS NOT NULL AND kb.visible(ch.old_path))))
-                      OR ch.for_account = (SELECT kb.current_account()))
+                 AND ((ch.for_account IS NULL AND (vn.p IS NOT NULL OR vo.p IS NOT NULL))
+                      OR ch.for_account = (SELECT id FROM me))
             )
             SELECT c.seq, c.ts, x.op, x.path, x.old_path, c.node_kind, c.version, c.base_version,
                    c.commit_kind, c.author, c.message
@@ -3289,14 +3313,11 @@ mod kb {
             "SELECT n.path, n.version, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status,
                     CASE WHEN lower(r.path) LIKE '%.tdbasset' THEN left(r.path, -9) ELSE r.path END,
                     coalesce(lower(r.path) LIKE '%.tdbasset', false), r.id
-               FROM kb.link l JOIN kb.node n ON n.id = l.file_id
+               FROM kb.link l JOIN kb.my_node n ON n.id = l.file_id
                LEFT JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL
-              WHERE n.deleted_at IS NULL{vis} AND {where_sql}
+              WHERE {where_sql}
               ORDER BY n.path, l.line, l.id LIMIT {lim}",
             lim = lim.max(1),
-            // As in `prop_keys`: the predicate only where there is a token, so the owner's
-            // statement is the one it was and keeps its plan.
-            vis = if has_token() { " AND kb.visible(n.path)" } else { "" },
         );
         Spi::connect(|client| {
             let args: Vec<pgrx::datum::DatumWithOid> = args.iter().map(|a| a.as_str().into()).collect();
@@ -3447,19 +3468,24 @@ mod kb {
     ) -> TableIterator<'static, (name!(key, String), name!(docs, i64), name!(values_n, i64), name!(kind, String))> {
         let lower = prefix.to_lowercase();
         let (lo, hi) = prefix_range(&lower);
-        // The owner's statement carries no visibility predicate at all, and an account's carries
-        // one. Not one statement with a guard in it: a subquery in the WHERE costs the *other*
-        // conjunct its custom plan, so the range over `property_kv` stopped being an index scan
-        // and the prefixed calls went 40-60x slower for the owner. Two texts, one chosen once.
-        let vis = if has_token() { " AND kb.visible(n.path)" } else { "" };
+        // `kb.my_node` is the join that used to be `kb.node` plus a per-row `kb.visible(n.path)`.
+        // That predicate is a function call for every row it is asked about, and the function
+        // queries the grant table, which queries the token table: a property query over 600
+        // documents ran 28x slower as an account than as the owner. The view is the same
+        // restriction evaluated once, and it carries `deleted_at IS NULL` with it.
+        //
+        // One statement now serves both, because the branch is chosen by an InitPlan *inside*
+        // `kb.my_node` rather than by a subquery in this statement's own WHERE — which is what
+        // the two texts below used to avoid, a guard there costing the range over `property_kv`
+        // its index scan and making the owner's prefixed calls 40-60x slower.
         let sql = format!(
             "SELECT r.key, count(DISTINCT r.file_id), count(DISTINCT r.val_lc),
                     CASE WHEN count(r.val_num) = 0 THEN 'text'
                          WHEN count(r.val_num) = count(r.val_txt) THEN 'number'
                          ELSE 'mixed' END
                FROM kb.property r
-               JOIN kb.node n ON n.id = r.file_id AND n.deleted_at IS NULL
-              WHERE ($1 = '' OR (r.key_lc >= $2 AND r.key_lc < $3)){vis}
+               JOIN kb.my_node n ON n.id = r.file_id
+              WHERE ($1 = '' OR (r.key_lc >= $2 AND r.key_lc < $3))
               GROUP BY r.key
               ORDER BY count(DISTINCT r.file_id) DESC, r.key
               LIMIT $4"
@@ -3496,17 +3522,22 @@ mod kb {
         let lower = prefix.to_lowercase();
         let (lo, hi) = prefix_range(&lower);
         let k = key.to_lowercase();
-        // The owner's statement carries no visibility predicate at all, and an account's carries
-        // one. Not one statement with a guard in it: a subquery in the WHERE costs the *other*
-        // conjunct its custom plan, so the range over `property_kv` stopped being an index scan
-        // and the prefixed calls went 40-60x slower for the owner. Two texts, one chosen once.
-        let vis = if has_token() { " AND kb.visible(n.path)" } else { "" };
+        // `kb.my_node` is the join that used to be `kb.node` plus a per-row `kb.visible(n.path)`.
+        // That predicate is a function call for every row it is asked about, and the function
+        // queries the grant table, which queries the token table: a property query over 600
+        // documents ran 28x slower as an account than as the owner. The view is the same
+        // restriction evaluated once, and it carries `deleted_at IS NULL` with it.
+        //
+        // One statement now serves both, because the branch is chosen by an InitPlan *inside*
+        // `kb.my_node` rather than by a subquery in this statement's own WHERE — which is what
+        // the two texts below used to avoid, a guard there costing the range over `property_kv`
+        // its index scan and making the owner's prefixed calls 40-60x slower.
         let sql = format!(
             "SELECT r.val_txt, count(DISTINCT r.file_id)
                FROM kb.property r
-               JOIN kb.node n ON n.id = r.file_id AND n.deleted_at IS NULL
+               JOIN kb.my_node n ON n.id = r.file_id
               WHERE r.key_lc = $1
-                AND ($2 = '' OR (r.val_lc >= $3 AND r.val_lc < $4)){vis}
+                AND ($2 = '' OR (r.val_lc >= $3 AND r.val_lc < $4))
               GROUP BY r.val_txt
               ORDER BY count(DISTINCT r.file_id) DESC, r.val_txt
               LIMIT $5"
@@ -3557,8 +3588,8 @@ mod kb {
             // `2026-09-16T05:04:00.000Z` on SQLite and `2026-09-16 05:04:00+00` here.
             "SELECT n.path, coalesce(n.nbytes, 0), coalesce(to_char(n.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), ''),
                     (SELECT f.data::text FROM kb.frontmatter f WHERE f.file_id = n.id AND f.version = n.version)
-               FROM kb.node n
-              WHERE n.deleted_at IS NULL AND n.kind = 1{vis}
+               FROM kb.my_node n
+              WHERE n.kind = 1
                 AND EXISTS (SELECT 1 FROM kb.property u WHERE u.file_id = n.id)
                 AND ({where_clause})
                 AND (${folder_i} = '/' OR n.path = ${folder_i} OR n.path LIKE ${like_i} ESCAPE '\\')
@@ -3567,9 +3598,6 @@ mod kb {
             folder_i = n + 1,
             like_i = n + 2,
             lim_i = n + 3,
-            // Only a token session carries the predicate; see `prop_keys` for why it is not one
-            // statement with a guard in it.
-            vis = if has_token() { " AND kb.visible(n.path)" } else { "" },
         );
         let rows = Spi::connect(|client| {
             let mut bound: Vec<pgrx::datum::DatumWithOid> = Vec::with_capacity(n + 3);
