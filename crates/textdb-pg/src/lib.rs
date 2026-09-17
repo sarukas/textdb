@@ -423,6 +423,11 @@ BEGIN
   SELECT g.alias INTO a FROM kb.my_grant g
    WHERE g.dormant AND (g.alias = '' OR p = '/' || g.alias OR p LIKE ('/' || g.alias || '/%')) LIMIT 1;
   IF FOUND THEN
+    -- A single-root account has no alias to name — its root *is* the share — so the message says
+    -- so rather than pointing at `/`, which reads like a bug in the caller.
+    IF a = '' THEN
+      PERFORM kb._raise('TX005', 'your root share is no longer available: its folder is in the trash', '');
+    END IF;
     PERFORM kb._raise('TX005', p || ': its folder is in the trash', '');
   END IF;
   -- A write at the root, or one segment below it, names something that would have to *be* a
@@ -547,17 +552,27 @@ CREATE INDEX chunk_tsv ON kb.chunk USING gin(tsv);
 CREATE VIEW kb.file AS
   -- The minimal listing tier plus what only a file has: its content and parsed front matter.
   -- `parent_path` is now `dir`, the one name for it across every surface.
-  SELECT n.path, n.name, 'file'::text AS kind, n.version,
+  --
+  -- The caller's paths and only what it can see, as `kb.entry` does and for the same reason: this
+  -- is the *writable* surface, so `UPDATE kb.file … WHERE dir = '/contracts'` has to mean the
+  -- account's `/contracts`, and a row it cannot see is not a row it can write. `content` is
+  -- projected too — it is text the caller reads — which the owner's branch skips outright, so a
+  -- store that delegates nothing materializes exactly as it did.
+  SELECT v.p AS path,
+         CASE WHEN v.p = '/' THEN '/' ELSE right(v.p, strpos(reverse(v.p), '/') - 1) END AS name,
+         'file'::text AS kind, n.version,
          coalesce(n.nbytes, 0) AS nbytes, coalesce(n.nlines, 0) AS nlines,
          n.updated_at, n.updated_by,
          n.id,
-         CASE WHEN strpos(reverse(n.path), '/') = length(n.path) THEN '/'
-              ELSE left(n.path, length(n.path) - strpos(reverse(n.path), '/')) END AS dir,
-         kb._materialize(n.root) AS content,
+         CASE WHEN strpos(reverse(v.p), '/') = length(v.p) THEN '/'
+              ELSE left(v.p, length(v.p) - strpos(reverse(v.p), '/')) END AS dir,
+         CASE WHEN (SELECT kb.current_account()) IS NULL THEN kb._materialize(n.root)
+              ELSE kb.content(v.p, NULL::bigint) END AS content,
          (SELECT fm.data FROM kb.frontmatter fm WHERE fm.file_id = n.id AND fm.version = n.version) AS frontmatter,
          NULL::bigint AS base_version
   FROM kb.node n
-  WHERE n.kind = 1 AND n.deleted_at IS NULL;
+  CROSS JOIN LATERAL (SELECT CASE WHEN (SELECT kb.current_account()) IS NULL THEN n.path ELSE kb.to_view(n.path) END AS p) v
+  WHERE n.kind = 1 AND n.deleted_at IS NULL AND ((SELECT kb.current_account()) IS NULL OR kb.visible(n.path));
 
 CREATE VIEW kb.file_version AS
   SELECT n.id, n.path, c.version, kb._materialize(c.root) AS content,
@@ -1137,6 +1152,14 @@ mod kb {
     /// row's `old_path`, an error's subject. The same words on both engines.
     const OUTSIDE: &str = "(outside your shares)";
 
+    /// May this connection write at this *store* path? True for the owner.
+    pub(crate) fn writable(store_path: &str) -> bool {
+        if account_id_now().is_none() {
+            return true;
+        }
+        Spi::get_one_with_args::<bool>("SELECT kb.writable($1)", &[store_path.into()]).ok().flatten().unwrap_or(false)
+    }
+
     /// Refuse an operation that would move or delete the *root* of a share.
     ///
     /// A share root is a folder the account works inside and does not own: moving or deleting it is
@@ -1155,7 +1178,7 @@ mod kb {
 
     /// A store path as this connection sees it; `None` when it sees nothing there. The owner's
     /// paths are the store's own, so this answers without touching the database for them.
-    fn to_view(store_path: &str) -> Option<String> {
+    pub(crate) fn to_view(store_path: &str) -> Option<String> {
         if account_id_now().is_none() {
             return Some(store_path.to_string());
         }

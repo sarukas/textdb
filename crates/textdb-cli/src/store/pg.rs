@@ -471,8 +471,13 @@ fn statement_error(e: postgres::Error, write: bool) -> StoreError {
     let Some(db) = e.as_db_error() else { return pg(e) };
     let read_only = db.code().code() == "25006" || db.message().contains("read-only transaction");
     let mut err = pg(e);
-    err.code = "TX004".to_string();
-    err.conflict = None;
+    // The SQL is the caller's, so a *SQL* error is invalid input — but a refusal the store raised
+    // from inside the statement keeps its own kind, as it does on SQLite: a row refused for want of
+    // rights exits 7, and a path the caller cannot address exits 5 (#12 C18, K4).
+    if !err.code.starts_with("TX") || err.code == "TX000" {
+        err.code = "TX004".to_string();
+        err.conflict = None;
+    }
     if read_only && !write {
         err.message = format!("{}: this statement changes the store; run it with --write", err.message);
     }

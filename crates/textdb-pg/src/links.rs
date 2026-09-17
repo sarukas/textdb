@@ -311,6 +311,16 @@ pub fn follow_move(
         let Some((source, root)) = live_path(file_id)? else {
             continue;
         };
+        // A linking file the caller may not write is left exactly as it is. It is still a fact
+        // about the move — the link now points somewhere else — so it is reported, as a count with
+        // no path: naming it would disclose a layout the account cannot see (#12 D14).
+        if !crate::kb::writable(&source) {
+            changes.push(serde_json::json!({
+                "path": "", "line": 0, "kind": "", "target": "", "now_at": "",
+                "version": Option::<i64>::None, "outside": true,
+            }));
+            continue;
+        }
         let mut rewritten = HashSet::new();
         let mut version = None;
         if let (LinkUpdates::Rewrite, Some(root)) = (mode, root) {
@@ -341,13 +351,18 @@ pub fn follow_move(
         }
         for p in &links {
             let now_at = live_path(p.resolved_id)?.map(|(path, _)| path).unwrap_or_default();
+            // Both paths in the caller's namespace. The file is one it can write, so it has a
+            // path; the target may not be, and is then named as nothing rather than as a store
+            // path.
+            let seen = |p: &str| crate::kb::to_view(p).unwrap_or_default();
             changes.push(serde_json::json!({
-                "path": source,
+                "path": seen(&source),
                 "line": p.line,
                 "kind": p.kind,
                 "target": p.target,
-                "now_at": now_at,
+                "now_at": seen(&now_at),
                 "version": if rewritten.contains(&p.id) { version } else { None },
+                "outside": false,
             }));
         }
     }

@@ -1047,10 +1047,16 @@ fn c_sql_writes_are_checked_per_row_before_anything_commits() {
 fn c_revert_batch_needs_every_file_of_the_batch_to_be_writable() {
     scenarios!("C19", "C20");
     on_each_engine(|f| {
+        // The engine's own writable relation, as in C17.
+        let table = if f.engine() == Engine::Sqlite { "kb" } else { "kb.file" };
         // C19: a batch entirely inside the rw share.
         let mine = ok(
-            f.as_("accounts-agent")
-                .args(["--json", "sql", "--write", "UPDATE kb SET content = content || '\nc19\n' WHERE path = '/contracts/acme.md'"]),
+            f.as_("accounts-agent").args([
+                "--json",
+                "sql",
+                "--write",
+                &format!("UPDATE {table} SET content = content || '\nc19\n' WHERE path = '/contracts/acme.md'"),
+            ]),
             None,
         )
         .json();
@@ -1060,8 +1066,12 @@ fn c_revert_batch_needs_every_file_of_the_batch_to_be_writable() {
 
         // C20: a batch admin made across both shares cannot be reverted by the ro holder.
         let theirs = ok(
-            f.as_("admin")
-                .args(["--json", "sql", "--write", "UPDATE kb SET content = content || '\nc20\n' WHERE path = '/products/roadmap.md'"]),
+            f.as_("admin").args([
+                "--json",
+                "sql",
+                "--write",
+                &format!("UPDATE {table} SET content = content || '\nc20\n' WHERE path = '/products/roadmap.md'"),
+            ]),
             None,
         )
         .json();
