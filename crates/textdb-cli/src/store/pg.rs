@@ -783,17 +783,19 @@ impl Store for PgStore {
             None => {
                 // One statement, so the content and its version come from the same snapshot.
                 //
-                // `kb.entry`, not `kb.node`: the raw table holds store paths, and the caller's
-                // path is its own. Everything this module sends is in the caller's namespace and
-                // the extension translates — reaching past it to a table was a leak waiting to
+                // A view, not `kb.node`: the raw table holds store paths, and the caller's path
+                // is its own. Everything this module sends is in the caller's namespace and the
+                // extension translates — reaching past it to a table was a leak waiting to
                 // happen and, once accounts existed, simply failed to find anything.
+                //
+                // `kb.file` rather than `kb.entry`, because `kb.file` already *has* the content
+                // column and builds it from the row it found. `kb.content(path)` off `kb.entry`
+                // resolved the caller's path a second time and looked the node up again, on the
+                // hottest read there is, to reach the row the outer query was already standing
+                // on.
                 let row = self
                     .client
-                    .query_opt(
-                        "SELECT kb.content(path, NULL::bigint), version FROM kb.entry \
-                         WHERE path = $1 AND kind = 'file'",
-                        &[&path],
-                    )
+                    .query_opt("SELECT content, version FROM kb.file WHERE path = $1", &[&path])
                     .map_err(pg)?;
                 let row = match row {
                     Some(row) => row,

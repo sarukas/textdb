@@ -68,17 +68,22 @@ pub struct NodeRow {
     pub path: String,
     pub root: Option<Hash>,
     pub version: i64,
+    /// Links the extractor found at this version. Carried because it answers "is there anything
+    /// to project?" without parsing the document: link projection scans the text for targets and
+    /// resolves each one, and for a document with none — every non-markdown file, and most
+    /// markdown ones — that whole pass is a markdown parse of the body for nothing.
+    pub nlinks: i64,
 }
 
 impl NodeRow {
     /// Live node at `path`; with `any`, fall back to the most recently deleted one.
     pub fn by_path(path: &str, any: bool) -> Option<NodeRow> {
-        let live = Self::query("SELECT id, kind, path, root, version FROM kb.node WHERE path = $1 AND deleted_at IS NULL", path);
+        let live = Self::query("SELECT id, kind, path, root, version, nlinks FROM kb.node WHERE path = $1 AND deleted_at IS NULL", path);
         if live.is_some() || !any {
             return live;
         }
         Self::query(
-            "SELECT id, kind, path, root, version FROM kb.node WHERE path = $1 ORDER BY deleted_at DESC LIMIT 1",
+            "SELECT id, kind, path, root, version, nlinks FROM kb.node WHERE path = $1 ORDER BY deleted_at DESC LIMIT 1",
             path,
         )
     }
@@ -95,6 +100,7 @@ impl NodeRow {
                     path: r.get::<String>(3).unwrap_or_else(|e| spi_err(e)).unwrap_or_default(),
                     root: root.and_then(|v| to_hash(&v).ok()),
                     version: r.get::<i64>(5).unwrap_or_else(|e| spi_err(e)).unwrap_or(0),
+                    nlinks: r.get::<i64>(6).unwrap_or_else(|e| spi_err(e)).unwrap_or(0),
                 });
             }
             out
@@ -105,7 +111,7 @@ impl NodeRow {
         Spi::connect(|client| {
             let t = client
                 .select(
-                    "SELECT id, kind, path, root, version FROM kb.node WHERE kind = 1 AND deleted_at IS NULL AND ($1 = '/' OR left(path, length($1) + 1) = $1 || '/') ORDER BY path",
+                    "SELECT id, kind, path, root, version, nlinks FROM kb.node WHERE kind = 1 AND deleted_at IS NULL AND ($1 = '/' OR left(path, length($1) + 1) = $1 || '/') ORDER BY path",
                     None,
                     &[prefix.into()],
                 )
@@ -119,6 +125,7 @@ impl NodeRow {
                     path: r.get::<String>(3).unwrap_or_else(|e| spi_err(e)).unwrap_or_default(),
                     root: root.and_then(|v| to_hash(&v).ok()),
                     version: r.get::<i64>(5).unwrap_or_else(|e| spi_err(e)).unwrap_or(0),
+                    nlinks: r.get::<i64>(6).unwrap_or_else(|e| spi_err(e)).unwrap_or(0),
                 });
             }
             v

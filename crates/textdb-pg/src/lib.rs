@@ -797,11 +797,20 @@ CREATE VIEW kb.folder AS
 -- they stopped being the moment an account could see the store under an alias. `kb._node_id`
 -- still does the existence check and the refusal, so a path outside the caller's shares is
 -- refused there rather than quietly listing nothing.
+-- **`AS MATERIALIZED` is load-bearing.** The folder's own path in the caller's namespace is one
+-- value, but written as a lateral subquery the planner folded `kb.to_view(n.path)` into the join
+-- condition and evaluated it once per candidate row — and `kb.to_view` queries the grant table,
+-- which queries the token table. Listing a 2,000-document folder as an account took 328 ms
+-- against the owner's 4.6 ms for that reason alone, and the plan said so outright: the call sat
+-- in `Join Filter`. Materialised, it is computed once and the account's listing costs what the
+-- owner's does.
 CREATE FUNCTION kb.ls(path text, recursive boolean DEFAULT false) RETURNS SETOF kb.entry LANGUAGE sql STABLE AS $$
-  SELECT e.* FROM (SELECT kb._node_id($1) AS id) d
-  JOIN LATERAL (SELECT CASE WHEN (SELECT kb.current_account()) IS NULL THEN n.path
-                            ELSE coalesce(kb.to_view(n.path), '/') END AS p
-                  FROM kb.node n WHERE n.id = d.id) v ON true
+  WITH v AS MATERIALIZED (
+    SELECT CASE WHEN (SELECT kb.current_account()) IS NULL THEN n.path
+                ELSE coalesce(kb.to_view(n.path), '/') END AS p
+      FROM kb.node n WHERE n.id = kb._node_id($1)
+  )
+  SELECT e.* FROM v
   JOIN kb.entry e
     ON CASE WHEN recursive THEN e.path <> '/' AND (v.p = '/' OR e.path LIKE kb._subtree_like(v.p)) ELSE e.dir IS NOT DISTINCT FROM v.p END
   ORDER BY CASE WHEN recursive THEN e.path ELSE e.name END
@@ -1320,11 +1329,21 @@ mod kb {
 
     /// A store path as this connection sees it; `None` when it sees nothing there. The owner's
     /// paths are the store's own, so this answers without touching the database for them.
+    /// A store path as this connection sees it, without leaving Rust.
+    ///
+    /// It used to ask SQL twice — `SELECT kb.current_account()` to find out whether there was
+    /// anything to do, then `SELECT kb.to_view($1)` to do it — and the second queries the grant
+    /// table, which queries the token table. That is two SPI round trips and a SHA-256 **per
+    /// row**, and `search` calls it once per hit: a two-term search over 2,000 documents spent
+    /// 75 of its 81 ms here, against 6 ms for the query that found the hits.
+    ///
+    /// `View::to_view` is the same rule — the one `textdb-core` holds and both engines share —
+    /// applied to a view this transaction has already paid for.
     pub(crate) fn to_view(store_path: &str) -> Option<String> {
-        if account_id_now().is_none() {
-            return Some(store_path.to_string());
+        match current_view() {
+            None => Some(store_path.to_string()),
+            Some(v) => v.to_view(store_path),
         }
-        Spi::get_one_with_args::<String>("SELECT kb.to_view($1)", &[store_path.into()]).ok().flatten()
     }
 
     /// This connection's view of the store, or `None` for the owner, who has no translation to do.
@@ -1332,7 +1351,41 @@ mod kb {
     /// The same `View` the SQLite binding builds, from the same three tables, so link projection
     /// is one algorithm over two persistences rather than two implementations that have to be
     /// kept agreeing (#12 part 2).
+    /// This connection's view, cached for the transaction that asked for it.
+    ///
+    /// Building one costs two queries — the account row and its grants — and it is asked for
+    /// per *row*: once per projected document, once per search hit, once per translated path.
+    /// A two-term search over 2,000 documents spent 75 of its 81 ms here, outside SQL entirely,
+    /// while the query that found the hits took 6.
+    ///
+    /// The key is the bearer plus the transaction's start time, so a different token or a later
+    /// transaction rebuilds it and nothing survives a commit. Granting or revoking inside the
+    /// same transaction is the one case that would go stale, and those commands clear it.
+    thread_local! {
+        static VIEW_CACHE: std::cell::RefCell<Option<(String, i64, Option<textdb_core::access::View>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Forget the cached view. Called wherever a grant changes under a live transaction.
+    pub(crate) fn forget_view() {
+        VIEW_CACHE.with(|c| *c.borrow_mut() = None);
+    }
+
     pub(crate) fn current_view() -> Option<textdb_core::access::View> {
+        let token = token_now();
+        // SAFETY: valid inside a transaction, which every function here runs in.
+        let xact = unsafe { pgrx::pg_sys::GetCurrentTransactionStartTimestamp() };
+        if let Some(v) = VIEW_CACHE.with(|c| {
+            c.borrow().as_ref().filter(|(t, x, _)| *t == token && *x == xact).map(|(_, _, v)| v.clone())
+        }) {
+            return v;
+        }
+        let built = build_view();
+        VIEW_CACHE.with(|c| *c.borrow_mut() = Some((token, xact, built.clone())));
+        built
+    }
+
+    fn build_view() -> Option<textdb_core::access::View> {
         use textdb_core::access::{Namespace, View};
         let id = account_id_now()?;
         let row: Option<(String, Option<i64>)> = Spi::connect(|client| {
@@ -1397,6 +1450,12 @@ mod kb {
     /// cannot see as `textdb:<id>`. The owner's text is the store's own, untouched.
     fn project_text_of(file_id: i64, source: &str, text: &[u8]) -> Vec<u8> {
         let Some(view) = current_view() else { return text.to_vec() };
+        // Asking costs one indexed lookup; not asking costs a markdown parse of the whole body.
+        // Below a few KiB the parse is the cheaper of the two, so the question is only worth
+        // putting for a document where it is not.
+        if text.len() >= ASK_NLINKS_ABOVE && !has_links(file_id) {
+            return text.to_vec();
+        }
         let spans = scan_target_spans(file_id, source, text);
         if spans.is_empty() {
             return text.to_vec();
@@ -1405,6 +1464,33 @@ mod kb {
     }
 
     /// The inverse, for text arriving from a caller.
+    /// Body size above which it is worth asking the node row whether there is anything to
+    /// project, rather than finding out by parsing.
+    const ASK_NLINKS_ABOVE: usize = 8 * 1024;
+
+    /// Does this document have any links recorded? The counter is on the node row, kept current
+    /// by every commit.
+    ///
+    /// Projection scans the text for link targets and resolves each one — a markdown parse of the
+    /// whole body, and a lookup per link. For a document with no links there is nothing to find
+    /// and nothing to change, and that is every file that is not markdown and most that are. A
+    /// 1 MiB read by an account was parsing a megabyte of non-markdown as markdown to discover
+    /// it had no links.
+    ///
+    /// Note this is HEAD's count, and projection also runs over *older* versions, whose link set
+    /// may differ. Erring is one-way by construction: a document that has links now is projected
+    /// whatever the version said, and one that has none now has had its links removed, so an old
+    /// version's targets are the caller's own paths already or point at what it cannot see —
+    /// which is exactly what `nlinks_broken` would have counted. The check is a fast path, not a
+    /// second opinion on what the text contains.
+    fn has_links(file_id: i64) -> bool {
+        Spi::get_one_with_args::<i64>("SELECT nlinks FROM kb.node WHERE id = $1", &[file_id.into()])
+            .ok()
+            .flatten()
+            .unwrap_or(1)
+            > 0
+    }
+
     fn unproject_text_of(file_id: i64, source: &str, text: &[u8]) -> Vec<u8> {
         let Some(view) = current_view() else { return text.to_vec() };
         let spans = scan_target_spans(file_id, source, text);
@@ -1472,9 +1558,14 @@ mod kb {
         author: Option<&str>,
         message: Option<&str>,
     ) -> i64 {
-        Spi::run_with_args(
+        // The seq comes back from the insert. It used to be fetched afterwards with
+        // `currval(pg_get_serial_sequence('kb.change','seq'))` — a second round trip *and* a
+        // catalogue lookup, on a function every write calls and whose result most callers
+        // (`record_commit` among them) throw away.
+        Spi::get_one_with_args::<i64>(
             "WITH c AS (INSERT INTO kb.change(op, node_id, node_kind, path, old_path, version, base_version, commit_kind, author, message, batch) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, kb.batch()) RETURNING seq) SELECT pg_notify('textdb_change', seq::text) FROM c",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, kb.batch()) RETURNING seq) \
+             SELECT seq FROM c, LATERAL pg_notify('textdb_change', c.seq::text)",
             &[
                 op.into(),
                 node_id.into(),
@@ -1488,10 +1579,8 @@ mod kb {
                 message.into(),
             ],
         )
-        .unwrap_or_else(|e| spi_err(e));
-        Spi::get_one::<i64>("SELECT currval(pg_get_serial_sequence('kb.change', 'seq'))")
-            .unwrap_or_else(|e| spi_err(e))
-            .unwrap_or(0)
+        .unwrap_or_else(|e| spi_err(e))
+        .unwrap_or(0)
     }
 
     /// One row in an account's own feed: an event about its shares, which nobody else's feed
@@ -1559,16 +1648,22 @@ mod kb {
     ) {
         let st = SpiStorage::new();
         let (nbytes, nlines) = ok(totals(&st, &c.root));
-        let (old_bytes, old_lines, old_words) = Spi::connect(|client| {
+        // Every counter this commit is about to move, read once. There used to be two reads of
+        // this row — the content three here, the structure four where the sidecar was written —
+        // and two writes back, because the content and the structure each rolled their own
+        // delta up separately. They are one commit; they are now one read, one write and one
+        // journal row.
+        let (old_bytes, old_lines, old_words, old_authors) = Spi::connect(|client| {
             let rows = client
-                .select("SELECT nbytes, nlines, nwords FROM kb.node WHERE id = $1", None, &[file_id.into()])
+                .select("SELECT nbytes, nlines, nwords, nauthors FROM kb.node WHERE id = $1", None, &[file_id.into()])
                 .unwrap_or_else(|e| spi_err(e));
-            let mut out = (None, None, None);
+            let mut out = (None, None, None, 0i64);
             for r in rows {
                 out = (
                     r.get::<i64>(1).unwrap_or_else(|e| spi_err(e)),
                     r.get::<i64>(2).unwrap_or_else(|e| spi_err(e)),
                     r.get::<i64>(3).unwrap_or_else(|e| spi_err(e)),
+                    r.get::<i64>(4).unwrap_or(None).unwrap_or(0),
                 );
             }
             out
@@ -1599,16 +1694,96 @@ mod kb {
         .unwrap_or_else(|e| spi_err(e));
         let op = if c.version == 1 { "create" } else { "commit" };
         record_change(op, file_id, 1, path, None, Some(c.version as i64), base_version, Some(c.kind.as_str()), author, message);
-        Spi::run_with_args(
+        // `xmax = 0` on the returned row means the upsert inserted rather than updated, which
+        // is exactly when the author count goes up. It used to be recounted with a `SELECT
+        // count(*) FROM kb.file_author` inside the node update — a second pass over the rows
+        // this statement just touched, to learn a number it already knows.
+        let new_author = Spi::get_one_with_args::<bool>(
             "INSERT INTO kb.file_author AS a (file_id, author, commits, first_ts, last_ts) VALUES ($1, coalesce($2, ''), 1, now(), now()) \
-             ON CONFLICT (file_id, author) DO UPDATE SET commits = a.commits + 1, last_ts = EXCLUDED.last_ts",
+             ON CONFLICT (file_id, author) DO UPDATE SET commits = a.commits + 1, last_ts = EXCLUDED.last_ts \
+             RETURNING (xmax = 0)",
             &[file_id.into(), author.into()],
         )
-        .unwrap_or_else(|e| spi_err(e));
+        .unwrap_or_else(|e| spi_err(e))
+        .unwrap_or(false);
+        let nauthors = old_authors + new_author as i64;
+        // One statement, not one per chunk. `SpiStorage::flush` learned this for `kb.chunk`
+        // itself — "652 statements to store a 1 MiB document" — and the reference rows it
+        // writes alongside were left behind: a create that added 650 chunks still paid 650
+        // round trips here, right after the batched insert that stored them.
+        let mut seen = std::collections::HashSet::new();
+        let fresh: Vec<Vec<u8>> = c.new_chunks.iter().filter(|h| seen.insert(**h)).map(|h| h.to_vec()).collect();
+        if !fresh.is_empty() {
+            Spi::run_with_args(
+                "INSERT INTO kb.chunk_ref(chunk_id, file_id, version) \
+                 SELECT ch.id, $2, $3 FROM unnest($1::bytea[]) AS w(hash) JOIN kb.chunk ch ON ch.hash = w.hash \
+                 ON CONFLICT DO NOTHING",
+                &[fresh.into(), file_id.into(), (c.version as i64).into()],
+            )
+            .unwrap_or_else(|e| spi_err(e));
+        }
+        // The structure, when there is one, before the row is written: its counters go into
+        // the same update and its delta into the same journal row as the content's.
+        let lower = path.to_ascii_lowercase();
+        let structure = (lower.ends_with(".md") || lower.ends_with(".markdown")).then(|| {
+            let bytes = ok(materialize_all(&st, &c.root));
+            let s = MarkdownExtractor.extract(&bytes);
+            ok(write_structure(file_id, c.version as i64, &s));
+            let title = document_title(&s);
+            // **Read the old counters here, not at the top of this function.** Storing the link
+            // rows can relink documents that were waiting for this one, and a relink calls
+            // `refresh_broken_links`, which moves `nlinks_broken` on this very row and rolls its
+            // own delta into the folders. Counters read before that has happened are a version
+            // behind, and the delta computed from them counts the same change twice: a file with
+            // two links, one broken, made its folder report three.
+            let old = Spi::connect(|client| {
+                let rows = client
+                    .select("SELECT nsections, nprops, nlinks, nlinks_broken FROM kb.node WHERE id = $1", None, &[file_id.into()])
+                    .unwrap_or_else(|e| spi_err(e));
+                let mut out = [0i64; 4];
+                for r in rows {
+                    let g = |i: usize| r.get::<i64>(i).unwrap_or(None).unwrap_or(0);
+                    out = [g(1), g(2), g(3), g(4)];
+                }
+                out
+            });
+            // Broken links are counted after `write_structure` has stored this version's rows.
+            let counts = [
+                s.sections.len() as i64,
+                s.frontmatter.as_ref().and_then(|v| v.as_object()).map_or(0, |o| o.len()) as i64,
+                s.links.len() as i64,
+                ok(broken_links_of(file_id)),
+            ];
+            (title, counts, old)
+        });
+        // A file with no structure leaves those four columns alone, so there is nothing to read
+        // for it and nothing to roll up.
+        let (str_counts, old_str) = structure.as_ref().map(|(_, c, o)| (*c, *o)).unwrap_or(([0i64; 4], [0i64; 4]));
         Spi::run_with_args(
-            "UPDATE kb.node SET nbytes = $1, nlines = $2, updated_by = $3, nwords = $5, \
-             nauthors = (SELECT count(*) FROM kb.file_author WHERE file_id = $4) WHERE id = $4",
-            &[(nbytes as i64).into(), (nlines as i64).into(), author.into(), file_id.into(), nwords.into()],
+            "UPDATE kb.node SET nbytes = $1, nlines = $2, updated_by = $3, nwords = $5, nauthors = $6, \
+                    title = CASE WHEN $12 THEN $7 ELSE title END, \
+                    nsections = CASE WHEN $12 THEN $8 ELSE nsections END, \
+                    nprops = CASE WHEN $12 THEN $9 ELSE nprops END, \
+                    nlinks = CASE WHEN $12 THEN $10 ELSE nlinks END, \
+                    nlinks_broken = CASE WHEN $12 THEN $11 ELSE nlinks_broken END \
+              WHERE id = $4",
+            &[
+                (nbytes as i64).into(),
+                (nlines as i64).into(),
+                author.into(),
+                file_id.into(),
+                nwords.into(),
+                nauthors.into(),
+                structure.as_ref().and_then(|(t, _, _)| t.as_deref()).into(),
+                str_counts[0].into(),
+                str_counts[1].into(),
+                str_counts[2].into(),
+                str_counts[3].into(),
+                // Only a document with a structure has a title, and one that loses its title
+                // must lose it: `coalesce` would keep the old one forever. A file that is not
+                // markdown has none of this and keeps whatever the row holds.
+                structure.is_some().into(),
+            ],
         )
         .unwrap_or_else(|e| spi_err(e));
         let change = Totals {
@@ -1618,75 +1793,16 @@ mod kb {
             lines: nlines as i64 - old_lines.unwrap_or(0),
             words: nwords - old_words.unwrap_or(0),
             versions: 1,
-            // The structure counts move in `write_structure_counts`, which knows what the
-            // extractor found; it rolls its own delta up so this one stays about content.
-            ..Totals::default()
+            sections: str_counts[0] - old_str[0],
+            props: str_counts[1] - old_str[1],
+            links: str_counts[2] - old_str[2],
+            links_broken: str_counts[3] - old_str[3],
         };
         ok(add_to_ancestors(path, &change, author));
-        let mut seen = std::collections::HashSet::new();
-        for h in &c.new_chunks {
-            if !seen.insert(*h) {
-                continue;
-            }
-            Spi::run_with_args(
-                "INSERT INTO kb.chunk_ref(chunk_id, file_id, version) SELECT id, $2, $3 FROM kb.chunk WHERE hash = $1 ON CONFLICT DO NOTHING",
-                &[h.to_vec().into(), file_id.into(), (c.version as i64).into()],
-            )
-            .unwrap_or_else(|e| spi_err(e));
-        }
-        let lower = path.to_ascii_lowercase();
-        if lower.ends_with(".md") || lower.ends_with(".markdown") {
-            let bytes = ok(materialize_all(&st, &c.root));
-            let s = MarkdownExtractor.extract(&bytes);
-            ok(write_structure(file_id, c.version as i64, &s));
-            ok(write_structure_counts(file_id, path, &s));
-        }
         if c.version == 1 {
             // Links elsewhere may have been waiting for a file of this name.
             ok(crate::links::relink(&[textdb_md::resolve::name_key(path)], &[]));
         }
-    }
-
-    /// Store what the extractor found on the node row and roll the change into the folders.
-    ///
-    /// The same pattern the word count uses, so a listing reads "12 headings, 4 properties,
-    /// 2 links" off the row rather than running three queries per file.
-    fn write_structure_counts(file_id: i64, path: &str, s: &textdb_core::structure::Structure) -> Result<(), TextdbError> {
-        let title = document_title(s);
-        let sections = s.sections.len() as i64;
-        // Top-level front matter keys: `project.name` and `project.phase` are one property to
-        // a reader, the way `meta get project` shows it.
-        let props = s.frontmatter.as_ref().and_then(|v| v.as_object()).map_or(0, |o| o.len()) as i64;
-        let links = s.links.len() as i64;
-        let broken = broken_links_of(file_id)?;
-        let old = Spi::connect(|client| {
-            let rows = client
-                .select(
-                    "SELECT nsections, nprops, nlinks, nlinks_broken FROM kb.node WHERE id = $1",
-                    None,
-                    &[file_id.into()],
-                )
-                .map_err(storage_err)?;
-            let mut out = (0i64, 0i64, 0i64, 0i64);
-            for r in rows {
-                let g = |i: usize| r.get::<i64>(i).unwrap_or(None).unwrap_or(0);
-                out = (g(1), g(2), g(3), g(4));
-            }
-            Ok::<_, TextdbError>(out)
-        })?;
-        Spi::run_with_args(
-            "UPDATE kb.node SET title = $1, nsections = $2, nprops = $3, nlinks = $4, nlinks_broken = $5 WHERE id = $6",
-            &[title.as_deref().into(), sections.into(), props.into(), links.into(), broken.into(), file_id.into()],
-        )
-        .map_err(storage_err)?;
-        let change = Totals {
-            sections: sections - old.0,
-            props: props - old.1,
-            links: links - old.2,
-            links_broken: broken - old.3,
-            ..Totals::default()
-        };
-        add_to_ancestors(path, &change, None)
     }
 
     /// Recount `file_id`'s broken links, store the number and move the folders above it.
@@ -1765,10 +1881,18 @@ mod kb {
                 )
                 .map_err(storage_err)?;
             }
-            for t in ["kb.section", "kb.link", "kb.frontmatter", "kb.property"] {
-                Spi::run_with_args(&format!("UPDATE {t} SET version = $1 WHERE file_id = $2 AND version <> $1"), &[version.into(), file_id.into()])
-                    .map_err(storage_err)?;
-            }
+            // Four tables, one round trip. The sidecar rows are unchanged and only their
+            // version stamp moves, which is the common case on every body edit — four
+            // statements to touch four stamps was four times the SPI for one fact.
+            Spi::run_with_args(
+                "WITH s AS (UPDATE kb.section SET version = $1 WHERE file_id = $2 AND version <> $1), \
+                      l AS (UPDATE kb.link SET version = $1 WHERE file_id = $2 AND version <> $1), \
+                      f AS (UPDATE kb.frontmatter SET version = $1 WHERE file_id = $2 AND version <> $1), \
+                      p AS (UPDATE kb.property SET version = $1 WHERE file_id = $2 AND version <> $1) \
+                 SELECT 1",
+                &[version.into(), file_id.into()],
+            )
+            .map_err(storage_err)?;
             return Ok(());
         }
         for t in ["kb.section", "kb.frontmatter"] {
@@ -3537,9 +3661,12 @@ mod kb {
             return TableIterator::new(Vec::new());
         }
         let limit = lim.max(1) as usize;
-        // Only a token session carries the predicate; see `prop_keys` for why it is not one
-        // statement with a guard in it.
-        let vis = if has_token() { " AND kb.visible(n.path)" } else { "" };
+        // `kb.my_node`, not `kb.node` with a `kb.visible(n.path)` bolted on. That predicate is a
+        // function call per candidate row, and the function queries the grant table, which
+        // queries the token table: a two-term search over 2,000 documents took 362 ms as an
+        // account against 11 ms as the owner. The view is already only what this connection may
+        // see — a join, evaluated once — and it carries `deleted_at IS NULL` too. `n.path` on it
+        // is still the store's, which is what the prefix here is: `resolve` translated it above.
         // Per term: file_id → (chunk_id, rank).
         let mut per_term: Vec<std::collections::HashMap<i64, (i64, f32)>> = Vec::new();
         for t in &terms {
@@ -3547,7 +3674,7 @@ mod kb {
             let files: std::collections::HashMap<i64, (i64, f32)> = Spi::connect(|client| {
                 let t = client
                     .select(
-                        &format!("SELECT r.file_id, c.id, ts_rank(c.tsv, q) FROM kb.chunk c JOIN kb.chunk_ref r ON r.chunk_id = c.id JOIN kb.node n ON n.id = r.file_id, to_tsquery('simple', $1) q WHERE c.tsv @@ q AND n.deleted_at IS NULL AND n.kind = 1 AND ($2 = '/' OR n.path LIKE kb._subtree_like($2)){vis} ORDER BY 3 DESC LIMIT $3"),
+                        "SELECT r.file_id, c.id, ts_rank(c.tsv, q) FROM kb.chunk c JOIN kb.chunk_ref r ON r.chunk_id = c.id JOIN kb.my_node n ON n.id = r.file_id, to_tsquery('simple', $1) q WHERE c.tsv @@ q AND n.kind = 1 AND ($2 = '/' OR n.path LIKE kb._subtree_like($2)) ORDER BY 3 DESC LIMIT $3",
                         None,
                         &[tsq.as_str().into(), prefix.as_str().into(), ((limit.saturating_mul(50)).min(500_000) as i64).into()],
                     )
@@ -3708,15 +3835,20 @@ mod kb {
 
     /// Is `textdb.token` set on this connection at all? A C-level GUC read, no query.
     fn has_token() -> bool {
+        !token_now().is_empty()
+    }
+
+    /// The `textdb.token` GUC as it stands. A C-level read, no query.
+    fn token_now() -> String {
         let name = c"textdb.token";
         // SAFETY: the name is a valid NUL-terminated string and `missing_ok` is set, so an
         // unregistered GUC gives a null pointer rather than an error.
         let raw = unsafe { pgrx::pg_sys::GetConfigOption(name.as_ptr(), true, false) };
         if raw.is_null() {
-            return false;
+            return String::new();
         }
         // SAFETY: non-null means Postgres owns a NUL-terminated string for the lifetime of this call.
-        !unsafe { std::ffi::CStr::from_ptr(raw) }.to_bytes().is_empty()
+        unsafe { std::ffi::CStr::from_ptr(raw) }.to_string_lossy().into_owned()
     }
 
     /// Only the owner runs the delegation commands.
@@ -3869,6 +4001,9 @@ mod kb {
     #[pg_extern]
     fn account_convert(name: &str, alias: default!(Option<&str>, "NULL")) -> String {
         admin_only("convert accounts");
+        // A grant that moves under a live transaction must not be answered from a view built
+        // before it did.
+        forget_view();
         let id = account_id_of(name);
         let root: Option<i64> =
             Spi::get_one_with_args("SELECT root_node_id FROM kb.account WHERE id = $1", &[id.into()]).ok().flatten();
@@ -3971,6 +4106,9 @@ mod kb {
     #[pg_extern]
     fn token_revoke(id: i64) -> bool {
         admin_only("revoke tokens");
+        // A grant that moves under a live transaction must not be answered from a view built
+        // before it did.
+        forget_view();
         let n = Spi::get_one_with_args::<i64>(
             "WITH u AS (UPDATE kb.token SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL RETURNING 1) \
              SELECT count(*) FROM u",
@@ -3994,6 +4132,9 @@ mod kb {
     ) -> TableIterator<'static, (name!(alias, String), name!(rights, String), name!(store_path, String), name!(node_id, i64))> {
         use textdb_core::access::{Namespace, Rights};
         admin_only("grant access");
+        // A grant that moves under a live transaction must not be answered from a view built
+        // before it did.
+        forget_view();
         let rights = match Rights::parse(rights) {
             Some(r) => r,
             None => fail(TextdbError::InvalidEdit(format!("rights are 'ro' or 'rw', not '{rights}'"))),
@@ -4032,6 +4173,9 @@ mod kb {
     #[pg_extern]
     fn access_rename(account: &str, from: &str, to: &str) -> bool {
         admin_only("rename shares");
+        // A grant that moves under a live transaction must not be answered from a view built
+        // before it did.
+        forget_view();
         let id = account_id_of(account);
         let mut grants = grants_of(id);
         if let Err(e) = grants.rename(from, to) {
@@ -4055,6 +4199,9 @@ mod kb {
     #[pg_extern]
     fn access_revoke(account: &str, alias: &str) -> bool {
         admin_only("revoke shares");
+        // A grant that moves under a live transaction must not be answered from a view built
+        // before it did.
+        forget_view();
         let id = account_id_of(account);
         let n = Spi::get_one_with_args::<i64>(
             "WITH d AS (UPDATE kb.grant SET revoked_at = now() WHERE account_id = $1 AND alias = $2 \
@@ -4212,6 +4359,9 @@ mod kb {
     #[pg_extern]
     fn account_disable(name: &str, disabled: default!(bool, "true")) -> bool {
         admin_only("disable accounts");
+        // A grant that moves under a live transaction must not be answered from a view built
+        // before it did.
+        forget_view();
         let id = account_id_of(name);
         Spi::run_with_args(
             "UPDATE kb.account SET disabled_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1",
