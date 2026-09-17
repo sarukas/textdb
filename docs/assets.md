@@ -191,8 +191,9 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
   on upload is still to come (see stage 3 below).
 - **Google Drive** (an rclone remote of type `drive`, as `rclone listremotes --long` shows, or a
   `:drive` connection string; a shared drive in a team). Built in sprints (stage 3 below): file ids
-  as items, the listing with its id guard, and pulls by id are in; the rest is planned, from what
-  Drive was seen to do on a test shared drive:
+  as items, the listing with its id guard, pulls by id and pushes in place are in; moves, trash and
+  the states for changes made in the drive are planned, from what Drive was seen to do on a test
+  shared drive:
   - *Item* = the Drive file id, recorded in the pointer's `item`. An id stays with a file through
     renames, moves and in-place overwrites; a pointer an earlier build wrote (item = path) gets its
     id at its next push.
@@ -435,8 +436,8 @@ Second part, Google Drive (as described under asset stores): Drive file ids as i
 store listing per command with the id guard, pushes overwriting in place after a checked trash
 copy, pulls by id, moves by id and Drive's trash following pointers, the `changed-in-store`,
 `moved-in-store`, `trashed-in-store`, `invalid-item` and `ambiguous` states, and tests against a
-real shared drive. Sprints: (1) ids, listing, guard, pull by id; (2) push in place and trash
-copies; (3) moves and trash following pointers; (4) changes made in the drive; each reviewed.
+real shared drive. Sprints, each reviewed: (1) ids, listing, guard, pull by id (done); (2) push in
+place and trash copies (done); (3) moves and trash following pointers; (4) changes made in the drive.
 
 Third part, SharePoint: its rewriting of Office files on upload (tracking the provider's version
 tag instead of comparing hashes), with the same id-based moves and change detection. Needs a
