@@ -273,6 +273,21 @@ impl PgStore {
         })
     }
 
+    /// Why a `kb.entry` lookup found nothing: forbidden, or simply not there.
+    ///
+    /// `kb.entry` holds only what the caller can see, so a path under a share whose folder is in
+    /// the trash — or whose grant was taken away — is missing from it exactly as a path that never
+    /// existed is. The difference is the whole of TX005, and `kb.resolve` is what knows it: sync
+    /// deletes what the store no longer has and leaves alone what it merely may not have, so a
+    /// revocation reported as absence is what would empty a checkout (#12 D11, H6).
+    fn why_missing(&mut self, path: &str) -> StoreError {
+        match self.client.query_one("SELECT kb.resolve($1)", &[&path]) {
+            Err(e) => pg(e),
+            // It resolves, so there is no node at it.
+            Ok(_) => StoreError::not_found(format!("not found: {path}")),
+        }
+    }
+
     /// A path as this connection's own, resolving an `id:1234` reference to the path that names
     /// the same document here.
     ///
@@ -743,8 +758,11 @@ impl Store for PgStore {
                 ),
                 &[&path],
             )
-            .map_err(pg)?
-            .ok_or_else(|| StoreError::not_found(format!("not found: {path}")))?;
+            .map_err(pg)?;
+        let row = match row {
+            Some(row) => row,
+            None => return Err(self.why_missing(&path)),
+        };
         Ok(entry(&row))
     }
 
@@ -769,8 +787,11 @@ impl Store for PgStore {
                          WHERE path = $1 AND kind = 'file'",
                         &[&path],
                     )
-                    .map_err(pg)?
-                    .ok_or_else(|| StoreError::not_found(format!("not found: {path}")))?;
+                    .map_err(pg)?;
+                let row = match row {
+                    Some(row) => row,
+                    None => return Err(self.why_missing(&path)),
+                };
                 let text: String = row.get(0);
                 Ok((text.into_bytes(), row.get(1)))
             }

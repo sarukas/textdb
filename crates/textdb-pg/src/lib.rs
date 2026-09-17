@@ -277,6 +277,20 @@ CREATE FUNCTION kb.current_account() RETURNS bigint LANGUAGE sql STABLE AS $$
      AND t.revoked_at IS NULL
      AND (t.expires_at IS NULL OR t.expires_at > now())
      AND a.disabled_at IS NULL
+     -- An admin account's token *is* the owner: the store whole, in its own paths. NULL here is
+     -- what "no account" means everywhere else, so every surface reads it as the owner without
+     -- knowing there is such a kind. Not a fallback — an unknown or revoked bearer is still
+     -- refused by `kb.auth` — but a kind the owner granted (#12 H19).
+     AND a.kind <> 'admin'
+$$;
+
+-- The account a bearer names, admin-kind included, for authenticating rather than for filtering.
+CREATE FUNCTION kb._account_of(bearer text) RETURNS kb.account LANGUAGE sql STABLE AS $$
+  SELECT a.* FROM kb.token t JOIN kb.account a ON a.id = t.account_id
+   WHERE t.hash = encode(sha256(convert_to(nullif(bearer, ''), 'UTF8')), 'hex')
+     AND t.revoked_at IS NULL
+     AND (t.expires_at IS NULL OR t.expires_at > now())
+     AND a.disabled_at IS NULL
 $$;
 
 -- Set the connection's token, the counterpart of SQLite's textdb_auth(). Returns the account
@@ -286,7 +300,7 @@ CREATE FUNCTION kb.auth(bearer text) RETURNS text LANGUAGE plpgsql AS $$
 DECLARE who text;
 BEGIN
   PERFORM set_config('textdb.token', coalesce(bearer, ''), false);
-  SELECT a.name INTO who FROM kb.account a WHERE a.id = kb.current_account();
+  SELECT a.name INTO who FROM kb._account_of(bearer) a;
   IF who IS NULL THEN
     PERFORM set_config('textdb.token', '', false);
     PERFORM kb._raise('TX005', 'this token is not usable: it is unknown, expired or revoked', NULL);
@@ -905,7 +919,12 @@ mod kb {
     fn json_result(r: Result<(i64, CommitKind), TextdbError>) -> pgrx::JsonB {
         pgrx::JsonB(match r {
             Ok((v, k)) => serde_json::json!({ "version": v, "kind": k.as_str() }),
+            // The caller's own paths here too. A conflict payload names the file it is about, and
+            // this outcome is handed to `kb._check_j`, which raises from it without going through
+            // `fail` — so translating only there left the one message that always gets pasted
+            // somewhere naming a store path (#12 C16).
             Err(e) => {
+                let e = to_view_err(e);
                 let detail = match &e {
                     TextdbError::Conflict(c) => serde_json::to_string(c).unwrap_or_default(),
                     _ => String::new(),
@@ -1173,9 +1192,9 @@ mod kb {
     /// Scanned from the text rather than read from `kb.link`: the rows hold the current version's
     /// links and an older version's offsets would not line up, and this way the projection needs
     /// no columns of its own on either engine.
-    fn scan_target_spans(text: &[u8]) -> Vec<textdb_core::access::TargetSpan> {
-        use textdb_md::MarkdownExtractor;
+    fn scan_target_spans(file_id: i64, source: &str, text: &[u8]) -> Vec<textdb_core::access::TargetSpan> {
         use textdb_core::StructureExtractor;
+        use textdb_md::MarkdownExtractor;
         MarkdownExtractor
             .extract(text)
             .links
@@ -1183,33 +1202,37 @@ mod kb {
             .filter(|l| !l.external)
             .filter_map(|l| {
                 let (from, to) = l.span?;
-                let store = format!("/{}", l.target_path.trim_start_matches('/'));
-                let mut span = textdb_core::access::TargetSpan {
+                // Resolved by the rules the index uses, not by trying the target as a path: a name
+                // link (`[[nda]]`), a wiki path matching deeper and a relative path all reach a
+                // document without naming one, and the projector has to know which document.
+                let (id, _status) =
+                    textdb_md::resolve::resolve(&crate::links::PgLookup, file_id, source, &l.kind, &l.target_path, l.anchor.as_deref(), false)
+                        .unwrap_or((None, "broken"));
+                Some(textdb_core::access::TargetSpan {
                     target: l.target_path,
                     from: from as usize,
                     to: to as usize,
                     kind: l.kind,
-                    resolved: None,
-                    resolved_id: None,
+                    resolved: id.and_then(path_of_node),
+                    resolved_id: id,
                     alias: l.alias,
-                };
-                for candidate in [store.clone(), format!("{store}.md")] {
-                    if let Some(n) = node_by_path(&candidate) {
-                        span.resolved = Some(n.path);
-                        span.resolved_id = Some(n.id);
-                        break;
-                    }
-                }
-                Some(span)
+                })
             })
             .collect()
     }
 
+    /// The live path of a node id, for turning a resolved link back into one.
+    fn path_of_node(id: i64) -> Option<String> {
+        Spi::get_one_with_args::<String>("SELECT path FROM kb.node WHERE id = $1 AND deleted_at IS NULL", &[id.into()])
+            .ok()
+            .flatten()
+    }
+
     /// A document as this caller reads it: root-absolute links in its own paths, and the ones it
     /// cannot see as `textdb:<id>`. The owner's text is the store's own, untouched.
-    fn project_text(text: &[u8]) -> Vec<u8> {
+    fn project_text_of(file_id: i64, source: &str, text: &[u8]) -> Vec<u8> {
         let Some(view) = current_view() else { return text.to_vec() };
-        let spans = scan_target_spans(text);
+        let spans = scan_target_spans(file_id, source, text);
         if spans.is_empty() {
             return text.to_vec();
         }
@@ -1217,9 +1240,9 @@ mod kb {
     }
 
     /// The inverse, for text arriving from a caller.
-    fn unproject_text(text: &[u8]) -> Vec<u8> {
+    fn unproject_text_of(file_id: i64, source: &str, text: &[u8]) -> Vec<u8> {
         let Some(view) = current_view() else { return text.to_vec() };
-        let spans = scan_target_spans(text);
+        let spans = scan_target_spans(file_id, source, text);
         if spans.is_empty() {
             return text.to_vec();
         }
@@ -1232,19 +1255,24 @@ mod kb {
     }
 
     /// [`project_text`] over a string, for the surfaces that speak `String`.
-    fn project_str(text: String) -> String {
+    fn project_str(file_id: i64, source: &str, text: String) -> String {
         if account_id_now().is_none() {
             return text;
         }
-        String::from_utf8_lossy(&project_text(text.as_bytes())).into_owned()
+        String::from_utf8_lossy(&project_text_of(file_id, source, text.as_bytes())).into_owned()
     }
 
-    /// [`unproject_text`] over a string.
-    fn unproject_str(text: &str) -> String {
+    /// [`unproject_text_of`] over a string.
+    ///
+    /// `file_id` and `source` are the document the text belongs to: a relative link means a path
+    /// from where the file sits, so un-projecting one needs to know where that is. A file being
+    /// created has no id yet, and `0` is the right answer for it — nothing resolves against a
+    /// document that is not there.
+    fn unproject_str(file_id: i64, source: &str, text: &str) -> String {
         if account_id_now().is_none() {
             return text.to_string();
         }
-        String::from_utf8_lossy(&unproject_text(text.as_bytes())).into_owned()
+        String::from_utf8_lossy(&unproject_text_of(file_id, source, text.as_bytes())).into_owned()
     }
 
     /// A caller's path as a store path, raising TX003 or TX005 as `kb.resolve` decides. Returns
@@ -1734,7 +1762,9 @@ mod kb {
     pub(crate) fn create_impl(path: &str, content: &str, author: Option<&str>, message: Option<&str>) -> Result<i64, TextdbError> {
         let path = normalize_path(path)?;
         let path = resolve(&path, true);
-        create_at(&path, &unproject_str(content), author, message)
+        // A file being created has no id yet; nothing resolves against a document that is not there.
+        let content = unproject_str(0, &path, content);
+        create_at(&path, &content, author, message)
     }
 
     // The internal `*_at` forms take a path that is **already** a store path and text that is
@@ -1789,8 +1819,9 @@ mod kb {
         // Text arriving from a caller is in the caller's namespace: its root-absolute links
         // become the store's before anything is committed, so the store holds one canonical
         // spelling whoever wrote it (#12 E9).
-        let content = &unproject_str(content);
-        match node_by_path(&path) {
+        let here = node_by_path(&path);
+        let content = &unproject_str(here.as_ref().map_or(0, |n| n.id), &path, content);
+        match here {
             None => Ok((create_at(&path, content, author, message)?, CommitKind::Direct)),
             Some(_) => update_content_at(&path, content, base_version, author, message),
         }
@@ -1850,7 +1881,8 @@ mod kb {
         let path = resolve(&path, true);
         // Each piece of replacement text is the caller's, so each goes back to the store's
         // namespace; the line numbers are the same in both, because a rewrite never adds one.
-        let in_store: Vec<(u64, u64, Vec<u8>)> = ranges.iter().map(|(a, b, t)| (*a, *b, unproject_text(t))).collect();
+        let id = node_by_path(&path).map_or(0, |n| n.id);
+        let in_store: Vec<(u64, u64, Vec<u8>)> = ranges.iter().map(|(a, b, t)| (*a, *b, unproject_text_of(id, &path, t))).collect();
         let ranges: &[(u64, u64, Vec<u8>)] = &in_store;
         let mut sorted: Vec<&(u64, u64, Vec<u8>)> = ranges.iter().collect();
         sorted.sort_by_key(|r| r.0);
@@ -1924,11 +1956,12 @@ mod kb {
         }
         // Both halves of each replacement are anchored on the text the caller read, so both go
         // back to the store's namespace before they are matched against what the store holds.
+        let id_here = node_by_path(&path).map_or(0, |n| n.id);
         let in_store: Vec<crate::bulk::Replacement> = replacements
             .iter()
             .map(|r| crate::bulk::Replacement {
-                old: unproject_text(&r.old),
-                new: unproject_text(&r.new),
+                old: unproject_text_of(id_here, &path, &r.old),
+                new: unproject_text_of(id_here, &path, &r.new),
                 expected: r.expected,
             })
             .collect();
@@ -1968,7 +2001,8 @@ mod kb {
         let path = resolve(&path, true);
         // In the store's namespace before it is diffed: the caller wrote its own paths, and the
         // diff has to be against what the store holds or every projected link reads as a change.
-        update_content_at(&path, &unproject_str(content), base_version, author, message)
+        let id = node_by_path(&path).map_or(0, |n| n.id);
+        update_content_at(&path, &unproject_str(id, &path, content), base_version, author, message)
     }
 
     fn update_content_at(path: &str, content: &str, base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
@@ -2017,8 +2051,8 @@ mod kb {
         // Both sides are anchored on the text the caller read, so both go back to the store's
         // namespace: matching against un-projected text is what makes the edit one version
         // rather than an edit and a link rewrite (#12 E16).
-        let (old, new) = (&unproject_str(old), &unproject_str(new));
         let n = file_by_path_r(&path)?;
+        let (old, new) = (&unproject_str(n.id, &path, old), &unproject_str(n.id, &path, new));
         let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let mut st = SpiStorage::new();
         let content = materialize_all(&st, &cur)?;
@@ -2060,8 +2094,8 @@ mod kb {
     fn append_impl(path: &str, tail: &str, author: Option<&str>, message: Option<&str>) -> Result<(i64, CommitKind), TextdbError> {
         let path = normalize_path(path)?;
         let path = resolve(&path, true);
-        let tail = &unproject_str(tail);
         let n = file_by_path_r(&path)?;
+        let tail = &unproject_str(n.id, &path, tail);
         let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let mut st = SpiStorage::new();
         let c = commit_append(&mut st, &P, n.id as u64, &path, tail.as_bytes(), RETRIES)?;
@@ -2217,19 +2251,19 @@ mod kb {
         let path = ok(normalize_path(path));
         let path = resolve(&path, false);
         let st = SpiStorage::new();
-        let bytes = match version {
+        let (id, bytes) = match version {
             None => {
                 let n = file_by_path(&path);
-                ok(materialize_all(&st, &n.root.unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())))))
+                (n.id, ok(materialize_all(&st, &n.root.unwrap_or_else(|| fail(TextdbError::NotFound(path.clone()))))))
             }
             Some(v) => {
                 let n = NodeRow::by_path(&path, true).unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
-                ok(materialize_all(&st, &root_of_version(n.id, v as u64)))
+                (n.id, ok(materialize_all(&st, &root_of_version(n.id, v as u64))))
             }
         };
         // A document is text the caller reads, so its links are in the caller's paths and the
         // ones it cannot see are id references (#12 part 2).
-        String::from_utf8_lossy(&project_text(&bytes)).into_owned()
+        String::from_utf8_lossy(&project_text_of(id, &path, &bytes)).into_owned()
     }
 
     /// Lines `[l_from, l_to]`, 1-based inclusive.
@@ -2251,7 +2285,7 @@ mod kb {
         let bytes = ok(textdb_core::lines(&st, &root, (l_from - 1) as u64, (l_to - 1) as u64));
         // Projected like any other text the caller reads. Rewriting never changes a line count,
         // so the numbers mean the same thing in either namespace.
-        String::from_utf8_lossy(&project_text(&bytes)).into_owned()
+        String::from_utf8_lossy(&project_text_of(n.id, &path, &bytes)).into_owned()
     }
 
     /// Text of the section whose heading matches (exact heading path, then last component).
@@ -2285,7 +2319,7 @@ mod kb {
         if body.is_empty() {
             return String::new();
         }
-        let body = project_str(body);
+        let body = project_str(n.id, &path, body);
         // The caller's own path in the header too.
         let p = to_view(&path).unwrap_or_else(|| OUTSIDE.to_string());
         format!("--- {p}@{v1}\n+++ {p}@{v2}\n{body}", p = p, v1 = v1, v2 = v2, body = body)
@@ -2432,8 +2466,8 @@ mod kb {
                     h.new_count as i64,
                     // A diff is text the caller reads, each side projected against its own
                     // version's links (#12 E16).
-                    String::from_utf8_lossy(&project_text(&h.old_text)).into_owned(),
-                    String::from_utf8_lossy(&project_text(&h.new_text)).into_owned(),
+                    String::from_utf8_lossy(&project_text_of(n.id, &n.path, &h.old_text)).into_owned(),
+                    String::from_utf8_lossy(&project_text_of(n.id, &n.path, &h.new_text)).into_owned(),
                 )
             })
             .collect();
@@ -3541,9 +3575,15 @@ mod kb {
         if name.is_empty() || name.contains('/') || name.trim() != name {
             fail(TextdbError::InvalidEdit(format!("'{name}' cannot be an account name")));
         }
-        if !matches!(kind, "agent" | "person") {
+        // `admin` is the third: an account that sees the store whole, for a deployment where
+        // nobody connects as the owner and every caller arrives with a bearer (#12 H19). It holds
+        // no shares, so it takes no root.
+        if kind == "admin" && root.is_some() {
+            fail(TextdbError::InvalidEdit("an admin account sees the whole store, so it has no root".into()));
+        }
+        if !matches!(kind, "agent" | "person" | "admin") {
             fail(TextdbError::InvalidEdit(format!(
-                "account kind is 'agent' or 'person', not '{kind}'"
+                "account kind is 'agent', 'person' or 'admin', not '{kind}'"
             )));
         }
         let taken = Spi::get_one_with_args::<i64>("SELECT id FROM kb.account WHERE name = $1", &[name.into()])

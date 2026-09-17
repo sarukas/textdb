@@ -1015,12 +1015,16 @@ fn c_an_account_cannot_write_as_someone_else() {
 fn c_sql_writes_are_checked_per_row_before_anything_commits() {
     scenarios!("C17", "C18");
     on_each_engine(|f| {
+        // The writable relation is the engine's own: SQLite has the `kb` virtual table, Postgres
+        // `kb.file`, and the catalogue is about what the rule does, not about one spelling.
+        let table = if f.engine() == Engine::Sqlite { "kb" } else { "kb.file" };
+
         // C17: every row under an rw share.
         ok(
             f.as_("accounts-agent").args([
                 "sql",
                 "--write",
-                "UPDATE kb SET content = content || '\n-- seen\n' WHERE dir = '/contracts'",
+                &format!("UPDATE {table} SET content = content || '\n-- seen\n' WHERE dir = '/contracts'"),
             ]),
             None,
         );
@@ -1030,7 +1034,7 @@ fn c_sql_writes_are_checked_per_row_before_anything_commits() {
         let before = ok(f.as_("admin").args(["cat", "/products/roadmap.md"]), None).stdout;
         let out = run(
             f.as_("accounts-agent")
-                .args(["sql", "--write", "UPDATE kb SET content = content || 'x' WHERE dir = '/products'"]),
+                .args(["sql", "--write", &format!("UPDATE {table} SET content = content || 'x' WHERE dir = '/products'")]),
             None,
         );
         refused(&out, FORBIDDEN, "TX005");
@@ -1867,13 +1871,24 @@ fn k_sql_speaks_the_views_paths() {
         assert_eq!(first["dir"], "/contracts/2026", "K1: {rows}");
         assert_eq!(first["depth"], 3, "K1: {rows}");
 
-        // K3: the share roots are folders with their totals.
-        let ls = ok(f.as_("accounts-agent").args(["--json", "sql", "SELECT path, kind FROM textdb_ls('/') ORDER BY path"]), None).json();
+        // K3: the share roots are folders with their totals. The listing function is the engine's
+        // own name for one thing: `textdb_ls` on SQLite, `kb.ls` on Postgres.
+        let ls_fn = if f.engine() == Engine::Sqlite { "textdb_ls" } else { "kb.ls" };
+        let ls = ok(
+            f.as_("accounts-agent")
+                .args(["--json", "sql", &format!("SELECT path, kind FROM {ls_fn}('/') ORDER BY path")]),
+            None,
+        )
+        .json();
         let paths: Vec<&str> = ls["rows"].as_array().unwrap().iter().filter_map(|r| r["path"].as_str()).collect();
         assert_eq!(paths, ["/contracts", "/products"], "K3: {ls}");
 
         // K4: a store path is not found, through SQL as anywhere else.
-        refused(&run(f.as_("accounts-agent").args(["sql", "SELECT * FROM textdb_ls('/legal')"]), None), NOT_FOUND, "TX003");
+        refused(
+            &run(f.as_("accounts-agent").args(["sql", &format!("SELECT * FROM {ls_fn}('/legal')")]), None),
+            NOT_FOUND,
+            "TX003",
+        );
 
         // K5: commits on visible paths, with every author.
         let commits = ok(f.as_("accounts-agent").args(["--json", "sql", "SELECT DISTINCT path FROM commits ORDER BY path"]), None).json();
