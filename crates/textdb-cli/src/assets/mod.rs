@@ -764,6 +764,17 @@ impl Drivers {
     }
 }
 
+/// What became of a store's own copy of an asset whose pointer went away.
+pub(crate) enum StoreCopy {
+    /// In the store's own trash now, or there already.
+    Trashed,
+    /// Left where it is, for a reason nobody needs telling: another pointer names those bytes, or
+    /// the store keeps no trash of a provider's own.
+    Left,
+    /// Left where it is for a reason a sync tells of.
+    LeftBecause(String),
+}
+
 /// The asset stores' own files as a sync may change them: which pointers still name what, and the
 /// drivers to move or trash with. Made once for a command, since knowing what every pointer names
 /// reads the store's pointers, and each driver opens once.
@@ -777,13 +788,23 @@ impl StoreFiles {
         Ok(StoreFiles { in_use: InUse::new(), drivers: Drivers::new(st)? })
     }
 
-    /// Whether a pointer other than the asset `own`'s still names `location` in the store `store`.
-    /// A pointer textdb cannot read counts as naming it: what a store's files are for is not
-    /// guessed at from the pointers it could parse.
-    fn still_named(&mut self, st: &mut dyn Store, store: &str, location: &str, own: &str) -> Result<bool> {
+    /// Why the file at `location` in the store `store` stays where it is, if it does: another
+    /// pointer than the asset `own`'s names it, or a pointer of the store cannot be read at all and
+    /// what its bytes are for is therefore not known. `None` leaves the file to the caller.
+    fn keeps(&mut self, st: &mut dyn Store, store: &str, location: &str, own: &str) -> Result<Option<StoreCopy>> {
         self.in_use.refresh(st)?;
-        let unreadable = self.in_use.pointers.values().any(|(_, names)| names.is_none());
-        Ok(unreadable || self.in_use.shared(store, location, own))
+        // A pointer textdb cannot read names nothing it can be sure of: what a store's files are
+        // for is not guessed at from the pointers that happened to parse. Said out loud, since one
+        // such pointer anywhere in the store stops every store of every asset being tidied.
+        let mut unreadable: Vec<&str> = self.in_use.pointers.iter().filter(|(_, (_, names))| names.is_none()).map(|(p, _)| p.as_str()).collect();
+        unreadable.sort();
+        if let Some(first) = unreadable.first() {
+            return Ok(Some(StoreCopy::LeftBecause(match unreadable.len() {
+                1 => format!("the pointer {first} cannot be read, so what its bytes are for is not known"),
+                n => format!("{n} pointers cannot be read ({first} among them), so what their bytes are for is not known"),
+            })));
+        }
+        Ok(self.in_use.shared(store, location, own).then_some(StoreCopy::Left))
     }
 
     /// The file the asset `own`'s pointer names, moved in its store to `to` (the asset's own path
@@ -791,20 +812,30 @@ impl StoreFiles {
     /// nothing moved -- another pointer names those bytes, or the store keeps items by path and the
     /// bytes stay for them.
     pub(crate) fn moved(&mut self, st: &mut dyn Store, store: &str, item: &str, to: &str, own: &str) -> Result<Option<String>> {
-        if self.still_named(st, store, item, own)? {
+        // Items that are paths move with their pointer already: no driver is asked, so a store this
+        // computer cannot reach is not waited on for work that could not come to anything.
+        if item.starts_with('/') || self.keeps(st, store, item, own)?.is_some() {
             return Ok(None);
         }
         self.drivers.get(store).map_err(StoreError::invalid)?.move_to(item, to)
     }
 
-    /// The file the deleted pointer of the asset `own` named, sent to its store's own trash, once
-    /// no pointer names it. `false` where it stays: another pointer names it, or the store keeps no
-    /// trash of its own.
-    pub(crate) fn trashed(&mut self, st: &mut dyn Store, store: &str, item: &str, own: &str) -> Result<bool> {
-        if self.still_named(st, store, item, own)? {
-            return Ok(false);
+    /// The file the deleted pointer of the asset `own` named, holding the bytes `sha256`, sent to
+    /// its store's own trash once no pointer names it.
+    pub(crate) fn trashed(&mut self, st: &mut dyn Store, store: &str, item: &str, own: &str, sha256: &str) -> Result<StoreCopy> {
+        // A store keeping its files by path keeps no trash of a provider's own, so there is nothing
+        // to ask a driver -- and nothing to wait for where the store cannot be reached.
+        if item.starts_with('/') {
+            return Ok(StoreCopy::Left);
         }
-        self.drivers.get(store).map_err(StoreError::invalid)?.trash(item)
+        if let Some(kept) = self.keeps(st, store, item, own)? {
+            return Ok(kept);
+        }
+        let sent = self.drivers.get(store).map_err(StoreError::invalid)?.trash(item, sha256)?;
+        Ok(match sent {
+            true => StoreCopy::Trashed,
+            false => StoreCopy::Left,
+        })
     }
 }
 

@@ -191,9 +191,10 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
   on upload is still to come (see stage 3 below).
 - **Google Drive** (an rclone remote of type `drive`, as `rclone listremotes --long` shows, or a
   `:drive` connection string; a shared drive in a team). Built in sprints (stage 3 below): file ids
-  as items, the listing with its id guard, pulls by id and pushes in place are in; moves, trash and
-  the states for changes made in the drive are planned, from what Drive was seen to do on a test
-  shared drive:
+  as items, the listing with its id guard, pulls by id, pushes in place and Drive's trash following
+  a deleted pointer are in; the move a pointer's own move makes is written in the driver and not yet
+  wired, and the states for changes made in the drive are planned, from what Drive was seen to do on
+  a test shared drive:
   - *Item* = the Drive file id, recorded in the pointer's `item`. An id stays with a file through
     renames, moves and in-place overwrites; a pointer an earlier build wrote (item = path) gets its
     id at its next push.
@@ -239,9 +240,17 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
     drive is overwritten, a file another pointer also names stays where it is, and a file someone
     sent to Drive's trash is reported rather than restored: rclone untrashes only a whole folder
     (`backend untrash` restored every trashed file of the one it was given), which would bring back
-    files that are no business of this move.
-  - *Pointers deleted in textdb* send their file to Drive's trash once no pointer names its id;
-    Drive empties it after 30 days, and until then a pull still finds it.
+    files that are no business of this move. Written in the driver, not yet wired to sync or `mv`:
+    that is the second half of the sprint.
+  - *Pointers deleted in textdb* send their file to Drive's trash once no pointer names its id, the
+    file of that name is still the one the id names, the bytes there are the ones the pointer named,
+    every pointer of the store can be read, and the store is bound and reachable on this computer.
+    Anything else leaves the file where it is and the sync says why: bytes someone replaced in the
+    drive are told of, never taken away by a deletion here, and one pointer textdb cannot read stops
+    the tidying of every store until it is fixed or removed. The store's copy goes only once the
+    file on disk is safely in the directory's own trash. Drive empties its trash after 30 days, and
+    until then a pull by id still finds it. A pointer that never reached the store (one only on a
+    git branch, say) protects nothing: the store is what is asked.
   - *Changes made directly in the drive* show in `assets status` and are followed on pull, never
     undone in the drive: `changed-in-store` (same id, other bytes: someone replaced it; a pull
     takes them as the pointer's new version, or a conflict when the local file changed too),
@@ -338,7 +347,9 @@ operations take the asset's real path: `textdb mv /a/arch.png /b/arch.png` moves
 the next sync moves the real file on disk of every directory synced with the folder; the asset
 store keeps the bytes where they were put, which the pointer's item still names. `textdb rm
 /a/arch.png` deletes the pointer, and the next sync moves the real file to `.textdb/trash/`.
-Moving and trashing items in the asset store itself is still to come (stage 3, second part).
+A deleted pointer's file goes to the asset store's own trash too, where the store keeps one (Google
+Drive's, for thirty days); moving the store's file along with its pointer is written in the driver
+and not yet wired (stage 3, second part).
 
 ## Sync
 
@@ -459,7 +470,8 @@ store listing per command with the id guard, pushes overwriting in place after a
 copy, pulls by id, moves by id and Drive's trash following pointers, the `changed-in-store`,
 `moved-in-store`, `trashed-in-store`, `invalid-item` and `ambiguous` states, and tests against a
 real shared drive. Sprints, each reviewed: (1) ids, listing, guard, pull by id (done); (2) push in
-place and trash copies (done); (3) moves and trash following pointers; (4) changes made in the drive.
+place and trash copies (done); (3) moves and trash following pointers (Drive's trash on a deleted
+pointer done, moves next); (4) changes made in the drive.
 
 Third part, SharePoint: its rewriting of Office files on upload (tracking the provider's version
 tag instead of comparing hashes), with the same id-based moves and change detection. Needs a

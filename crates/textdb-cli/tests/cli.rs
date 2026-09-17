@@ -1202,7 +1202,7 @@ fn assets_on_google_drive_are_pulled_by_file_id_and_never_from_outside_the_store
     // A pointer deleted in textdb sends its file to Drive's trash -- but only once every pointer of
     // the store can be read, since what bytes are for is not guessed at from the pointers that
     // happened to parse. Two assets: one deleted while a pointer cannot be read, one after.
-    for (name, last) in [("d", 3u8), ("e", 4)] {
+    for (name, last) in [("d", 3u8), ("e", 4), ("f", 5)] {
         std::fs::write(vault.join(format!("img/{name}.png")), [137u8, 80, 78, 71, 0, last]).unwrap();
     }
     ok(&mut t(&["sync", "/", dir]), None);
@@ -1214,26 +1214,50 @@ fn assets_on_google_drive_are_pulled_by_file_id_and_never_from_outside_the_store
             .find_map(|l| l.strip_prefix("item: ").map(str::to_string))
             .unwrap()
     };
-    let (id_d, id_e) = (item_of("d"), item_of("e"));
+    let (id_d, id_e, id_f) = (item_of("d"), item_of("e"), item_of("f"));
     let live = || rc(&["lsjson", "-R", "--files-only", &root]);
-    assert!(live().contains(&id_d) && live().contains(&id_e), "both files are in the drive after the push: {}", live());
+    let there = live();
+    assert!([&id_d, &id_e, &id_f].iter().all(|id| there.contains(id.as_str())), "all three files are in the drive after the push: {there}");
 
-    // A pointer textdb cannot read counts as naming those bytes: nothing goes to Drive's trash.
+    // A pointer textdb cannot read counts as naming those bytes: nothing goes to Drive's trash, and
+    // the sync says which pointer it could not read rather than leaving it to be guessed at.
     ok(&mut t(&["write", "/img/bad.png.tdbasset"]), Some("not a pointer at all\n"));
     run(&mut t(&["sync", "/", dir]), None);
     ok(&mut t(&["rm", "/img/d.png"]), None);
-    run(&mut t(&["sync", "/", dir]), None);
+    let unreadable = run(&mut t(&["--json", "sync", "/", dir]), None);
     assert!(live().contains(&id_d), "a file went to Drive's trash while a pointer of the store could not be read");
+    let said = format!("{}{}", unreadable.stdout, unreadable.stderr);
+    assert!(said.contains("cannot be read") && said.contains("bad.png"), "the sync did not say which pointer it could not read: {said}");
 
-    // That pointer gone, a deletion does send the file to Drive's trash, and a pull by id still
-    // finds it there.
+    // Bytes someone replaced in the drive are theirs: a deleted pointer does not take them away,
+    // whatever its own bytes were, and the sync says so. The file keeps its id through the
+    // replacement, so only the bytes tell the two apart.
     ok(&mut t(&["rm", "/img/bad.png.tdbasset"]), None);
     run(&mut t(&["sync", "/", dir]), None);
+    let theirs = vault.join("theirs.png");
+    std::fs::write(&theirs, [137u8, 80, 78, 71, 9, 9]).unwrap();
+    let at_e = rc(&["lsjson", "-R", "--files-only", &root]);
+    let path_of_e = serde_json::from_str::<Vec<serde_json::Value>>(&at_e)
+        .unwrap()
+        .into_iter()
+        .find(|l| l["ID"].as_str() == Some(id_e.as_str()))
+        .map(|l| l["Path"].as_str().unwrap().to_string())
+        .unwrap();
+    rc(&["copyto", "--ignore-times", theirs.to_str().unwrap(), &format!("{root}/{path_of_e}")]);
+    std::fs::remove_file(&theirs).unwrap();
     ok(&mut t(&["rm", "/img/e.png"]), None);
+    let kept = run(&mut t(&["--json", "sync", "/", dir]), None);
+    assert!(live().contains(&id_e), "bytes replaced in the drive were sent to Drive's trash by a deleted pointer");
+    let said = format!("{}{}", kept.stdout, kept.stderr);
+    assert!(said.contains("other than the ones its pointer named"), "the sync did not say the bytes in the drive are not the pointer's: {said}");
+
+    // A pointer whose file in the drive still holds the bytes it named: that one does go to Drive's
+    // trash, where a pull by id would still find it for the thirty days Drive keeps it.
+    ok(&mut t(&["rm", "/img/f.png"]), None);
     ok(&mut t(&["sync", "/", dir]), None);
-    assert!(!live().contains(&id_e), "the file is still live in the drive: {}", live());
+    assert!(!live().contains(&id_f), "the file is still live in the drive: {}", live());
     let gone = rc(&["lsjson", "-R", "--files-only", "--drive-trashed-only", &root]);
-    assert!(gone.contains(&id_e), "the file is not in Drive's trash: {gone}");
+    assert!(gone.contains(&id_f), "the file is not in Drive's trash: {gone}");
 }
 
 #[test]

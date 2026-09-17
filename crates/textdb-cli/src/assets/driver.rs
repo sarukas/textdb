@@ -61,10 +61,11 @@ pub trait Driver {
     fn move_to(&self, _item: &str, _to: &str) -> Result<Option<String>> {
         Ok(None)
     }
-    /// Send the file the item `item` names to the provider's own trash, the caller having made sure
-    /// no pointer names it any more. `false` where the provider keeps no trash of its own and the
-    /// file stays where it is.
-    fn trash(&self, _item: &str) -> Result<bool> {
+    /// Send the file the item `item` names, holding the bytes whose SHA-256 is `sha256`, to the
+    /// provider's own trash, the caller having made sure no pointer names it any more. Other bytes
+    /// there are someone else's doing in the store and are never trashed: what was changed there is
+    /// told of, not undone. `false` where the provider keeps no trash of its own and the file stays.
+    fn trash(&self, _item: &str, _sha256: &str) -> Result<bool> {
         Ok(false)
     }
     /// The folder on this computer the store keeps its files in, for a local store.

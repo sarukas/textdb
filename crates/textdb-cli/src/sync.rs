@@ -1980,10 +1980,14 @@ fn apply(
     // store keeps its files by an id of its own (Google Drive). What every pointer still names, and
     // the drivers to do it with, are read once here, and only when something was deleted. A store
     // this computer cannot reach is a note below, never a failed sync.
-    let mut store_files = match plan.asset_trash.is_empty() {
-        true => None,
-        false => crate::assets::StoreFiles::new(&mut *sides.st).ok(),
-    };
+    let (mut store_files, mut no_store_files) = (None, None);
+    if !plan.asset_trash.is_empty() {
+        match crate::assets::StoreFiles::new(&mut *sides.st) {
+            Ok(files) => store_files = Some(files),
+            // Never silently: a file's fate is not decided by something that failed unremarked.
+            Err(e) => no_store_files = Some(e.message),
+        }
+    }
     // A pointer deleted in textdb leaves disk only once its file is in the trash, so a move that
     // fails is tried again by the next sync rather than leaving the file to be pushed as new.
     let mut trash = None;
@@ -1995,25 +1999,29 @@ fn apply(
                 format!(".textdb/trash/{}-{nanos:09}", crate::assets::driver::stamp(now))
             })
             .clone();
-        // The file in the asset store goes to the store's own trash as well, once no pointer names
-        // it: the pointer is read while it is still on disk, the store having none of it any more.
-        if let Some(files) = store_files.as_mut() {
-            let named = sides.disk(pointer_rel).ok().and_then(|text| crate::assets::pointer::Pointer::parse(&text).ok());
-            if let Some(p) = named {
-                let here = store_path(&prefix, pointer_rel);
-                let own = crate::assets::pointer::asset_path(&here).to_string();
-                let item = p.item.clone().unwrap_or_else(|| own.clone());
-                // Left where it is on anything going wrong, and told of: bytes are not lost to a
-                // sync that could not make sure of them.
-                if let Err(e) = files.trashed(&mut *sides.st, &p.store, &item, &own) {
-                    report.kept.push(note(file, format!("its copy in the asset store {} stays there: {}", p.store, e.message)));
-                }
-            }
+        // Read while the pointer is still on disk: the store has none of it after the deletion.
+        let named = sides.disk(pointer_rel).ok().and_then(|text| crate::assets::pointer::Pointer::parse(&text).ok());
+        if let Some(why) = &no_store_files {
+            report.kept.push(note(file, format!("its copy in its asset store stays there: {why}")));
         }
         match move_disk(dir, file, &format!("{folder}/{file}")) {
             Ok(()) => {
                 had.forget(file);
                 moved(file, &format!("{folder}/{file}"));
+                // The store's own copy follows, once these bytes are safely in this directory's
+                // trash: a file the sync could not set aside here keeps its copy there.
+                if let (Some(files), Some(p)) = (store_files.as_mut(), named.as_ref()) {
+                    let own = crate::assets::pointer::asset_path(&store_path(&prefix, pointer_rel)).to_string();
+                    let item = p.item.clone().unwrap_or_else(|| own.clone());
+                    let stays = |why: String| note(file, format!("its copy in the asset store {} stays there: {why}", p.store));
+                    match files.trashed(&mut *sides.st, &p.store, &item, &own, &p.sha256) {
+                        Ok(crate::assets::StoreCopy::LeftBecause(why)) => report.kept.push(stays(why)),
+                        Ok(_) => {}
+                        // Told of, never a failed sync: bytes are not lost to a sync that could not
+                        // make sure of them.
+                        Err(e) => report.kept.push(stays(e.message)),
+                    }
+                }
                 if let Err(e) = remove_disk(dir, pointer_rel) {
                     failed(report, &mut rows, pointer_rel, e.to_string());
                 }
