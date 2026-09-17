@@ -1118,6 +1118,22 @@ mod kb {
     /// row's `old_path`, an error's subject. The same words on both engines.
     const OUTSIDE: &str = "(outside your shares)";
 
+    /// Refuse an operation that would move or delete the *root* of a share.
+    ///
+    /// A share root is a folder the account works inside and does not own: moving or deleting it is
+    /// the owner's to do, and the account's alias is its name for the share rather than for the
+    /// folder. Writing inside it is ordinary, so only `mv` and `rm` ask this.
+    fn refuse_share_root(store_path: &str, what: &str) -> Result<(), TextdbError> {
+        let Some(view) = current_view() else { return Ok(()) };
+        let alias = view.grants().live().find(|g| g.store_path == store_path).map(|g| g.alias.clone());
+        match alias {
+            Some(alias) => Err(TextdbError::Forbidden(format!(
+                "/{alias} is a share, not a folder of yours to {what}; it is the owner's to move or delete"
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// A store path as this connection sees it; `None` when it sees nothing there. The owner's
     /// paths are the store's own, so this answers without touching the database for them.
     fn to_view(store_path: &str) -> Option<String> {
@@ -2091,6 +2107,7 @@ mod kb {
     ) -> Result<Vec<serde_json::Value>, TextdbError> {
         let from = normalize_path(from)?;
         let from = resolve(&from, true);
+        refuse_share_root(&from, "move")?;
         let to = normalize_path(to)?;
         let to = resolve(&to, true);
         if from == "/" || to == "/" {
@@ -2168,6 +2185,7 @@ mod kb {
     pub(crate) fn delete_impl(path: &str, author: Option<&str>, message: Option<&str>) -> Result<(), TextdbError> {
         let path = normalize_path(path)?;
         let path = resolve(&path, true);
+        refuse_share_root(&path, "delete")?;
         if path == "/" {
             return Err(TextdbError::InvalidEdit("cannot delete the root".into()));
         }
@@ -2219,6 +2237,11 @@ mod kb {
     fn lines(path: &str, l_from: i64, l_to: i64) -> String {
         let path = ok(normalize_path(path));
         let path = resolve(&path, false);
+        lines_at(&path, l_from, l_to)
+    }
+
+    fn lines_at(path: &str, l_from: i64, l_to: i64) -> String {
+        let path = path.to_string();
         let n = file_by_path(&path);
         if l_from <= 0 || l_to < l_from {
             return String::new();
@@ -2243,7 +2266,9 @@ mod kb {
         )
         .unwrap_or_else(|e| spi_err(e));
         match span {
-            (Some(a), Some(b)) => Some(lines(&path, a, b)),
+            // `path` is a store path by now, and `lines` resolves a caller's; the internal form
+            // takes it as it is.
+            (Some(a), Some(b)) => Some(lines_at(&path, a, b)),
             _ => None,
         }
     }
@@ -3105,7 +3130,7 @@ mod kb {
                                  ELSE 'mixed' END
                        FROM kb.property r
                        JOIN kb.node n ON n.id = r.file_id AND n.deleted_at IS NULL
-                      WHERE ($1 = '' OR (r.key_lc >= $2 AND r.key_lc < $3))
+                      WHERE kb.visible(n.path) AND ($1 = '' OR (r.key_lc >= $2 AND r.key_lc < $3))
                       GROUP BY r.key
                       ORDER BY count(DISTINCT r.file_id) DESC, r.key
                       LIMIT $4",
@@ -3143,7 +3168,7 @@ mod kb {
                     "SELECT r.val_txt, count(DISTINCT r.file_id)
                        FROM kb.property r
                        JOIN kb.node n ON n.id = r.file_id AND n.deleted_at IS NULL
-                      WHERE r.key_lc = $1
+                      WHERE kb.visible(n.path) AND r.key_lc = $1
                         AND ($2 = '' OR (r.val_lc >= $3 AND r.val_lc < $4))
                       GROUP BY r.val_txt
                       ORDER BY count(DISTINCT r.file_id) DESC, r.val_txt
@@ -3191,7 +3216,7 @@ mod kb {
             "SELECT n.path, coalesce(n.nbytes, 0), coalesce(to_char(n.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), ''),
                     (SELECT f.data::text FROM kb.frontmatter f WHERE f.file_id = n.id AND f.version = n.version)
                FROM kb.node n
-              WHERE n.deleted_at IS NULL AND n.kind = 1
+              WHERE n.deleted_at IS NULL AND n.kind = 1 AND kb.visible(n.path)
                 AND EXISTS (SELECT 1 FROM kb.property u WHERE u.file_id = n.id)
                 AND ({where_clause})
                 AND (${folder_i} = '/' OR n.path = ${folder_i} OR n.path LIKE ${like_i} ESCAPE '\\')
@@ -3215,8 +3240,11 @@ mod kb {
             let r = client.select(&sql, None, &bound).unwrap_or_else(|e| spi_err(e));
             let mut out = Vec::new();
             for row in r {
+                let path: String = row.get::<String>(1).unwrap_or_default().unwrap_or_default();
+                // Filtered above, so `None` means the node went in the meantime.
+                let Some(path) = to_view(&path) else { continue };
                 out.push((
-                    row.get::<String>(1).unwrap_or_default().unwrap_or_default(),
+                    path,
                     row.get::<i64>(2).unwrap_or_default().unwrap_or(0),
                     row.get::<String>(3).unwrap_or_default().unwrap_or_default(),
                     row.get::<String>(4).unwrap_or_default(),
@@ -3916,12 +3944,14 @@ mod kb {
     }
 
 
-    /// `mkdir -p`, for a caller's path. `kb._mkdir` is the internal one and takes a store path.
+    /// `mkdir -p`, for a caller's path.
+    ///
+    /// `kb._mkdir` resolves for itself — the `kb.folder` trigger hands it a caller's path too —
+    /// so resolving here as well translated twice, and an account's `/contracts/2027` came back
+    /// as "not found: /legal/contracts/2027" (CLAUDE.md, the same trap on both engines).
     #[pg_extern]
     fn mkdir(path: &str) -> i64 {
-        let path = ok(normalize_path(path));
-        let path = resolve(&path, true);
-        _mkdir(&path)
+        _mkdir(path)
     }
 
     /// Stop an account without forgetting it: its tokens stop working and its grants stay, so

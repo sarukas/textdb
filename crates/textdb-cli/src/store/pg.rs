@@ -145,12 +145,17 @@ fn pg(e: postgres::Error) -> StoreError {
 /// `kb.commit`, `kb.grant` and the rest are the owner's, and reading them walks straight past every
 /// filter this feature adds.
 ///
-/// Decided from the plan rather than from the statement text: Postgres is asked what the statement
-/// would actually read, so a table reached through a quoted name, a search path, an alias or a CTE
-/// is found, and a *view* over those tables — which is the sanctioned surface — is not, because a
-/// view's own relation is what the plan names. A statement that will not plan is left for the
-/// prepare below to report in its own words.
-fn refuse_raw_tables(tx: &mut postgres::Transaction<'_>, query: &str, types: &[Type]) -> Result<()> {
+/// This reads the statement, not the plan. The plan cannot answer the question: Postgres inlines a
+/// view into the plan of the query that reads it, so `SELECT * FROM files` and `SELECT * FROM
+/// kb.node` both come out as a scan of `kb.node`, and a check on the plan would refuse the
+/// sanctioned surface along with the raw one. What the statement *names* is therefore what decides,
+/// and the limit of that is written down rather than implied: a caller that reaches a table under
+/// another name — through `search_path`, a quoted spelling, or a view of its own — is not caught
+/// here. The mechanism that does catch it is Postgres's own, a role with no privilege on the tables
+/// and `SECURITY DEFINER` on the functions that need them, and that is the follow-up this guard
+/// stands in for. Nothing about it is a substitute for the extension's filtering, which is where a
+/// row is actually kept back; this is about the raw tables having no business being read at all.
+fn refuse_raw_tables(tx: &mut postgres::Transaction<'_>, query: &str) -> Result<()> {
     let account: Option<String> = tx
         .query_one("SELECT (SELECT a.name FROM kb.account a WHERE a.id = kb.current_account())", &[])
         .map_err(pg)?
@@ -158,31 +163,20 @@ fn refuse_raw_tables(tx: &mut postgres::Transaction<'_>, query: &str, types: &[T
     if account.is_none() {
         return Ok(());
     }
-    // Every table of the extension's own schema, less the views a caller may read.
+    // Every table of the extension's schema; its views are not in this list, and are the surface.
     let rows = tx
         .query(
-            "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace              WHERE n.nspname = 'kb' AND c.relkind IN ('r', 'p')",
+            "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'kb' AND c.relkind IN ('r', 'p')",
             &[],
         )
         .map_err(pg)?;
-    let tables: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
-    // `EXPLAIN` names every relation the plan touches, one line per node (`Seq Scan on kb.node n`).
-    // A statement whose only tables are behind a function call is fine: the function is the
-    // surface, and it does its own filtering.
-    let plan: String = match tx.query_one(&format!("EXPLAIN (FORMAT TEXT, VERBOSE, COSTS OFF) {query}"), &[]) {
-        Ok(row) => row.get::<_, String>(0),
-        // Not plannable here (it has parameters, or it is not a query at all): fall back to the
-        // relations the parser can see, which is what a prepared statement's plan would name.
-        Err(_) => match tx.prepare_typed(query, types) {
-            Ok(_) => String::new(),
-            Err(_) => return Ok(()),
-        },
-    };
-    for t in tables {
-        // `"kb.node"` in the JSON plan, and `kb.node` in a message: both are the table named.
-        if plan.contains(&format!("kb.{t} ")) || plan.contains(&format!("on kb.{t}\n")) || plan.ends_with(&format!("on kb.{t}")) {
+    let words: Vec<&str> = query.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')).collect();
+    for t in rows.iter().map(|r| r.get::<_, String>(0)) {
+        if words.iter().any(|w| w.eq_ignore_ascii_case(&format!("kb.{t}"))) {
             return Err(StoreError::forbidden(format!(
-                "kb.{t} is the store's own table and is not yours to read; the views and kb.* are                  (files, folders, commits, links, properties, sections, authors, frontmatter)"
+                "kb.{t} is the store's own table and is not yours to read; the views and kb.* are \
+                 (files, folders, commits, links, properties, sections, authors, frontmatter)"
             )));
         }
     }
@@ -277,6 +271,23 @@ impl PgStore {
             sql_views_ready: false,
             assets_ready: false,
         })
+    }
+
+    /// A path as this connection's own, resolving an `id:1234` reference to the path that names
+    /// the same document here.
+    ///
+    /// Every query below addresses `kb.entry`, whose `path` is the caller's, and an id reference
+    /// is not a path in any view — so it has to become one before it can be compared. Only an id
+    /// costs the round trip; an ordinary path is already what it will be matched against.
+    fn own_path(&mut self, path: &str) -> Result<String> {
+        if !path.trim_start_matches('/').starts_with("id:") {
+            return Ok(path.to_string());
+        }
+        let row = self.client.query_one("SELECT kb.to_view(kb.resolve($1))", &[&path]).map_err(pg)?;
+        row.try_get::<_, Option<String>>(0)
+            .ok()
+            .flatten()
+            .ok_or_else(|| StoreError::not_found(format!("not found: {path}")))
     }
 
     fn ensure_asset_tables(&mut self) -> Result<()> {
@@ -707,7 +718,7 @@ impl Store for PgStore {
     }
 
     fn ls(&mut self, path: &str, recursive: bool) -> Result<Vec<Entry>> {
-        let path = normalize_path(path)?;
+        let path = self.own_path(&normalize_path(path)?)?;
         self.stat(&path)?;
         let rows = self
             .client
@@ -722,7 +733,7 @@ impl Store for PgStore {
     }
 
     fn stat(&mut self, path: &str) -> Result<Entry> {
-        let path = normalize_path(path)?;
+        let path = self.own_path(&normalize_path(path)?)?;
         let row = self
             .client
             .query_opt(
@@ -738,7 +749,7 @@ impl Store for PgStore {
     }
 
     fn read(&mut self, path: &str, version: Option<i64>) -> Result<(Vec<u8>, i64)> {
-        let path = normalize_path(path)?;
+        let path = self.own_path(&normalize_path(path)?)?;
         match version {
             Some(v) => {
                 let text: String = self.client.query_one("SELECT kb.content($1, $2)", &[&path, &v]).map_err(pg)?.get(0);
@@ -1346,7 +1357,7 @@ impl Store for PgStore {
         }
         let fail = |e| statement_error(e, write);
         let mut tx = self.client.build_transaction().read_only(!write).start().map_err(pg)?;
-        refuse_raw_tables(&mut tx, query, &types)?;
+        refuse_raw_tables(&mut tx, query)?;
         let batch: Option<String> = if write {
             let id: String = tx.query_one(NEW_BATCH_ID, &[]).map_err(pg)?.get(0);
             tx.execute("SELECT set_config('textdb.batch', $1, true)", &[&id]).map_err(pg)?;
