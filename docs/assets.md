@@ -211,6 +211,12 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
 
 - Store table `asset_store(name, driver, root, options)`: `driver` ∈ `local`, `rclone`; `root` is
   the store-side identity (a folder, or an rclone remote path such as `teamdrive:textdb`).
+  A row has no owner, and a pointer names its store by name: whoever can write the textdb store
+  can add a store, or point an existing name somewhere else, and thereby change where every asset
+  of that name is read from and written to for everyone else. On a shared store that is the
+  sharpest edge in the current design — see [`permissions.md`](permissions.md), which also covers
+  why a store's own credentials stay per person, and what a pointer does and does not tell its
+  readers.
 - Machine binding, because the same shared drive is mounted or configured differently per user:
   environment `TEXTDB_ASSET_STORE_<NAME>` (name upper case, other characters `_`), else
   `asset-stores.json` in the config directory (`TEXTDB_CONFIG_DIR`, else `%APPDATA%\textdb`,

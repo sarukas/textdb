@@ -23,6 +23,15 @@ This repository is the proof of concept described in [`docs/spec.md`](docs/spec.
   plus folder import, export back to disk (only changed files, so a git checkout shows real changes; names that
   clash on Windows or macOS are caught first), rename/move/delete, a trash, download and replace. HTTP API and client semantics:
   [`docs/live-app.md`](docs/live-app.md).
+- **Assets (binaries beside the documents):** [`docs/assets.md`](docs/assets.md) — images, PDFs and
+  other binaries kept in an asset store (a folder, a NAS, an rclone remote, Google Drive) with a
+  small `NAME.tdbasset` pointer in the store beside the documents that link to them: push, pull,
+  status, verify, relocate, what a sync does with a binary dropped into a vault, and what a file
+  moved, replaced or trashed in the store makes of the asset.
+- **Who may do what:** [`docs/permissions.md`](docs/permissions.md) — what textdb enforces today
+  (nothing: no principals, roles or ACLs, and `--author` is self-asserted), what the asset stores
+  add to the question (store rows nobody owns, per-person provider credentials, what a pointer
+  tells its readers, and a denial that looks like a failure), and the options for each.
 - **Python library:** [`python/`](python/README.md) — `Corpus.open("sqlite:///kb.db" | "postgresql://…")`,
   file/folder loaders, anchored edits, conflict handling, CLI.
 - **Skills for AI agents:** [`skills/textdb-install`](skills/textdb-install/SKILL.md),
