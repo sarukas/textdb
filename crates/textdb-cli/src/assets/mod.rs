@@ -1921,8 +1921,35 @@ pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
         };
         rows.push(json!({ "path": item.path, "here": item.state, "asset_store": in_store, "note": item.note }));
     }
+    // Files in a store that no pointer names: an upload someone made by hand, a leftover of a push
+    // that never committed, the file of a pointer since deleted. Compared with what every pointer in
+    // the store names, not only this vault's, since other folders' assets live in the same store.
+    // Told of, never counted as problems: whose files those are is not for textdb to decide.
+    let mut in_use = InUse::new();
+    let named: HashSet<(String, String)> = match in_use.refresh(st) {
+        Ok(()) => in_use.pointers.values().filter_map(|(_, names)| names.clone()).collect(),
+        Err(_) => HashSet::new(),
+    };
+    let stores: BTreeSet<String> = found.iter().filter_map(|i| i.pointer.as_ref().map(|p| p.store.clone())).collect();
+    let mut unnamed = Vec::new();
+    for store in stores {
+        let listed = match drivers.get(&store) {
+            Ok(d) => d.files(),
+            Err(e) => Err(StoreError::other(e)),
+        };
+        match listed {
+            Ok(Some(files)) => unnamed.extend(
+                files
+                    .into_iter()
+                    .filter(|(item, _)| !named.contains(&(store.clone(), location_key(item))))
+                    .map(|(_, at)| json!({ "store": store, "at": at })),
+            ),
+            Ok(None) => {}
+            Err(e) => unnamed.push(json!({ "store": store, "unchecked": e.message })),
+        }
+    }
     if json {
-        emit_json(&json!({ "prefix": v.prefix, "dir": v.dir.display().to_string(), "assets": rows, "problems": problems }))?;
+        emit_json(&json!({ "prefix": v.prefix, "dir": v.dir.display().to_string(), "assets": rows, "unnamed": unnamed, "problems": problems }))?;
     } else {
         let mut s = format!("verified {} assets of {} in {}\n", rows.len(), v.prefix, v.dir.display());
         for r in rows.iter().filter(|r| r["here"] != "ok" || r["asset_store"] != "ok") {
@@ -1932,6 +1959,12 @@ pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
                 r["here"].as_str().unwrap_or(""),
                 r["asset_store"].as_str().unwrap_or("")
             ));
+        }
+        for u in &unnamed {
+            match u["unchecked"].as_str() {
+                Some(why) => s.push_str(&format!("  the asset store {} could not be listed: {why}\n", u["store"].as_str().unwrap_or(""))),
+                None => s.push_str(&format!("  {} in the asset store {}: no pointer names it\n", u["at"].as_str().unwrap_or(""), u["store"].as_str().unwrap_or(""))),
+            }
         }
         s.push_str(&format!("{problems} problems\n"));
         out(s.as_bytes())?;

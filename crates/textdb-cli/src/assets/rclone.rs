@@ -1085,6 +1085,48 @@ impl Driver for RcloneDriver {
         Ok((Some(l.id), held))
     }
 
+    fn files(&self) -> Result<Option<Vec<(String, String)>>> {
+        let mut out: Vec<(String, String)> = match self.is_drive() {
+            // The listing this command already made of the store's live files: a drive's item is
+            // the file's id, which is what a pointer holds.
+            true => {
+                self.ensure_listed()?;
+                self.listing
+                    .borrow()
+                    .as_ref()
+                    .map_or_else(Vec::new, |l| l.by_id.iter().filter(|(_, e)| !e.trashed).map(|(id, e)| (id.clone(), e.path.clone())).collect())
+            }
+            // No hashes asked for: this says which files are there, not what is in them.
+            false => {
+                let listed = self.run(&["lsjson", "-R", "--files-only", "--no-modtime", "--no-mimetype", "--", &self.root])?;
+                match listed.status.code() {
+                    // Addressed by path, so each file names itself.
+                    Some(0) => serde_json::from_slice::<Vec<Listed>>(&listed.stdout)
+                        .map_err(|e| StoreError::other(format!("listing {}: unexpected rclone output ({e})", self.root)))?
+                        .into_iter()
+                        .filter(|l| !l.is_dir)
+                        .map(|l| {
+                            let at = format!("/{}", l.path.trim_start_matches('/'));
+                            (at.clone(), at)
+                        })
+                        .collect(),
+                    // Nothing there is nothing to tell of.
+                    Some(3 | 4) => Vec::new(),
+                    _ => return Err(failure(&format!("listing {}", self.root), &listed)),
+                }
+            }
+        };
+        // textdb's own are not files a pointer should name: the store's trash and everything in it,
+        // and the partial copies a push writes beside a path.
+        out.retain(|(_, at)| {
+            let rel = at.trim_start_matches('/');
+            !rel.starts_with(TRASH) && !rel.rsplit('/').next().is_some_and(|name| name.starts_with('.') && name.ends_with(".tdbpart"))
+        });
+        out.sort();
+        out.dedup();
+        Ok(Some(out))
+    }
+
     fn found(&self, item: &str) -> Result<Option<Found>> {
         // Items that are paths are where they say; a drive knows where the file of an id is now.
         if item.starts_with('/') || !is_drive_id(item) || !self.is_drive() {

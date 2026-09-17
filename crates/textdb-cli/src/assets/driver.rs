@@ -92,6 +92,14 @@ pub trait Driver {
     fn trash(&self, _item: &str, _sha256: &str) -> Result<bool> {
         Ok(false)
     }
+    /// Every file the store keeps, where the store can list them: the item that names it (a
+    /// provider's id, or the store path where files are addressed by path) and the store path it is
+    /// at. What tells of files in a store that no pointer names -- compared by item, since that is
+    /// what a pointer holds. textdb's own are left out (the store's trash, the locks in it, a push's
+    /// partial copies). `None` where a driver cannot say.
+    fn files(&self) -> Result<Option<Vec<(String, String)>>> {
+        Ok(None)
+    }
     /// The folder on this computer the store keeps its files in, for a local store.
     fn local_root(&self) -> Option<&Path> {
         None
@@ -471,6 +479,37 @@ impl Driver for LocalDriver {
     fn lock(&self, path: &str) -> Result<Held> {
         self.file(path)?;
         Ok(Held::of(self.lock_file(path)?))
+    }
+
+    fn files(&self) -> Result<Option<Vec<(String, String)>>> {
+        fn walk(root: &Path, at: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
+            for e in std::fs::read_dir(at)? {
+                let e = e?;
+                let path = e.path();
+                let name = e.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    // The store's own trash, and everything in it, is nothing a pointer names.
+                    if name != TRASH {
+                        walk(root, &path, out)?;
+                    }
+                } else if !(name.starts_with('.') && name.ends_with(".tdbpart")) {
+                    if let Ok(rel) = path.strip_prefix(root) {
+                        out.push(format!("/{}", rel.to_string_lossy().replace('\\', "/")));
+                    }
+                }
+            }
+            Ok(())
+        }
+        let mut out = Vec::new();
+        match walk(&self.root, &self.root, &mut out) {
+            Ok(()) => {}
+            // A store folder that is not there holds no files to tell of.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(Vec::new())),
+            Err(e) => return Err(io(format!("listing {}", self.root.display()), e)),
+        }
+        out.sort();
+        // The item of a local store is the path its bytes are at, so each file names itself.
+        Ok(Some(out.into_iter().map(|at| (at.clone(), at)).collect()))
     }
 
     fn local_root(&self) -> Option<&Path> {

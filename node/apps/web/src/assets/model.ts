@@ -45,6 +45,20 @@ const LABELS: Record<AssetState, StateLabel> = {
   orphan: { label: "Orphan", tone: "problem", hint: "Its pointer was moved or deleted in the store: the next sync moves or trashes the file." },
   "invalid-pointer": { label: "Invalid pointer", tone: "problem", hint: "The pointer document cannot be read." },
   "invalid-path": { label: "Invalid name", tone: "problem", hint: "The name cannot be a file on every system: rename it." },
+  "changed-in-store": { label: "Changed in store", tone: "action", hint: "Someone replaced its bytes in the asset store: pull to take them as its new version." },
+  "moved-here": {
+    label: "Moved here",
+    tone: "action",
+    hint: "The asset moved here while its file stayed where it was in the asset store: `textdb assets relocate` moves the file to it, or move the pointer back.",
+  },
+  "moved-in-store": {
+    label: "Moved in store",
+    tone: "action",
+    hint: "Someone moved its file in the asset store: a pull still fetches it, and `textdb assets relocate` brings it back to the asset.",
+  },
+  "trashed-in-store": { label: "Trashed in store", tone: "problem", hint: "Its file is in the asset store's own trash: a pull still fetches it, until the store empties it." },
+  ambiguous: { label: "Two in store", tone: "problem", hint: "The asset store holds two files of that name: keep one of them there, and neither is read or written over until then." },
+  "invalid-item": { label: "Not in store", tone: "problem", hint: "The asset store has no file of that item: purged from its trash, or a file outside the store." },
 };
 
 export function stateLabel(state: string): StateLabel {
@@ -93,10 +107,16 @@ export function actionFor(item: Pick<AssetItem, "state">): "pull" | "push" | nul
   switch (item.state) {
     case "not-pulled":
     case "outdated":
+    // Its bytes in the store are not the ones its pointer names, and a pull takes them as the new
+    // version; one in the store's own trash is still fetched by its item.
+    case "changed-in-store":
+    case "trashed-in-store":
       return "pull";
     case "new":
     case "modified":
       return "push";
+    // The move states are settled by `textdb assets relocate` or by moving the pointer back, and
+    // `ambiguous` and `invalid-item` are sorted out in the store itself: neither is a pull or push.
     default:
       return null;
   }
