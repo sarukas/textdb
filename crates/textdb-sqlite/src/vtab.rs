@@ -458,16 +458,21 @@ unsafe impl VTabCursor for KbCursor<'_> {
         };
         let rows = stmt.query_map(rusqlite::params_from_iter(params), map)?.collect::<Result<Vec<_>>>()?;
         // Out in the account's paths, and never a row it cannot see: an id equality and a scan
-        // both reach the whole table, so this is the filter as much as the translation.
-        self.rows = rows
-            .into_iter()
-            .filter_map(|mut r| {
-                let p = view.to_view(&r.path)?;
-                r.name = if p == "/" { "/".to_string() } else { crate::db::name_of(&p).to_string() };
-                r.path = p;
-                Some(r)
-            })
-            .collect();
+        // both reach the whole table, so this is the filter as much as the translation. The
+        // owner's rows are already what they will be, and go through untouched — translating them
+        // would be two string allocations a row for an answer identical to the one in hand.
+        self.rows = if view.is_admin() {
+            rows
+        } else {
+            rows.into_iter()
+                .filter_map(|mut r| {
+                    let p = view.to_view(&r.path)?;
+                    r.name = if p == "/" { "/".to_string() } else { crate::db::name_of(&p).to_string() };
+                    r.path = p;
+                    Some(r)
+                })
+                .collect()
+        };
         self.i = 0;
         Ok(())
     }
