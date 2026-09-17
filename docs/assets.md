@@ -94,6 +94,42 @@ A file whose name differs from a pointer's only in case is that asset (on Window
 is the same file); a second file differing only in case is a `conflict`. A pointer whose path
 cannot be a file on every system is `invalid-path`.
 
+## A binary dropped into a vault, and what a sync does with it
+
+Someone copies a few images into a synced folder and runs `textdb sync`. **Nothing is copied into
+the asset store, and the files stay exactly where they are.** The sync counts them as `new` assets
+and says so; their bytes are never read into textdb either, since a binary is never taken in as a
+document (one that `--ext` would otherwise have taken is skipped with a note naming the asset store
+or a rule as the way to keep it). A store being configured changes none of this: publishing is
+something asked for, never a side effect of syncing.
+
+Three ways to publish them, then:
+
+| | What it does |
+|---|---|
+| `textdb assets push` | Publishes the `new` and `modified` assets now |
+| `textdb sync --push / DIR` | The same, as part of that one sync (`--pull` likewise fetches) |
+| `asset_sync` = `push`, `pull` or `both` | Every sync of this store does it; the default is `off` |
+
+`--push` and `--pull` decide a single run; without either, the store's `asset_sync` setting decides,
+and with neither set the answer is `off`. Pulling is not the mirror of pushing: `asset_pull`
+defaults to `linked`, so a pull fetches the assets the notes link to and nothing else, until it is
+set to `all`.
+
+What a push does, in order: it copies the bytes into the store (a copy, never a move -- the real
+file stays on disk, where it is edited), hashes what arrived to be sure of it, then writes the
+`NAME.tdbasset` pointer next to the file and commits that pointer to textdb. The binary itself never
+enters textdb or git; the pointer is the versioned thing. Which store it goes to: `--to NAME` when
+given, else the store its pointer already names, else the first store declared. Inside the store the
+bytes go to the asset's own path under the root, so `/img/a.png` is `<root>/img/a.png` and the store
+stays browsable by hand.
+
+One deliberate refusal to know about: a sync that brings a `.gitattributes` in from textdb, or
+moves, sets aside or deletes one on disk, pushes no assets on that run -- the file that decides what
+counts as an asset has just changed under it. It reports that the rules changed, and an explicit
+push or the next sync with `--accept-rules` goes ahead. That way a rules file someone else committed
+cannot make a later sync publish what it should not.
+
 ## Which files are documents, assets or ignored
 
 Git's attribute syntax, in the vault's `.gitattributes`, with a `textdb` attribute:
