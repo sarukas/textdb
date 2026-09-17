@@ -1096,15 +1096,27 @@ impl Driver for RcloneDriver {
                     .as_ref()
                     .map_or_else(Vec::new, |l| l.by_id.iter().filter(|(_, e)| !e.trashed).map(|(id, e)| (id.clone(), e.path.clone())).collect())
             }
-            // No hashes asked for: this says which files are there, not what is in them.
+            // No hashes asked for: this says which files are there, not what is in them. A drive
+            // reached through an alias remote comes here too, so shortcuts and Google documents are
+            // skipped the same as above: neither is a file of the store's a pointer could name.
             false => {
-                let listed = self.run(&["lsjson", "-R", "--files-only", "--no-modtime", "--no-mimetype", "--", &self.root])?;
+                let listed = self.run(&[
+                    "lsjson",
+                    "-R",
+                    "--files-only",
+                    "--no-modtime",
+                    "--no-mimetype",
+                    "--drive-skip-shortcuts",
+                    "--drive-skip-gdocs",
+                    "--",
+                    &self.root,
+                ])?;
                 match listed.status.code() {
                     // Addressed by path, so each file names itself.
                     Some(0) => serde_json::from_slice::<Vec<Listed>>(&listed.stdout)
                         .map_err(|e| StoreError::other(format!("listing {}: unexpected rclone output ({e})", self.root)))?
                         .into_iter()
-                        .filter(|l| !l.is_dir)
+                        .filter(|l| !l.is_dir && l.size >= 0)
                         .map(|l| {
                             let at = format!("/{}", l.path.trim_start_matches('/'));
                             (at.clone(), at)
@@ -1120,7 +1132,10 @@ impl Driver for RcloneDriver {
         // and the partial copies a push writes beside a path.
         out.retain(|(_, at)| {
             let rel = at.trim_start_matches('/');
-            !rel.starts_with(TRASH) && !rel.rsplit('/').next().is_some_and(|name| name.starts_with('.') && name.ends_with(".tdbpart"))
+            // That folder itself, not one whose name merely starts the same way: a folder somebody
+            // called `.textdb-trash-old` is theirs, and belongs in what the store is said to hold.
+            let in_trash = rel == TRASH || rel.strip_prefix(TRASH).is_some_and(|rest| rest.starts_with('/'));
+            !in_trash && !rel.rsplit('/').next().is_some_and(|name| name.starts_with('.') && name.ends_with(".tdbpart"))
         });
         out.sort();
         out.dedup();

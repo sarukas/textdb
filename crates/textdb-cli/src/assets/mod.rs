@@ -1384,16 +1384,16 @@ pub(crate) fn not_pulled_after_conflict(st: &mut dyn Store, v: &Vault) -> Result
 /// Drive) is reached at all, and one that cannot be reached leaves its assets as they are and says
 /// so. The move itself is never made here: `textdb assets relocate` makes it, `textdb mv` puts the
 /// pointer back.
-pub(crate) fn counts_and_moves(st: &mut dyn Store, v: &Vault, save: bool, ask_stores: bool) -> Result<(BTreeMap<String, usize>, Vec<String>)> {
+pub(crate) fn counts_and_moves(st: &mut dyn Store, v: &Vault, save: bool, stores: Option<&mut StoreFiles>) -> Result<(BTreeMap<String, usize>, Vec<String>)> {
     let scan = scan(st, v)?;
     let mut cache = VaultCache::open(v);
     let mut found = items(v, &scan, &mut cache, &[])?;
-    // A dry run asks nothing of anyone's provider: it says what a sync would do here, and reaching
-    // a drive to tell of a move is not that.
-    let mut notes = match (ask_stores, StoreFiles::new(st)) {
-        (false, _) => Vec::new(),
-        (true, Ok(mut files)) => mark_store_states(&mut found, |store, item| files.found(store, item)),
-        (true, Err(e)) => vec![format!("the asset stores could not be read ({}): what was changed in them is not told of", e.message)],
+    // Whose stores to ask is the caller's to say, so a sync asks one set of them for its pull, its
+    // states and its deletions alike. A dry run asks nothing of anyone's provider -- it says what a
+    // sync would do here, and reaching a drive to tell of a move is not that -- so it passes none.
+    let mut notes = match stores {
+        None => Vec::new(),
+        Some(files) => mark_store_states(&mut found, |store, item| files.found(store, item)),
     };
     // One line each while they are few, one line for a folderful: a folder moved in textdb is
     // hundreds of assets, and a sync saying so hundreds of times says nothing at all.
@@ -1549,7 +1549,7 @@ pub fn pull(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, linked_fro
     let v = vault(st, paths.first().map(String::as_str).or(linked_from), dir)?;
     let scope = scope_of(paths)?;
     let linked = linked_from.map(|p| linked_assets(st, p)).transpose()?;
-    let PullReport { pulled, bytes, kept, failed } = pull_run(st, &v, &scope, linked.as_ref(), author, dry_run)?;
+    let PullReport { pulled, bytes, kept, failed } = pull_run(st, &v, &scope, linked.as_ref(), author, dry_run, None)?;
     if json {
         emit_json(&json!({ "dry_run": dry_run, "pulled": pulled, "bytes": bytes, "kept": kept, "failed": failed }))?;
     } else {
@@ -1580,12 +1580,19 @@ pub(crate) fn pull_run(
     linked: Option<&BTreeSet<String>>,
     author: Option<&str>,
     dry_run: bool,
+    stores: Option<&mut StoreFiles>,
 ) -> Result<PullReport> {
     check_scope(v, scope)?;
     let scan = scan(st, v)?;
     let mut cache = VaultCache::open(v);
     let mut found = items(v, &scan, &mut cache, scope)?;
-    let mut files = StoreFiles::new(st)?;
+    // The caller's stores when it has them -- a sync's pull, states and deletions then list a drive
+    // and open its drivers once between them -- and this command's own otherwise.
+    let mut owned = None;
+    let files = match stores {
+        Some(files) => files,
+        None => owned.insert(StoreFiles::new(st)?),
+    };
     // What the stores hold is asked before anything is fetched, so bytes someone replaced in a store
     // are followed rather than refused as the wrong ones. A dry run asks nothing of anyone's
     // provider: it says what a pull would do here, and reaching a drive to look is not that.
@@ -1924,28 +1931,58 @@ pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
     // Files in a store that no pointer names: an upload someone made by hand, a leftover of a push
     // that never committed, the file of a pointer since deleted. Compared with what every pointer in
     // the store names, not only this vault's, since other folders' assets live in the same store.
-    // Told of, never counted as problems: whose files those are is not for textdb to decide.
-    let mut in_use = InUse::new();
-    let named: HashSet<(String, String)> = match in_use.refresh(st) {
-        Ok(()) => in_use.pointers.values().filter_map(|(_, names)| names.clone()).collect(),
-        Err(_) => HashSet::new(),
-    };
-    let stores: BTreeSet<String> = found.iter().filter_map(|i| i.pointer.as_ref().map(|p| p.store.clone())).collect();
+    // Told of, never counted as problems: whose files those are is not for textdb to decide. Only
+    // for a whole vault -- a check of one asset has no business listing every file of a drive.
     let mut unnamed = Vec::new();
-    for store in stores {
-        let listed = match drivers.get(&store) {
-            Ok(d) => d.files(),
-            Err(e) => Err(StoreError::other(e)),
+    if scope.is_empty() {
+        let mut in_use = InUse::new();
+        // What a store's files are for is never guessed at from the pointers that happened to parse.
+        // One pointer textdb cannot read and it names none of them, saying why instead: this list is
+        // read as "nothing needs these bytes", and someone acts on it by hand in their own drive.
+        let named = match in_use.refresh(st) {
+            Err(e) => Err(format!("the store's pointers could not be read ({})", e.message)),
+            Ok(()) => {
+                let mut unreadable: Vec<&str> = in_use.pointers.iter().filter(|(_, (_, names))| names.is_none()).map(|(p, _)| p.as_str()).collect();
+                unreadable.sort();
+                match unreadable.first() {
+                    Some(first) => Err(match unreadable.len() {
+                        1 => format!("the pointer {first} cannot be read, so what the store's files are for is not known"),
+                        n => format!("{n} pointers cannot be read ({first} among them), so what the store's files are for is not known"),
+                    }),
+                    // A pointer an earlier build wrote names its file by the path it sits at, one
+                    // pushed since by the id the drive keeps it under: a file is named when either
+                    // says so, or every asset not pushed again since would read as named by nothing.
+                    None => Ok(in_use
+                        .pointers
+                        .iter()
+                        .filter_map(|(pointer, (_, names))| names.as_ref().map(|(store, key)| (pointer, store, key)))
+                        .flat_map(|(pointer, store, key)| [(store.clone(), key.clone()), (store.clone(), location_key(asset_path(pointer)))])
+                        .collect::<HashSet<(String, String)>>()),
+                }
+            }
         };
-        match listed {
-            Ok(Some(files)) => unnamed.extend(
-                files
-                    .into_iter()
-                    .filter(|(item, _)| !named.contains(&(store.clone(), location_key(item))))
-                    .map(|(_, at)| json!({ "store": store, "at": at })),
-            ),
-            Ok(None) => {}
-            Err(e) => unnamed.push(json!({ "store": store, "unchecked": e.message })),
+        let stores: BTreeSet<String> = found.iter().filter_map(|i| i.pointer.as_ref().map(|p| p.store.clone())).collect();
+        for store in stores {
+            let listed = match &named {
+                // Said of the store itself: it is why none of its files are spoken for here.
+                Err(why) => Err(StoreError::other(why.clone())),
+                Ok(_) => match drivers.get(&store) {
+                    Ok(d) => d.files(),
+                    Err(e) => Err(StoreError::other(e)),
+                },
+            };
+            match (listed, &named) {
+                (Ok(Some(files)), Ok(named)) => unnamed.extend(
+                    files
+                        .into_iter()
+                        .filter(|(item, at)| {
+                            !named.contains(&(store.clone(), location_key(item))) && !named.contains(&(store.clone(), location_key(at)))
+                        })
+                        .map(|(_, at)| json!({ "store": store, "at": at })),
+                ),
+                (Ok(_), _) => {}
+                (Err(e), _) => unnamed.push(json!({ "store": store, "unchecked": e.message })),
+            }
         }
     }
     if json {

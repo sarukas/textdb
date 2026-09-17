@@ -673,6 +673,21 @@ fn assets_push_pull_verify_links_and_gitignore() {
     assert_eq!(std::fs::read(vault.join("docs/deck.pdf")).unwrap(), b"%PDF-1.4 one");
     assert_eq!(ok(&mut t(&["--json", "assets", "verify"]), None).json()["problems"], 0);
 
+    // A file somebody else put in the asset store, which no pointer names: told of, and no problem
+    // of textdb's to count -- whose bytes those are is not for textdb to decide. The assets' own
+    // files are named by their pointers, so none of them is listed here.
+    std::fs::create_dir_all(bucket.join("img")).unwrap();
+    std::fs::write(bucket.join("img/nobodys.png"), b"\x89PNG theirs").unwrap();
+    let listed = ok(&mut t(&["--json", "assets", "verify"]), None).json();
+    assert_eq!(listed["problems"], 0, "{listed}");
+    let unnamed: Vec<&str> = listed["unnamed"].as_array().unwrap().iter().filter_map(|u| u["at"].as_str()).collect();
+    assert_eq!(unnamed, vec!["/img/nobodys.png"], "{listed}");
+    // One asset, or one folder, asked about on its own never lists a store's files: what a store
+    // holds that nothing names is a whole vault's question, and listing a drive is not free.
+    let one = ok(&mut t(&["--json", "assets", "verify", "/img"]), None).json();
+    assert_eq!(one["unnamed"].as_array().unwrap().len(), 0, "{one}");
+    std::fs::remove_file(bucket.join("img/nobodys.png")).unwrap();
+
     // Bytes damaged in the asset store: verify fails, and pull does not put them in place.
     std::fs::write(bucket.join("data/x.dat"), b"damaged").unwrap();
     let bad = run(&mut t(&["--json", "assets", "verify"]), None);
@@ -1172,9 +1187,29 @@ fn assets_on_google_drive_are_pulled_by_file_id_and_never_from_outside_the_store
     let id = pointer.lines().find_map(|l| l.strip_prefix("item: ")).unwrap().to_string();
     assert!(!id.starts_with('/'), "the item is the Drive file id: {pointer}");
 
+    // What the drive holds is the asset's own state while the file here is still the bytes its
+    // pointer names: moved there it is `moved-in-store` and says where it went, trashed there it is
+    // `trashed-in-store`. Neither is the vault's to settle, and a pull still fetches either.
+    let asset_at = |path: &str| {
+        ok(&mut t(&["--json", "assets", "status", "--dir", dir]), None).json()["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["path"] == path)
+            .cloned()
+            .unwrap_or_else(|| panic!("{path} is not in `assets status`"))
+    };
     // Renamed in the drive and then trashed there: pulled all the same, by its id.
     rc(&["moveto", &format!("{root}/img/a.png"), &format!("{root}/elsewhere/renamed.png")]);
+    let moved_in_store = asset_at("/img/a.png");
+    assert_eq!(moved_in_store["state"], "moved-in-store", "{moved_in_store}");
+    assert!(
+        moved_in_store["in_store"].as_str().is_some_and(|at| at.ends_with("elsewhere/renamed.png")),
+        "the asset does not say where its file went in the drive: {moved_in_store}"
+    );
     rc(&["deletefile", &format!("{root}/elsewhere/renamed.png")]);
+    let trashed_in_store = asset_at("/img/a.png");
+    assert_eq!(trashed_in_store["state"], "trashed-in-store", "{trashed_in_store}");
     std::fs::remove_file(vault.join("img/a.png")).unwrap();
     ok(&mut t(&["assets", "pull", "--dir", dir]), None);
     assert_eq!(std::fs::read(vault.join("img/a.png")).unwrap(), bytes);
@@ -1198,6 +1233,13 @@ fn assets_on_google_drive_are_pulled_by_file_id_and_never_from_outside_the_store
     let pulled = run(&mut t(&["assets", "pull", "--dir", dir]), None);
     assert!(format!("{}{}", pulled.stdout, pulled.stderr).contains("names no file of the asset store"), "{} {}", pulled.stdout, pulled.stderr);
     assert!(!vault.join("img/c.png").exists());
+    // Nothing about this vault is wrong once the bytes its pointer names are here -- but the store
+    // holds no file of that item, so that is what the asset says of itself, and neither a pull nor
+    // a push guesses at which file was meant. Taken away again, so what follows sees it as it was.
+    std::fs::write(vault.join("img/c.png"), bytes).unwrap();
+    let invalid_item = asset_at("/img/c.png");
+    assert_eq!(invalid_item["state"], "invalid-item", "{invalid_item}");
+    std::fs::remove_file(vault.join("img/c.png")).unwrap();
 
     // A pointer deleted in textdb sends its file to Drive's trash -- but only once every pointer of
     // the store can be read, since what bytes are for is not guessed at from the pointers that
@@ -1245,6 +1287,10 @@ fn assets_on_google_drive_are_pulled_by_file_id_and_never_from_outside_the_store
         .unwrap();
     rc(&["copyto", "--ignore-times", theirs.to_str().unwrap(), &format!("{root}/{path_of_e}")]);
     std::fs::remove_file(&theirs).unwrap();
+    // The file here is still the one the pointer names; the drive's is somebody else's now. The
+    // asset says so, and a pull would take those bytes as its new version rather than refuse them.
+    let changed_in_store = asset_at("/img/e.png");
+    assert_eq!(changed_in_store["state"], "changed-in-store", "{changed_in_store}");
     ok(&mut t(&["rm", "/img/e.png"]), None);
     let kept = run(&mut t(&["--json", "sync", "/", dir]), None);
     assert!(live().contains(&id_e), "bytes replaced in the drive were sent to Drive's trash by a deleted pointer");

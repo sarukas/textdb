@@ -482,15 +482,39 @@ impl Driver for LocalDriver {
     }
 
     fn files(&self) -> Result<Option<Vec<(String, String)>>> {
-        fn walk(root: &Path, at: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
+        /// How deep a store's own folders are ever walked: a link to its own root would otherwise
+        /// walk for as long as the stack held.
+        const DEEPEST: usize = 64;
+        // What was there but not looked at. A listing of a store is read as "no pointer names
+        // these", so one that quietly left something out would have a reader deleting bytes on the
+        // strength of it: anything missed fails the listing instead of thinning it.
+        fn walk(root: &Path, at: &Path, depth: usize, out: &mut Vec<String>, missed: &mut Vec<String>) -> std::io::Result<()> {
+            if depth >= DEEPEST {
+                missed.push(format!("{} is more than {DEEPEST} folders deep", at.display()));
+                return Ok(());
+            }
             for e in std::fs::read_dir(at)? {
                 let e = e?;
                 let path = e.path();
                 let name = e.file_name().to_string_lossy().into_owned();
-                if path.is_dir() {
-                    // The store's own trash, and everything in it, is nothing a pointer names.
-                    if name != TRASH {
-                        walk(root, &path, out)?;
+                // What a link leads to is not this store's to list, and whose bytes those are is
+                // not for a walk of somebody's folders to decide.
+                let kind = std::fs::symlink_metadata(&path)?;
+                if kind.is_symlink() {
+                    missed.push(format!("{} is a link or junction", path.display()));
+                } else if kind.is_dir() {
+                    // The store's own trash, and everything in it, is nothing a pointer names: that
+                    // folder at the store's root, where a push puts what it replaces, and not one
+                    // somebody gave the same name deeper in -- those files are theirs, and belong in
+                    // what the store is said to hold.
+                    if !(depth == 0 && name == TRASH) {
+                        match walk(root, &path, depth + 1, out, missed) {
+                            Ok(()) => {}
+                            // Gone while this walked -- a push moving bytes about, someone tidying.
+                            // What it held goes unlisted, which is not the same as nothing to list.
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => missed.push(format!("{} went while it was being listed", path.display())),
+                            Err(e) => return Err(e),
+                        }
                     }
                 } else if !(name.starts_with('.') && name.ends_with(".tdbpart")) {
                     if let Ok(rel) = path.strip_prefix(root) {
@@ -500,12 +524,18 @@ impl Driver for LocalDriver {
             }
             Ok(())
         }
-        let mut out = Vec::new();
-        match walk(&self.root, &self.root, &mut out) {
+        let (mut out, mut missed) = (Vec::new(), Vec::new());
+        match walk(&self.root, &self.root, 0, &mut out, &mut missed) {
             Ok(()) => {}
-            // A store folder that is not there holds no files to tell of.
+            // The store's own folder, not one below it: a store that is not there holds no files.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(Vec::new())),
             Err(e) => return Err(io(format!("listing {}", self.root.display()), e)),
+        }
+        if let Some(first) = missed.first() {
+            return Err(StoreError::other(match missed.len() {
+                1 => format!("listing {}: {first}, so what the store holds is not all known", self.root.display()),
+                n => format!("listing {}: {first} ({n} such), so what the store holds is not all known", self.root.display()),
+            }));
         }
         out.sort();
         // The item of a local store is the path its bytes are at, so each file names itself.
@@ -652,6 +682,30 @@ mod tests {
         assert_eq!(stamp(UNIX_EPOCH), "19700101-000000");
         assert_eq!(stamp(UNIX_EPOCH + std::time::Duration::from_secs(1_789_460_100)), "20260915-081500");
         assert_eq!(stamp(UNIX_EPOCH + std::time::Duration::from_secs(951_782_400)), "20000229-000000");
+    }
+
+    #[test]
+    fn what_a_local_store_holds_leaves_out_textdbs_own_files_and_nobody_elses() {
+        // Its own name, since tests share a process and so the pid with one another.
+        let tmp = std::env::temp_dir().join(format!("textdb-driver-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("store");
+        std::fs::create_dir_all(root.join("img").join(TRASH)).unwrap();
+        std::fs::create_dir_all(root.join(TRASH).join("old")).unwrap();
+        std::fs::write(root.join("img/a.png"), b"one").unwrap();
+        // Half of a push that never finished, and bytes a push replaced: textdb's own, both.
+        std::fs::write(root.join("img/.a.png.tdbpart"), b"half").unwrap();
+        std::fs::write(root.join(TRASH).join("old/a.png"), b"gone").unwrap();
+        // A folder of that name below the root is somebody's own, and what it holds is the store's.
+        std::fs::write(root.join("img").join(TRASH).join("theirs.png"), b"mine").unwrap();
+        let d = LocalDriver { root: root.clone() };
+        let listed = d.files().unwrap().unwrap();
+        // The item of a local store is the path its bytes are at, so each file names itself.
+        let theirs = format!("/img/{TRASH}/theirs.png");
+        assert_eq!(listed, vec![(theirs.clone(), theirs), ("/img/a.png".to_string(), "/img/a.png".to_string())], "{listed:?}");
+        // A store folder that is not there holds no files to tell of, which is no error of its own.
+        assert_eq!(LocalDriver { root: tmp.join("nowhere") }.files().unwrap(), Some(Vec::new()));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

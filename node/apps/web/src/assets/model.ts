@@ -54,9 +54,13 @@ const LABELS: Record<AssetState, StateLabel> = {
   "moved-in-store": {
     label: "Moved in store",
     tone: "action",
-    hint: "Someone moved its file in the asset store: a pull still fetches it, and `textdb assets relocate` brings it back to the asset.",
+    hint: "Someone moved its file in the asset store: the file here is still the asset's own bytes, and `textdb assets relocate` brings the file back to it.",
   },
-  "trashed-in-store": { label: "Trashed in store", tone: "problem", hint: "Its file is in the asset store's own trash: a pull still fetches it, until the store empties it." },
+  "trashed-in-store": {
+    label: "Trashed in store",
+    tone: "problem",
+    hint: "Its file is in the asset store's own trash: the copy here is still the asset's own bytes, but they go for good when the store empties its trash — restore the file there.",
+  },
   ambiguous: { label: "Two in store", tone: "problem", hint: "The asset store holds two files of that name: keep one of them there, and neither is read or written over until then." },
   "invalid-item": { label: "Not in store", tone: "problem", hint: "The asset store has no file of that item: purged from its trash, or a file outside the store." },
 };
@@ -108,15 +112,16 @@ export function actionFor(item: Pick<AssetItem, "state">): "pull" | "push" | nul
     case "not-pulled":
     case "outdated":
     // Its bytes in the store are not the ones its pointer names, and a pull takes them as the new
-    // version; one in the store's own trash is still fetched by its item.
+    // version.
     case "changed-in-store":
-    case "trashed-in-store":
       return "pull";
     case "new":
     case "modified":
       return "push";
-    // The move states are settled by `textdb assets relocate` or by moving the pointer back, and
-    // `ambiguous` and `invalid-item` are sorted out in the store itself: neither is a pull or push.
+    // A store-side state only ever replaces `ok`, so the file here is already the asset's own bytes
+    // and there is nothing to fetch: `trashed-in-store` is settled in the store (a pull would not
+    // take it, and no push puts those bytes back), the move states by `textdb assets relocate` or
+    // by moving the pointer back, `ambiguous` and `invalid-item` in the store itself.
     default:
       return null;
   }
