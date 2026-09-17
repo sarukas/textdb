@@ -462,13 +462,17 @@ impl VaultCache {
 pub struct Item {
     /// The asset's path in the store.
     pub path: String,
-    /// `ok`, `new`, `modified`, `outdated`, `conflict`, `not-pulled`, `invalid-pointer` or
-    /// `invalid-path`.
+    /// `ok`, `new`, `modified`, `outdated`, `conflict`, `not-pulled`, `moved-here`,
+    /// `invalid-pointer` or `invalid-path`.
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<String>,
+    /// Where the asset store keeps the file now, when the store can tell and that is not where the
+    /// asset's own path says it should be.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_store: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// The media type: the pointer's, or from the name for a file without one.
@@ -504,6 +508,7 @@ impl Item {
             state: "ok",
             size: None,
             store: None,
+            in_store: None,
             note: None,
             media_type: pointer::media_type(rel).to_string(),
             sha256: None,
@@ -705,16 +710,66 @@ fn item_line(i: &Item) -> String {
     format!("  {:<16}{}{size}{note}\n", i.state, i.path)
 }
 
+/// Ask the stores that keep their files by an id of their own where each asset's file is now, and
+/// mark the ones whose file is not where the asset's path says: `moved-here`, the asset having moved
+/// in textdb while its file stayed. A store that cannot be asked leaves its assets as they were and
+/// is named in what comes back, so nothing is silently taken for being in its place.
+pub(crate) fn mark_moved_here(items: &mut [Item], files: &mut StoreFiles) -> Vec<String> {
+    let mut unasked: BTreeMap<String, String> = BTreeMap::new();
+    for item in items.iter_mut() {
+        let Some((store, named)) = item.pointer.as_ref().and_then(|p| p.item.as_deref().map(|i| (p.store.clone(), i.to_string()))) else { continue };
+        if named.starts_with('/') {
+            continue;
+        }
+        match files.at(&store, &named) {
+            // Compared as the store compares its own locations: a path differing only in letter
+            // case is the same place, and calling that a move would ask for one that cannot settle.
+            Ok(Some(at)) if location_key(&at) != location_key(&item.path) => {
+                let told = format!("its file in the asset store is at {at}: `textdb assets relocate {}` moves it there, or move the pointer back to {at}", item.path);
+                item.in_store = Some(at);
+                // Only over `ok`: what the bytes themselves say comes first, and an asset waiting to
+                // be pulled is still that. Either way this is told of as well, never instead.
+                if item.state == "ok" {
+                    item.state = "moved-here";
+                }
+                item.note = Some(match item.note.take() {
+                    Some(had) => format!("{had}; {told}"),
+                    None => told,
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                unasked.entry(store).or_insert(e.message);
+            }
+        }
+    }
+    unasked
+        .into_iter()
+        .map(|(store, why)| format!("the asset store {store} could not be asked where its files are ({why}): assets moved in textdb are not told of"))
+        .collect()
+}
+
 pub fn status(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: bool) -> Result<()> {
     let v = vault(st, path, dir)?;
     let scan = scan(st, &v)?;
     let mut cache = VaultCache::open(&v);
     let scope = scope_of(&path.map(str::to_string).into_iter().collect::<Vec<_>>())?;
-    let items = items(&v, &scan, &mut cache, &scope)?;
+    let mut items = items(&v, &scan, &mut cache, &scope)?;
+    // The stores are asked where their files are, so an asset that moved in textdb while its file
+    // stayed shows as `moved-here`; one that cannot be reached says so and changes nothing.
+    let unasked = match StoreFiles::new(st) {
+        Ok(mut files) => mark_moved_here(&mut items, &mut files),
+        Err(e) => vec![format!("the asset stores could not be read ({}): assets moved in textdb are not told of", e.message)],
+    };
     cache.save();
     let c = counts(&items);
     if json {
-        return emit_json(&json!({ "prefix": v.prefix, "dir": v.dir.display().to_string(), "assets": items, "counts": c }));
+        // In the document too: a reader of the JSON must not take every asset for being in its
+        // place when a store was never asked.
+        return emit_json(&json!({ "prefix": v.prefix, "dir": v.dir.display().to_string(), "assets": items, "counts": c, "notes": unasked }));
+    }
+    for line in &unasked {
+        eprintln!("note: {line}");
     }
     let mut s = format!("assets of {} in {}\n", v.prefix, v.dir.display());
     for i in items.iter().filter(|i| i.state != "ok" || i.note.is_some()) {
@@ -764,6 +819,17 @@ impl Drivers {
     }
 }
 
+/// What became of a store's own copy of an asset whose path changed.
+pub(crate) enum StoreMove {
+    /// At the asset's own path now; the item its pointer names (on Google Drive the id, which a
+    /// move leaves as it was).
+    Moved(Option<String>),
+    /// Left where it is, for a reason nobody needs telling.
+    Left,
+    /// Left where it is, for a reason a command tells of.
+    LeftBecause(String),
+}
+
 /// What became of a store's own copy of an asset whose pointer went away.
 pub(crate) enum StoreCopy {
     /// In the store's own trash now, or there already.
@@ -791,7 +857,7 @@ impl StoreFiles {
     /// Why the file at `location` in the store `store` stays where it is, if it does: another
     /// pointer than the asset `own`'s names it, or a pointer of the store cannot be read at all and
     /// what its bytes are for is therefore not known. `None` leaves the file to the caller.
-    fn keeps(&mut self, st: &mut dyn Store, store: &str, location: &str, own: &str) -> Result<Option<StoreCopy>> {
+    pub(crate) fn keeps(&mut self, st: &mut dyn Store, store: &str, location: &str, own: &str) -> Result<Option<StoreCopy>> {
         self.in_use.refresh(st)?;
         // A pointer textdb cannot read names nothing it can be sure of: what a store's files are
         // for is not guessed at from the pointers that happened to parse. Said out loud, since one
@@ -811,13 +877,24 @@ impl StoreFiles {
     /// now), once no other pointer names it: the item the pointer should name, or `None` where
     /// nothing moved -- another pointer names those bytes, or the store keeps items by path and the
     /// bytes stay for them.
-    pub(crate) fn moved(&mut self, st: &mut dyn Store, store: &str, item: &str, to: &str, own: &str) -> Result<Option<String>> {
+    pub(crate) fn moved(&mut self, st: &mut dyn Store, store: &str, item: &str, to: &str, own: &str) -> Result<StoreMove> {
         // Items that are paths move with their pointer already: no driver is asked, so a store this
         // computer cannot reach is not waited on for work that could not come to anything.
-        if item.starts_with('/') || self.keeps(st, store, item, own)?.is_some() {
-            return Ok(None);
+        if item.starts_with('/') {
+            return Ok(StoreMove::Left);
         }
-        self.drivers.get(store).map_err(StoreError::invalid)?.move_to(item, to)
+        if let Some(kept) = self.keeps(st, store, item, own)? {
+            return Ok(match kept {
+                StoreCopy::LeftBecause(why) => StoreMove::LeftBecause(why),
+                _ => StoreMove::Left,
+            });
+        }
+        Ok(StoreMove::Moved(self.drivers.get(store).map_err(StoreError::invalid)?.move_to(item, to)?))
+    }
+
+    /// Where the store `store` keeps the file the item `item` names, when it can tell.
+    pub(crate) fn at(&mut self, store: &str, item: &str) -> Result<Option<String>> {
+        self.drivers.get(store).map_err(StoreError::invalid)?.at(item)
     }
 
     /// The file the deleted pointer of the asset `own` named, holding the bytes `sha256`, sent to
@@ -1185,16 +1262,46 @@ pub(crate) fn not_pulled_after_conflict(st: &mut dyn Store, v: &Vault) -> Result
     Ok(found.iter().filter(|i| i.state == "not-pulled" && originals.contains(&i.rel)).map(|i| i.path.clone()).collect())
 }
 
-/// How many of the vault's assets are in each state.
-/// What it learns is saved only with `save` (not in a dry run).
-pub(crate) fn state_counts(st: &mut dyn Store, v: &Vault, save: bool) -> Result<BTreeMap<String, usize>> {
+/// How many of the vault's assets are in each state, and what to tell of the ones that moved in
+/// textdb while their store kept their file where it was. The stores are asked once: for a store
+/// keeping its files by path there is nothing to ask, so only a store with ids of its own (Google
+/// Drive) is reached at all, and one that cannot be reached leaves its assets as they are and says
+/// so. The move itself is never made here: `textdb assets relocate` makes it, `textdb mv` puts the
+/// pointer back.
+pub(crate) fn counts_and_moves(st: &mut dyn Store, v: &Vault, save: bool, ask_stores: bool) -> Result<(BTreeMap<String, usize>, Vec<String>)> {
     let scan = scan(st, v)?;
     let mut cache = VaultCache::open(v);
-    let found = items(v, &scan, &mut cache, &[])?;
+    let mut found = items(v, &scan, &mut cache, &[])?;
+    // A dry run asks nothing of anyone's provider: it says what a sync would do here, and reaching
+    // a drive to tell of a move is not that.
+    let mut notes = match (ask_stores, StoreFiles::new(st)) {
+        (false, _) => Vec::new(),
+        (true, Ok(mut files)) => mark_moved_here(&mut found, &mut files),
+        (true, Err(e)) => vec![format!("the asset stores could not be read ({}): assets moved in textdb are not told of", e.message)],
+    };
+    // One line each while they can be read, one line for a folderful: a folder moved in textdb is
+    // hundreds of assets, and a sync saying so hundreds of times says nothing.
+    let misplaced: Vec<&Item> = found.iter().filter(|i| i.in_store.is_some()).collect();
+    let told = |i: &Item| {
+        format!(
+            "{}: its file in the asset store is at {}, where the asset used to be: `textdb assets relocate {}` moves it to the asset, or move the pointer back",
+            i.path,
+            i.in_store.as_deref().unwrap_or(""),
+            i.path
+        )
+    };
+    match misplaced.len() {
+        0 => {}
+        1..=3 => notes.extend(misplaced.iter().map(|i| told(i))),
+        n => notes.push(format!(
+            "{n} assets moved in textdb while their files stayed where they were in their asset stores (the first still at {}): `textdb assets relocate` moves the files to their assets, or move the pointers back",
+            misplaced[0].in_store.as_deref().unwrap_or("")
+        )),
+    }
     if save {
         cache.save();
     }
-    Ok(counts(&found).into_iter().map(|(state, n)| (state.to_string(), n)).collect())
+    Ok((counts(&found).into_iter().map(|(state, n)| (state.to_string(), n)).collect(), notes))
 }
 
 /// What a push did: the assets pushed (as JSON rows), their bytes, and what was left for a
@@ -1440,6 +1547,88 @@ pub(crate) fn pull_run(st: &mut dyn Store, v: &Vault, scope: &[String], linked: 
     }
     cache.save();
     Ok(PullReport { pulled, bytes, kept, failed })
+}
+
+/// What a relocate did: the files moved in their stores, what it left and why, and what failed.
+#[derive(Default)]
+pub(crate) struct RelocateReport {
+    pub moved: Vec<serde_json::Value>,
+    pub kept: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+pub fn relocate(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, dry_run: bool, json: bool) -> Result<()> {
+    let v = vault(st, paths.first().map(String::as_str), dir)?;
+    let scope = scope_of(paths)?;
+    let RelocateReport { moved, kept, failed } = relocate_run(st, &v, &scope, dry_run)?;
+    if json {
+        emit_json(&json!({ "dry_run": dry_run, "moved": moved, "kept": kept, "failed": failed }))?;
+    } else {
+        let mut s = format!("{} {} assets in their stores\n", if dry_run { "would move" } else { "moved" }, moved.len());
+        for m in &moved {
+            s.push_str(&format!("  {} -> {}\n", m["from"].as_str().unwrap_or(""), m["to"].as_str().unwrap_or("")));
+        }
+        for k in &kept {
+            s.push_str(&format!("  kept       {k}\n"));
+        }
+        for f in &failed {
+            s.push_str(&format!("  failed     {f}\n"));
+        }
+        out(s.as_bytes())?;
+    }
+    if !failed.is_empty() {
+        return Err(StoreError::other(format!("{} assets could not be moved in their stores", failed.len())));
+    }
+    Ok(())
+}
+
+/// Move the file of every `moved-here` asset within `scope` to the asset's own path in its store,
+/// keeping the provider's file and so its id. Nothing is moved onto bytes already there, and a file
+/// another pointer also names stays where it is.
+pub(crate) fn relocate_run(st: &mut dyn Store, v: &Vault, scope: &[String], dry_run: bool) -> Result<RelocateReport> {
+    check_scope(v, scope)?;
+    let scan = scan(st, v)?;
+    let mut cache = VaultCache::open(v);
+    let mut found = items(v, &scan, &mut cache, scope)?;
+    let mut files = StoreFiles::new(st)?;
+    let mut r = RelocateReport::default();
+    r.kept.extend(mark_moved_here(&mut found, &mut files));
+    for item in &found {
+        let (Some(p), Some(at)) = (&item.pointer, &item.in_store) else { continue };
+        let Some(named) = p.item.as_deref() else { continue };
+        let row = json!({ "path": item.path, "from": at, "to": item.path, "store": p.store });
+        // A pointer this directory has not caught up with is not the one to move a store's file by.
+        if item.disk_differs {
+            r.kept.push(format!("{}: its pointer changed in the store since this directory was synced; sync first", item.path));
+            continue;
+        }
+        if dry_run {
+            // What would keep the file where it is is known without moving anything, so a dry run
+            // says `kept` for those rather than promising a move it would not make.
+            match files.keeps(st, &p.store, named, &item.path)? {
+                Some(StoreCopy::LeftBecause(why)) => r.kept.push(format!("{}: {why}", item.path)),
+                Some(_) => r.kept.push(format!("{}: another pointer names those bytes, so they stay where they are", item.path)),
+                None => r.moved.push(row),
+            }
+            continue;
+        }
+        match files.moved(st, &p.store, named, &item.path, &item.path) {
+            // The item the pointer names after the move: on Google Drive the file's id, which a
+            // move leaves alone, so the pointer needs no rewriting. A store that answered with
+            // another item would need one, and nothing here writes pointers: told of instead.
+            Ok(StoreMove::Moved(now)) if now.as_deref().is_none_or(|now| now == named) => r.moved.push(row),
+            Ok(StoreMove::Moved(now)) => r.failed.push(format!(
+                "{}: its file moved in the asset store, but the store now names it {} and not {named}: push it, so its pointer names what the store does",
+                item.path,
+                now.as_deref().unwrap_or("")
+            )),
+            Ok(StoreMove::LeftBecause(why)) => r.kept.push(format!("{}: {why}", item.path)),
+            Ok(StoreMove::Left) => r.kept.push(format!("{}: another pointer names those bytes, so they stay where they are", item.path)),
+            Err(e) => r.failed.push(format!("{}: {}", item.path, e.message)),
+        }
+    }
+    cache.save();
+    Ok(r)
 }
 
 pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: bool) -> Result<()> {

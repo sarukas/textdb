@@ -972,8 +972,13 @@ fn sync_assets(st: &mut dyn Store, o: &Options, prefix: &str, plan: &Plan, attrs
             }
         }
     }
-    match assets::state_counts(st, &v, !o.dry_run) {
-        Ok(counts) => a.counts = counts,
+    // The counts, and what to tell of an asset that moved in textdb while its store kept its file
+    // where it was: the sync says so and moves nothing of its own in a store.
+    match assets::counts_and_moves(st, &v, !o.dry_run, !o.dry_run) {
+        Ok((counts, notes)) => {
+            a.counts = counts;
+            a.notes.extend(notes);
+        }
         Err(e) => a.notes.push(format!("assets not listed: {}", e.message)),
     }
     a.mode = mode;

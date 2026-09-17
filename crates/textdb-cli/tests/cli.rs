@@ -1258,6 +1258,53 @@ fn assets_on_google_drive_are_pulled_by_file_id_and_never_from_outside_the_store
     assert!(!live().contains(&id_f), "the file is still live in the drive: {}", live());
     let gone = rc(&["lsjson", "-R", "--files-only", "--drive-trashed-only", &root]);
     assert!(gone.contains(&id_f), "the file is not in Drive's trash: {gone}");
+
+    // An asset moved in textdb leaves its file in the drive where it was: nothing moves a person's
+    // drive about on its own. The asset is `moved-here`, and the sync says so with the way out.
+    std::fs::write(vault.join("img/g.png"), [137u8, 80, 78, 71, 0, 6]).unwrap();
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "push", "--dir", dir]), None);
+    let id_g = item_of("g");
+    let where_of = |id: &str| {
+        serde_json::from_str::<Vec<serde_json::Value>>(&rc(&["lsjson", "-R", "--files-only", &root]))
+            .unwrap()
+            .into_iter()
+            .find(|l| l["ID"].as_str() == Some(id))
+            .map(|l| l["Path"].as_str().unwrap().to_string())
+    };
+    assert_eq!(where_of(&id_g).as_deref(), Some("img/g.png"));
+    ok(&mut t(&["mv", "/img/g.png", "/pics/g.png"]), None);
+    let after_mv = ok(&mut t(&["--json", "sync", "/", dir]), None).json();
+    assert_eq!(where_of(&id_g).as_deref(), Some("img/g.png"), "`mv` moved the file in the drive");
+    let notes = format!("{}", after_mv["assets"]["notes"]);
+    assert!(notes.contains("/pics/g.png") && notes.contains("relocate"), "the sync did not say the asset moved and how to settle it: {notes}");
+    let status = ok(&mut t(&["--json", "assets", "status", "--dir", dir]), None).json();
+    let moved_here = status["assets"].as_array().unwrap().iter().find(|a| a["path"] == "/pics/g.png").unwrap().clone();
+    assert_eq!(moved_here["state"], "moved-here", "{moved_here}");
+    assert_eq!(moved_here["in_store"], "/img/g.png", "{moved_here}");
+
+    // `relocate` moves it in the drive to the asset's own path, and Drive keeps the file's id
+    // through the move, so the pointer needs no rewriting and links in the drive still point at it.
+    ok(&mut t(&["assets", "relocate", "--dir", dir, "--dry-run"]), None);
+    assert_eq!(where_of(&id_g).as_deref(), Some("img/g.png"), "a dry run moved it");
+    ok(&mut t(&["assets", "relocate", "--dir", dir]), None);
+    assert_eq!(where_of(&id_g).as_deref(), Some("pics/g.png"), "the file did not move to the asset's path");
+    // Read where the pointer is now: the sync moved it with the asset, and Drive keeps the file's
+    // id through the move, so the pointer still names what it named before.
+    let item_at = |rel: &str| {
+        std::fs::read_to_string(vault.join(rel))
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("item: ").map(str::to_string))
+            .unwrap()
+    };
+    assert_eq!(item_at("pics/g.png.tdbasset"), id_g, "the move gave the file a new id");
+    let settled = ok(&mut t(&["--json", "assets", "status", "--dir", dir]), None).json();
+    let g = settled["assets"].as_array().unwrap().iter().find(|a| a["path"] == "/pics/g.png").unwrap().clone();
+    assert_eq!(g["state"], "ok", "{g}");
+    // Of this asset: others in this test were left broken on purpose (one in Drive's trash, one
+    // naming a file outside the store), and verify counts those as the problems they are.
+    assert_eq!(run(&mut t(&["assets", "verify", "/pics/g.png", "--dir", dir]), None).status, 0);
 }
 
 #[test]

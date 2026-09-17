@@ -741,6 +741,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             ),
             AssetsOp::Pull { paths, dir, linked_from, dry_run } => assets::pull(st, &paths, dir.as_deref(), linked_from.as_deref(), dry_run, json),
             AssetsOp::Verify { path, dir } => assets::verify(st, path.as_deref(), dir.as_deref(), json),
+            AssetsOp::Relocate { paths, dir, dry_run } => assets::relocate(st, &paths, dir.as_deref(), dry_run, json),
             AssetsOp::Gitignore { path, dir, dry_run } => assets::gitignore(st, path.as_deref(), dir.as_deref(), dry_run, json),
             AssetsOp::MigrateFromGit { path, dir, to, message, dry_run } => assets::migrate::migrate_from_git(
                 st,
@@ -1727,6 +1728,18 @@ enum AssetsOp {
         path: Option<String>,
         #[arg(long)]
         dir: Option<PathBuf>,
+    },
+    /// Move the file of every asset whose store keeps it somewhere other than the asset's own path
+    /// to that path, for a store keeping its files by an id of its own (Google Drive): the asset
+    /// moved in textdb and its file stayed where it was. Those assets are `moved-here`, or told of
+    /// so alongside another difference. Moving the pointer back instead is `textdb mv`.
+    Relocate {
+        #[arg(value_parser = store_path)]
+        paths: Vec<String>,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Write the managed block of .gitignore patterns that keeps assets out of git and their
     /// pointers in.

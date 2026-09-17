@@ -1085,6 +1085,25 @@ impl Driver for RcloneDriver {
         Ok((Some(l.id), held))
     }
 
+    fn at(&self, item: &str) -> Result<Option<String>> {
+        // Items that are paths are where they say; a drive knows where the file of an id is now,
+        // from the one listing this command makes of the store's live files.
+        if item.starts_with('/') || !is_drive_id(item) || !self.is_drive() {
+            return Ok(None);
+        }
+        // The live files only, never Drive's trash: an id that is not among them (one someone
+        // trashed, one purged, one of another drive) is nothing this has to tell of, and listing the
+        // trash to find that out would cost every command that asks a listing of its own.
+        self.ensure_listed()?;
+        Ok(self
+            .listing
+            .borrow()
+            .as_ref()
+            .and_then(|l| l.by_id.get(item))
+            .filter(|e| !e.trashed)
+            .map(|e| e.path.clone()))
+    }
+
     fn move_to(&self, item: &str, to: &str) -> Result<Option<String>> {
         // A store whose items are paths has nothing to move: the pointer's own path is its item.
         if item.starts_with('/') || !self.is_drive() {

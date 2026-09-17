@@ -54,6 +54,13 @@ pub trait Driver {
     fn put(&self, path: &str, src: &Path, sha256: &str, replaces: Option<&str>) -> Result<(Option<String>, Held)>;
     /// Copy the stored file to `dest`, which must not exist.
     fn get(&self, path: &str, item: Option<&str>, dest: &Path) -> Result<()>;
+    /// Where the store keeps the file the item `item` names, as a store path, when it can tell: a
+    /// provider whose items are ids of its own knows it wherever the file was moved to in the
+    /// provider. `None` where there is nothing to tell -- the item is a path already -- or no file
+    /// of that item is there.
+    fn at(&self, _item: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
     /// Move the file the item `item` names to the store path `to`, keeping the provider's own file
     /// and so its id, and returning the item the pointer should name now. `None` where there is
     /// nothing to move: a store whose items are paths has the bytes at the pointer's old path
