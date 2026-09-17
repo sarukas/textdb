@@ -211,10 +211,16 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
     bytes it replaces, a server-side copy of it goes to `.textdb-trash/…` and is checked (rclone
     cannot read Drive's revisions, so this keeps older versions a pointer may still name); then
     the new bytes are uploaded onto the same file, which readers see whole or not at all (Drive
-    shows the old bytes until the upload finishes), and hashed; bytes other than the upload's put
-    the trash copy back in place and fail the push. A new asset is uploaded to its free path, and a
-    listing afterwards reports two files of that name in the folder (Drive allows it). Bytes that
-    are not the ones replaced are kept, and the upload goes beside them, as today.
+    shows the old bytes until the upload finishes), and the file is looked at again: it must be the
+    same file (its id) holding the upload's bytes, read through by id where Drive keeps no SHA-256.
+    Anything else fails the push, and what was there goes back only onto its own file, empty then or
+    holding those bytes still; otherwise the trash copy is named and left, since bytes textdb did
+    not write are not its to overwrite. A push leaves a path the drive holds two files of alone
+    (Drive allows that): which of them it would replace is not textdb's to guess. Bytes that are
+    not the ones replaced are kept, and the upload goes beside them, as today. Until sprint 4's
+    fallback to the trash copy, a pointer naming older bytes than its file now holds (a push whose
+    pointer was not committed, say) is `differs` and cannot be pulled, though the bytes are in
+    `.textdb-trash`.
   - *Pull downloads by id* (`rclone backend copyid`) to its partial file and checks the hash, so
     an asset renamed or moved in the drive, or in Drive's trash, is still found. A pointer naming
     older bytes than its id holds now is fetched from the trash copy with its SHA-256.
