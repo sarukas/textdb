@@ -334,6 +334,14 @@ CREATE VIEW kb.my_grant AS
 -- a measured fact.
 
 -- Can this connection see this store path at all?
+--
+-- **Call it as `(SELECT kb.current_account()) IS NULL OR kb.visible(col)`, never bare.** The guard
+-- inside this function is an InitPlan of *this function's* query, so it is re-evaluated on every
+-- call, and a bare `kb.visible(col)` in a WHERE is one call per row. Written as the OR above, the
+-- subquery is an InitPlan of the *caller's* statement — evaluated once — and the owner's branch
+-- short-circuits to a boolean constant. The difference was measured: the property surface
+-- (`kb.prop_keys`, `kb.prop_values`, `kb.prop_find`) was 10x to 94x slower for the owner with the
+-- bare form, on a store that delegates nothing.
 CREATE FUNCTION kb.visible(p text) RETURNS boolean LANGUAGE sql STABLE AS $$
   SELECT (SELECT kb.current_account()) IS NULL
       OR EXISTS (SELECT 1 FROM kb.my_grant g
@@ -3069,9 +3077,12 @@ mod kb {
                     coalesce(lower(r.path) LIKE '%.tdbasset', false), r.id
                FROM kb.link l JOIN kb.node n ON n.id = l.file_id
                LEFT JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL
-              WHERE n.deleted_at IS NULL AND kb.visible(n.path) AND {where_sql}
+              WHERE n.deleted_at IS NULL{vis} AND {where_sql}
               ORDER BY n.path, l.line, l.id LIMIT {lim}",
-            lim = lim.max(1)
+            lim = lim.max(1),
+            // As in `prop_keys`: the predicate only where there is a token, so the owner's
+            // statement is the one it was and keeps its plan.
+            vis = if has_token() { " AND kb.visible(n.path)" } else { "" },
         );
         Spi::connect(|client| {
             let args: Vec<pgrx::datum::DatumWithOid> = args.iter().map(|a| a.as_str().into()).collect();
@@ -3222,19 +3233,27 @@ mod kb {
     ) -> TableIterator<'static, (name!(key, String), name!(docs, i64), name!(values_n, i64), name!(kind, String))> {
         let lower = prefix.to_lowercase();
         let (lo, hi) = prefix_range(&lower);
+        // The owner's statement carries no visibility predicate at all, and an account's carries
+        // one. Not one statement with a guard in it: a subquery in the WHERE costs the *other*
+        // conjunct its custom plan, so the range over `property_kv` stopped being an index scan
+        // and the prefixed calls went 40-60x slower for the owner. Two texts, one chosen once.
+        let vis = if has_token() { " AND kb.visible(n.path)" } else { "" };
+        let sql = format!(
+            "SELECT r.key, count(DISTINCT r.file_id), count(DISTINCT r.val_lc),
+                    CASE WHEN count(r.val_num) = 0 THEN 'text'
+                         WHEN count(r.val_num) = count(r.val_txt) THEN 'number'
+                         ELSE 'mixed' END
+               FROM kb.property r
+               JOIN kb.node n ON n.id = r.file_id AND n.deleted_at IS NULL
+              WHERE ($1 = '' OR (r.key_lc >= $2 AND r.key_lc < $3)){vis}
+              GROUP BY r.key
+              ORDER BY count(DISTINCT r.file_id) DESC, r.key
+              LIMIT $4"
+        );
         let rows = Spi::connect(|client| {
             let r = client
                 .select(
-                    "SELECT r.key, count(DISTINCT r.file_id), count(DISTINCT r.val_lc),
-                            CASE WHEN count(r.val_num) = 0 THEN 'text'
-                                 WHEN count(r.val_num) = count(r.val_txt) THEN 'number'
-                                 ELSE 'mixed' END
-                       FROM kb.property r
-                       JOIN kb.node n ON n.id = r.file_id AND n.deleted_at IS NULL
-                      WHERE kb.visible(n.path) AND ($1 = '' OR (r.key_lc >= $2 AND r.key_lc < $3))
-                      GROUP BY r.key
-                      ORDER BY count(DISTINCT r.file_id) DESC, r.key
-                      LIMIT $4",
+                    &sql,
                     None,
                     &[lower.as_str().into(), lo.as_str().into(), hi.as_str().into(), lim.max(1).into()],
                 )
@@ -3263,17 +3282,25 @@ mod kb {
         let lower = prefix.to_lowercase();
         let (lo, hi) = prefix_range(&lower);
         let k = key.to_lowercase();
+        // The owner's statement carries no visibility predicate at all, and an account's carries
+        // one. Not one statement with a guard in it: a subquery in the WHERE costs the *other*
+        // conjunct its custom plan, so the range over `property_kv` stopped being an index scan
+        // and the prefixed calls went 40-60x slower for the owner. Two texts, one chosen once.
+        let vis = if has_token() { " AND kb.visible(n.path)" } else { "" };
+        let sql = format!(
+            "SELECT r.val_txt, count(DISTINCT r.file_id)
+               FROM kb.property r
+               JOIN kb.node n ON n.id = r.file_id AND n.deleted_at IS NULL
+              WHERE r.key_lc = $1
+                AND ($2 = '' OR (r.val_lc >= $3 AND r.val_lc < $4)){vis}
+              GROUP BY r.val_txt
+              ORDER BY count(DISTINCT r.file_id) DESC, r.val_txt
+              LIMIT $5"
+        );
         let rows = Spi::connect(|client| {
             let r = client
                 .select(
-                    "SELECT r.val_txt, count(DISTINCT r.file_id)
-                       FROM kb.property r
-                       JOIN kb.node n ON n.id = r.file_id AND n.deleted_at IS NULL
-                      WHERE kb.visible(n.path) AND r.key_lc = $1
-                        AND ($2 = '' OR (r.val_lc >= $3 AND r.val_lc < $4))
-                      GROUP BY r.val_txt
-                      ORDER BY count(DISTINCT r.file_id) DESC, r.val_txt
-                      LIMIT $5",
+                    &sql,
                     None,
                     &[k.as_str().into(), lower.as_str().into(), lo.as_str().into(), hi.as_str().into(), lim.max(1).into()],
                 )
@@ -3317,7 +3344,7 @@ mod kb {
             "SELECT n.path, coalesce(n.nbytes, 0), coalesce(to_char(n.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), ''),
                     (SELECT f.data::text FROM kb.frontmatter f WHERE f.file_id = n.id AND f.version = n.version)
                FROM kb.node n
-              WHERE n.deleted_at IS NULL AND n.kind = 1 AND kb.visible(n.path)
+              WHERE n.deleted_at IS NULL AND n.kind = 1{vis}
                 AND EXISTS (SELECT 1 FROM kb.property u WHERE u.file_id = n.id)
                 AND ({where_clause})
                 AND (${folder_i} = '/' OR n.path = ${folder_i} OR n.path LIKE ${like_i} ESCAPE '\\')
@@ -3326,6 +3353,9 @@ mod kb {
             folder_i = n + 1,
             like_i = n + 2,
             lim_i = n + 3,
+            // Only a token session carries the predicate; see `prop_keys` for why it is not one
+            // statement with a guard in it.
+            vis = if has_token() { " AND kb.visible(n.path)" } else { "" },
         );
         let rows = Spi::connect(|client| {
             let mut bound: Vec<pgrx::datum::DatumWithOid> = Vec::with_capacity(n + 3);
@@ -3417,6 +3447,9 @@ mod kb {
             return TableIterator::new(Vec::new());
         }
         let limit = lim.max(1) as usize;
+        // Only a token session carries the predicate; see `prop_keys` for why it is not one
+        // statement with a guard in it.
+        let vis = if has_token() { " AND kb.visible(n.path)" } else { "" };
         // Per term: file_id → (chunk_id, rank).
         let mut per_term: Vec<std::collections::HashMap<i64, (i64, f32)>> = Vec::new();
         for t in &terms {
@@ -3424,7 +3457,7 @@ mod kb {
             let files: std::collections::HashMap<i64, (i64, f32)> = Spi::connect(|client| {
                 let t = client
                     .select(
-                        "SELECT r.file_id, c.id, ts_rank(c.tsv, q) FROM kb.chunk c JOIN kb.chunk_ref r ON r.chunk_id = c.id JOIN kb.node n ON n.id = r.file_id, to_tsquery('simple', $1) q WHERE c.tsv @@ q AND n.deleted_at IS NULL AND n.kind = 1 AND ($2 = '/' OR n.path LIKE kb._subtree_like($2)) AND kb.visible(n.path) ORDER BY 3 DESC LIMIT $3",
+                        &format!("SELECT r.file_id, c.id, ts_rank(c.tsv, q) FROM kb.chunk c JOIN kb.chunk_ref r ON r.chunk_id = c.id JOIN kb.node n ON n.id = r.file_id, to_tsquery('simple', $1) q WHERE c.tsv @@ q AND n.deleted_at IS NULL AND n.kind = 1 AND ($2 = '/' OR n.path LIKE kb._subtree_like($2)){vis} ORDER BY 3 DESC LIMIT $3"),
                         None,
                         &[tsq.as_str().into(), prefix.as_str().into(), ((limit.saturating_mul(50)).min(500_000) as i64).into()],
                     )
@@ -3569,8 +3602,31 @@ mod kb {
     // cannot disagree about what a grant means. What is here is persistence and the SPI calls.
 
     /// This connection's account id, or `None` for the owner.
+    /// This connection's account id, or `None` for the owner.
+    ///
+    /// The token GUC is read first, directly, because this is the question every helper on the
+    /// owner's path asks and the answer is almost always "no token": a row-by-row caller —
+    /// `to_view`, `project_text`, `writable` — would otherwise spend an SPI round trip per row to
+    /// learn there is no account. `kb.current_account()` returns NULL for an empty GUC by
+    /// construction, so the shortcut is the same answer and not an approximation.
     fn account_id_now() -> Option<i64> {
+        if !has_token() {
+            return None;
+        }
         Spi::get_one::<i64>("SELECT kb.current_account()").ok().flatten()
+    }
+
+    /// Is `textdb.token` set on this connection at all? A C-level GUC read, no query.
+    fn has_token() -> bool {
+        let name = c"textdb.token";
+        // SAFETY: the name is a valid NUL-terminated string and `missing_ok` is set, so an
+        // unregistered GUC gives a null pointer rather than an error.
+        let raw = unsafe { pgrx::pg_sys::GetConfigOption(name.as_ptr(), true, false) };
+        if raw.is_null() {
+            return false;
+        }
+        // SAFETY: non-null means Postgres owns a NUL-terminated string for the lifetime of this call.
+        !unsafe { std::ffi::CStr::from_ptr(raw) }.to_bytes().is_empty()
     }
 
     /// Only the owner runs the delegation commands.
