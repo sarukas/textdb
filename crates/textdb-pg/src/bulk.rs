@@ -255,6 +255,20 @@ pub fn revert(batch: &str, author: Option<&str>, skip_changed: bool) -> Result<V
     if recs.is_empty() {
         return Err(TextdbError::NotFound(format!("no changes recorded under batch {batch}")));
     }
+    // Reverting is a write to every path the batch touched, so the whole set is settled before
+    // anything is undone: a batch that reached outside this account's writable shares is refused
+    // whole rather than half-reverted (#12 C20).
+    for path in recs.iter().flat_map(|r| [Some(&r.path), r.old_path.as_ref()]).flatten() {
+        if !kb::writable(path) {
+            return Err(TextdbError::Forbidden(format!(
+                "batch {batch} changed files you may not write, so none of it was reverted"
+            )));
+        }
+    }
+    // Paths in the report are the caller's, even though the undo below works in the store's.
+    let view = kb::current_view();
+    let show = |p: &str| view.as_ref().and_then(|v| v.to_view(p)).unwrap_or_else(|| p.to_string());
+    let _owner = kb::AsOwner::begin();
     let message = format!("revert batch {batch}");
     let mut span: HashMap<i64, (i64, i64)> = HashMap::new();
     for r in recs.iter().filter(|r| r.op == "create" || r.op == "commit") {
@@ -275,19 +289,19 @@ pub fn revert(batch: &str, author: Option<&str>, skip_changed: bool) -> Result<V
                 match node_by_id(r.node_id)? {
                     Some(n) if !n.deleted && n.path == r.path => {
                         if kb::node_by_path(old).is_some() {
-                            skipped.push(format!("{} not moved back: {old} exists", r.path));
+                            skipped.push(format!("{} not moved back: {} exists", show(&r.path), show(old)));
                             continue;
                         }
                         kb::rename_impl(&r.path, old, author, Some(&message), None, false)?;
-                        moved_back.push(json!({ "from": r.path, "to": old }));
+                        moved_back.push(json!({ "from": show(&r.path), "to": show(old) }));
                     }
-                    _ => skipped.push(format!("{} not moved back to {old}: moved or deleted since", r.path)),
+                    _ => skipped.push(format!("{} not moved back to {}: moved or deleted since", show(&r.path), show(old))),
                 }
             }
             "delete" => {
                 let Some(d) = node_by_id(r.node_id)? else { continue };
                 if !d.deleted {
-                    skipped.push(format!("{} not restored: no longer deleted", r.path));
+                    skipped.push(format!("{} not restored: no longer deleted", show(&r.path)));
                     continue;
                 }
                 // What this delete took: the files below the path deleted at the same moment.
@@ -314,13 +328,13 @@ pub fn revert(batch: &str, author: Option<&str>, skip_changed: bool) -> Result<V
                 if d.kind == 0 && files.is_empty() {
                     if kb::node_by_path(&r.path).is_none() {
                         kb::ensure_folder(&r.path)?;
-                        recreated.push(r.path.clone());
+                        recreated.push(show(&r.path));
                     }
                     continue;
                 }
                 for (id, path, root) in files {
                     if kb::node_by_path(&path).is_some() {
-                        skipped.push(format!("{path} not restored: the path is taken"));
+                        skipped.push(format!("{} not restored: the path is taken", show(&path)));
                         continue;
                     }
                     let content = match (span.get(&id), root) {
@@ -331,7 +345,7 @@ pub fn revert(batch: &str, author: Option<&str>, skip_changed: bool) -> Result<V
                         (None, None) => continue,
                     };
                     kb::create_impl(&path, &String::from_utf8_lossy(&content), author, Some(&message))?;
-                    recreated.push(path);
+                    recreated.push(show(&path));
                 }
             }
             "create" | "commit" => {
@@ -342,22 +356,22 @@ pub fn revert(batch: &str, author: Option<&str>, skip_changed: bool) -> Result<V
                 let Some(n) = node_by_id(r.node_id)? else { continue };
                 if n.deleted {
                     if !deleted_by_batch(&n.path) {
-                        skipped.push(format!("{} not restored: deleted since the batch", n.path));
+                        skipped.push(format!("{} not restored: deleted since the batch", show(&n.path)));
                     }
                     continue;
                 }
                 if n.version != last {
-                    skipped.push(format!("{} not restored: changed since the batch (v{last}, now v{})", n.path, n.version));
+                    skipped.push(format!("{} not restored: changed since the batch (v{last}, now v{})", show(&n.path), n.version));
                     continue;
                 }
                 if first <= 1 {
                     kb::delete_impl(&n.path, author, Some(&message))?;
-                    removed.push(n.path.clone());
+                    removed.push(show(&n.path));
                     continue;
                 }
                 let content = content_at(r.node_id, first - 1)?;
                 let (version, _) = kb::update_content_impl(&n.path, &String::from_utf8_lossy(&content), Some(n.version), author, Some(&message))?;
-                restored.push(json!({ "path": n.path, "version": version }));
+                restored.push(json!({ "path": show(&n.path), "version": version }));
             }
             _ => {}
         }

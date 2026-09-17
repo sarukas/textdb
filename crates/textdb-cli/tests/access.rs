@@ -1937,14 +1937,32 @@ fn k_the_engines_own_entry_points_filter_and_translate() {
                 assert!(out.to_string().contains("accounts-agent"), "K9: {out}");
             }
             // K8: RLS hides the rows even from a hand-written query on the table.
+            //
+            // Under a role that is not exempt from a policy. Postgres exempts a superuser and the
+            // table's owner, which is L2 of this catalogue — whoever can connect as the owner
+            // already has everything — so asserting RLS on the connection the rest of the
+            // catalogue uses would be asserting something false. `SET ROLE` is enough: a policy
+            // is applied by the *current* role, and this is the role a hosted deployment gives a
+            // caller, one that owns nothing and arrives with a bearer.
             Engine::Postgres => {
                 let mut c = postgres::Client::connect(&f.store.url, postgres::NoTls).expect("K8: connect");
+                c.batch_execute(
+                    "DO $$ BEGIN CREATE ROLE textdb_caller NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$;\
+                     GRANT USAGE ON SCHEMA kb TO textdb_caller;\
+                     GRANT SELECT ON ALL TABLES IN SCHEMA kb TO textdb_caller;",
+                )
+                .expect("K8: the caller's role");
                 c.batch_execute(&format!("SET textdb.token = '{bearer}'")).expect("K8: set the token");
                 let rows = c.query("SELECT path FROM kb.ls('/') ORDER BY path", &[]).expect("K8: kb.ls");
                 let paths: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
                 assert_eq!(paths, ["/contracts", "/products"], "K8");
+                c.batch_execute("SET ROLE textdb_caller").expect("K8: become the caller");
                 let raw = c.query("SELECT path FROM kb.node WHERE path LIKE '/hr%'", &[]).expect("K8: kb.node");
                 assert!(raw.is_empty(), "K8: RLS must hide what the token cannot see");
+                // And the same role does see its own, so the policy is a filter and not a wall.
+                let mine = c.query("SELECT path FROM kb.node WHERE path LIKE '/legal/contracts%'", &[]).expect("K8: kb.node");
+                assert!(!mine.is_empty(), "K8: the policy must still show what the token can see");
+                c.batch_execute("RESET ROLE").expect("K8: back");
             }
         }
     });

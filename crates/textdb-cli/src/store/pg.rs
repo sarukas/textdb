@@ -329,8 +329,10 @@ impl PgStore {
     /// call into `kb.*`.
     fn link_rows(&mut self, incoming: bool, path: &str, statuses: &[&str]) -> Result<Vec<LinkRow>> {
         let which = if incoming { "kb.backlinks" } else { "kb.links" };
-        // `kb.links` takes one status; the rest of the set is a filter here, as it is on SQLite.
-        let one = statuses.first().copied().unwrap_or("");
+        // `kb.links` narrows to one status. Asked for several — `--broken` is broken,
+        // anchor-missing and not-in-store — it is asked for all of them and `keep_statuses` picks,
+        // because narrowing to the first would drop the other two.
+        let one = if statuses.len() == 1 { statuses[0] } else { "" };
         let rows = self
             .client
             .query(

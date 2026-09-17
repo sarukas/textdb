@@ -538,6 +538,23 @@ CREATE FUNCTION kb.path_history_enabled() RETURNS boolean LANGUAGE sql STABLE AS
                   kb._switch(kb.setting('path_history')),
                   true)
 $$;
+
+-- Row-level security on the node table, so a hand-written query is filtered by the same rule every
+-- surface uses (#12 K8). The views above are the sanctioned way in and read it as their owner, so
+-- this changes nothing about them; what it stops is a connection that has the table itself.
+--
+-- Deliberately not `FORCE`: the owner is the extension's own bookkeeping — folder totals, the
+-- change feed, the link index — and a policy over that would filter the store's own maintenance.
+-- Postgres exempts the table owner and any superuser from a policy, which is the same boundary
+-- L2 of the catalogue records as accepted: whoever can connect as the owner already has
+-- everything. The deployment this is for is the other one, where callers connect as a role that
+-- owns nothing and arrives with a bearer.
+--
+-- Reading is complete; writing under such a role is not, because the functions that write reach
+-- the tables as the caller and would need `SECURITY DEFINER` to do their bookkeeping. That is
+-- recorded as the next step rather than half-done here.
+ALTER TABLE kb.node ENABLE ROW LEVEL SECURITY;
+CREATE POLICY node_visible ON kb.node USING (kb.visible(path));
 "#,
     name = "kb_tables",
     bootstrap
@@ -1151,6 +1168,33 @@ mod kb {
     /// What a path outside the caller's shares is called where one has to be named: a history
     /// row's `old_path`, an error's subject. The same words on both engines.
     const OUTSIDE: &str = "(outside your shares)";
+
+    /// Work as the owner for the rest of this transaction: no filter, no translation.
+    ///
+    /// For an operation whose rights have already been settled over the whole set it touches and
+    /// which then works in store paths — `revert_batch` is the one. Calling a public function with
+    /// a store path would translate it a second time (CLAUDE.md), and every path it passes has
+    /// already been shown to be one the account may write. The token is cleared transaction-locally,
+    /// so it comes back whatever happens next, and `restore` puts it back at once on the way out.
+    pub(crate) struct AsOwner(Option<String>);
+
+    impl AsOwner {
+        pub(crate) fn begin() -> Self {
+            let was = Spi::get_one::<String>("SELECT current_setting('textdb.token', true)").ok().flatten();
+            if was.as_deref().is_some_and(|t| !t.is_empty()) {
+                let _ = Spi::run("SELECT set_config('textdb.token', '', true)");
+            }
+            AsOwner(was)
+        }
+    }
+
+    impl Drop for AsOwner {
+        fn drop(&mut self) {
+            if let Some(t) = self.0.take().filter(|t| !t.is_empty()) {
+                let _ = Spi::run_with_args("SELECT set_config('textdb.token', $1, true)", &[t.as_str().into()]);
+            }
+        }
+    }
 
     /// May this connection write at this *store* path? True for the owner.
     pub(crate) fn writable(store_path: &str) -> bool {
