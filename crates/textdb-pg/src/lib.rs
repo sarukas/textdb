@@ -273,7 +273,13 @@ CREATE UNIQUE INDEX grant_alias ON kb.grant(account_id, alias);
 CREATE FUNCTION kb.current_account() RETURNS bigint LANGUAGE sql STABLE AS $$
   SELECT t.account_id
     FROM kb.token t JOIN kb.account a ON a.id = t.account_id
-   WHERE t.hash = encode(sha256(convert_to(nullif(current_setting('textdb.token', true), ''), 'UTF8')), 'hex')
+   -- The gate first, and on its own: with no token this is a constant-false qual, so the planner
+   -- makes the whole body a one-time filter and the token table is never touched. Without it every
+   -- call probed `kb.token` to hash a NULL and match nothing, and this function is an InitPlan of
+   -- every listing, every read and every view — a fixed cost per statement for a feature the
+   -- caller is not using.
+   WHERE nullif(current_setting('textdb.token', true), '') IS NOT NULL
+     AND t.hash = encode(sha256(convert_to(nullif(current_setting('textdb.token', true), ''), 'UTF8')), 'hex')
      AND t.revoked_at IS NULL
      AND (t.expires_at IS NULL OR t.expires_at > now())
      AND a.disabled_at IS NULL
@@ -578,12 +584,29 @@ CREATE VIEW kb.file AS
   -- The minimal listing tier plus what only a file has: its content and parsed front matter.
   -- `parent_path` is now `dir`, the one name for it across every surface.
   --
-  -- The caller's paths and only what it can see, as `kb.entry` does and for the same reason: this
-  -- is the *writable* surface, so `UPDATE kb.file … WHERE dir = '/contracts'` has to mean the
-  -- account's `/contracts`, and a row it cannot see is not a row it can write. `content` is
-  -- projected too — it is text the caller reads — which the owner's branch skips outright, so a
-  -- store that delegates nothing materializes exactly as it did.
-  SELECT v.p AS path,
+  -- **Two branches, not one with a CASE in it.** `kb.file` is the hot read surface — `SELECT
+  -- content FROM kb.file WHERE path = $1` is what a client writes — and a `path` column computed
+  -- as `CASE … THEN n.path ELSE kb.to_view(n.path) END` is a function of the column, so the
+  -- equality cannot use `node_path` and every read becomes a sequential scan. That was measured
+  -- at a flat +850us per read whatever the document's size, which is the same trap the SQLite
+  -- binding hit with `kb.ls` (CLAUDE.md). Written as a UNION ALL gated on an InitPlan, the owner's
+  -- branch has `n.path` and gets its index scan, and the account's branch is a one-time filter
+  -- that never runs for the owner — and the other way round for an account.
+  SELECT
+         n.path AS path, n.name AS name, 'file'::text AS kind, n.version,
+         coalesce(n.nbytes, 0) AS nbytes, coalesce(n.nlines, 0) AS nlines,
+         n.updated_at, n.updated_by,
+         n.id,
+         CASE WHEN strpos(reverse(n.path), '/') = length(n.path) THEN '/'
+              ELSE left(n.path, length(n.path) - strpos(reverse(n.path), '/')) END AS dir,
+         kb._materialize(n.root) AS content,
+         (SELECT fm.data FROM kb.frontmatter fm WHERE fm.file_id = n.id AND fm.version = n.version) AS frontmatter,
+         NULL::bigint AS base_version
+  FROM kb.node n
+  WHERE n.kind = 1 AND n.deleted_at IS NULL AND (SELECT kb.current_account()) IS NULL
+  UNION ALL
+  SELECT
+         v.p AS path,
          CASE WHEN v.p = '/' THEN '/' ELSE right(v.p, strpos(reverse(v.p), '/') - 1) END AS name,
          'file'::text AS kind, n.version,
          coalesce(n.nbytes, 0) AS nbytes, coalesce(n.nlines, 0) AS nlines,
@@ -591,13 +614,12 @@ CREATE VIEW kb.file AS
          n.id,
          CASE WHEN strpos(reverse(v.p), '/') = length(v.p) THEN '/'
               ELSE left(v.p, length(v.p) - strpos(reverse(v.p), '/')) END AS dir,
-         CASE WHEN (SELECT kb.current_account()) IS NULL THEN kb._materialize(n.root)
-              ELSE kb.content(v.p, NULL::bigint) END AS content,
+         kb.content(v.p, NULL::bigint) AS content,
          (SELECT fm.data FROM kb.frontmatter fm WHERE fm.file_id = n.id AND fm.version = n.version) AS frontmatter,
          NULL::bigint AS base_version
   FROM kb.node n
-  CROSS JOIN LATERAL (SELECT CASE WHEN (SELECT kb.current_account()) IS NULL THEN n.path ELSE kb.to_view(n.path) END AS p) v
-  WHERE n.kind = 1 AND n.deleted_at IS NULL AND ((SELECT kb.current_account()) IS NULL OR kb.visible(n.path));
+  CROSS JOIN LATERAL (SELECT kb.to_view(n.path) AS p) v
+  WHERE n.kind = 1 AND n.deleted_at IS NULL AND (SELECT kb.current_account()) IS NOT NULL AND kb.visible(n.path);
 
 CREATE VIEW kb.file_version AS
   SELECT n.id, n.path, c.version, kb._materialize(c.root) AS content,
