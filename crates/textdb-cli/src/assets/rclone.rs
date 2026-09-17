@@ -1362,32 +1362,16 @@ mod tests {
         assert!(d.get("/short/x.png", None, &tmp.join("short.png")).is_err());
         assert!(!tmp.join("short.png").exists());
 
-        // A path the drive holds two files of is left to be sorted out there, never half replaced.
-        std::fs::write(&src, b"a name of two files").unwrap();
-        let dup1 = hash_file(&src).unwrap().0;
-        let d = RcloneDriver::new(exe.clone(), root.clone());
-        d.check().unwrap();
-        let twin = d.put("/dup/a.png", &src, &dup1, None).unwrap().0.unwrap();
-        // Two files of one name are Drive's own doing, and no rclone command asks for them
-        // straight: a copy by id into the folder that already holds the name replaces what is there
-        // (one file, a new id), so the copy goes to a folder of its own and is then moved
-        // server-side, by id, in beside the first.
-        let remote = format!("{}:", remote_name(&base));
-        let inside = inside_remote(&root);
-        rc(&["backend", "copyid", &remote, &twin, &format!("{remote}{inside}/spare/")]);
-        let spare = id_at(&format!("{root}/spare/a.png"));
-        rc(&["backend", "moveid", &remote, &spare, &format!("{remote}{inside}/dup/")]);
-        let shown = rc(&["lsjson", &format!("{root}/dup")]);
-        let there = serde_json::from_str::<Vec<serde_json::Value>>(&shown).unwrap();
-        assert_eq!(there.iter().filter(|l| l["Name"] == "a.png").count(), 2, "the drive does not hold two files of that name: {shown}");
-        std::fs::write(&src, b"a name of two files, other bytes").unwrap();
-        let dup2 = hash_file(&src).unwrap().0;
-        let d = RcloneDriver::new(exe.clone(), root.clone());
-        d.check().unwrap();
-        match d.put("/dup/a.png", &src, &dup2, Some(&dup1)) {
-            Err(e) => assert!(e.message.contains("two files of one name"), "{}", e.message),
-            Ok(_) => panic!("a push went ahead with two files of one name in the drive"),
-        }
+        // A path the drive holds two files of is not tested here: Drive allows two, but rclone will
+        // not make them. Asked three ways against a real drive -- a copy by id into the folder that
+        // already holds the name, and a copy to a folder of its own then a move by id in beside the
+        // first, naming the folder and naming the file -- it ends with one file every time, because
+        // an identical file at the destination makes rclone skip the transfer and delete what it
+        // moved, and other bytes there it overwrites. One run did leave two, from a listing of a
+        // folder it had just written itself: a race, not something a test can ask for. The refusal
+        // is tested on a listing that holds one name twice instead, in the unit test
+        // `a_path_the_drive_holds_two_files_of_is_refused_before_a_push_reads_anything`, which CI
+        // runs; two made by hand in Drive's own pages are what would try it on a drive.
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

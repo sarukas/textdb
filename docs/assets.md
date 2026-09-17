@@ -245,7 +245,10 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
     store folder that no pointer names.
   - Tests run only on a person's own computer, against a remote named by
     `TEXTDB_TEST_GDRIVE` (a folder named `textdb-test`), each in a new subfolder removed at the
-    end; CI keeps testing rclone's local backend.
+    end; CI keeps testing rclone's local backend. Two files of one name are Drive's own doing and
+    rclone will not make them (it skips an identical file at the destination and deletes what it
+    moved, and overwrites other bytes), so that refusal is tested on a listing holding a name
+    twice; making two by hand in Drive's pages is what would try it on a drive.
 
 What a vault last had of each asset (to tell a local edit from a remote one) is kept in the same
 cache, keyed by host and directory and never roaming with a profile (a cache an older build kept
