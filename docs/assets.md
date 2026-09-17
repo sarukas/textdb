@@ -130,6 +130,33 @@ counts as an asset has just changed under it. It reports that the rules changed,
 push or the next sync with `--accept-rules` goes ahead. That way a rules file someone else committed
 cannot make a later sync publish what it should not.
 
+## Pulling assets into a vault
+
+`textdb assets pull` puts the real file where its pointer is: in the vault directory, at the
+pointer's own path without `.tdbasset` -- or under the name already on disk, where that differs only
+in letter case. What it fetches and what it leaves alone:
+
+| State | Pull |
+|---|---|
+| `not-pulled` | fetched |
+| `outdated` | fetched; what was here goes to `.textdb/trash/<yyyymmdd-HHMMSS>-<nanos>/…` first, never overwritten |
+| `modified` | kept: changed here, so not replaced (push it, or delete it and pull) |
+| `conflict` | kept, with the reason |
+
+Each file is downloaded to a partial name beside where it is going, hashed there against the
+pointer's `sha256` and size, and only then renamed into place. Bytes that are not the ones the
+pointer names therefore never appear under the real name: that asset fails, the partial file goes,
+and the message names `textdb assets verify`. Nothing is written through a symbolic link or junction
+already in the directory, whose target may be anywhere outside the vault. On a Google Drive store
+the download goes by the file's id, so an asset someone renamed, moved to another folder, or sent to
+Drive's trash is still found and fetched.
+
+`pull` on its own fetches everything in scope that needs it; `--linked-from PATH` narrows it to the
+assets the notes at or below that path link to. A sync's pull is the narrower one by default, since
+`asset_pull` is `linked` until it is set to `all` (see Sync below) -- so an explicit pull and a
+sync's pull deliberately differ. `--dry-run` says what it would fetch and how many bytes. Assets
+that could not be fetched exit 1.
+
 ## Which files are documents, assets or ignored
 
 Git's attribute syntax, in the vault's `.gitattributes`, with a `textdb` attribute:
