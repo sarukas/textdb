@@ -269,8 +269,36 @@ What is worth knowing before you build on it:
   numbers are the same in every view, so `cat -n`, `replace-lines` and search line numbers mean
   one thing.
 - **Writes are checked before anything commits**, the author of a write is the account, and
-  `--author` naming someone else is refused.
+  `--author` naming someone else is refused. Reverting a batch is settled over the *whole* batch
+  first: one file you may not write refuses all of it rather than undoing half.
+- **A root path that names no share of yours is a broken link, not a way in.** `[[hr/salaries]]`
+  written by an account with no `hr` keeps its bytes — the text is the author's — and is recorded
+  as broken for everyone, rather than resolving against the store's root.
+- **The share is a node, not a path.** The owner moving or renaming a shared folder changes
+  nothing for its holders. Moving or deleting the share *root* is refused to the holder: it is a
+  folder they work inside and do not own. A renamed alias reaches a checkout as a directory move,
+  so the next `sync` renames it and keeps whatever else was in it.
+- **The SQL surface answers in the account's paths too**, and the store's own tables do not: the
+  `files`, `folders`, `commits`, `links`, `properties`, `sections`, `authors` and `frontmatter`
+  views, the `kb`/`kb.file` writable relation and the `textdb_*`/`kb.*` functions are the surface,
+  and a token session naming `kb_node` (SQLite) or `kb.node` (Postgres) is refused.
+- **An `admin`-kind account** (`account create ops --kind admin`) sees the whole store in the
+  store's own paths. It is what a hosted deployment needs, where nobody opens the file or connects
+  as the owner and every caller arrives with a bearer. It holds no shares, so it takes no root,
+  and an unknown or revoked bearer is still refused rather than falling back to it.
+
+### The trust boundary
 
 On SQLite anyone who can open the file can read the raw `kb_*` tables or skip `textdb_auth`; on
-Postgres a superuser can. Both mean "you own the store", which is the trust boundary either way.
-The model is real where a server holds the store and clients hold tokens.
+Postgres the owner of the tables and any superuser can. Both mean "you own the store", which is
+the trust boundary either way. The model is real where a server holds the store and clients hold
+tokens.
+
+On Postgres that shape has a second layer: `kb.node` carries a row-level security policy, so a
+connection whose role owns nothing is filtered by the same rule every surface uses even on a
+hand-written query against the table. The policy is deliberately not `FORCE`d — the table's owner
+is the extension's own bookkeeping, and a policy over that would filter the store's maintenance —
+so it binds exactly the role a hosted deployment hands a caller. Reading under such a role is
+complete; **writing is not yet**, because the functions that write reach the tables as the caller
+and need `SECURITY DEFINER` to do their bookkeeping. Until then, run the writing connection as the
+owner and rely on the token for the filtering, which is what the CLI does.
