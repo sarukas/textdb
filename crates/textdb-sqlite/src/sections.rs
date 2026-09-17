@@ -60,17 +60,21 @@ impl Match {
 /// `prefix` is a folder (or a single file's path); `/` means the whole vault. The rows come
 /// back in document order within a document, and documents in path order, so an outline pane
 /// can render them without sorting.
+/// `view` is the caller's namespace: `prefix` is a path it wrote, the rows come back in its
+/// paths, and it sees nothing outside its shares. The owner's view translates nothing and adds
+/// no predicate, so this costs a store that delegates nothing exactly what it did before.
 #[allow(clippy::too_many_arguments)]
 pub fn outline(
     conn: &Connection,
     p: &str,
+    view: &textdb_core::access::View,
     prefix: &str,
     heading: Option<&str>,
     mode: Match,
     max_level: Option<i64>,
     limit: usize,
 ) -> Result<Vec<OutlineRow>> {
-    let prefix = crate::normalize_path(prefix)?;
+    let prefix = crate::access::to_store(view, &crate::normalize_path(prefix)?)?;
     // The same indexed range the rest of the binding uses: `path >= '/a/' AND path < '/a0'`
     // seeks `node_path`, where `like` or `substr` would scan it. The root has no bound, so
     // it takes the range that holds every path.
@@ -107,6 +111,12 @@ pub fn outline(
         sql.push_str(&format!(" AND s.level <= ?{}", args.len() + 1));
         args.push(l.into());
     }
+    // The subtree bounds are the caller's own share once the prefix is translated, but a bare
+    // `/` is not: without this an account asking for the whole vault would be handed the store.
+    if let Some((pred, mut extra)) = crate::access::visible_sql(view, "n.path") {
+        sql.push_str(&format!(" AND ({})", crate::access::renumber(&pred, args.len())));
+        args.append(&mut extra);
+    }
     sql.push_str(&format!(" ORDER BY n.path, s.line_from LIMIT ?{}", args.len() + 1));
     args.push((limit as i64).into());
 
@@ -131,27 +141,55 @@ pub fn outline(
             })
         })
         .map_err(sql_err)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+    let mut out = Vec::new();
+    for row in rows {
+        let mut row = row.map_err(sql_err)?;
+        // A row's path is translated once, where the row is built.
+        match view.to_view(&row.path) {
+            Some(p) => row.path = p,
+            None => continue,
+        }
+        out.push(row);
+    }
+    Ok(out)
 }
 
 /// Every distinct heading under `prefix`, most-used first, for autosuggest.
-pub fn heading_names(conn: &Connection, p: &str, prefix: &str, starts: &str, limit: usize) -> Result<Vec<(String, i64, i64)>> {
-    let prefix = crate::normalize_path(prefix)?;
+///
+/// No paths come back, but the *counts* are a fact about documents, so they are still the
+/// caller's own: an account must not learn how often a heading it cannot see is used.
+pub fn heading_names(
+    conn: &Connection,
+    p: &str,
+    view: &textdb_core::access::View,
+    prefix: &str,
+    starts: &str,
+    limit: usize,
+) -> Result<Vec<(String, i64, i64)>> {
+    let prefix = crate::access::to_store(view, &crate::normalize_path(prefix)?)?;
     let (lo, hi) = crate::db::subtree_bounds(&prefix).unwrap_or_else(|| ("/".into(), "0".into()));
     let (hlo, hhi) = fold_range(starts);
+    let mut args: Vec<rusqlite::types::Value> =
+        vec![prefix.clone().into(), lo.into(), hi.into(), hlo.into(), hhi.into(), (limit as i64).into()];
+    let vis = match crate::access::visible_sql(view, "n.path") {
+        None => String::new(),
+        Some((pred, mut extra)) => {
+            let pred = crate::access::renumber(&pred, args.len());
+            args.append(&mut extra);
+            format!(" AND ({pred})")
+        }
+    };
     let mut st = conn
         .prepare_cached(&format!(
             "SELECT min(s.heading), count(*), count(DISTINCT s.file_id) \
                FROM {p}section s JOIN {p}node n ON n.id = s.file_id \
               WHERE n.deleted_at IS NULL AND (n.path = ?1 OR (n.path >= ?2 AND n.path < ?3)) \
-                AND s.heading_lc >= ?4 AND s.heading_lc < ?5 \
+                AND s.heading_lc >= ?4 AND s.heading_lc < ?5{vis} \
               GROUP BY s.heading_lc ORDER BY count(*) DESC, s.heading_lc LIMIT ?6"
         ))
         .map_err(sql_err)?;
     let rows = st
-        .query_map(params![prefix, lo, hi, hlo, hhi, limit as i64], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
+        .query_map(rusqlite::params_from_iter(args), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .map_err(sql_err)?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
 }

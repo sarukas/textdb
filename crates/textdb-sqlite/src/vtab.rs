@@ -788,8 +788,13 @@ unsafe impl VTabCursor for FnCursor<'_> {
                 _ => None,
             }
         };
-        let db = TextDb::attach(self.tab.conn(), &self.tab.prefix, false)
-            .with_view(crate::access::session(unsafe { self.tab.conn().handle() } as usize));
+        // This connection's account. `db` carries it for the surfaces built on `TextDb`; the
+        // three that call a helper directly — outline, headings, links — take it as an argument,
+        // because a helper handed a bare `Connection` speaks store paths and filters nothing.
+        // Those three used to do exactly that: `textdb_outline` asked for an account's own folder
+        // and found nothing, and asked for `/` and was handed the store.
+        let view = crate::access::session(unsafe { self.tab.conn().handle() } as usize);
+        let db = TextDb::attach(self.tab.conn(), &self.tab.prefix, false).with_view(view.clone());
         self.rows = match self.kind {
             FnKind::Ls => {
                 let dir = s(&hidden[0]).unwrap_or_else(|| "/".into());
@@ -828,7 +833,7 @@ unsafe impl VTabCursor for FnCursor<'_> {
                 let max_level = hidden_i64(&hidden[3]);
                 let lim = hidden_i64(&hidden[4]).map_or(1000, |i| i.max(0) as usize);
                 let int = |v: Option<i64>| v.map_or(Value::Null, Value::Integer);
-                crate::sections::outline(self.tab.conn(), &self.tab.prefix, &prefix, heading.as_deref(), mode, max_level, lim)
+                crate::sections::outline(self.tab.conn(), &self.tab.prefix, &view, &prefix, heading.as_deref(), mode, max_level, lim)
                     .map_err(map_err)?
                     .into_iter()
                     .map(|r| {
@@ -861,7 +866,7 @@ unsafe impl VTabCursor for FnCursor<'_> {
                 let only: Vec<&str> = if status.is_empty() { Vec::new() } else { vec![status.as_str()] };
                 let lim = hidden_i64(&hidden[2]).map_or(10_000, |i| i.max(0) as usize);
                 let dir = if self.tab.kind == FnKind::Links { Direction::Out } else { Direction::In };
-                crate::links::rows(self.tab.conn(), &self.tab.prefix, &path, dir, &only, lim)
+                crate::links::rows(self.tab.conn(), &self.tab.prefix, &view, &path, dir, &only, lim)
                     .map_err(map_err)?
                     .into_iter()
                     .map(|r| {
@@ -885,7 +890,7 @@ unsafe impl VTabCursor for FnCursor<'_> {
                 let prefix = s(&hidden[0]).unwrap_or_else(|| "/".into());
                 let starts = s(&hidden[1]).unwrap_or_default();
                 let lim = hidden_i64(&hidden[2]).map_or(100, |i| i.max(0) as usize);
-                crate::sections::heading_names(self.tab.conn(), &self.tab.prefix, &prefix, &starts, lim)
+                crate::sections::heading_names(self.tab.conn(), &self.tab.prefix, &view, &prefix, &starts, lim)
                     .map_err(map_err)?
                     .into_iter()
                     .map(|(h, n, d)| vec![Value::Text(h), Value::Integer(n), Value::Integer(d)])

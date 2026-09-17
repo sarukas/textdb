@@ -631,7 +631,7 @@ impl Store for SqliteStore {
         limit: i64,
     ) -> Result<Vec<crate::store::OutlineRow>> {
         let m = textdb_sqlite::sections::Match::parse(mode);
-        Ok(textdb_sqlite::sections::outline(&self.conn, DEFAULT_PREFIX, prefix, heading, m, max_level, limit.max(1) as usize)?
+        Ok(textdb_sqlite::sections::outline(&self.conn, DEFAULT_PREFIX, &self.view, prefix, heading, m, max_level, limit.max(1) as usize)?
             .into_iter()
             .map(|r| crate::store::OutlineRow {
                 path: r.path,
@@ -652,7 +652,7 @@ impl Store for SqliteStore {
             .collect())
     }
     fn heading_names(&mut self, prefix: &str, starts: &str, limit: i64) -> Result<Vec<crate::store::HeadingName>> {
-        Ok(textdb_sqlite::sections::heading_names(&self.conn, DEFAULT_PREFIX, prefix, starts, limit.max(1) as usize)?
+        Ok(textdb_sqlite::sections::heading_names(&self.conn, DEFAULT_PREFIX, &self.view, prefix, starts, limit.max(1) as usize)?
             .into_iter()
             .map(|(heading, sections, docs)| crate::store::HeadingName { heading, sections, docs })
             .collect())
@@ -688,7 +688,7 @@ impl Store for SqliteStore {
     }
 
     fn sections_of(&mut self, path: &str) -> Result<Vec<(i64, i64, String)>> {
-        Ok(textdb_sqlite::sections::outline(&self.conn, DEFAULT_PREFIX, path, None, textdb_sqlite::sections::Match::Exact, None, 10_000)?
+        Ok(textdb_sqlite::sections::outline(&self.conn, DEFAULT_PREFIX, &self.view, path, None, textdb_sqlite::sections::Match::Exact, None, 10_000)?
             .into_iter()
             .map(|r| (r.line_from, r.line_to, r.heading_path))
             .collect())

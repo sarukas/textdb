@@ -527,14 +527,20 @@ pub enum Direction {
 ///
 /// `statuses` filters on `status` and empty means all of them. A link to an asset's pointer is
 /// reported as the asset, which is what the user wrote and what `backlinks` on an asset finds.
+/// `view` is the caller's namespace. The rule is the CLI's, and the two must stay the same: the
+/// **linking** file has to be one the account can see, the **target** may not be and that is not
+/// a reason to drop the row — a hidden target keeps its row, is marked `hidden` and names no
+/// path, so a reader learns a document is there and nothing about where (#12 B13, E).
 pub fn rows(
     conn: &Connection,
     p: &str,
+    view: &textdb_core::access::View,
     path: &str,
     dir: Direction,
     statuses: &[&str],
     lim: usize,
 ) -> Result<Vec<LinkRow>> {
+    let path = &crate::access::to_store(view, path)?;
     let (lo, hi) = subtree_bounds(path).unwrap_or_else(|| ("/".into(), "0".into()));
     // `status` is a closed set the caller does not choose freely, so the list is built into the
     // statement text: it keeps the statement cacheable and the values can only be our own.
@@ -559,33 +565,65 @@ pub fn rows(
              AND (path = ?1 OR path = ?1 || '.tdbasset' OR (path >= ?2 AND path < ?3))){only}"
         ),
     };
+    let mut args: Vec<rusqlite::types::Value> = vec![path.clone().into(), lo.into(), hi.into(), (lim as i64).into()];
+    let vis = match crate::access::visible_sql(view, "n.path") {
+        None => "1".to_string(),
+        Some((pred, mut extra)) => {
+            let pred = crate::access::renumber(&pred, args.len());
+            args.append(&mut extra);
+            pred
+        }
+    };
     let mut stmt = conn
         .prepare_cached(&format!(
             "SELECT n.path, n.version, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status, \
              CASE WHEN r.path LIKE '%.tdbasset' THEN substr(r.path, 1, length(r.path) - 9) ELSE r.path END, \
-             coalesce(r.path LIKE '%.tdbasset', 0) \
+             coalesce(r.path LIKE '%.tdbasset', 0), l.resolved_id \
              FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL \
              LEFT JOIN {p}node r ON r.id = l.resolved_id AND r.deleted_at IS NULL \
-             WHERE {cond} ORDER BY n.path, l.line, l.rowid LIMIT ?4"
+             WHERE ({cond}) AND ({vis}) ORDER BY n.path, l.line, l.rowid LIMIT ?4"
         ))
         .map_err(sql_err)?;
-    let out = stmt
-        .query_map(params![path, lo, hi, lim as i64], |r| {
-            Ok(LinkRow {
-                path: r.get(0)?,
-                version: r.get(1)?,
-                line: r.get(2)?,
-                kind: r.get(3)?,
-                target: r.get(4)?,
-                anchor: r.get(5)?,
-                alias: r.get(6)?,
-                status: r.get(7)?,
-                resolved: r.get(8)?,
-                asset: r.get::<_, i64>(9)? != 0,
-            })
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(args), |r| {
+            Ok((
+                LinkRow {
+                    path: r.get(0)?,
+                    version: r.get(1)?,
+                    line: r.get(2)?,
+                    kind: r.get(3)?,
+                    target: r.get(4)?,
+                    anchor: r.get(5)?,
+                    alias: r.get(6)?,
+                    status: r.get(7)?,
+                    resolved: r.get(8)?,
+                    asset: r.get::<_, i64>(9)? != 0,
+                },
+                r.get::<_, Option<i64>>(10)?,
+            ))
         })
         .map_err(sql_err)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(sql_err)?;
-    Ok(out)
+    // Both ends into the caller's namespace, where the row is built.
+    Ok(rows
+        .into_iter()
+        .filter_map(|(mut l, resolved_id)| {
+            l.path = view.to_view(&l.path)?;
+            if let Some(t) = l.resolved.take() {
+                match view.to_view(&t) {
+                    Some(v) => l.resolved = Some(v),
+                    None => {
+                        // The reader is told there is a document and nothing about where it is:
+                        // the target reads as the id form, exactly as the text does.
+                        l.status = Some("hidden".into());
+                        if let Some(id) = resolved_id {
+                            l.target = format!("textdb:{id}");
+                        }
+                    }
+                }
+            }
+            Some(l)
+        })
+        .collect())
 }
