@@ -489,6 +489,45 @@ BEGIN RAISE EXCEPTION USING ERRCODE = code, MESSAGE = code || ' ' || msg, DETAIL
 CREATE FUNCTION kb._subtree_like(p text) RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
 $$ SELECT replace(replace(replace(p, '\', '\\'), '%', '\%'), '_', '\_') || '/%' $$;
 
+-- Every node this connection can see, with the share it came through and the path it sees it at.
+--
+-- **This is where delegated access is enforced and translated, once.** Written the obvious way a
+-- listing view asks `kb.visible(n.path)` in its `WHERE` and computes `kb.to_view(n.path)` in its
+-- target list, and both query `kb.my_grant` again for every row — as did the `share` and `rights`
+-- columns of `kb.entry`, making four grant lookups a row. Worse, both are functions *of* the
+-- column, so `WHERE path = $1` could not use `node_path` and every delegated read scanned the
+-- whole node table. Measured before this view existed: one `SELECT content FROM kb.file WHERE
+-- path = $1` took 0.5 ms at 10 nodes, 281 ms at 1,000 and 6.3 s at 20,000, against a flat 0.4 ms
+-- for the owner. That is not a tax on delegation, it is a read that stops working as a store grows.
+--
+-- Driving from the grant instead: the grant is read once, the share bounds `n.path` as an index
+-- range, and the projection `kb.to_view` did per row is the same arithmetic inline. The bounds
+-- are `~>=~`/`~<~` rather than `>=`/`<` because `node_path` is a `text_pattern_ops` index and
+-- those are its operators — which also means the bound may come from the join rather than having
+-- to be a constant, so the nested loop over `kb.my_grant` supplies it.
+--
+-- `path` is the **store's** path and `vp` the caller's; a surface built on this answers in `vp`.
+-- `kb.my_grant` already tells an account its shares' store paths, so this exposes nothing new.
+CREATE VIEW kb.my_node AS
+  -- The owner, who has no view: every live node, at its own path, through no share. An InitPlan,
+  -- so a store that delegates nothing plans as though none of the rest of this were here.
+  SELECT n.*, NULL::text AS share, NULL::text AS rights, n.path AS vp
+    FROM kb.node n
+   WHERE n.deleted_at IS NULL AND (SELECT kb.current_account()) IS NULL
+  UNION ALL
+  SELECT n.*, g.alias AS share, g.rights AS rights,
+         CASE WHEN g.alias = ''
+              THEN coalesce(nullif(substr(n.path, length(g.store_path) + 1), ''), '/')
+              ELSE '/' || g.alias || substr(n.path, length(g.store_path) + 1) END AS vp
+    FROM kb.my_grant g
+    JOIN kb.node n
+      ON n.path ~>=~ g.store_path AND n.path ~<~ (g.store_path || '0')
+   WHERE n.deleted_at IS NULL AND NOT g.dormant
+     AND (SELECT kb.current_account()) IS NOT NULL
+     -- The range is the index key and this is the exactness: '.' (0x2E) sorts before '/' (0x2F),
+     -- so `/a` .. `/a0` also spans `/a.md`, which is a sibling and not a child.
+     AND (n.path = g.store_path OR n.path LIKE kb._subtree_like(g.store_path));
+
 -- An on/off value: on, true, yes, 1 / off, false, no, 0 in any case; NULL for anything else.
 CREATE FUNCTION kb._switch(v text) RETURNS boolean LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
   SELECT CASE lower(btrim(v, E' \t\r\n')) WHEN 'on' THEN true WHEN 'true' THEN true WHEN 'yes' THEN true WHEN '1' THEN true
@@ -605,21 +644,36 @@ CREATE VIEW kb.file AS
   FROM kb.node n
   WHERE n.kind = 1 AND n.deleted_at IS NULL AND (SELECT kb.current_account()) IS NULL
   UNION ALL
+  -- The account's branch reads `kb.my_node`, which is where the filtering, the translation and
+  -- the index range live — once, for every surface. What stays here is the file-shaped part.
+  --
+  -- The two branches are still spelled out rather than both reading `kb.my_node`, because the
+  -- owner's `content` must stay a bare `kb._materialize`: projection is a no-op for a caller
+  -- with no view, but it is a no-op that copies the whole document twice across the SQL
+  -- boundary, and this is the surface 1 MiB reads go through.
+  --
+  -- The equality on `path` is a filter on this branch and not an index key, and no view can make
+  -- it one: the caller's predicate binds to the view's output column, and nothing can apply
+  -- `kb.to_store` to it on the way in. Narrowing to the share is the most a view can do. A
+  -- caller that wants the index for a single document reads `kb.content(path)`, which resolves
+  -- the path once and looks it up.
   SELECT
-         v.p AS path,
-         CASE WHEN v.p = '/' THEN '/' ELSE right(v.p, strpos(reverse(v.p), '/') - 1) END AS name,
+         n.vp AS path,
+         CASE WHEN n.vp = '/' THEN '/' ELSE right(n.vp, strpos(reverse(n.vp), '/') - 1) END AS name,
          'file'::text AS kind, n.version,
          coalesce(n.nbytes, 0) AS nbytes, coalesce(n.nlines, 0) AS nlines,
          n.updated_at, n.updated_by,
          n.id,
-         CASE WHEN strpos(reverse(v.p), '/') = length(v.p) THEN '/'
-              ELSE left(v.p, length(v.p) - strpos(reverse(v.p), '/')) END AS dir,
-         kb.content(v.p, NULL::bigint) AS content,
+         CASE WHEN strpos(reverse(n.vp), '/') = length(n.vp) THEN '/'
+              ELSE left(n.vp, length(n.vp) - strpos(reverse(n.vp), '/')) END AS dir,
+         -- The row is in hand, so this projects the text it already has. `kb.content(n.vp)`
+         -- would normalise the path, resolve it through the view and look the node up again,
+         -- for every row the branch touched.
+         kb._project_text(n.id, n.path, kb._materialize(n.root)) AS content,
          (SELECT fm.data FROM kb.frontmatter fm WHERE fm.file_id = n.id AND fm.version = n.version) AS frontmatter,
          NULL::bigint AS base_version
-  FROM kb.node n
-  CROSS JOIN LATERAL (SELECT kb.to_view(n.path) AS p) v
-  WHERE n.kind = 1 AND n.deleted_at IS NULL AND (SELECT kb.current_account()) IS NOT NULL AND kb.visible(n.path);
+  FROM kb.my_node n
+  WHERE n.kind = 1 AND n.share IS NOT NULL;
 
 CREATE VIEW kb.file_version AS
   SELECT n.id, n.path, c.version, kb._materialize(c.root) AS content,
@@ -633,12 +687,12 @@ CREATE VIEW kb.file_version AS
 CREATE VIEW kb.entry AS
   -- The canonical listing record: the same twenty-four columns in the same order as
   -- textdb_ls and textdb_entry on SQLite, so one query text reads on either engine.
-  -- `v.p` is the path in the *caller's* namespace: the store's own for the owner, and for an
-  -- account the one under its alias. Computed once per row in the LATERAL below and used for
-  -- `path`, `name`, `dir` and `depth`, so a listing never quotes a store path at an account and
-  -- an account's own path is what comes back everywhere (#12 §2.1).
-  SELECT v.p AS path,
-         CASE WHEN v.p = '/' THEN '/' ELSE right(v.p, strpos(reverse(v.p), '/') - 1) END AS name,
+  -- `n.vp` is the path in the *caller's* namespace: the store's own for the owner, and for an
+  -- account the one under its alias. `kb.my_node` computes it, and it is used for `path`,
+  -- `name`, `dir` and `depth`, so a listing never quotes a store path at an account and an
+  -- account's own path is what comes back everywhere (#12 §2.1).
+  SELECT n.vp AS path,
+         CASE WHEN n.vp = '/' THEN '/' ELSE right(n.vp, strpos(reverse(n.vp), '/') - 1) END AS name,
          CASE n.kind WHEN 1 THEN 'file' ELSE 'folder' END AS kind,
          CASE n.kind WHEN 1 THEN n.version END AS version,
          CASE n.kind WHEN 1 THEN coalesce(n.nbytes, 0) ELSE n.t_bytes + coalesce(d.bytes, 0) END AS nbytes,
@@ -652,10 +706,10 @@ CREATE VIEW kb.entry AS
               ELSE n.updated_by END AS updated_by,
          n.id,
          -- One name for the parent, on both engines and every surface.
-         CASE WHEN v.p = '/' THEN NULL
-              WHEN strpos(reverse(v.p), '/') = length(v.p) THEN '/'
-              ELSE left(v.p, length(v.p) - strpos(reverse(v.p), '/')) END AS dir,
-         CASE WHEN v.p = '/' THEN 0 ELSE length(v.p) - length(replace(v.p, '/', '')) END::bigint AS depth,
+         CASE WHEN n.vp = '/' THEN NULL
+              WHEN strpos(reverse(n.vp), '/') = length(n.vp) THEN '/'
+              ELSE left(n.vp, length(n.vp) - strpos(reverse(n.vp), '/')) END AS dir,
+         CASE WHEN n.vp = '/' THEN 0 ELSE length(n.vp) - length(replace(n.vp, '/', '')) END::bigint AS depth,
          CASE WHEN n.kind = 1 AND strpos(reverse(n.name), '.') > 1 AND strpos(reverse(n.name), '.') < length(n.name)
               THEN lower(right(n.name, strpos(reverse(n.name), '.') - 1)) END AS ext,
          n.title,
@@ -680,14 +734,10 @@ CREATE VIEW kb.entry AS
          ELSE '[]'::jsonb END AS authors,
          -- The access tier (#12). NULL for the owner, who reaches everything directly; for an
          -- account, the share this row came through and its rights.
-         (SELECT g.alias FROM kb.my_grant g
-           WHERE NOT g.dormant AND (n.path = g.store_path OR n.path LIKE kb._subtree_like(g.store_path)) LIMIT 1) AS share,
-         (SELECT g.rights FROM kb.my_grant g
-           WHERE NOT g.dormant AND (n.path = g.store_path OR n.path LIKE kb._subtree_like(g.store_path)) LIMIT 1) AS rights,
+         n.share, n.rights,
          -- Only the root row carries the share list; here so the two views union.
          NULL::jsonb AS shares
-  FROM kb.node n
-  CROSS JOIN LATERAL (SELECT CASE WHEN (SELECT kb.current_account()) IS NULL THEN n.path ELSE kb.to_view(n.path) END AS p) v
+  FROM kb.my_node n
   LEFT JOIN LATERAL (
     SELECT sum(x.files)::bigint AS files, sum(x.folders)::bigint AS folders, sum(x.bytes)::bigint AS bytes,
            sum(x.lines)::bigint AS lines, sum(x.words)::bigint AS words, sum(x.versions)::bigint AS versions,
@@ -696,11 +746,14 @@ CREATE VIEW kb.entry AS
            (array_agg(x.updated_by ORDER BY x.ts DESC) FILTER (WHERE x.updated_by IS NOT NULL))[1] AS updated_by
     FROM kb.folder_delta x WHERE x.folder_id = n.id
   ) d ON n.kind = 0
-  -- Every listing surface is built on this view, so filtering here is what makes "the extension
-  -- enforces it, not the caller" true: `kb.ls`, `kb.file`, `kb.folder`, `textdb sql`'s `files`
-  -- and `folders`, and the web app all inherit it. The subquery is an InitPlan for the owner,
-  -- evaluated once, so a store that delegates nothing plans exactly as it did before.
-  WHERE n.deleted_at IS NULL AND ((SELECT kb.current_account()) IS NULL OR kb.visible(n.path));
+  -- Every listing surface is built on this view, so filtering in `kb.my_node` is what makes
+  -- "the extension enforces it, not the caller" true: `kb.ls`, `kb.file`, `kb.folder`,
+  -- `textdb sql`'s `files` and `folders`, and the web app all inherit it. There is no `WHERE`
+  -- left here — `kb.my_node` is already only what this connection may see, at the paths it sees
+  -- them, with the share each came through. It used to ask four separate questions of
+  -- `kb.my_grant` per row (`kb.visible`, `kb.to_view`, and one subquery each for `share` and
+  -- `rights`); the join answers all four at once.
+  ;
 
 -- An aliased account's root: the list of its shares, not a node. `kb.entry` is built on
 -- `kb.node` and so has no row for it, and `stat /` then answered "not found" on a path the
@@ -1020,6 +1073,21 @@ mod kb {
     #[pg_extern(immutable, parallel_safe, strict)]
     fn chunk_text(bytes: &[u8]) -> String {
         String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    /// Project a document's text into the caller's namespace, given the row it came from.
+    ///
+    /// `kb.content(path)` does this too, but it starts from a *path*: it normalises it, resolves
+    /// it through the view and looks the node up again. In `kb.file`'s account branch the row is
+    /// already in hand, so all three were repeated for every row the branch touched. This takes
+    /// the id and the store path the caller already has and does the projection alone.
+    ///
+    /// NULL in, NULL out — a file with no root has no text, and the owner's branch spells that
+    /// the same way with a bare `kb._materialize`.
+    #[pg_extern(stable, parallel_safe)]
+    fn _project_text(file_id: i64, store_path: &str, body: Option<&str>) -> Option<String> {
+        let body = body?;
+        Some(String::from_utf8_lossy(&project_text_of(file_id, store_path, body.as_bytes())).into_owned())
     }
 
     /// Materialize a Merkle root to text (view column `content`).
