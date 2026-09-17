@@ -1128,6 +1128,13 @@ mod tests {
         exe.filter(|_| runs)
     }
 
+    /// Give `d` the store listing `json` describes, as a command's first look at a drive would.
+    fn listed(d: &RcloneDriver, json: &serde_json::Value) {
+        let mut l = Listing::default();
+        l.add(&serde_json::to_vec(json).unwrap(), false).unwrap();
+        *d.listing.borrow_mut() = Some(l);
+    }
+
     fn walk(dir: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -1176,11 +1183,6 @@ mod tests {
 
     #[test]
     fn a_push_keeps_the_listing_right_for_the_assets_after_it() {
-        let listed = |d: &RcloneDriver, json: &serde_json::Value| {
-            let mut l = Listing::default();
-            l.add(&serde_json::to_vec(json).unwrap(), false).unwrap();
-            *d.listing.borrow_mut() = Some(l);
-        };
         let one = serde_json::json!([
             { "Path": "img/a.png", "Name": "a.png", "Size": 3, "IsDir": false, "ID": "1OldIdAbCdEfGhI" },
             { "Path": "img/b.png", "Name": "b.png", "Size": 4, "IsDir": false, "ID": "1OtherIdAbCdEfG" },
@@ -1206,6 +1208,29 @@ mod tests {
         listed(&d, &two);
         d.remember("1OldIdAbCdEfGhI", "/img/a.png", 9, &"cd".repeat(32));
         assert!(d.listing.borrow().is_none(), "the listing was kept although another file held that name");
+    }
+
+    /// Two files of one name is Drive's own doing, not something rclone can be asked for, so the
+    /// refusal is tested on a listing that holds them; the gated test below asks a real drive for
+    /// them as well.
+    #[test]
+    fn a_path_the_drive_holds_two_files_of_is_refused_before_a_push_reads_anything() {
+        let d = RcloneDriver::new(PathBuf::from("rclone"), "gdrive:textdb".to_string());
+        listed(
+            &d,
+            &serde_json::json!([
+                { "Path": "img/a.png", "Name": "a.png", "Size": 3, "IsDir": false, "ID": "1OneIdAbCdEfGhIj" },
+                { "Path": "img/a.png", "Name": "a.png", "Size": 7, "IsDir": false, "ID": "1TwoIdAbCdEfGhIj" },
+                { "Path": "img/b.png", "Name": "b.png", "Size": 4, "IsDir": false, "ID": "1OtherIdAbCdEfGh" },
+            ]),
+        );
+        match d.refuse_two_of_a_name("/img/a.png") {
+            Err(e) => assert!(e.message.contains("two files of one name"), "{}", e.message),
+            Ok(()) => panic!("a push was let through to a path the drive holds two files of"),
+        }
+        // The one name the drive holds twice, not every name beside it.
+        d.refuse_two_of_a_name("/img/b.png").unwrap();
+        d.refuse_two_of_a_name("/img/none.png").unwrap();
     }
 
     /// A Google Drive folder called `textdb-test` to test against (`TEXTDB_TEST_GDRIVE`, such as
@@ -1343,10 +1368,18 @@ mod tests {
         let d = RcloneDriver::new(exe.clone(), root.clone());
         d.check().unwrap();
         let twin = d.put("/dup/a.png", &src, &dup1, None).unwrap().0.unwrap();
-        rc(&["backend", "copyid", &format!("{}:", remote_name(&base)), &twin, &format!("{}:{}/dup/", remote_name(&base), inside_remote(&root))]);
-        let listed = rc(&["lsjson", &format!("{root}/dup")]);
-        let there = serde_json::from_str::<Vec<serde_json::Value>>(&listed).unwrap();
-        assert_eq!(there.iter().filter(|l| l["Name"] == "a.png").count(), 2, "the drive does not hold two files of that name: {listed}");
+        // Two files of one name are Drive's own doing, and no rclone command asks for them
+        // straight: a copy by id into the folder that already holds the name replaces what is there
+        // (one file, a new id), so the copy goes to a folder of its own and is then moved
+        // server-side, by id, in beside the first.
+        let remote = format!("{}:", remote_name(&base));
+        let inside = inside_remote(&root);
+        rc(&["backend", "copyid", &remote, &twin, &format!("{remote}{inside}/spare/")]);
+        let spare = id_at(&format!("{root}/spare/a.png"));
+        rc(&["backend", "moveid", &remote, &spare, &format!("{remote}{inside}/dup/")]);
+        let shown = rc(&["lsjson", &format!("{root}/dup")]);
+        let there = serde_json::from_str::<Vec<serde_json::Value>>(&shown).unwrap();
+        assert_eq!(there.iter().filter(|l| l["Name"] == "a.png").count(), 2, "the drive does not hold two files of that name: {shown}");
         std::fs::write(&src, b"a name of two files, other bytes").unwrap();
         let dup2 = hash_file(&src).unwrap().0;
         let d = RcloneDriver::new(exe.clone(), root.clone());
