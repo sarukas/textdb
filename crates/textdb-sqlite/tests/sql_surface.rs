@@ -877,3 +877,33 @@ fn links_and_backlinks_are_table_valued_functions() {
         .collect::<rusqlite::Result<Vec<_>>>();
     assert!(bad.is_err(), "{bad:?}");
 }
+
+/// A search scoped to a folder must find what is in it, however large the store around it.
+///
+/// The FTS index is over chunks and the ranker has no early termination, so the retrieval used to
+/// take the best `limit * 50` chunks *globally* and apply the folder and visibility filters to
+/// what was left. Past that many matches elsewhere, a scoped search returned nothing at all: a
+/// five-document folder whose every document held the word answered empty, and so did an account
+/// whose entire vault was that folder. Wrong answers, arriving only once a store got big.
+///
+/// 3,000 documents is comfortably past `10 * 50` and small enough to stay a unit test.
+#[test]
+fn a_scoped_search_is_not_truncated_by_the_rest_of_the_store() {
+    let conn = setup();
+    let db = TextDb::attach(&conn, "kb_", false);
+    for i in 0..3_000 {
+        db.create(&format!("/bulk/{}/{i}.md", i / 500), format!("common filler text, bulk {i}\n").as_bytes(), None, None)
+            .unwrap();
+    }
+    for i in 0..5 {
+        db.create(&format!("/tiny/{i}.md"), format!("common filler text, tiny {i}\n").as_bytes(), None, None).unwrap();
+    }
+
+    // Unscoped, the store answers with whatever ranks best; that has always worked.
+    assert_eq!(db.search_lines("common", "/", 10, 1).unwrap().len(), 10, "unscoped");
+
+    // Scoped to the small folder, every one of its documents matches and all five must come back.
+    let hits = db.search_lines("common", "/tiny", 10, 1).unwrap();
+    assert_eq!(hits.len(), 5, "a folder of five matching documents inside a store of 3,000");
+    assert!(hits.iter().all(|h| h.path.starts_with("/tiny/")), "{:?}", hits.iter().map(|h| &h.path).collect::<Vec<_>>());
+}

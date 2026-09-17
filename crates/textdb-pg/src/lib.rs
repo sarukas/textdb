@@ -1352,21 +1352,8 @@ mod kb {
         }
     }
 
-    /// This connection's view of the store, or `None` for the owner, who has no translation to
-    /// do — cached for the transaction that asked for it.
-    ///
-    /// The same `View` the SQLite binding builds, from the same three tables, so link projection
-    /// is one algorithm over two persistences rather than two implementations that have to be
-    /// kept agreeing (#12 part 2).
-    ///
-    /// Building one costs two queries — the account row and its grants — and it is asked for
-    /// per *row*: once per projected document, once per search hit, once per translated path.
-    /// A two-term search over 2,000 documents spent 75 of its 81 ms here, outside SQL entirely,
-    /// while the query that found the hits took 6.
-    ///
-    /// The key is the bearer plus the transaction's start time, so a different token or a later
-    /// transaction rebuilds it and nothing survives a commit. Granting or revoking inside the
-    /// same transaction is the one case that would go stale, and those commands clear it.
+    // The cache `current_view` below reads. Keyed on the bearer and the transaction's start time,
+    // so a different token or a later transaction rebuilds it and nothing survives a commit.
     thread_local! {
         static VIEW_CACHE: std::cell::RefCell<Option<(String, i64, Option<textdb_core::access::View>)>> =
             const { std::cell::RefCell::new(None) };
@@ -1377,6 +1364,18 @@ mod kb {
         VIEW_CACHE.with(|c| *c.borrow_mut() = None);
     }
 
+    /// This connection's view of the store, or `None` for the owner, who has no translation to
+    /// do — cached for the transaction that asked for it.
+    ///
+    /// The same `View` the SQLite binding builds, from the same three tables, so link projection
+    /// is one algorithm over two persistences rather than two implementations that have to be
+    /// kept agreeing (#12 part 2).
+    ///
+    /// Building one costs two queries — the account row and its grants — and it is asked for
+    /// per *row*: once per projected document, once per search hit, once per translated path.
+    /// A two-term search over 2,000 documents spent 75 of its 81 ms here, outside SQL entirely,
+    /// while the query that found the hits took 6. Granting or revoking inside the same
+    /// transaction is the one case the cache would go stale for, and those commands clear it.
     pub(crate) fn current_view() -> Option<textdb_core::access::View> {
         let token = token_now();
         // SAFETY: valid inside a transaction, which every function here runs in.
@@ -2546,18 +2545,23 @@ mod kb {
         let path = ok(normalize_path(path));
         let path = resolve(&path, false);
         let st = SpiStorage::new();
-        let (id, bytes) = match version {
+        let (id, nlinks, bytes) = match version {
             None => {
                 let n = file_by_path(&path);
-                (n.id, ok(materialize_all(&st, &n.root.unwrap_or_else(|| fail(TextdbError::NotFound(path.clone()))))))
+                let root = n.root.unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
+                (n.id, n.nlinks, ok(materialize_all(&st, &root)))
             }
             Some(v) => {
                 let n = NodeRow::by_path(&path, true).unwrap_or_else(|| fail(TextdbError::NotFound(path.clone())));
-                (n.id, ok(materialize_all(&st, &root_of_version(n.id, v as u64))))
+                (n.id, n.nlinks, ok(materialize_all(&st, &root_of_version(n.id, v as u64))))
             }
         };
         // A document is text the caller reads, so its links are in the caller's paths and the
-        // ones it cannot see are id references (#12 part 2).
+        // ones it cannot see are id references (#12 part 2). A document with none is handed back
+        // as it is: the row already says so, and `project_text_of` would otherwise have to ask.
+        if nlinks == 0 {
+            return String::from_utf8_lossy(&bytes).into_owned();
+        }
         String::from_utf8_lossy(&project_text_of(id, &path, &bytes)).into_owned()
     }
 
@@ -3695,14 +3699,25 @@ mod kb {
         // account against 11 ms as the owner. The view is already only what this connection may
         // see — a join, evaluated once — and it carries `deleted_at IS NULL` too. `n.path` on it
         // is still the store's, which is what the prefix here is: `resolve` translated it above.
-        // Per term: file_id → (chunk_id, rank).
-        let mut per_term: Vec<std::collections::HashMap<i64, (i64, f32)>> = Vec::new();
+        // Per term: the documents that hold it, with the rank the index gave the best chunk of
+        // each — used only to decide which reach the reranking pool. `df` is the size of that
+        // set before the limit, which is what BM25's idf needs and what a `count(*)` window
+        // computed after the filter and before the truncation gives for nothing.
+        let mut per_term: Vec<std::collections::HashMap<i64, f32>> = Vec::new();
+        let mut dfs: Vec<u64> = Vec::new();
         for t in &terms {
             let tsq = tsquery_term(t);
-            let files: std::collections::HashMap<i64, (i64, f32)> = Spi::connect(|client| {
+            let mut df = 0u64;
+            let files: std::collections::HashMap<i64, f32> = Spi::connect(|client| {
                 let t = client
                     .select(
-                        "SELECT r.file_id, c.id, ts_rank(c.tsv, q) FROM kb.chunk c JOIN kb.chunk_ref r ON r.chunk_id = c.id JOIN kb.my_node n ON n.id = r.file_id, to_tsquery('simple', $1) q WHERE c.tsv @@ q AND n.kind = 1 AND ($2 = '/' OR n.path LIKE kb._subtree_like($2)) ORDER BY 3 DESC LIMIT $3",
+                        "SELECT file_id, rank, count(*) OVER () AS df FROM ( \
+                           SELECT r.file_id AS file_id, max(ts_rank(c.tsv, q)) AS rank \
+                             FROM kb.chunk c JOIN kb.chunk_ref r ON r.chunk_id = c.id \
+                             JOIN kb.my_node n ON n.id = r.file_id, to_tsquery('simple', $1) q \
+                            WHERE c.tsv @@ q AND n.kind = 1 AND ($2 = '/' OR n.path LIKE kb._subtree_like($2)) \
+                            GROUP BY r.file_id \
+                         ) g ORDER BY rank DESC LIMIT $3",
                         None,
                         &[tsq.as_str().into(), prefix.as_str().into(), ((limit.saturating_mul(50)).min(500_000) as i64).into()],
                     )
@@ -3710,33 +3725,37 @@ mod kb {
                 let mut m = std::collections::HashMap::new();
                 for r in t {
                     let fid: i64 = r.get(1).unwrap_or_else(|e| spi_err(e)).unwrap_or(0);
-                    let cid: i64 = r.get(2).unwrap_or_else(|e| spi_err(e)).unwrap_or(0);
-                    let rank: f32 = r.get(3).unwrap_or_else(|e| spi_err(e)).unwrap_or(0.0);
-                    m.entry(fid).or_insert((cid, rank));
+                    let rank: f32 = r.get(2).unwrap_or_else(|e| spi_err(e)).unwrap_or(0.0);
+                    df = r.get::<i64>(3).unwrap_or_else(|e| spi_err(e)).unwrap_or(0).max(0) as u64;
+                    m.entry(fid).or_insert(rank);
                 }
                 m
             });
             per_term.push(files);
+            dfs.push(df);
         }
-        let mut candidates: Vec<(i64, i64, f32)> = per_term[0]
+        let mut candidates: Vec<(i64, f32)> = per_term[0]
             .iter()
             .filter(|(id, _)| per_term[1..].iter().all(|m| m.contains_key(id)))
-            .map(|(id, (c, r))| (*id, *c, *r))
+            .map(|(id, r)| (*id, *r))
             .collect();
-        candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        // Retrieval order, which decides what reaches the pool below and nothing a caller sees.
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let st = SpiStorage::new();
         let parsed = textdb_core::terms::parse(terms.clone());
         if parsed.is_empty() {
             return TableIterator::new(Vec::new());
         }
         let per_file = per_file.max(1) as usize;
-        // Ranked best first already; the best value scales the rest into (0, 1]. `ts_rank` is
-        // positive and bm25 is negative for the same meaning, so both are normalised here
-        // rather than left for a caller to discover which engine it is talking to.
-        let best = candidates.iter().map(|(_, _, r)| *r as f64).fold(f64::MIN, f64::max);
-        let scale = if best > 0.0 { best } else { 1.0 };
+        // **`ts_rank` chose the pool; `textdb_core::bm25` chooses the order.** `ts_rank` has no
+        // term saturation, no length normalisation and no inverse document frequency, so the same
+        // query against the same documents used to come back in a different order here than on
+        // SQLite. It is still what finds the documents — that is what an index is for — and it no
+        // longer decides what a caller sees. The scorer, the constants and the arithmetic are the
+        // ones in `textdb-core`, shared with the other binding.
+        let candidates = rescore(&parsed, &candidates, &dfs, &corpus_of(&prefix), &st);
         let mut hits = Vec::new();
-        for (file_id, _chunk_id, rank) in candidates {
+        for (file_id, rank) in candidates {
             if hits.len() >= limit {
                 break;
             }
@@ -3782,7 +3801,7 @@ mod kb {
                     n as i64,
                     textdb_core::terms::show(line, &parsed),
                     section_at(&spans, n as i64),
-                    ((rank as f64) / scale).clamp(0.0, 1.0),
+                    rank,
                     more,
                 ));
             }
@@ -3819,6 +3838,78 @@ mod kb {
     fn quote_lexeme(s: &str) -> String {
         format!("'{}'", s.replace('\'', "''"))
     }
+
+    /// Documents in the scope, and words across them: what BM25 normalises a length against.
+    ///
+    /// Both come off the folder row, where the listing surfaces already keep them folded, so the
+    /// corpus statistics are an indexed lookup rather than an aggregate over the store. `prefix`
+    /// is a store path, already resolved.
+    fn corpus_of(prefix: &str) -> textdb_core::bm25::Corpus {
+        let row: Option<(i64, i64)> = Spi::connect(|client| {
+            let rows = client
+                .select(
+                    "SELECT CASE kind WHEN 'folder' THEN coalesce(files, 0) ELSE 1 END, coalesce(nwords, 0)                        FROM kb.entry WHERE path = $1",
+                    None,
+                    &[prefix.into()],
+                )
+                .ok()?;
+            rows.into_iter().next().map(|r| {
+                (r.get::<i64>(1).ok().flatten().unwrap_or(0), r.get::<i64>(2).ok().flatten().unwrap_or(0))
+            })
+        });
+        let (ndocs, total_words) = row.unwrap_or((0, 0));
+        textdb_core::bm25::Corpus { ndocs: ndocs.max(0) as u64, total_words: total_words.max(0) as u64 }
+    }
+
+    /// Documents rescored before the rows are cut to what was asked for.
+    ///
+    /// The same policy as the SQLite binding, for the same reason: scoring needs a document's
+    /// text and reading text is what a search spends its time on, so only the head of the pool is
+    /// rescored and the tail keeps the retrieval order behind it.
+    fn rescore(
+        parsed: &[textdb_core::terms::Term],
+        candidates: &[(i64, f32)],
+        dfs: &[u64],
+        corpus: &textdb_core::bm25::Corpus,
+        st: &SpiStorage,
+    ) -> Vec<(i64, f64)> {
+        use textdb_core::bm25::{normalise, score, TermDf};
+        let head = candidates.len().min(RERANK_POOL);
+        let td: Vec<TermDf> = parsed
+            .iter()
+            .enumerate()
+            .map(|(i, term)| TermDf { term, df: dfs.get(i).copied().unwrap_or(1) })
+            .collect();
+        let mut scored: Vec<(i64, f64)> = Vec::with_capacity(head);
+        for (file_id, _) in &candidates[..head] {
+            let root: Option<Vec<u8>> = Spi::get_one_with_args("SELECT root FROM kb.node WHERE id = $1 AND deleted_at IS NULL", &[(*file_id).into()])
+                .ok()
+                .flatten();
+            let s = match root.and_then(|r| to_hash(&r).ok()) {
+                Some(h) => match materialize_all(st, &h) {
+                    Ok(body) => score(&td, &String::from_utf8_lossy(&body), corpus),
+                    Err(_) => 0.0,
+                },
+                None => 0.0,
+            };
+            scored.push((*file_id, s));
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut only: Vec<f64> = scored.iter().map(|(_, s)| *s).collect();
+        normalise(&mut only);
+        for (row, s) in scored.iter_mut().zip(only) {
+            row.1 = s;
+        }
+        // The tail was never scored, so it sorts below everything that was.
+        scored.extend(candidates[head..].iter().map(|(id, _)| (*id, 0.0)));
+        scored
+    }
+
+    /// Documents rescored before the rows are cut to what was asked for; the SQLite binding holds
+    /// the same constant for the same reason. A flat bound and not a multiple of the rows asked
+    /// for: `limit` counts rows, a document supplies up to `per_file` of them, and sizing this
+    /// from `limit` had a default search reranking three hundred documents to show ten.
+    const RERANK_POOL: usize = 64;
 
     fn tsquery_term(t: &str) -> String {
         if let Some(stem) = t.strip_suffix('*') {

@@ -5,6 +5,7 @@
 //! no database dependency; bindings implement [`Storage`] and own persistence.
 
 pub mod access;
+pub mod bm25;
 pub mod chunker;
 pub mod commit;
 pub mod diff;

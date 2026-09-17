@@ -89,7 +89,7 @@ Seven keys, one row per matching **line**, from `search` and `grep` alike.
 | 3 | `line` | int | 1-based |
 | 4 | `text` | string | the matching line, windowed around the match when longer than 300 characters, with the cut ends marked |
 | 5 | `section` | string \| null | the heading path the line sits under (`API Guide / Errors`), for `cat --section` |
-| 6 | `score` | number \| null | relevance, higher is better, scaled to (0, 1] against the best hit of this query; `null` from `grep` |
+| 6 | `score` | number \| null | relevance, higher is better, scaled to (0, 1] against the best hit of this query; `null` from `grep`. BM25 over the document, from `textdb_core::bm25` and not from the engine's own ranker, so both engines order a query the same way. Only the first 64 documents retrieved are scored — enough to order what a caller reads; past that the rows keep the retrieval order |
 | 7 | `more` | int | matching lines in this file held back by `--per-file`; 0 otherwise |
 
 `--limit` counts **rows** on both commands and `--per-file` caps how many come from one

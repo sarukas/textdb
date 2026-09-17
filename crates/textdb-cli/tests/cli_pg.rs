@@ -722,3 +722,64 @@ fn a_folder_carries_the_authors_below_it_on_postgres() {
     assert_eq!((row("/notes/a")["nauthors"].as_i64(), row("/notes/a")["updated_by"].as_str()), (Some(3), Some("carol")));
     assert_eq!(row("/")["nauthors"].as_i64(), Some(3));
 }
+
+/// Both engines rank the same documents in the same order, because neither ranks them.
+///
+/// FTS5's `rank` is a chunk-level bm25 and Postgres's `ts_rank` is not bm25 at all — no term
+/// saturation, no length normalisation, no inverse document frequency — so the same query against
+/// the same documents came back in a different order depending on which engine answered. The
+/// scoring now happens in `textdb_core::bm25`, over the document rather than a chunk, and the two
+/// engines' own rankers only decide which documents are worth scoring.
+///
+/// The corpus is built so a wrong ranker gets it wrong: `hit.md` says the rare word once in a
+/// short document, `buried.md` says it once in a long one, and `noise.md` never says it but is
+/// full of the common word. BM25 puts the short one first.
+#[test]
+fn both_engines_rank_search_hits_the_same_way() {
+    let Some(db) = database() else { return };
+    let filler = "common filler about systems and data. ".repeat(60);
+    ok(textdb(&db).args(["write", "/r/hit.md"]), Some("# Hit\n\nzarquon and common\n"));
+    ok(textdb(&db).args(["write", "/r/buried.md"]), Some(&format!("# Buried\n\n{filler}\n\nzarquon once here\n")));
+    ok(textdb(&db).args(["write", "/r/noise.md"]), Some(&format!("# Noise\n\n{filler}\n")));
+
+    let order = |q: &str| -> Vec<String> {
+        ok(textdb(&db).args(["--json", "search", q, "-p", "/r"]), None)
+            .json()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["path"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // The rare word is in two documents; the shorter one wins on length normalisation.
+    let rare = order("zarquon");
+    assert_eq!(rare, vec!["/r/hit.md", "/r/buried.md"], "postgres");
+
+    // Same store, same query, through the SQLite binding.
+    let lite = tempfile::tempdir().unwrap();
+    let file = lite.path().join("kb.db").display().to_string();
+    let lite_cmd = |args: &[&str]| -> Command {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_textdb"));
+        c.env_remove("TEXTDB_STORE")
+            .env_remove("TEXTDB_AUTHOR")
+            .env("TEXTDB_CEILING_DIRECTORIES", std::env::current_dir().unwrap_or_default())
+            .args(["--store", &file])
+            .args(args);
+        c
+    };
+    let w = |p: &str, body: &str| {
+        ok(&mut lite_cmd(&["write", p]), Some(body));
+    };
+    w("/r/hit.md", "# Hit\n\nzarquon and common\n");
+    w("/r/buried.md", &format!("# Buried\n\n{filler}\n\nzarquon once here\n"));
+    w("/r/noise.md", &format!("# Noise\n\n{filler}\n"));
+    let lite_order: Vec<String> = ok(&mut lite_cmd(&["--json", "search", "zarquon", "-p", "/r"]), None)
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(lite_order, rare, "the two engines disagree about the order");
+}

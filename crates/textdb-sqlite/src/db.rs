@@ -14,6 +14,18 @@ use textdb_md::MarkdownExtractor;
 use crate::stats::Totals;
 use crate::storage::{sql_err, SqliteStorage};
 
+/// Documents rescored before the rows are cut to what was asked for.
+///
+/// Reranking is only worth what it changes: the order of what is shown. Scoring a document needs
+/// its text, and reading text is what a search spends its time on, so this is a flat bound rather
+/// than a multiple of the rows asked for. `limit` counts *rows* and a document supplies up to
+/// `per_file` of them, so the rows a caller actually reads come from far fewer documents than
+/// their number suggests — sized from `limit` instead, a default `search` reranked three hundred
+/// documents to show ten, and paid for every one of them.
+///
+/// A caller wanting more documents than this gets the rest in the retrieval order behind them.
+const RERANK_POOL: usize = 64;
+
 /// New chunks per batched `chunk_ref` insert.
 ///
 /// Fixed so the statement text repeats and `prepare_cached` can hold it; a batch sized to
@@ -2449,8 +2461,9 @@ impl TextDb<'_> {
     pub fn search_lines(&self, query: &str, prefix: &str, limit: usize, per_file: usize) -> Result<Vec<Hit>> {
         // Candidates are found with a generous window: `limit` rows may all come from one
         // document, so the number of documents to consider is not the number of rows wanted.
-        let (terms, candidates) = self.search_candidates(query, prefix, limit)?;
-        self.resolve_hits(&terms, candidates, limit, per_file)
+        let (terms, candidates, dfs) = self.search_candidates(query, prefix, limit)?;
+        let corpus = self.corpus(prefix);
+        self.resolve_hits(&terms, candidates, &dfs, &corpus, limit, per_file)
     }
 
     /// The documents a query matches, best first, without resolving a line or a snippet.
@@ -2460,13 +2473,15 @@ impl TextDb<'_> {
     /// into a line number, so a caller that only needs to know *which* documents matched —
     /// a file list, a count, a facet — should not pay for it.
     pub fn search_paths(&self, query: &str, prefix: &str, limit: usize) -> Result<Vec<(String, f64)>> {
-        let (_, candidates) = self.search_candidates(query, prefix, limit)?;
+        let (terms, candidates, dfs) = self.search_candidates(query, prefix, limit)?;
+        let corpus = self.corpus(prefix);
+        let candidates = self.rescore(&terms, &candidates, &dfs, &corpus)?;
         let mut st = self
             .conn
             .prepare_cached(&format!("SELECT path FROM {}node WHERE id = ?1 AND deleted_at IS NULL", self.p))
             .map_err(sql_err)?;
         let mut out = Vec::new();
-        for (file_id, _, rank) in candidates {
+        for (file_id, rank) in candidates.into_iter().take(limit) {
             if let Some(path) = st
                 .query_row(params![file_id], |r| r.get::<_, String>(0))
                 .optional()
@@ -2484,11 +2499,11 @@ impl TextDb<'_> {
     /// The query's terms, and the `(file_id, chunk_id, rank)` of every document that matches
     /// every one of them, best first.
     #[allow(clippy::type_complexity)]
-    fn search_candidates(&self, query: &str, prefix: &str, limit: usize) -> Result<(Vec<String>, Vec<(i64, i64, f64)>)> {
+    fn search_candidates(&self, query: &str, prefix: &str, limit: usize) -> Result<(Vec<String>, Vec<(i64, f64)>, Vec<u64>)> {
         let prefix = self.store_path(prefix)?;
         let terms = query_terms(query);
         if terms.is_empty() {
-            return Ok((terms, vec![]));
+            return Ok((terms, vec![], vec![]));
         }
         // The prefix above narrows to what the caller asked for; this narrows to what they may
         // see at all. For an account searching `/`, the second is the whole of the restriction.
@@ -2497,22 +2512,50 @@ impl TextDb<'_> {
             Some((pred, args)) => (crate::access::renumber(&pred, 3), args),
         };
         // Per term: file_id → (chunk_id, rank) of the best chunk hit.
-        let mut per_term: Vec<std::collections::HashMap<i64, (i64, f64)>> = Vec::new();
+        // Per term: the documents that hold it, with the rank the index gave the best chunk of
+        // each — used only to decide which documents reach the reranking pool. `df` is the size
+        // of that set *before* the limit, which is what BM25's idf needs and what a `count(*)`
+        // window computed after the filter and before the truncation gives for nothing.
+        let mut per_term: Vec<std::collections::HashMap<i64, f64>> = Vec::new();
+        let mut dfs: Vec<u64> = Vec::new();
         // The index is over chunks, so every hit has to be resolved to the files that
         // contain it. Doing that one chunk at a time meant up to `limit * 50` extra
         // statements per term; the join does it in one, and `ORDER BY rank` is what makes
         // the first row seen for a file its best chunk, as before.
+        //
+        // **The limit is on the outside, and that is the whole of it.** With it on the FTS
+        // subquery the store took the best `limit * 50` chunks *in the whole index* and then
+        // applied the folder and the visibility filter to whatever was left — so past that many
+        // matches elsewhere a scoped search answered with nothing. A folder of five documents
+        // whose every document held the word came back empty inside a store of 200,000, and so
+        // did an account whose entire vault was that folder. Postgres never had it, because its
+        // filter and its limit are in one query; this is now the same shape, and the two engines
+        // answer the same question the same way.
+        //
+        // It costs what correctness costs here: ranking by bm25 visits every matching row, so a
+        // term common across a large store is now bounded by how many chunks hold it rather than
+        // by `limit`. A *scoped* search is bounded by the folder, which is the case that was
+        // wrong and is also the one that matters for a delegated account.
         let mut fts_stmt = self
             .conn
             .prepare_cached(&format!(
-                "SELECT r.file_id, f.chunk_id, f.rank                  FROM (SELECT rowid AS chunk_id, rank AS rank FROM {p}fts WHERE {p}fts MATCH ?1 ORDER BY rank LIMIT ?2) f                  JOIN {p}chunk_ref r ON r.chunk_id = f.chunk_id                  JOIN {p}node n ON n.id = r.file_id                  WHERE n.deleted_at IS NULL AND n.kind = 1                    AND (?3 = '/' OR substr(n.path, 1, length(?3) + 1) = ?3 || '/') AND ({vis})                  ORDER BY f.rank",
+                "SELECT file_id, rank, count(*) OVER () AS df FROM ( \
+                    SELECT r.file_id AS file_id, min(f.rank) AS rank \
+                      FROM (SELECT rowid AS chunk_id, rank AS rank FROM {p}fts WHERE {p}fts MATCH ?1) f \
+                      JOIN {p}chunk_ref r ON r.chunk_id = f.chunk_id \
+                      JOIN {p}node n ON n.id = r.file_id \
+                     WHERE n.deleted_at IS NULL AND n.kind = 1 \
+                       AND (?3 = '/' OR substr(n.path, 1, length(?3) + 1) = ?3 || '/') AND ({vis}) \
+                     GROUP BY r.file_id \
+                  ) ORDER BY rank LIMIT ?2",
                 p = self.p,
                 vis = vis_sql,
             ))
             .map_err(sql_err)?;
         for t in &terms {
             let q = fts5_term(t);
-            let mut files: std::collections::HashMap<i64, (i64, f64)> = Default::default();
+            let mut files: std::collections::HashMap<i64, f64> = Default::default();
+            let mut df = 0u64;
             let mut args: Vec<rusqlite::types::Value> = vec![
                 rusqlite::types::Value::Text(q),
                 rusqlite::types::Value::Integer((limit.max(1) * 50) as i64),
@@ -2521,23 +2564,43 @@ impl TextDb<'_> {
             args.extend(vis_args.iter().cloned());
             let rows = fts_stmt
                 .query_map(rusqlite::params_from_iter(args.iter()), |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?))
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, i64>(2)?))
                 })
                 .map_err(sql_err)?;
             for row in rows {
-                let (file_id, chunk_id, rank) = row.map_err(sql_err)?;
-                files.entry(file_id).or_insert((chunk_id, rank));
+                let (file_id, rank, n) = row.map_err(sql_err)?;
+                df = n.max(0) as u64;
+                files.entry(file_id).or_insert(rank);
             }
             per_term.push(files);
+            dfs.push(df);
         }
-        // Intersect file sets; order by the first term's rank.
-        let mut candidates: Vec<(i64, i64, f64)> = per_term[0]
+        // Intersect file sets; order by the first term's rank, which is the retrieval order and
+        // decides which documents reach the pool, not what a caller sees.
+        let mut candidates: Vec<(i64, f64)> = per_term[0]
             .iter()
             .filter(|(id, _)| per_term[1..].iter().all(|m| m.contains_key(id)))
-            .map(|(id, (chunk, rank))| (*id, *chunk, *rank))
+            .map(|(id, rank)| (*id, *rank))
             .collect();
-        candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-        Ok((terms, candidates))
+        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok((terms, candidates, dfs))
+    }
+
+    /// Documents in the scope, and words across them: what BM25 normalises a length against.
+    ///
+    /// Both come off the folder row, where the listing surfaces already keep them folded, so the
+    /// corpus statistics are an indexed lookup rather than an aggregate over the store.
+    fn corpus(&self, prefix: &str) -> textdb_core::bm25::Corpus {
+        let e = self.entry(prefix).ok();
+        match e {
+            // A folder carries totals over everything below it; a single file is a corpus of one.
+            Some(e) if e.kind == 0 => textdb_core::bm25::Corpus {
+                ndocs: e.files.unwrap_or(0).max(0) as u64,
+                total_words: e.nwords.max(0) as u64,
+            },
+            Some(e) => textdb_core::bm25::Corpus { ndocs: 1, total_words: e.nwords.max(0) as u64 },
+            None => textdb_core::bm25::Corpus { ndocs: 0, total_words: 0 },
+        }
     }
 
     /// Turn candidates into hit rows: every line of each matching document that actually
@@ -2548,7 +2611,67 @@ impl TextDb<'_> {
     /// `line` a fact rather than a hint — and drops a document whose words only ever appear
     /// apart, which document-level AND would otherwise report with a line holding none of
     /// them.
-    fn resolve_hits(&self, terms: &[String], candidates: Vec<(i64, i64, f64)>, limit: usize, per_file: usize) -> Result<Vec<Hit>> {
+    /// The candidates, in the order a caller should see them, with their score.
+    ///
+    /// Only the head of the pool is rescored. Scoring needs a document's text and reading it is
+    /// the expensive part of a search, so rescoring everything the retrieval found would make a
+    /// ten-row answer read five hundred documents. The head is `RERANK_POOL` documents or three
+    /// times the rows asked for, whichever is larger, which is enough for the order of what is
+    /// shown to be decided by BM25 rather than by which engine answered; the tail keeps the
+    /// engine's own order and is only reached when the head could not fill the rows.
+    fn rescore(
+        &self,
+        terms: &[String],
+        candidates: &[(i64, f64)],
+        dfs: &[u64],
+        corpus: &textdb_core::bm25::Corpus,
+    ) -> Result<Vec<(i64, f64)>> {
+        use textdb_core::bm25::{normalise, score, TermDf};
+        let parsed = textdb_core::terms::parse(terms.to_vec());
+        let head = candidates.len().min(RERANK_POOL);
+        let td: Vec<TermDf> = parsed
+            .iter()
+            .enumerate()
+            .map(|(i, term)| TermDf { term, df: dfs.get(i).copied().unwrap_or(1) })
+            .collect();
+        let st = self.storage();
+        let mut node = self
+            .conn
+            .prepare_cached(&format!("SELECT root FROM {}node WHERE id = ?1 AND deleted_at IS NULL", self.p))
+            .map_err(sql_err)?;
+        let mut scored: Vec<(i64, f64)> = Vec::with_capacity(head);
+        for (file_id, _) in &candidates[..head] {
+            let root: Option<Vec<u8>> =
+                node.query_row(params![file_id], |r| r.get(0)).optional().map_err(sql_err)?;
+            let s = match root {
+                Some(root) => {
+                    let body = st.document(&to_hash(&root)?)?.0;
+                    score(&td, &String::from_utf8_lossy(&body), corpus)
+                }
+                None => 0.0,
+            };
+            scored.push((*file_id, s));
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut only: Vec<f64> = scored.iter().map(|(_, s)| *s).collect();
+        normalise(&mut only);
+        for (row, s) in scored.iter_mut().zip(only) {
+            row.1 = s;
+        }
+        // The tail was never scored, so it sorts below everything that was.
+        scored.extend(candidates[head..].iter().map(|(id, _)| (*id, 0.0)));
+        Ok(scored)
+    }
+
+    fn resolve_hits(
+        &self,
+        terms: &[String],
+        candidates: Vec<(i64, f64)>,
+        dfs: &[u64],
+        corpus: &textdb_core::bm25::Corpus,
+        limit: usize,
+        per_file: usize,
+    ) -> Result<Vec<Hit>> {
         let st = self.storage();
         let parsed = textdb_core::terms::parse(terms.to_vec());
         if parsed.is_empty() {
@@ -2562,13 +2685,18 @@ impl TextDb<'_> {
                 self.p
             ))
             .map_err(sql_err)?;
-        // Ranked best first already; the best absolute value scales the rest into (0, 1].
-        // bm25 is negative and lower is better, so the sign is flipped here once rather than
-        // left for every caller to discover.
-        let best = candidates.iter().map(|(_, _, r)| -r).fold(f64::MIN, f64::max);
-        let scale = if best > 0.0 { best } else { 1.0 };
+        // **The engine's rank chose the pool; `textdb_core::bm25` chooses the order.** FTS5's
+        // `rank` is a chunk-level bm25 and Postgres's `ts_rank` is not bm25 at all, so the same
+        // query against the same documents used to come back in a different order depending on
+        // which engine answered. Both are still used to find the documents — that is what an
+        // index is for — and neither decides what a caller sees.
+        //
+        // Reranking costs reading documents that may not be shown: the score needs the text, and
+        // the text is only worth having for the ones that are. The pool is bounded for that
+        // reason, and the documents in it were mostly going to be read anyway.
+        let scored = self.rescore(terms, &candidates, dfs, corpus)?;
         let mut hits: Vec<Hit> = Vec::new();
-        for (file_id, _chunk_id, rank) in candidates {
+        for (file_id, rank) in scored {
             if hits.len() >= limit {
                 break;
             }
@@ -2601,7 +2729,7 @@ impl TextDb<'_> {
                     line: n as i64,
                     text: textdb_core::terms::show(line, &parsed),
                     section: section_at(&sections, n as i64),
-                    score: (-rank / scale).clamp(0.0, 1.0),
+                    score: rank,
                     more,
                 });
             }
