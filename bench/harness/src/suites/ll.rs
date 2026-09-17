@@ -123,13 +123,19 @@ pub fn long_lines(ctx: &Ctx) -> anyhow::Result<()> {
 }
 
 /// textdb-sqlite leaf hashes (None for other backends).
+///
+/// Matched on the engine rather than the whole id, so the delegated twin
+/// (`textdb-sqlite@account`) is not silently left without the measurement. It reads the node
+/// table directly, which speaks store paths, so the account's path is translated on the way in.
 pub fn leaf_hashes(ctx: &Ctx, path: &str) -> Option<Vec<textdb_core::Hash>> {
-    if ctx.backend.id() != "textdb-sqlite" {
+    let (engine, delegated) = crate::backends::delegate::split(ctx.backend.id());
+    if engine != "textdb-sqlite" {
         return None;
     }
+    let path = crate::backends::delegate::store_path(delegated, path);
     let conn = rusqlite::Connection::open(ctx.work.join("textdb.db")).ok()?;
     let db = textdb_sqlite::TextDb::attach(&conn, "kb_", true);
-    let n = db.node_by_path(path).ok()??;
+    let n = db.node_by_path(&path).ok()??;
     let st = textdb_sqlite::SqliteStorage::new(&conn, "kb_");
     Some(textdb_core::leaves(&st, &n.root?).ok()?.into_iter().map(|l| l.hash).collect())
 }

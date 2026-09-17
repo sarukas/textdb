@@ -62,10 +62,47 @@ bench/scripts/make-results.py bench/out bench/RESULTS.md bench/scripts/results-n
 | `--work DIR` | `bench/data` | Where backends put their data. Wiped per backend per rep. |
 | `--drop-caches` | off | Drop the page cache before rep 1 for a cold-cache number. Linux only; elsewhere every rep is recorded `warm`. |
 | `--tests DIR` | `bench/harness/tests` | The matrix TOML. |
+| `--as-account` | off | Also run every textdb backend as a delegated account. See [Delegated access](#delegated-access). |
 | `-v` | off | Verbose. |
 
 `results.jsonl` appends, so point a second run at a fresh `--out` unless you mean to
 combine them (which is how `fs-git` gets added to a run for one test only).
+
+## Delegated access
+
+Every backend above opens its store as the **owner**, so every number the matrix has produced is
+the owner's: nothing measured a filtered read, a translated listing or a projected document.
+`--as-account` measures the other half.
+
+```sh
+./target/release/textdb-bench run --size s --as-account \
+    --backends textdb-sqlite,textdb-pg --pg postgres://postgres@localhost:54329/postgres
+```
+
+It adds a **delegated twin** beside each textdb backend — `textdb-sqlite@account`,
+`textdb-pg@account` — and runs both in the **same invocation**, the twin immediately after its
+owner in every test. That is the point of the flag rather than a second run: this container's own
+drift reaches 10× on a single cell, so owner and account have to be measured back to back to be
+comparable at all. `--backends textdb-pg@account` names a twin directly if only that column is
+wanted.
+
+Nothing else about the suite changes. The twin authenticates as an account whose **root is one
+folder** (`/bench`), so the path the suite writes is the path the account writes: `/notes/a.md`
+goes in as `/notes/a.md` and comes back as `/notes/a.md`, while the store holds
+`/bench/notes/a.md` and every operation crosses the view on the way. No path is rewritten in the
+harness — a suite that rewrote paths would be measuring its own string work alongside the store's,
+and every oracle would have to be taught the difference. Every oracle therefore applies unchanged:
+a twin that quietly stopped filtering would fail the same checks as any other backend.
+
+Two things it does not measure, both worth knowing before reading a number from it:
+
+- **The aliased namespace.** The other shape — where the account's root lists aliases and every
+  path gains a `/<alias>` prefix — would need exactly the harness-side rewriting above, and
+  differs by one `format!` inside `to_store`; everything expensive runs the same either way.
+- **Row-level security, on Postgres.** `kb.node`'s policy is deliberately not `FORCE`d, and
+  Postgres exempts a table's owner and any superuser from a policy. The harness connects as the
+  role that owns the extension, so a delegated Postgres run measures the `kb.*` view and function
+  surface and **not** the RLS layer under it.
 
 ## Run size
 

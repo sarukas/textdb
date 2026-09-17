@@ -51,23 +51,30 @@ pub fn edit_sequence(ctx: &Ctx) -> anyhow::Result<()> {
     let mut leaf_prev: Option<HashSet<textdb_core::Hash>> = None;
     let mut leaf_changed: Vec<f64> = Vec::new();
     let mut leaf_unchanged_frac: Vec<f64> = Vec::new();
+    // The engine, with any `@account` suffix taken off: a delegated twin is the same engine and
+    // must report the same counters, or ME-04 would be blank for it exactly as it once was for
+    // `textdb-pg` — a measurement missing rather than failing, which is the harder kind to see.
+    let (engine, delegated) = crate::backends::delegate::split(ctx.backend.id());
     let leaf_set = |ctx: &Ctx| -> Option<HashSet<textdb_core::Hash>> {
         if !is_textdb {
             return None;
         }
-        if ctx.backend.id() == "textdb-sqlite" {
-            // Reach the leaf hashes through a fresh embedded handle on the same file.
+        if engine == "textdb-sqlite" {
+            // Reach the leaf hashes through a fresh embedded handle on the same file. It reads
+            // the node table, which speaks store paths whatever the caller holds.
+            let store_path = crate::backends::delegate::store_path(delegated, path);
             let db_path = ctx.work.join("textdb.db");
             let conn = rusqlite::Connection::open(db_path).ok()?;
             let db = textdb_sqlite::TextDb::attach(&conn, "kb_", true);
-            let n = db.node_by_path(path).ok()??;
+            let n = db.node_by_path(&store_path).ok()??;
             let st = textdb_sqlite::SqliteStorage::new(&conn, "kb_");
             return Some(textdb_core::leaves(&st, &n.root?).ok()?.into_iter().map(|l| l.hash).collect());
         }
         // Postgres answers through `kb.leaf_hashes`, a hook on the extension. Without this
         // `leaves_changed` was collected for `textdb-sqlite` only, so ME-04 reported nothing
-        // for `textdb-pg` and claim 1 could never pass for it whatever it did.
-        if ctx.backend.id() == "textdb-pg" {
+        // for `textdb-pg` and claim 1 could never pass for it whatever it did. It resolves the
+        // path through the view, so the account's own path is what it wants.
+        if engine == "textdb-pg" {
             return ctx.backend.leaf_hashes(path).ok().flatten();
         }
         None

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::backend::*;
-use crate::backends::col_bytes;
+use crate::backends::{col_bytes, delegate};
 use crate::reference::splice;
 
 static INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -24,21 +24,43 @@ pub struct TextdbSqlite {
     file: PathBuf,
     mode: Mode,
     base_wchar: AtomicU64,
+    /// The bearer every connection authenticates with, for the `@account` twin (#14 item 2).
+    /// `None` is the owner, and then nothing on any path below this costs anything.
+    bearer: Option<String>,
 }
 
 impl TextdbSqlite {
     pub fn new(dir: &Path, mode: Mode) -> anyhow::Result<Self> {
+        Self::open_store(dir, mode, false)
+    }
+
+    /// The same store, opened by an account that holds [`delegate::SHARE`] as its whole
+    /// namespace. See `delegate` for why that shape and what it does not measure.
+    pub fn as_account(dir: &Path, mode: Mode) -> anyhow::Result<Self> {
+        Self::open_store(dir, mode, true)
+    }
+
+    fn open_store(dir: &Path, mode: Mode, delegated: bool) -> anyhow::Result<Self> {
         let file = dir.join("textdb.db");
-        let b = TextdbSqlite {
+        let mut b = TextdbSqlite {
             id: INSTANCE.fetch_add(1, Ordering::Relaxed),
             file,
             mode,
             base_wchar: AtomicU64::new(io_counters::self_wchar()),
+            bearer: None,
         };
         b.with(|c| {
             c.execute_batch("CREATE VIRTUAL TABLE IF NOT EXISTS kb USING textdb(store='kb_');")?;
             Ok(())
         })?;
+        if delegated {
+            let bearer = b.with(grant_bench_account)?;
+            b.bearer = Some(bearer);
+            // The connection this thread cached during setup is the owner's, and `open` only
+            // authenticates when it builds one. Dropping it here is what makes the very next
+            // call — on this thread as much as any other — arrive as the account.
+            close_conn(b.id);
+        }
         Ok(b)
     }
 
@@ -50,7 +72,17 @@ impl TextdbSqlite {
             sync
         ))?;
         textdb_sqlite::register(&c, "kb_")?;
+        if let Some(bearer) = &self.bearer {
+            // One call, the way a SQL client does it: from here the virtual table and every
+            // `textdb_*` function answer in this account's paths and see only its share.
+            c.query_row("SELECT textdb_auth(?1)", params![bearer], |_| Ok(()))?;
+        }
         Ok(c)
+    }
+
+    /// The store path a suite path names, for the two hooks that read the node table directly.
+    fn store_path(&self, p: &str) -> String {
+        delegate::store_path(self.bearer.is_some(), p)
     }
 
     pub fn with<T>(&self, f: impl FnOnce(&Connection) -> R<T>) -> R<T> {
@@ -81,6 +113,34 @@ impl TextdbSqlite {
     }
 }
 
+/// Create the share folder, the account whose root it is, and a bearer for it. Returns the
+/// bearer.
+///
+/// Through the Rust access API rather than SQL because SQLite has no SQL surface for accounts —
+/// `textdb_auth` is the only one of these an embedded client can reach, and the rest is what the
+/// CLI calls. Postgres does have them, and its half of this uses them; each engine's setup is the
+/// path a deployment of that engine actually takes. Untimed either way: this runs once, before
+/// the suite, and nothing here is measured.
+fn grant_bench_account(c: &Connection) -> R<String> {
+    use textdb_core::access::{Grants, Namespace, Rights};
+    use textdb_sqlite::access as acl;
+
+    let now = textdb_sqlite::SqliteStorage::now();
+    let node_id = textdb_sqlite::TextDb::attach(c, "kb_", true)
+        .ensure_folder(delegate::SHARE)
+        .map_err(|e| delegate::setup_err("share folder", e))?;
+    let account = acl::create_account(c, "kb_", delegate::ACCOUNT, "agent", Some(node_id), &now)
+        .map_err(|e| delegate::setup_err("account", e))?;
+    // A single-root account's root is a share like any other, held under the empty alias, so
+    // everything downstream reads one table and not two.
+    let g = Grants::new()
+        .add(Namespace::SingleRoot, node_id, delegate::SHARE, None, Rights::Rw)
+        .map_err(|e| delegate::setup_err("grant", e))?;
+    acl::insert_grant(c, "kb_", account.id, &g, Some("owner"), &now).map_err(|e| delegate::setup_err("grant", e))?;
+    let (bearer, _) = acl::create_token(c, "kb_", account.id, Some("bench"), None, &now).map_err(|e| delegate::setup_err("token", e))?;
+    Ok(bearer)
+}
+
 fn content_param(b: &[u8]) -> rusqlite::types::Value {
     match std::str::from_utf8(b) {
         Ok(s) => rusqlite::types::Value::Text(s.to_string()),
@@ -109,7 +169,11 @@ impl Backend for TextdbSqlite {
     }
 
     fn id(&self) -> &'static str {
-        "textdb-sqlite"
+        if self.bearer.is_some() {
+            "textdb-sqlite@account"
+        } else {
+            "textdb-sqlite"
+        }
     }
     fn capabilities(&self) -> Caps {
         Caps {
@@ -328,6 +392,11 @@ impl Backend for TextdbSqlite {
     // every query is at the document's current version.
 
     fn links(&self, prefix: &str) -> R<Vec<LinkRow>> {
+        // Read from the sidecar tables, which speak store paths and carry unprojected link
+        // targets: there is no account-side answer to give. See `delegate::NO_SIDECAR_VIEW`.
+        if self.bearer.is_some() {
+            return Err(BackendError::NotSupported(delegate::NO_SIDECAR_VIEW));
+        }
         self.with(|c| {
             let (lo, hi) = subtree_range(prefix);
             let mut st = c.prepare_cached(
@@ -343,6 +412,11 @@ impl Backend for TextdbSqlite {
         })
     }
     fn backlinks(&self, path: &str) -> R<Vec<LinkRow>> {
+        // Read from the sidecar tables, which speak store paths and carry unprojected link
+        // targets: there is no account-side answer to give. See `delegate::NO_SIDECAR_VIEW`.
+        if self.bearer.is_some() {
+            return Err(BackendError::NotSupported(delegate::NO_SIDECAR_VIEW));
+        }
         self.with(|c| {
             let mut st = c.prepare_cached(
                 "SELECT n.path, l.target_path, l.line, l.status, r.path
@@ -356,6 +430,11 @@ impl Backend for TextdbSqlite {
         })
     }
     fn frontmatter(&self, path: &str) -> R<Option<String>> {
+        // Read from the sidecar tables, which speak store paths and carry unprojected link
+        // targets: there is no account-side answer to give. See `delegate::NO_SIDECAR_VIEW`.
+        if self.bearer.is_some() {
+            return Err(BackendError::NotSupported(delegate::NO_SIDECAR_VIEW));
+        }
         self.with(|c| {
             let v: Option<Option<String>> = c
                 .prepare_cached(
@@ -409,6 +488,11 @@ impl Backend for TextdbSqlite {
         })
     }
     fn sections(&self, path: &str) -> R<Vec<SectionRow>> {
+        // Read from the sidecar tables, which speak store paths and carry unprojected link
+        // targets: there is no account-side answer to give. See `delegate::NO_SIDECAR_VIEW`.
+        if self.bearer.is_some() {
+            return Err(BackendError::NotSupported(delegate::NO_SIDECAR_VIEW));
+        }
         self.with(|c| {
             let mut st = c.prepare_cached(
                 "SELECT s.heading_path, s.level, s.line_from, s.line_to
@@ -475,7 +559,9 @@ impl Backend for TextdbSqlite {
         })
     }
     fn sync_dir(&self, prefix: &str, dir: &std::path::Path) -> R<crate::backend::SyncStats> {
-        super::run_sync(&self.file.display().to_string(), prefix, dir)
+        // `sync` is the one operation that lives in the CLI rather than the SQL surface, so the
+        // bearer reaches it the way a deployment sends one: in the environment.
+        super::run_sync(&self.file.display().to_string(), prefix, dir, self.bearer.as_deref())
     }
     fn changes_since(&self, seq: u64) -> R<(u64, u64)> {
         self.with(|c| {
@@ -521,8 +607,12 @@ impl Backend for TextdbSqlite {
                 ("tree_nodes", nodes as f64),
             ];
             if !path.is_empty() {
+                // `TextDb::attach` with no view is the owner's, so this speaks store paths while
+                // everything the suite calls speaks the account's. Untimed instrumentation, and
+                // the one place in this file that has to know the difference.
+                let path = self.store_path(path);
                 let db = textdb_sqlite::TextDb::attach(c, "kb_", true);
-                if let Ok(Some(n)) = db.node_by_path(path) {
+                if let Ok(Some(n)) = db.node_by_path(&path) {
                     if let Some(root) = n.root {
                         let st = textdb_sqlite::SqliteStorage::new(c, "kb_");
                         if let Ok(d) = textdb_core::tree::depth(&st, &root) {
@@ -541,6 +631,8 @@ impl Backend for TextdbSqlite {
 
 /// Leaf hash set of a file at HEAD (for LL-04 / ME-04 leaf-stability metrics).
 pub fn leaf_hashes(b: &TextdbSqlite, path: &str) -> R<Vec<textdb_core::Hash>> {
+    let path = b.store_path(path);
+    let path = path.as_str();
     b.with(|c| {
         let db = textdb_sqlite::TextDb::attach(c, "kb_", true);
         let n = db

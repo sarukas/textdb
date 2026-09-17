@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use postgres::{Client, NoTls};
 
 use crate::backend::*;
+use crate::backends::delegate;
 use crate::backends::sql_text_pg::pg_written_bytes;
 use crate::reference::splice;
 
@@ -34,20 +35,44 @@ pub struct TextdbPg {
     url: String,
     mode: Mode,
     base_written: Mutex<u64>,
+    /// The bearer every connection authenticates with, for the `@account` twin (#14 item 2).
+    /// `None` is the owner, and then nothing on any path below this costs anything.
+    bearer: Option<String>,
 }
 
 impl TextdbPg {
     pub fn new(url: &str, mode: Mode) -> anyhow::Result<Self> {
-        let b = TextdbPg {
+        Self::open_store(url, mode, false)
+    }
+
+    /// The same store, opened by an account that holds [`delegate::SHARE`] as its whole
+    /// namespace. See `delegate` for why that shape and what it does not measure — in
+    /// particular that the RLS policy on `kb.node` does not apply to the role the harness
+    /// connects as, so this measures the `kb.*` surface and not the layer beneath it.
+    pub fn as_account(url: &str, mode: Mode) -> anyhow::Result<Self> {
+        Self::open_store(url, mode, true)
+    }
+
+    fn open_store(url: &str, mode: Mode, delegated: bool) -> anyhow::Result<Self> {
+        let mut b = TextdbPg {
             id: INSTANCE.fetch_add(1, Ordering::Relaxed),
             url: url.to_string(),
             mode,
             base_written: Mutex::new(0),
+            bearer: None,
         };
         b.with(|c| {
             c.batch_execute("DROP EXTENSION IF EXISTS textdb_pg CASCADE; DROP SCHEMA IF EXISTS kb CASCADE; CREATE EXTENSION textdb_pg;")?;
             Ok(())
         })?;
+        if delegated {
+            let bearer = b.with(grant_bench_account)?;
+            b.bearer = Some(bearer);
+            // The connection this thread cached during setup is the owner's, and `open` only
+            // authenticates when it builds one. Dropping it here is what makes the very next
+            // call — on this thread as much as any other — arrive as the account.
+            close_conn(b.id);
+        }
         Ok(b)
     }
 
@@ -55,6 +80,11 @@ impl TextdbPg {
         let mut c = Client::connect(&self.url, NoTls)?;
         let sc = if self.mode == Mode::Durable { "on" } else { "off" };
         c.batch_execute(&format!("SET synchronous_commit = {};", sc))?;
+        if let Some(bearer) = &self.bearer {
+            // One call, the way a SQL client does it: from here every `kb.*` view and function
+            // answers in this account's paths and sees only its share.
+            c.query_one("SELECT kb.auth($1)", &[&bearer.as_str()])?;
+        }
         Ok(c)
     }
 
@@ -102,7 +132,11 @@ impl Backend for TextdbPg {
         close_conn(self.id);
     }
     fn id(&self) -> &'static str {
-        "textdb-pg"
+        if self.bearer.is_some() {
+            "textdb-pg@account"
+        } else {
+            "textdb-pg"
+        }
     }
     fn capabilities(&self) -> Caps {
         Caps {
@@ -289,6 +323,11 @@ impl Backend for TextdbPg {
     // not `100XXXdone`.
 
     fn links(&self, prefix: &str) -> R<Vec<LinkRow>> {
+        // Read from the sidecar tables, which speak store paths and carry unprojected link
+        // targets: there is no account-side answer to give. See `delegate::NO_SIDECAR_VIEW`.
+        if self.bearer.is_some() {
+            return Err(BackendError::NotSupported(delegate::NO_SIDECAR_VIEW));
+        }
         self.with(|c| {
             let rows = c.query(
                 "SELECT n.path, l.target_path, l.line, l.status, r.path
@@ -303,6 +342,11 @@ impl Backend for TextdbPg {
         })
     }
     fn backlinks(&self, path: &str) -> R<Vec<LinkRow>> {
+        // Read from the sidecar tables, which speak store paths and carry unprojected link
+        // targets: there is no account-side answer to give. See `delegate::NO_SIDECAR_VIEW`.
+        if self.bearer.is_some() {
+            return Err(BackendError::NotSupported(delegate::NO_SIDECAR_VIEW));
+        }
         self.with(|c| {
             let rows = c.query(
                 "SELECT n.path, l.target_path, l.line, l.status, r.path
@@ -316,6 +360,11 @@ impl Backend for TextdbPg {
         })
     }
     fn frontmatter(&self, path: &str) -> R<Option<String>> {
+        // Read from the sidecar tables, which speak store paths and carry unprojected link
+        // targets: there is no account-side answer to give. See `delegate::NO_SIDECAR_VIEW`.
+        if self.bearer.is_some() {
+            return Err(BackendError::NotSupported(delegate::NO_SIDECAR_VIEW));
+        }
         self.with(|c| {
             let rows = c.query(
                 // `data` is jsonb here and TEXT in the SQLite binding; ::text gives both
@@ -370,6 +419,11 @@ impl Backend for TextdbPg {
         })
     }
     fn sections(&self, path: &str) -> R<Vec<SectionRow>> {
+        // Read from the sidecar tables, which speak store paths and carry unprojected link
+        // targets: there is no account-side answer to give. See `delegate::NO_SIDECAR_VIEW`.
+        if self.bearer.is_some() {
+            return Err(BackendError::NotSupported(delegate::NO_SIDECAR_VIEW));
+        }
         self.with(|c| {
             let rows = c.query(
                 "SELECT s.heading_path, s.level, s.line_from, s.line_to
@@ -423,7 +477,9 @@ impl Backend for TextdbPg {
         })
     }
     fn sync_dir(&self, prefix: &str, dir: &std::path::Path) -> R<crate::backend::SyncStats> {
-        super::run_sync(&self.url, prefix, dir)
+        // `sync` is the one operation that lives in the CLI rather than the SQL surface, so the
+        // bearer reaches it the way a deployment sends one: in the environment.
+        super::run_sync(&self.url, prefix, dir, self.bearer.as_deref())
     }
     fn changes_since(&self, seq: u64) -> R<(u64, u64)> {
         self.with(|c| {
@@ -504,6 +560,26 @@ impl Backend for TextdbPg {
             Ok(v)
         })
     }
+}
+
+/// Create the share folder, the account whose root it is, and a bearer for it. Returns the
+/// bearer.
+///
+/// Through `kb.*` rather than the Rust API, because Postgres has the admin surface in SQL and
+/// that is the path a deployment of this engine takes. (SQLite has no SQL surface for accounts,
+/// so its half calls the same functions the CLI does.) Untimed either way: this runs once,
+/// before the suite, and nothing here is measured.
+fn grant_bench_account(c: &mut Client) -> R<String> {
+    c.execute("INSERT INTO kb.folder (path) VALUES ($1)", &[&delegate::SHARE])
+        .map_err(|e| delegate::setup_err("share folder", e))?;
+    // `--root` makes it single-root and writes the grant in the same call, under the empty
+    // alias: the account's root *is* that folder, so its paths are the suite's paths.
+    c.query_one("SELECT kb.account_create($1, 'agent', $2)", &[&delegate::ACCOUNT, &delegate::SHARE])
+        .map_err(|e| delegate::setup_err("account", e))?;
+    let row = c
+        .query_one("SELECT bearer FROM kb.token_create($1, 'bench')", &[&delegate::ACCOUNT])
+        .map_err(|e| delegate::setup_err("token", e))?;
+    Ok(row.get::<_, String>(0))
 }
 
 fn pg_link_row(r: &postgres::Row) -> LinkRow {
