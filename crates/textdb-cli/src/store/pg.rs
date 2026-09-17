@@ -25,28 +25,36 @@ CREATE OR REPLACE TEMP VIEW files AS
   SELECT * FROM kb.entry WHERE kind = 'file';
 CREATE OR REPLACE TEMP VIEW folders AS
   SELECT * FROM kb.entry WHERE kind = 'folder';
+-- Every one of these joins `kb.entry`, never `kb.node`: the view speaks the caller's paths and
+-- holds only what it can see, so each of these inherits both. Joining the table gave an account
+-- the store's paths on every surface but the two above (#12 K1, K5).
 CREATE OR REPLACE TEMP VIEW frontmatter AS
-  SELECT n.path, f.data FROM kb.frontmatter f JOIN kb.node n ON n.id = f.file_id AND n.deleted_at IS NULL;
+  SELECT n.path, f.data FROM kb.frontmatter f JOIN kb.entry n ON n.id = f.file_id;
 CREATE OR REPLACE TEMP VIEW properties AS
   SELECT n.path, r.key, r.val_txt AS value, r.val_num AS number, r.ord
-  FROM kb.property r JOIN kb.node n ON n.id = r.file_id AND n.deleted_at IS NULL;
+  FROM kb.property r JOIN kb.entry n ON n.id = r.file_id;
 CREATE OR REPLACE TEMP VIEW sections AS
   SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to,
          s.heading AS title, s.nwords, s.nwords_total,
          n.nbytes, n.nlines, n.nwords AS file_nwords, n.version, n.updated_at, n.updated_by
-  FROM kb.section s JOIN kb.node n ON n.id = s.file_id AND n.deleted_at IS NULL;
+  FROM kb.section s JOIN kb.entry n ON n.id = s.file_id;
 CREATE OR REPLACE TEMP VIEW links AS
-  SELECT n.path, n.version, l.line, coalesce(l.kind, '') AS kind, l.target_path AS target, l.anchor, l.alias, l.status,
+  SELECT n.path, n.version, l.line, coalesce(l.kind, '') AS kind,
+         -- A target this account cannot see is the id reference its content reads as, never the
+         -- path the link was written with (#12 E).
+         CASE WHEN l.resolved_id IS NOT NULL AND r.id IS NULL THEN 'textdb:' || l.resolved_id
+              ELSE l.target_path END AS target,
+         l.anchor, l.alias, l.status,
          CASE WHEN lower(r.path) LIKE '%.tdbasset' THEN left(r.path, -9) ELSE r.path END AS resolved,
          coalesce(lower(r.path) LIKE '%.tdbasset', false) AS asset
-  FROM kb.link l JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL
-  LEFT JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL;
+  FROM kb.link l JOIN kb.entry n ON n.id = l.file_id
+  LEFT JOIN kb.entry r ON r.id = l.resolved_id;
 CREATE OR REPLACE TEMP VIEW commits AS
   SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines, c.nwords, c.batch
-  FROM kb.commit c JOIN kb.node n ON n.id = c.file_id AND n.deleted_at IS NULL;
+  FROM kb.commit c JOIN kb.entry n ON n.id = c.file_id;
 CREATE OR REPLACE TEMP VIEW authors AS
   SELECT n.path, nullif(a.author, '') AS author, a.commits, a.first_ts, a.last_ts
-  FROM kb.file_author a JOIN kb.node n ON n.id = a.file_id AND n.deleted_at IS NULL;";
+  FROM kb.file_author a JOIN kb.entry n ON n.id = a.file_id;";
 
 /// The sync base tables, as the extension defines them, for stores installed before they were.
 const SYNC_TABLES: &str = "\
@@ -129,6 +137,56 @@ fn pg(e: postgres::Error) -> StoreError {
         Some(db) => StoreError::other(format!("{} (SQLSTATE {})", db.message(), db.code().code())),
         None => StoreError::other(e),
     }
+}
+
+/// Refuse a token session the store's own tables (#12 K2).
+///
+/// `kb.entry`, `kb.ls`, the `textdb sql` views and the `kb.*` functions are the surface; `kb.node`,
+/// `kb.commit`, `kb.grant` and the rest are the owner's, and reading them walks straight past every
+/// filter this feature adds.
+///
+/// Decided from the plan rather than from the statement text: Postgres is asked what the statement
+/// would actually read, so a table reached through a quoted name, a search path, an alias or a CTE
+/// is found, and a *view* over those tables — which is the sanctioned surface — is not, because a
+/// view's own relation is what the plan names. A statement that will not plan is left for the
+/// prepare below to report in its own words.
+fn refuse_raw_tables(tx: &mut postgres::Transaction<'_>, query: &str, types: &[Type]) -> Result<()> {
+    let account: Option<String> = tx
+        .query_one("SELECT (SELECT a.name FROM kb.account a WHERE a.id = kb.current_account())", &[])
+        .map_err(pg)?
+        .get(0);
+    if account.is_none() {
+        return Ok(());
+    }
+    // Every table of the extension's own schema, less the views a caller may read.
+    let rows = tx
+        .query(
+            "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace              WHERE n.nspname = 'kb' AND c.relkind IN ('r', 'p')",
+            &[],
+        )
+        .map_err(pg)?;
+    let tables: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+    // `EXPLAIN` names every relation the plan touches, one line per node (`Seq Scan on kb.node n`).
+    // A statement whose only tables are behind a function call is fine: the function is the
+    // surface, and it does its own filtering.
+    let plan: String = match tx.query_one(&format!("EXPLAIN (FORMAT TEXT, VERBOSE, COSTS OFF) {query}"), &[]) {
+        Ok(row) => row.get::<_, String>(0),
+        // Not plannable here (it has parameters, or it is not a query at all): fall back to the
+        // relations the parser can see, which is what a prepared statement's plan would name.
+        Err(_) => match tx.prepare_typed(query, types) {
+            Ok(_) => String::new(),
+            Err(_) => return Ok(()),
+        },
+    };
+    for t in tables {
+        // `"kb.node"` in the JSON plan, and `kb.node` in a message: both are the table named.
+        if plan.contains(&format!("kb.{t} ")) || plan.contains(&format!("on kb.{t}\n")) || plan.ends_with(&format!("on kb.{t}")) {
+            return Err(StoreError::forbidden(format!(
+                "kb.{t} is the store's own table and is not yours to read; the views and kb.* are                  (files, folders, commits, links, properties, sections, authors, frontmatter)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The statuses a `links` call asked for, when it asked for more than the one `kb.links` takes.
@@ -1113,6 +1171,12 @@ impl Store for PgStore {
 
     fn file_heads(&mut self, prefix: &str) -> Result<Vec<FileHead>> {
         let prefix = normalize_path(prefix)?;
+        // The prefix has to resolve before anything is read: a folder outside the caller's shares
+        // is not an empty sync, it is not found, and `kb.entry` filtering it away would have made
+        // a sync of someone else's folder look like a successful sync of nothing (#12 G17, L4).
+        if prefix != "/" {
+            self.client.query_one("SELECT kb.resolve($1)", &[&prefix]).map_err(pg)?;
+        }
         // `kb.entry`, not `kb.node`: the raw table holds the store's paths, and a sync reconciles
         // the caller's. Reading the table here gave a checkout the store's layout — `legal/` as a
         // top-level directory — and then failed to read back what it had just written.
@@ -1282,6 +1346,7 @@ impl Store for PgStore {
         }
         let fail = |e| statement_error(e, write);
         let mut tx = self.client.build_transaction().read_only(!write).start().map_err(pg)?;
+        refuse_raw_tables(&mut tx, query, &types)?;
         let batch: Option<String> = if write {
             let id: String = tx.query_one(NEW_BATCH_ID, &[]).map_err(pg)?.get(0);
             tx.execute("SELECT set_config('textdb.batch', $1, true)", &[&id]).map_err(pg)?;

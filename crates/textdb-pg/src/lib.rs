@@ -377,8 +377,26 @@ $$;
 -- `sync` deletes what is absent from the store and leaves alone what it is merely forbidden, so
 -- conflating the two is what would empty a checkout when a share is revoked.
 CREATE FUNCTION kb.resolve(p text, need_write boolean DEFAULT false) RETURNS text LANGUAGE plpgsql STABLE AS $$
-DECLARE sp text; a text;
+DECLARE sp text; a text; n text;
 BEGIN
+  -- `id:1234` names a document without naming a path, which is how two views hand one document to
+  -- each other: every view has its own paths and the id is the same everywhere. A caller that
+  -- cannot see it is told not-found, exactly as a caller naming its path would be — otherwise ids
+  -- would be an oracle for probing the store one number at a time (#12 J).
+  n := substring(p from '^/?id:[[:space:]]*([0-9]+)[[:space:]]*$');
+  IF n IS NOT NULL THEN
+    SELECT x.path INTO sp FROM kb.node x WHERE x.id = n::bigint AND x.deleted_at IS NULL;
+    IF sp IS NULL OR NOT kb.visible(sp) THEN
+      PERFORM kb._raise('TX003', 'not found: ' || p, '');
+    END IF;
+    IF need_write AND NOT kb.writable(sp) THEN
+      PERFORM kb._raise('TX005', 'you have read-only access to ' || p, '');
+    END IF;
+    RETURN sp;
+  END IF;
+  IF p ~ '^/?id:' THEN
+    PERFORM kb._raise('TX004', format('%L is not an id; ids are numbers, as `id:1234`', p), '');
+  END IF;
   IF kb.current_account() IS NULL THEN RETURN p; END IF;
   sp := kb.to_store(p);
   IF sp IS NOT NULL THEN
@@ -392,6 +410,20 @@ BEGIN
    WHERE g.dormant AND (g.alias = '' OR p = '/' || g.alias OR p LIKE ('/' || g.alias || '/%')) LIMIT 1;
   IF FOUND THEN
     PERFORM kb._raise('TX005', p || ': its folder is in the trash', '');
+  END IF;
+  -- A write at the root, or one segment below it, names something that would have to *be* a
+  -- share. Saying so is not a disclosure — the account already knows its own shares — and the
+  -- alternative is "not found: /notes.md", which reads like a bug in the caller rather than the
+  -- rule it ran into. Deeper paths stay not-found, indistinguishable from a folder that never
+  -- existed, which is what keeps store paths unguessable (#12 C8, C9).
+  IF need_write AND NOT EXISTS (SELECT 1 FROM kb.my_grant WHERE alias = '')
+     AND (p = '/' OR p !~ '^/[^/]+/') THEN
+    SELECT string_agg('/' || g.alias || '/ (' || g.rights || ')', ', ' ORDER BY g.alias) INTO a
+      FROM kb.my_grant g WHERE NOT g.dormant;
+    IF a IS NULL THEN
+      PERFORM kb._raise('TX005', 'the root lists your shares, and you have none', '');
+    END IF;
+    PERFORM kb._raise('TX005', 'the root lists your shares; write inside one of them: ' || a, '');
   END IF;
   PERFORM kb._raise('TX003', 'not found: ' || p, '');
   RETURN NULL;
@@ -1202,7 +1234,9 @@ mod kb {
     /// A caller's path as a store path, raising TX003 or TX005 as `kb.resolve` decides. Returns
     /// the path unchanged for the owner without touching the database.
     fn resolve(path: &str, need_write: bool) -> String {
-        if account_id_now().is_none() {
+        // The owner has no translation to do — except for an `id:` reference, which is not a path
+        // in any view and has to be looked up whoever asks.
+        if account_id_now().is_none() && !path.trim_start_matches('/').starts_with("id:") {
             return path.to_string();
         }
         match Spi::get_one_with_args::<String>("SELECT kb.resolve($1, $2)", &[path.into(), need_write.into()]) {
@@ -1256,8 +1290,8 @@ mod kb {
     /// from — so the feed hands them out as they are (#12 F7-F9).
     fn record_share_event(account_id: i64, op: &str, node_id: i64, path: &str, old_path: Option<&str>, message: &str) {
         Spi::run_with_args(
-            "WITH c AS (INSERT INTO kb.change(op, node_id, node_kind, path, old_path, message, for_account, batch) \
-             VALUES ($1, $2, 0, $3, $4, $5, $6, kb.batch()) RETURNING seq) SELECT pg_notify('textdb_change', seq::text) FROM c",
+            "WITH c AS (INSERT INTO kb.change(op, node_id, node_kind, path, old_path, author, message, for_account, batch) \
+             VALUES ($1, $2, 0, $3, $4, 'owner', $5, $6, kb.batch()) RETURNING seq) SELECT pg_notify('textdb_change', seq::text) FROM c",
             &[op.into(), node_id.into(), path.into(), old_path.into(), message.into(), account_id.into()],
         )
         .unwrap_or_else(|e| spi_err(e));
@@ -3710,7 +3744,7 @@ mod kb {
         )
         .unwrap_or_else(|e| spi_err(e));
         let local = if g.alias.is_empty() { "/".to_string() } else { format!("/{}", g.alias) };
-        record_share_event(id, "mkdir", g.node_id, &local, None, &format!("share granted ({})", g.rights.as_str()));
+        record_share_event(id, "share", g.node_id, &local, None, &format!("share granted ({})", g.rights.as_str()));
         TableIterator::once((g.alias.clone(), g.rights.as_str().to_string(), g.store_path.clone(), g.node_id))
     }
 
@@ -3757,7 +3791,7 @@ mod kb {
             .flatten()
             .unwrap_or(0);
         let local = if alias.is_empty() { "/".to_string() } else { format!("/{alias}") };
-        record_share_event(id, "delete", node_id, &local, None, "share revoked");
+        record_share_event(id, "unshare", node_id, &local, None, "share revoked");
         true
     }
 
