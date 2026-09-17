@@ -1976,6 +1976,14 @@ fn apply(
             Err(e) => report.failed.push(note(from, format!("not moved to {to} with its folder: {e}"))),
         }
     }
+    // A pointer deleted in textdb takes the file it named with it in its asset store too, where the
+    // store keeps its files by an id of its own (Google Drive). What every pointer still names, and
+    // the drivers to do it with, are read once here, and only when something was deleted. A store
+    // this computer cannot reach is a note below, never a failed sync.
+    let mut store_files = match plan.asset_trash.is_empty() {
+        true => None,
+        false => crate::assets::StoreFiles::new(&mut *sides.st).ok(),
+    };
     // A pointer deleted in textdb leaves disk only once its file is in the trash, so a move that
     // fails is tried again by the next sync rather than leaving the file to be pushed as new.
     let mut trash = None;
@@ -1987,6 +1995,21 @@ fn apply(
                 format!(".textdb/trash/{}-{nanos:09}", crate::assets::driver::stamp(now))
             })
             .clone();
+        // The file in the asset store goes to the store's own trash as well, once no pointer names
+        // it: the pointer is read while it is still on disk, the store having none of it any more.
+        if let Some(files) = store_files.as_mut() {
+            let named = sides.disk(pointer_rel).ok().and_then(|text| crate::assets::pointer::Pointer::parse(&text).ok());
+            if let Some(p) = named {
+                let here = store_path(&prefix, pointer_rel);
+                let own = crate::assets::pointer::asset_path(&here).to_string();
+                let item = p.item.clone().unwrap_or_else(|| own.clone());
+                // Left where it is on anything going wrong, and told of: bytes are not lost to a
+                // sync that could not make sure of them.
+                if let Err(e) = files.trashed(&mut *sides.st, &p.store, &item, &own) {
+                    report.kept.push(note(file, format!("its copy in the asset store {} stays there: {}", p.store, e.message)));
+                }
+            }
+        }
         match move_disk(dir, file, &format!("{folder}/{file}")) {
             Ok(()) => {
                 had.forget(file);

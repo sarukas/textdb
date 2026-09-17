@@ -54,6 +54,19 @@ pub trait Driver {
     fn put(&self, path: &str, src: &Path, sha256: &str, replaces: Option<&str>) -> Result<(Option<String>, Held)>;
     /// Copy the stored file to `dest`, which must not exist.
     fn get(&self, path: &str, item: Option<&str>, dest: &Path) -> Result<()>;
+    /// Move the file the item `item` names to the store path `to`, keeping the provider's own file
+    /// and so its id, and returning the item the pointer should name now. `None` where there is
+    /// nothing to move: a store whose items are paths has the bytes at the pointer's old path
+    /// still, for whatever else names them, and the pointer's next push puts them at its own path.
+    fn move_to(&self, _item: &str, _to: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+    /// Send the file the item `item` names to the provider's own trash, the caller having made sure
+    /// no pointer names it any more. `false` where the provider keeps no trash of its own and the
+    /// file stays where it is.
+    fn trash(&self, _item: &str) -> Result<bool> {
+        Ok(false)
+    }
     /// The folder on this computer the store keeps its files in, for a local store.
     fn local_root(&self) -> Option<&Path> {
         None

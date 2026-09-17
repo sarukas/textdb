@@ -231,9 +231,15 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
   - *Pull downloads by id* (`rclone backend copyid`) to its partial file and checks the hash, so
     an asset renamed or moved in the drive, or in Drive's trash, is still found. A pointer naming
     older bytes than its id holds now is fetched from the trash copy with its SHA-256.
-  - *Pointers moved in textdb* (sync, `mv`) move their file server-side by id (`rclone backend
-    moveid` to `REMOTE:path`), keeping the id; a file in Drive's trash is restored first. A file
-    another pointer also names stays where it is.
+  - *Pointers moved in textdb* (sync, `mv`) move their file in the drive to the asset's new path,
+    keeping the id and so every link people made to it: the id's path is looked up in the store's
+    listing, then `rclone moveto` moves it from there, which Drive does server-side and the id
+    survives. Not `rclone backend moveid`, which copies and deletes: a real drive answered it with a
+    file of a *new* id at the new name and the old one in Drive's trash. Nothing of that name in the
+    drive is overwritten, a file another pointer also names stays where it is, and a file someone
+    sent to Drive's trash is reported rather than restored: rclone untrashes only a whole folder
+    (`backend untrash` restored every trashed file of the one it was given), which would bring back
+    files that are no business of this move.
   - *Pointers deleted in textdb* send their file to Drive's trash once no pointer names its id;
     Drive empties it after 30 days, and until then a pull still finds it.
   - *Changes made directly in the drive* show in `assets status` and are followed on pull, never

@@ -1198,6 +1198,42 @@ fn assets_on_google_drive_are_pulled_by_file_id_and_never_from_outside_the_store
     let pulled = run(&mut t(&["assets", "pull", "--dir", dir]), None);
     assert!(format!("{}{}", pulled.stdout, pulled.stderr).contains("names no file of the asset store"), "{} {}", pulled.stdout, pulled.stderr);
     assert!(!vault.join("img/c.png").exists());
+
+    // A pointer deleted in textdb sends its file to Drive's trash -- but only once every pointer of
+    // the store can be read, since what bytes are for is not guessed at from the pointers that
+    // happened to parse. Two assets: one deleted while a pointer cannot be read, one after.
+    for (name, last) in [("d", 3u8), ("e", 4)] {
+        std::fs::write(vault.join(format!("img/{name}.png")), [137u8, 80, 78, 71, 0, last]).unwrap();
+    }
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "push", "--dir", dir]), None);
+    let item_of = |name: &str| {
+        std::fs::read_to_string(vault.join(format!("img/{name}.png.tdbasset")))
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("item: ").map(str::to_string))
+            .unwrap()
+    };
+    let (id_d, id_e) = (item_of("d"), item_of("e"));
+    let live = || rc(&["lsjson", "-R", "--files-only", &root]);
+    assert!(live().contains(&id_d) && live().contains(&id_e), "both files are in the drive after the push: {}", live());
+
+    // A pointer textdb cannot read counts as naming those bytes: nothing goes to Drive's trash.
+    ok(&mut t(&["write", "/img/bad.png.tdbasset"]), Some("not a pointer at all\n"));
+    run(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["rm", "/img/d.png"]), None);
+    run(&mut t(&["sync", "/", dir]), None);
+    assert!(live().contains(&id_d), "a file went to Drive's trash while a pointer of the store could not be read");
+
+    // That pointer gone, a deletion does send the file to Drive's trash, and a pull by id still
+    // finds it there.
+    ok(&mut t(&["rm", "/img/bad.png.tdbasset"]), None);
+    run(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["rm", "/img/e.png"]), None);
+    ok(&mut t(&["sync", "/", dir]), None);
+    assert!(!live().contains(&id_e), "the file is still live in the drive: {}", live());
+    let gone = rc(&["lsjson", "-R", "--files-only", "--drive-trashed-only", &root]);
+    assert!(gone.contains(&id_e), "the file is not in Drive's trash: {gone}");
 }
 
 #[test]
@@ -1526,6 +1562,9 @@ fn sync_pairs_assets_with_their_real_files() {
     assert!(!v2.join("img/b.png").exists());
     let trash = deleted["assets"]["trash"].as_str().unwrap();
     assert_eq!(std::fs::read(v2.join(trash).join("img/b.png")).unwrap(), b"\x89PNG B");
+    // Its copy in the asset store stays where it is: a local store keeps no trash of the
+    // provider's own, and those bytes are there for whatever else may name them.
+    assert_eq!(std::fs::read(bucket.join("img/b.png")).unwrap(), b"\x89PNG B", "a deleted pointer took the local store's copy with it");
 
     // Renamed on disk: the pointer follows its file.
     ok(&mut t(&["sync", "/", d1]), None);

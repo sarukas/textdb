@@ -1070,6 +1070,87 @@ impl Driver for RcloneDriver {
         Ok((Some(l.id), held))
     }
 
+    fn move_to(&self, item: &str, to: &str) -> Result<Option<String>> {
+        // A store whose items are paths has nothing to move: the pointer's own path is its item.
+        if item.starts_with('/') || !self.is_drive() {
+            return Ok(None);
+        }
+        let dest = self.remote(to)?;
+        let (id, at) = match self.resolve(item)? {
+            // Purged from Drive's trash: nothing is left to move, and a push puts the bytes at the
+            // asset's own path again.
+            Resolved::Missing => return Ok(None),
+            // Never undone in the drive: a file someone sent to Drive's trash is told of, not
+            // restored, since rclone untrashes only a whole folder and a copy by id would be
+            // another file of another id with this one still trashed.
+            Resolved::File(id, e) if e.trashed => {
+                return Err(StoreError::invalid(format!(
+                    "its file (Drive id {id}, {}) is in Drive's trash: put it back in the drive, then sync again",
+                    self.remote(&e.path).unwrap_or_default()
+                )))
+            }
+            Resolved::File(id, e) => (id, e.path),
+            Resolved::Path(_) => return Ok(None),
+        };
+        if at == to {
+            return Ok(Some(id));
+        }
+        let from = self.remote(&at)?;
+        // Both names held: no push may put bytes at either while the file is between them.
+        let _held = (self.lock_remote(&at)?, self.lock_remote(to)?);
+        self.refuse_two_of_a_name(&at)?;
+        // The file this move takes along is the one the pointer names, not another that took over
+        // its name in the drive.
+        match self.stat(&at, false)? {
+            Some(l) if l.id == id => {}
+            Some(l) => return Err(self.not_the_named(&at, &id, &l.id)),
+            None => return Err(StoreError::not_found(format!("{from} is not there any more: sync again"))),
+        }
+        // Bytes textdb did not put there are not this move's to write over.
+        if self.stat(to, false)?.is_some() {
+            return Err(StoreError::invalid(format!("{dest} is a file in the drive already: it is not for this move to replace")));
+        }
+        self.ok(&format!("moving {from} to {dest}"), &["moveto", "--", &from, &dest])?;
+        // The store listed itself before the move; what it holds where is no longer what it said.
+        *self.listing.borrow_mut() = None;
+        // The same file under its new name: Drive keeps the id through a move, which is what the
+        // links people made to it follow.
+        match self.hashed_id(to)? {
+            Some((now, _)) if now == id => Ok(Some(id)),
+            Some((now, _)) => Err(StoreError::other(format!("moving {from} to {dest}: the file there is another one (Drive id {now})"))),
+            None => Err(StoreError::other(format!("moving {from} to {dest}: nothing is there afterwards"))),
+        }
+    }
+
+    fn trash(&self, item: &str) -> Result<bool> {
+        // A local or path-addressed store keeps no trash of the provider's own: its file stays.
+        if item.starts_with('/') || !self.is_drive() {
+            return Ok(false);
+        }
+        let (id, at) = match self.resolve(item)? {
+            // Purged, or someone in the drive put it there already: either way it is where a
+            // deleted pointer's file belongs.
+            Resolved::Missing => return Ok(true),
+            Resolved::File(_, e) if e.trashed => return Ok(true),
+            Resolved::File(id, e) => (id, e.path),
+            Resolved::Path(_) => return Ok(false),
+        };
+        let from = self.remote(&at)?;
+        let _held = self.lock_remote(&at)?;
+        self.refuse_two_of_a_name(&at)?;
+        // Trashed by its name, so the file of that name must be the one the pointer named.
+        match self.stat(&at, false)? {
+            Some(l) if l.id == id => {}
+            Some(l) => return Err(self.not_the_named(&at, &id, &l.id)),
+            None => return Ok(true),
+        }
+        // Drive's own trash, not textdb's: Drive keeps it for thirty days, and until then a pull by
+        // id still finds the bytes.
+        self.ok(&format!("sending {from} to Drive's trash"), &["deletefile", "--", &from])?;
+        *self.listing.borrow_mut() = None;
+        Ok(true)
+    }
+
     /// `dest` is the caller's own partial name, so rclone downloads straight to it. On Google
     /// Drive an item that is a file id is downloaded by that id, wherever under the store's root it
     /// is now, in Drive's trash too.
