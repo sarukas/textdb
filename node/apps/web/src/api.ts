@@ -381,6 +381,58 @@ export interface HistoryEntry {
   nwords: number | null;
 }
 
+/** One link written in a document, and what it resolves to: the canonical row of `docs/shapes.md`. */
+export interface Link {
+  /** The file the link is written in. */
+  path: string;
+  /** The version the line number belongs to. */
+  version: number;
+  line: number;
+  kind: "wiki" | "embed" | "md" | "image";
+  /** The link as written, without its anchor or alias. */
+  target: string;
+  anchor: string | null;
+  alias: string | null;
+  status: LinkStatus | null;
+  /** The file it points to; for an asset, the asset itself rather than its `.tdbasset` pointer. */
+  resolved: string | null;
+  asset: boolean;
+}
+
+export type LinkStatus = "ok" | "ambiguous" | "anchor-missing" | "broken" | "not-in-store" | "external";
+
+export const LINK_STATUSES: readonly LinkStatus[] = ["ok", "ambiguous", "anchor-missing", "broken", "not-in-store", "external"];
+
+/** One markdown heading, with its section's line span and word counts. See `docs/outlines.md`. */
+export interface OutlineEntry {
+  path: string;
+  /** The last component of the heading path, as written. */
+  heading: string;
+  /** The breadcrumb, `Parent / Child`. */
+  headingPath: string;
+  /** 1 for `#`, 2 for `##`, and so on. */
+  level: number;
+  lineFrom: number;
+  lineTo: number;
+  /** Words in the section's own lines. */
+  nwords: number | null;
+  /** Words in the section and everything nested under it. */
+  nwordsTotal: number | null;
+  nbytes: number | null;
+  nlines: number | null;
+  fileNwords: number | null;
+  version: number;
+  updated_at: string;
+  updatedBy: string | null;
+}
+
+/** A distinct heading in use across the scope asked about. */
+export interface HeadingName {
+  heading: string;
+  sections: number;
+  docs: number;
+}
+
 /** One matching line: the canonical hit row from `docs/shapes.md`. */
 export interface SearchHit {
   path: string;
@@ -619,6 +671,24 @@ export const api = {
     return new Uint8Array(await res.arrayBuffer());
   },
   exportZipUrl: (path: string) => `/api/export/zip?${qs({ path })}`,
+  // Markdown: the links a document writes, the ones written to it, and its headings. `outline`
+  // and `headingNames` take a folder or `/` as well, which is what the vault-wide views ask.
+  links: (path: string, opts: { status?: LinkStatus; limit?: number; signal?: AbortSignal } = {}) =>
+    request<Link[]>("GET", `/api/links?${qs({ path, status: opts.status, limit: opts.limit })}`, undefined, opts.signal),
+  backlinks: (path: string, opts: { status?: LinkStatus; limit?: number; signal?: AbortSignal } = {}) =>
+    request<Link[]>("GET", `/api/backlinks?${qs({ path, status: opts.status, limit: opts.limit })}`, undefined, opts.signal),
+  outline: (
+    path: string,
+    opts: { heading?: string; match?: "exact" | "prefix" | "contains"; level?: number; limit?: number; signal?: AbortSignal } = {},
+  ) =>
+    request<OutlineEntry[]>(
+      "GET",
+      `/api/outline?${qs({ path, heading: opts.heading, match: opts.match, level: opts.level, limit: opts.limit })}`,
+      undefined,
+      opts.signal,
+    ),
+  headingNames: (path: string, opts: { starts?: string; limit?: number; signal?: AbortSignal } = {}) =>
+    request<HeadingName[]>("GET", `/api/outline/names?${qs({ path, starts: opts.starts, limit: opts.limit })}`, undefined, opts.signal),
   syncLinks: () => request<SyncLinks>("GET", "/api/sync/links"),
   sync: (body: { prefix: string; dry_run?: boolean; commit?: boolean; base?: string | undefined; author?: string }) =>
     request<SyncReport>("POST", "/api/sync", body),
@@ -626,8 +696,8 @@ export const api = {
     request<{ rel: string; text: string }>("GET", `/api/sync/conflict?${qs({ prefix, rel })}`),
   syncResolve: (body: { prefix: string; rel: string; keep: "textdb" | "disk"; author?: string }) =>
     request<SyncReport>("POST", "/api/sync/resolve", body),
-  // Asset stores: declared once for everyone, bound per machine. Adding or removing one is the
-  // owner's and the store refuses anyone else; binding is this server's own configuration.
+  // Asset stores: declared once for everyone in the textdb store, bound per machine. All of it is
+  // the owner's over HTTP -- every field the server adds is about the machine it runs on.
   assetStores: () => request<AssetStoreRow[]>("GET", "/api/assets/stores"),
   putAssetStore: (body: { name: string; driver?: string; root: string }) =>
     request<{ stores: AssetStoreRow[] }>("POST", "/api/assets/stores", body),
