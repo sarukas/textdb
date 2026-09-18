@@ -266,6 +266,10 @@ interface HeadRow {
 }
 
 export class Corpus {
+  /** This corpus talks to SQLite; see `CorpusApi`. */
+  readonly backend = 'sqlite' as const;
+  /** Everything: the trash and the one-batch undo are this engine's own. */
+  readonly capabilities = { trash: true, revertBatch: true, syncState: true } as const;
   readonly db: string;
   readonly extension: string;
   readonly author: string | null;

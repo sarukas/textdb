@@ -1,4 +1,7 @@
+export type { Awaitable, Backend, Capabilities, ChangeWatcher, CorpusApi } from './api.ts';
 export { resolveExtension } from './connection.ts';
+export { connect, parseStore, type ConnectOptions, type StoreUrl } from './connect.ts';
+export { PgCorpus, redactUrl } from './pg.ts';
 export {
   type AuthorOptions,
   type BulkOptions,
@@ -22,6 +25,7 @@ export {
   Forbidden,
   InvalidEdit,
   NotFound,
+  Unsupported,
   TextdbError,
   fromMessage,
   toTextdbError,

@@ -57,6 +57,22 @@ export class Forbidden extends TextdbError {
   }
 }
 
+/**
+ * The store cannot do this at all, on this engine.
+ *
+ * Not a refusal and not a bad request: the trash and the one-batch undo read shadow tables that
+ * only the SQLite schema has, so against Postgres there is nothing to ask. `CorpusApi.capabilities`
+ * says which, so a client can avoid offering it rather than meeting this.
+ *
+ * Carries `TX004`, because on the wire it is a request the store will not take.
+ */
+export class Unsupported extends TextdbError {
+  constructor(message: string) {
+    super(message, 'TX004');
+    this.name = 'Unsupported';
+  }
+}
+
 export class InvalidEdit extends TextdbError {
   constructor(message: string, payload: Record<string, unknown> = {}) {
     super(message, 'TX004', payload);

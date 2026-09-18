@@ -44,6 +44,12 @@ jobs:
       - run: cd crates/textdb-sqlite-ext && cargo build --release
       - run: npm ci
         working-directory: node/packages/textdb
+      # The SDK's own suite, including the conformance matrix on SQLite. Its Postgres half runs in
+      # the pg-extension job, which is the only one with the extension installed.
+      - run: npm run typecheck
+        working-directory: node/packages/textdb
+      - run: npm test
+        working-directory: node/packages/textdb
       - run: npm ci
         working-directory: node/apps/server
       - run: npm run typecheck
@@ -86,6 +92,20 @@ jobs:
       # Postgres because TEXTDB_TEST_PG is set -- L5 of the catalogue requires both, and this is
       # the only job with the extension installed. Behind a feature, so it needs asking for.
       - run: cargo test --release -p textdb-cli --features access-tests --test access
+        env:
+          TEXTDB_TEST_PG: postgres://ci:ci@localhost:5432/postgres
+      # The SDK's conformance matrix, both halves: SQLite from the extension built here, and
+      # Postgres because TEXTDB_TEST_PG is set. This is what holds the two backends to one answer --
+      # `int8` arriving as a string, a timestamp rendered by the session's time zone, a record
+      # spelled differently on one side.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: cd crates/textdb-sqlite-ext && cargo build --release
+      - run: npm ci
+        working-directory: node/packages/textdb
+      - run: node --no-warnings --import tsx --test "test/conformance.test.ts"
+        working-directory: node/packages/textdb
         env:
           TEXTDB_TEST_PG: postgres://ci:ci@localhost:5432/postgres
       # A crashed backend shows only as a closed connection in the tests; the server log says which
