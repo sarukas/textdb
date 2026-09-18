@@ -201,6 +201,17 @@ and the Postgres halves of these answers were exercised by nothing. It runs in t
 job now, which is the one with the extension installed and a server up, so both engines answer
 there.
 
+## In the web app
+
+The *Access* panel (the owner's) is these commands: accounts, shares with their alias and
+rights, tokens. The session chip is who the browser is -- the owner, or the account whose token
+it presented -- and every path shown is then that account's own, with a `ro` marked where a
+share is read-only. Nothing there re-derives the rule: what an account may not do arrives as
+the store's refusal, and a folder it was never granted is missing rather than forbidden. What
+the server keeps to itself is the machine it runs on: sync and every asset route are the
+owner's, which is §4 above made visible rather than hidden ([demo-app.md](demo-app.md),
+[live-app.md](live-app.md#who-is-asking)).
+
 ## Not in scope here
 
 Whether textdb should mediate the bytes itself — an asset store the store proxies, so that a

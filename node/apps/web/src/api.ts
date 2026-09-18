@@ -99,11 +99,16 @@ export interface WhoamiShare extends Share {
 
 /** The old name for {@link Entry}, kept so call sites read unchanged. */
 
-/** One account of this store, as the owner sees it. */
+/**
+ * One account of this store, as the owner sees it.
+ *
+ * The CLI leaves a field out rather than sending null, so what is optional in the answer is
+ * optional here: `root` is there only for an account that holds a single root.
+ */
 export interface AccountRow {
   name: string;
   kind: string;
-  root: string | null;
+  root?: string;
   created_at: string;
   disabled: boolean;
   /** How many shares it holds. */
@@ -114,11 +119,13 @@ export interface AccountRow {
 export interface TokenRow {
   id: number;
   account: string;
-  label: string | null;
+  label?: string;
   created_at: string;
-  expires_at: string | null;
-  last_used_at: string | null;
-  revoked_at: string | null;
+  expires_at?: string;
+  last_used_at?: string;
+  revoked_at?: string;
+  /** Usable right now: not revoked, and not past its expiry. */
+  live: boolean;
 }
 
 /** One share: which account holds which folder, under which name, by which rights. */
@@ -126,10 +133,13 @@ export interface ShareRow {
   account: string;
   alias: string;
   rights: string;
-  /** Where the share root is in the store. The owner sees this; an account never does. */
-  store_path: string | null;
+  /**
+   * Where the share root is in the store -- the owner's spelling of it, which is not the account's.
+   * Left out of an account's own view, where naming it would disclose the layout the alias hides.
+   */
+  path?: string;
   node_id: number;
-  dormant?: boolean;
+  dormant: boolean;
 }
 
 export type LsEntry = Entry;

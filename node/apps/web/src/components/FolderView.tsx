@@ -577,6 +577,13 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
                 {label.label}
               </span>
             )}
+            {/* Held read-only: the row says so where it is, rather than leaving a save to find
+                out. The owner's rows carry no rights at all, so nothing is shown for them. */}
+            {e.rights === "ro" && (
+              <span className="rights rights-ro fasset" title={`Read-only: ${e.share ? `the share /${e.share}` : "this share"} is held ro`}>
+                ro
+              </span>
+            )}
             {within && <span className="fwithin">{within}</span>}
           </>
         );

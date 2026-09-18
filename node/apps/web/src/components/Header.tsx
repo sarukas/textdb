@@ -63,9 +63,13 @@ export function Header({ info, connection, lastSeq, author, onAuthor, onImport, 
       <button type="button" className="btn btn-small import-button" onClick={onImport}>
         Import folder…
       </button>
-      <button type="button" className="btn btn-small" onClick={onAssets} title="Asset stores, and where every asset’s bytes actually are">
-        Assets…
-      </button>
+      {/* The owner's alone: every asset route works on directories and drives of the server's own
+          machine, and a token session is refused all of them. Offering it would be a dead end. */}
+      {!who?.account && (
+        <button type="button" className="btn btn-small" onClick={onAssets} title="Asset stores, and where every asset’s bytes actually are">
+          Assets…
+        </button>
+      )}
       <button
         type="button"
         className="btn btn-small"

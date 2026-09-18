@@ -214,7 +214,7 @@ export function AccessPanel({ onClose, folder }: Props) {
                     <td>
                       <span className={`rights rights-${s.rights}`}>{s.rights}</span>
                     </td>
-                    <td>{s.store_path ? <code>{s.store_path}</code> : <span className="muted">—</span>}</td>
+                    <td>{s.path ? <code>{s.path}</code> : <span className="muted">—</span>}</td>
                     <td className="access-row-actions">
                       <button
                         type="button"
@@ -294,7 +294,9 @@ export function AccessPanel({ onClose, folder }: Props) {
               </thead>
               <tbody>
                 {(tokens ?? []).map((t) => (
-                  <tr key={t.id} className={t.revoked_at ? "access-off" : undefined}>
+                  // Not usable is not only revoked: a token past its expiry is as dead as one
+                  // taken away, and the store already says which with `live`.
+                  <tr key={t.id} className={t.live ? undefined : "access-off"}>
                     <td>
                       <code>{t.account}</code>
                     </td>
@@ -303,8 +305,8 @@ export function AccessPanel({ onClose, folder }: Props) {
                     <td className="mono">{t.expires_at ? t.expires_at.slice(0, 10) : <span className="muted">never</span>}</td>
                     <td className="mono">{t.last_used_at ? t.last_used_at.slice(0, 10) : <span className="muted">never</span>}</td>
                     <td className="access-row-actions">
-                      {t.revoked_at ? (
-                        <span className="access-tag">revoked</span>
+                      {!t.live ? (
+                        <span className="access-tag">{t.revoked_at ? "revoked" : "expired"}</span>
                       ) : (
                         <button
                           type="button"

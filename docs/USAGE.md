@@ -302,3 +302,14 @@ so it binds exactly the role a hosted deployment hands a caller. Reading under s
 complete; **writing is not yet**, because the functions that write reach the tables as the caller
 and need `SECURITY DEFINER` to do their bookkeeping. Until then, run the writing connection as the
 owner and rely on the token for the filtering, which is what the CLI does.
+
+**An HTTP server in front of it** is a third case, and the demo server
+([`live-app.md`](live-app.md#who-is-asking)) is the worked example. A bearer belongs to a
+connection, so it keeps one corpus per token rather than re-authenticating a shared one between
+requests. A request with no bearer is the owner, which is right for a server someone runs beside
+their own store and wrong for anything else: `TEXTDB_REQUIRE_TOKEN=1` makes a request without one
+a 401. What that server adds on its own account -- syncing a directory, reading and writing an
+asset store, binding one to its machine -- is the **owner's alone**, and a token session is
+refused it: those act on the machine the server runs on, with its credentials, not the account's.
+Everything else it passes through: the delegation commands run as the request's own session, so
+the store refuses whoever may not run them.

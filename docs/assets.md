@@ -679,7 +679,16 @@ For the folders the web server syncs (`TEXTDB_SYNC`), through the CLI as for syn
   pointer's versions with their authors and messages.
 - The sync dialog lists what a sync did with assets: pushed, pulled, renamed, trashed, set aside,
   and its conflicts, failures and notes.
-- Server: `GET /api/assets?prefix=&path=` (the CLI's status), `POST /api/assets/pull` and
+- *Assets…* in the header is the configuration and the whole picture: the declared stores with this
+  machine's binding and whether it can reach each one (declare, remove, bind), the folder's assets
+  with pull, push, relocate and verify over all of them, and, for one asset, the chain from its
+  path here to the file on the server's disk -- pointer, store, root, this machine's binding, the
+  item, and where the store actually keeps it. The owner's: a token session is refused every asset
+  route, since they act on this machine's directories and drives.
+- Server: `GET /api/assets/stores` and `POST /api/assets/stores`, `/stores/remove`, `/stores/bind`
+  (the stores, and this machine's binding -- the owner's), `POST /api/assets/relocate`,
+  `GET /api/assets/verify?prefix=[&path=]` (without a `path` it also lists the store's files that
+  no pointer names), `GET /api/assets?prefix=&path=` (the CLI's status), `POST /api/assets/pull` and
   `POST /api/assets/push` (`{ prefix, paths?, message?, author? }`, taking the folder's turn with
   its syncs), `GET /api/assets/file?prefix=&path=[&download=1]`: the asset's file from inside the
   folder's directory only, `nosniff`, sandboxed unless a PDF, and only images, PDF, audio and video

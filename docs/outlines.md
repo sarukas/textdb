@@ -47,6 +47,10 @@ textdb outline --names                      # the distinct headings in use, with
 
 `exact` and `prefix` seek the folded index; `contains` is the one shape that has to scan.
 
+**Web app** — the *Outline* rail beside a document, and *Headings & links…* over a folder: which
+headings are in use (autosuggested from the index), who has the one you pick, and the links that
+need attention ([demo-app.md](demo-app.md)).
+
 **SQL** — `textdb_outline(path, heading, match, level, limit)` and `textdb_headings(path,
 starts, limit)` on SQLite, `kb.outline(...)` and `kb.headings(...)` on Postgres, plus the
 `sections` view:

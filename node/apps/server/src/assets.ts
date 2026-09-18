@@ -1,7 +1,7 @@
 import { createReadStream, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
-import { type ErrorCode, NotFound } from '@textdb/node';
+import { AssetStores, type AssetStoreRow, type ErrorCode, NotFound } from '@textdb/node';
 import type { SyncLinkConfig } from './config.ts';
 import { badRequest, CodedError } from './errors.ts';
 import { runCli, type SyncService } from './sync.ts';
@@ -29,19 +29,7 @@ export interface AssetItem {
 }
 
 
-/** One asset store, as `textdb assets stores --json` reports it. */
-export interface AssetStoreRow {
-  name: string;
-  driver: string;
-  /** The store-side identity: a folder, or an rclone remote path. Shared by everyone. */
-  root: string;
-  /** Where *this machine* reaches it, when it was bound locally. */
-  bound_to: string | null;
-  /** Which file or environment variable said so. */
-  bound_by: string | null;
-  reachable: boolean;
-  problem: string | null;
-}
+export type { AssetStoreRow };
 
 /** What `assets verify --json` answers: each asset's two sides, and the store's loose files. */
 export interface AssetVerification {
@@ -214,10 +202,14 @@ export class AssetService {
   private active = 0;
   private readonly waiting: (() => void)[] = [];
 
+  /** The asset stores themselves, which are the store's configuration and not a folder's. */
+  private readonly assetStores: AssetStores;
+
   constructor(sync: SyncService | null, db: string, cli: string | null = null) {
     this.sync = sync;
     this.db = db;
     this.ownCli = cli;
+    this.assetStores = new AssetStores({ store: db, cli: sync?.cliPath ?? cli });
   }
 
   /** The folders this server syncs, or the refusal that there are none. */
@@ -266,29 +258,23 @@ export class AssetService {
   /**
    * The asset stores this textdb store declares, with whether this machine can reach each one.
    *
-   * Not scoped to a folder: a store is the store's, and the same one serves every vault. Every one
-   * of these runs as the owner, because the routes are the owner's -- see the comment on them.
-   *
-   * Each of the three that change something answers with the whole list, because the CLI prints it
-   * after the change: one run, and one set of reachability checks, rather than two.
+   * Not scoped to a folder: a store is the store's, and the same one serves every vault. The SDK's
+   * `AssetStores` runs the commands; these run as the owner, because the routes are the owner's --
+   * see the comment on them. Each of the three that change something answers with the whole list,
+   * because the CLI prints it after the change: one run, and one set of reachability checks.
    */
   stores(): Promise<AssetStoreRow[]> {
-    return this.run(['assets', 'stores'], 'stores') as unknown as Promise<AssetStoreRow[]>;
+    return this.assetStores.list();
   }
 
   putStore(name: string, driver: string, root: string): Promise<AssetStoreRow[]> {
-    const args = [
-      'assets',
-      'stores',
-      `--add=${argument('the store name', name)}`,
-      `--driver=${argument('the driver', driver)}`,
-      `--root=${argument('the root', root)}`,
-    ];
-    return this.run(args, 'stores') as unknown as Promise<AssetStoreRow[]>;
+    return this.assetStores.put(argument('the store name', name)!, argument('the root', root)!, {
+      driver: argument('the driver', driver),
+    });
   }
 
   removeStore(name: string): Promise<AssetStoreRow[]> {
-    return this.run(['assets', 'stores', `--remove=${argument('the store name', name)}`], 'stores') as unknown as Promise<AssetStoreRow[]>;
+    return this.assetStores.remove(argument('the store name', name)!);
   }
 
   /**
@@ -298,21 +284,20 @@ export class AssetService {
    * the same shared drive is mounted differently by everyone, and that is the whole point of a
    * binding.
    *
-   * `--bind` takes `NAME=LOCATION` and splits at the first `=`, so a name carrying one would bind
-   * some other store: `team=evil` would leave `team` bound to `evil=...`, and the store it named
-   * would not exist at all. The name is checked against the declared stores for the same reason --
-   * a typo otherwise writes a binding into this machine's config that nothing ever shows.
+   * A name carrying `=` is refused before anything else, because `--bind` splits at the first one
+   * and would bind some other store; and the name must be one that is declared, since a typo
+   * otherwise writes a binding into this machine's config file that nothing ever shows again.
    */
   async bindStore(name: string, location: string): Promise<AssetStoreRow[]> {
     const wanted = argument('the store name', name) ?? '';
+    // Before looking it up, so a name carrying `=` is answered as the bad request it is rather
+    // than as a store that happens not to exist.
     if (wanted.includes('=')) throw badRequest('an asset store name cannot contain "="');
     const declared = await this.stores();
     if (!declared.some((s) => s.name === wanted)) {
       throw new NotFound(`no asset store named ${wanted}: declare it before binding it to this machine`);
     }
-    return this.run(['assets', 'stores', `--bind=${wanted}=${argument('the location', location)}`], 'stores') as unknown as Promise<
-      AssetStoreRow[]
-    >;
+    return this.assetStores.bind(wanted, argument('the location', location) ?? '');
   }
 
   /** Move the files of `moved-here` assets to their asset's own place in the store. */

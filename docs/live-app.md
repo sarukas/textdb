@@ -64,8 +64,32 @@ version, body that is not JSON) is a 400 with code TX004.
 
 Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./kb.db`),
 `TEXTDB_SQLITE_EXT` (path of the loadable extension; otherwise found under
-`crates/textdb-sqlite-ext/target/release`), `PORT` (default 4317), `HOST` (default
-`127.0.0.1` — the API has no authentication, so it listens on loopback unless told otherwise).
+`crates/textdb-sqlite-ext/target/release`), `PORT` (default 4317), `HOST` (default `127.0.0.1`),
+`TEXTDB_REQUIRE_TOKEN` (`1` to answer nothing without a bearer).
+
+### Who is asking
+
+A request carries `Authorization: Bearer <token>`, or the `textdb_session` cookie that
+`POST /api/session` sets from one (HttpOnly and `SameSite=Strict`, so an `EventSource` and an
+`<img src>` carry it and no script can read it). **No bearer is the owner** — which is what
+anyone able to open the store file is anyway — unless `TEXTDB_REQUIRE_TOKEN=1`, when a request
+without one is a 401: "say who you are" is not "you may not".
+
+A bearer belongs to a connection, so the server keeps **one corpus per token**, pooled and
+closed when idle, and every document route answers in that account's view: its own paths, its
+own shares, and a folder it was never granted is a 404 rather than a 403 (`docs/permissions.md`).
+A write into a `ro` share is a 403.
+
+Two groups of routes are the **owner's** and refuse a token session outright, with `TX005` and
+the reason:
+
+- **Sync and assets** (`/api/sync*`, `/api/assets*`). Both work on directories and drives of the
+  *server's own machine*, configured by whoever started it, and run the CLI against them: an
+  account's request would either escalate or mean something undefined — whose directory is
+  `/notes` when `/notes` is an alias?
+- **Nothing else.** The delegation routes (`/api/access/*`) are *not* refused here: they run the
+  CLI with the request's own bearer, so the store refuses whoever may not run them, and an
+  `admin`-kind account's token works.
 
 | Method & path | Request | Response |
 |---|---|---|
@@ -113,6 +137,18 @@ Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./
 | `GET /api/meta/find?q=…[&folder=…&limit=…]` | | documents matching a property query; see `docs/properties.md` |
 | `GET /api/trash/entry?id=…` | | one trash entry |
 | `GET /api/events[?since=seq]` | `Last-Event-ID` honoured | Server-sent events, see below |
+| `GET /api/whoami` | | `{ account, admin, kind, namespace, shares }` — who this request is; the owner is `{ account: null, admin: true, kind: "owner", namespace: "store", shares: [] }` |
+| `POST /api/session` | `{ token }` (`null` logs out) | The `whoami` of that token, and a `textdb_session` cookie; a token the store refuses gets 403 and no cookie |
+| `GET /api/access/accounts` · `POST /api/access/accounts` | `{ name, kind?, root? }` | Accounts, and one created. Run as the request's own session, so the store refuses anyone who may not: 403 `TX005` |
+| `POST /api/access/accounts/enabled` · `/convert` | `{ name, enabled }` · `{ name, alias? }` | Disable or enable an account; turn a single-root account into one holding aliased shares |
+| `GET /api/access/tokens[?account=…]` · `POST /api/access/tokens` | `{ account, label?, expires? }` | Tokens (never their bearers), and one minted — the bearer is in that answer and nowhere else |
+| `POST /api/access/tokens/revoke` | `{ id }` | Revoke one |
+| `GET /api/access/shares?account=…` or `?path=…` | | An account's shares, or who can reach a path |
+| `POST /api/access/shares` · `/rename` · `/revoke` | `{ account, path, rights, alias? }` · `{ account, from, to }` · `{ account, alias }` | Grant `ro` or `rw` under an alias; rename the alias; revoke the share |
+| `GET /api/assets/stores` · `POST /api/assets/stores` · `/remove` | `{ name, driver?, root }` · `{ name }` | The asset stores this store declares, with this machine's binding and whether it can reach each one; declare one, or take a declaration away (refused while any pointer names its files). The owner's |
+| `POST /api/assets/stores/bind` | `{ name, location }` (`''` clears) | Where **this server's machine** reaches a store; written to this server's own config file, not to the textdb store |
+| `POST /api/assets/relocate` | `{ prefix, paths?, author? }` | Move the files of `moved-here` assets to the asset's own place in its store: `{ dry_run, moved, kept, failed }` |
+| `GET /api/assets/verify?prefix=/a[&path=…]` | | Hash every asset here and in its store: `{ prefix, dir, assets: [{ path, here, asset_store, note }], unnamed, problems }`. Without `path` it also lists the store's files that no pointer names |
 
 ### `GET /api/events`
 

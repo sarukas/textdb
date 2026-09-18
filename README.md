@@ -42,6 +42,9 @@ This repository is the proof of concept described in [`docs/spec.md`](docs/spec.
   tells its readers, and a denial that looks like a failure), and the options for each.
 - **Python library:** [`python/`](python/README.md) — `Corpus.open("sqlite:///kb.db" | "postgresql://…")`,
   file/folder loaders, anchored edits, conflict handling, CLI.
+- **Node SDK:** [`node/packages/textdb`](node/packages/textdb) — `connect({ store })` over SQLite or
+  Postgres behind one async interface, with a bearer per corpus; `Access` and `AssetStores` for the
+  configuration commands, which run the CLI so the store decides who may.
 - **Skills for AI agents:** [`skills/textdb-install`](skills/textdb-install/SKILL.md),
   [`skills/textdb-use-postgres`](skills/textdb-use-postgres/SKILL.md),
   [`skills/textdb-use-sqlite`](skills/textdb-use-sqlite/SKILL.md),

@@ -81,15 +81,8 @@ export class InvalidEdit extends TextdbError {
 
 const CODES = ['TX001', 'TX002', 'TX003', 'TX004', 'TX005', 'TX000'] as const;
 
-function fromCode(code: ErrorCode, message: string, detail?: string): TextdbError {
-  let payload: Record<string, unknown> = {};
-  if (detail) {
-    try {
-      payload = JSON.parse(detail) as Record<string, unknown>;
-    } catch {
-      payload = { detail };
-    }
-  }
+/** The error class a code means: `TX005` is a `Forbidden`, `TX003` a `NotFound`, and so on. */
+export function errorOf(code: ErrorCode, message: string, payload: Record<string, unknown> = {}): TextdbError {
   switch (code) {
     case 'TX001':
       return new Conflict(message, payload);
@@ -104,6 +97,18 @@ function fromCode(code: ErrorCode, message: string, detail?: string): TextdbErro
     default:
       return new TextdbError(message, code, payload);
   }
+}
+
+function fromCode(code: ErrorCode, message: string, detail?: string): TextdbError {
+  let payload: Record<string, unknown> = {};
+  if (detail) {
+    try {
+      payload = JSON.parse(detail) as Record<string, unknown>;
+    } catch {
+      payload = { detail };
+    }
+  }
+  return errorOf(code, message, payload);
 }
 
 /** Parse the SQLite form, `TX001 conflict: {json}` / `TX004 invalid edit: …` (as python/textdb/errors.py). */

@@ -138,6 +138,8 @@ environment and its own author name, and the instructions in
 ## Delegating folders to accounts
 
 One store holds every vault; an **account** is given whole folders of it and sees nothing else.
+The same commands are the web app's *Access* panel ([demo-app.md](demo-app.md)), which runs them
+as whoever is signed in there, so the store decides on each exactly as it does here.
 
 ```sh
 textdb account create accounts-agent --kind agent

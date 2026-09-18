@@ -1,4 +1,7 @@
+export { Access, type AccountRow, type ShareRow, type TokenRow } from './access.ts';
 export type { Awaitable, Backend, Capabilities, ChangeWatcher, CorpusApi } from './api.ts';
+export { AssetStores, type AssetStoreRow } from './assets.ts';
+export { Cli, type CliOptions, findCli, runCli } from './cli.ts';
 export { resolveExtension } from './connection.ts';
 export { connect, parseStore, type ConnectOptions, type StoreUrl } from './connect.ts';
 export { PgCorpus, redactUrl } from './pg.ts';
@@ -27,6 +30,7 @@ export {
   NotFound,
   Unsupported,
   TextdbError,
+  errorOf,
   fromMessage,
   toTextdbError,
 } from './errors.ts';
