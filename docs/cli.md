@@ -418,7 +418,12 @@ textdb setting asset_sync both                     # make that what every sync o
   synced to a folder); `rclone` is an rclone remote path, used with the rclone configuration of
   whoever runs textdb. rclone is `TEXTDB_RCLONE`, else the one next to `textdb` (a vault's
   `.textdb/bin`), else on the PATH; `--bind NAME=REMOTE:PATH` names another remote for the same
-  folder on one computer. `assets stores` tells whether each store is reachable.
+  folder on one computer. `assets stores` tells whether each store is reachable. Declaring a store
+  and removing one are the owner's: a token session is refused (exit 7), since the row says where a
+  name's bytes are kept for everybody. A name already pointing somewhere else cannot be re-pointed,
+  and a name pointers still use cannot be removed (exit 6) — the bytes would have to move with it,
+  which is [assets.md](assets.md), "Moving a store". Binding is per computer and needs nothing of
+  the store.
 - **The directory** is the one the store folder was last synced with; `--dir DIR` names it.
 - **Links** to an asset resolve to its pointer: `links` shows the asset's path with `asset: true`,
   `backlinks` takes the asset's path, `links --broken --dir DIR` lists assets not pulled into DIR,

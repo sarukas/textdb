@@ -2376,6 +2376,28 @@ pub struct StoresOptions {
     pub bind: Option<String>,
 }
 
+/// Refuse `what` -- `"be removed"`, `"be pointed somewhere else"` -- while pointers name the asset
+/// store `name`, `subject` naming what cannot do it.
+///
+/// A store row says where a name's bytes are kept and every pointer of that store names them by it,
+/// so changing where the name points, or taking it away, leaves each of those pointers naming
+/// nothing -- on every computer that has not bound the store locally, while the ones that have go on
+/// working. That is not a configuration edit but a move of the bytes, one asset at a time, which is
+/// not built (docs/assets.md, "Moving a store").
+fn in_use_or(st: &mut dyn Store, name: &str, subject: &str, what: &str) -> Result<()> {
+    match st.asset_store_users(name)? {
+        Some(0) => Ok(()),
+        Some(n) => Err(StoreError::invalid(format!(
+            "{subject} cannot {what}: {n} {} name{} its files, and the bytes would have to move with it -- see docs/assets.md, \"Moving a store\"",
+            if n == 1 { "pointer" } else { "pointers" },
+            if n == 1 { "s" } else { "" }
+        ))),
+        None => Err(StoreError::invalid(format!(
+            "{subject} cannot {what}: whether any pointer names its files could not be established, since some pointer documents could not be read"
+        ))),
+    }
+}
+
 pub fn stores(st: &mut dyn Store, o: StoresOptions, json: bool) -> Result<()> {
     if let Some(name) = &o.add {
         if !pointer::valid_store_name(name) {
@@ -2392,6 +2414,14 @@ pub fn stores(st: &mut dyn Store, o: StoresOptions, json: bool) -> Result<()> {
         if let Some(problem) = (o.driver == "rclone").then(|| rclone::shared_root_problem(&root)).flatten() {
             return Err(StoreError::invalid(problem));
         }
+        // A name that is already declared somewhere else is not re-addressed here: the bytes are
+        // where the old root says, and every pointer names them. Moving a store means copying the
+        // files to the new one and settling each pointer as it goes -- see docs/assets.md.
+        if let Some(old) = st.asset_stores()?.into_iter().find(|s| s.name == *name) {
+            if old.root != root || old.driver != o.driver {
+                in_use_or(st, name, &format!("{name} is declared already, in {} ({}), and", old.root, old.driver), "be pointed somewhere else")?;
+            }
+        }
         // A local root is created here rather than left for the first push to fail on: `--add`
         // then `push` said "the folder is not there", with nothing in between to have made it.
         if o.driver == "local" && !std::path::Path::new(&root).exists() {
@@ -2400,6 +2430,7 @@ pub fn stores(st: &mut dyn Store, o: StoresOptions, json: bool) -> Result<()> {
         st.put_asset_store(&AssetStore { name: name.clone(), driver: o.driver.clone(), root, options: None, created_at: None })?;
     }
     if let Some(name) = &o.remove {
+        in_use_or(st, name, &format!("the asset store {name}"), "be removed")?;
         if !st.remove_asset_store(name)? {
             return Err(StoreError::not_found(format!("no asset store named {name}")));
         }

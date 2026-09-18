@@ -2080,6 +2080,44 @@ fn l_guessing_store_paths_reveals_nothing() {
     });
 }
 
+/// M14: an asset store's declaration is the owner's. A row says where a name's bytes are kept for
+/// every account and every computer, so an account that could write one would move -- or orphan --
+/// every asset of that name for everybody, whatever its own rights are. Refused by the store, not
+/// by this CLI: on SQLite in the store module, on Postgres by a trigger on the table, so a
+/// hand-written INSERT meets the same rule.
+#[test]
+fn m_an_account_cannot_declare_or_remove_an_asset_store() {
+    scenarios!("M14");
+    on_each_engine(|f| {
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("bucket");
+        let mine = tmp.path().join("mine");
+        for d in [&bucket, &mine] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        ok(f.as_("admin").args(["assets", "stores", "--add", "bucket", "--driver", "local", "--root"]).arg(&bucket), None);
+
+        // A store of its own, to keep bytes where only it can reach them: refused.
+        let added = run(f.as_("accounts-agent").args(["assets", "stores", "--add", "mine", "--driver", "local", "--root"]).arg(&mine), None);
+        refused(&added, FORBIDDEN, "TX005");
+        // The team's store pointed at a folder of its own, which would move everyone's bytes.
+        let moved = run(f.as_("accounts-agent").args(["assets", "stores", "--add", "bucket", "--driver", "local", "--root"]).arg(&mine), None);
+        refused(&moved, FORBIDDEN, "TX005");
+        // And taking the declaration away, which would orphan every pointer naming it.
+        refused(&run(f.as_("accounts-agent").args(["assets", "stores", "--remove", "bucket"]), None), FORBIDDEN, "TX005");
+
+        // Nothing of it happened: the store is the one store, where the owner put it.
+        let seen = ok(f.as_("admin").args(["--json", "assets", "stores"]), None).json();
+        let names: Vec<&str> = seen.as_array().unwrap().iter().filter_map(|r| r["name"].as_str()).collect();
+        assert_eq!(names, vec!["bucket"], "M14: {seen}");
+        assert_eq!(seen[0]["root"].as_str(), bucket.to_str(), "M14: {seen}");
+
+        // Reading them is not refused, and must not be: an account cannot pull without the row.
+        let told = ok(f.as_("accounts-agent").args(["--json", "assets", "stores"]), None).json();
+        assert_eq!(told[0]["name"], "bucket", "M14: {told}");
+    });
+}
+
 /// L5: every scenario above runs on both engines. The harness does that by construction — this
 /// records the requirement and fails if the Postgres half was never exercised.
 #[test]
@@ -2106,7 +2144,7 @@ fn l_the_catalogue_runs_on_both_engines() {
 // happens.
 
 /// The working-loop rows, kept separate from `CATALOGUE` so neither list pretends to be the other.
-const EXTRA: &[&str] = &["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M12", "M13"];
+const EXTRA: &[&str] = &["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M12", "M13", "M14"];
 
 /// Two checkouts of one `rw` share, one per account: accounts-agent sees it at `contracts/`,
 /// contracts-agent is single-root and sees it at `/`. The pair every M row works with.

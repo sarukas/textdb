@@ -1393,6 +1393,20 @@ impl Store for PgStore {
             .collect())
     }
 
+    /// How many pointers name the asset store, counted over every pointer the store holds: see the
+    /// trait. Unreadable pointers leave no answer, since a store's assets may be exactly those.
+    fn asset_store_users(&mut self, store: &str) -> Result<Option<usize>> {
+        let Some((named, unreadable)) = self.every_pointer_names()? else { return Ok(None) };
+        let users = named.iter().filter(|((s, _), _)| s == store).count();
+        Ok(match (users, unreadable) {
+            (0, 0) => Some(0),
+            (0, _) => None,
+            (n, _) => Some(n),
+        })
+    }
+
+    // The owner-only rule for the two below is the extension's, as a trigger on kb.asset_store
+    // (`asset_store_owner_only`): a hand-written INSERT or DELETE meets it as this does.
     fn put_asset_store(&mut self, s: &super::AssetStore) -> Result<()> {
         self.ensure_asset_tables()?;
         self.client

@@ -212,12 +212,21 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
 
 - Store table `asset_store(name, driver, root, options)`: `driver` ∈ `local`, `rclone`; `root` is
   the store-side identity (a folder, or an rclone remote path such as `teamdrive:textdb`).
-  A row has no owner, and a pointer names its store by name: whoever can write the textdb store
-  can add a store, or point an existing name somewhere else, and thereby change where every asset
-  of that name is read from and written to for everyone else. On a shared store that is the
-  sharpest edge in the current design — see [`permissions.md`](permissions.md), which also covers
+  **The owner's row:** declaring a store and removing one are refused for a token session, by the
+  store rather than by the CLI — on SQLite in its store module, on Postgres by a trigger on the
+  table, so a hand-written `INSERT` meets the same rule. A row says where a name's bytes are kept
+  for every account and every computer, so an account that could write one would move, or orphan,
+  every asset of that name for everybody. See [`permissions.md`](permissions.md), which also covers
   why a store's own credentials stay per person, and what a pointer does and does not tell its
   readers.
+- **A declared store is not re-addressed while pointers name it.** `--add` on a name whose row
+  points somewhere else, and `--remove` of a name any pointer names, are refused (exit 6) and say
+  how many pointers name it. The bytes are where the old root says and every pointer names them by
+  it, so the edit alone would leave each of those pointers naming nothing — on every computer
+  that has not bound the store locally, while the ones that have go on working, which is worse than
+  all of them failing. Moving a store is a move of the bytes: see "Moving a store" below.
+  Re-declaring the same place is not a repoint, and a name with no row at all can be declared
+  freely — that is how a removed row is recovered.
 - Machine binding, because the same shared drive is mounted or configured differently per user:
   environment `TEXTDB_ASSET_STORE_<NAME>` (name upper case, other characters `_`), else
   `asset-stores.json` in the config directory (`TEXTDB_CONFIG_DIR`, else `%APPDATA%\textdb`,
@@ -375,6 +384,50 @@ that differs from its pointer is then a `conflict` until it is pulled or pushed 
 Push records the pointers it wrote in this directory's sync base for the vault's folder only (the
 base's time and other files stay), refuses a pointer the store deleted since that sync, and checks
 the pointer's version before uploading as well as before committing.
+
+## Moving a store (not built)
+
+Moving a store's bytes somewhere else — a new drive, a different provider, a folder reorganised at
+the top — is a migration, not a configuration edit, which is why `--add` on a name whose row points
+elsewhere is refused while pointers name it. What is missing is the thing that would make it safe,
+and it is written down here rather than half-built.
+
+**The shape it has to have.** Declare the new place as its own store, move the assets to it one at a
+time, then remove the old one once nothing names it. Both stores are declared while that runs and
+some pointers name each: that is a normal, consistent state, and it is what makes the move
+interruptible.
+
+- **Store to store, never through a checkout.** No machine will hold a team's binaries, so the bytes
+  must not pass through one: `rclone` to `rclone` on the same backend is a server-side copy (Drive
+  to Drive moves nothing through the machine running it), and local to remote or remote to local
+  streams one file at a time — bounded by the largest single asset, not by the vault. This is the
+  one capability the drivers do not have today: `relocate` moves a file *within* one store
+  (`move_to`), and nothing opens two stores at once.
+- **A checkout of pointers, with no bytes.** The pointers still have to be rewritten, and a pointer
+  is a document, so this runs from a synced directory as `relocate` does. That costs kilobytes: a
+  checkout can hold every pointer with nothing pulled — `not-pulled` is an ordinary state — and a
+  `not-pulled` asset migrates exactly like a pulled one.
+- **The pointers are the work queue.** "Still names the old store" is the list of what is left, so
+  the run needs no progress table and no migration id: `--limit N` does the next N, re-running
+  continues, and running it twice is not two moves. Grouped by `(store, item)` rather than by
+  pointer, so two pointers naming one file copy it once and both come to name the one file in the
+  new store (`asset_item_users` already answers that question).
+- **Per asset, in this order.** Copy the bytes to the asset's owner path in the new store; verify
+  the SHA-256 *there*; re-read the pointer and skip this one if its bytes changed since the copy
+  (the loop `push` already uses against a concurrent write); write the pointer and commit; leave
+  the old store's bytes alone. Deleting them is a separate later pass, never the same run: while the
+  old store still holds everything, undoing a half-finished move is pointer rewrites and nothing
+  else.
+- **The owner's.** It rewrites pointers across every share, so it is an admin operation like the
+  store rows themselves. A scoped version — an account moving its own subtree — falls out of the
+  same `rw` and `may_name` rules if it is ever wanted.
+- **Not decided.** Whether a move may also change the layout (a legacy flat store to owner paths is
+  the same machinery), and whether the later pass trashes the old bytes in the provider (Drive's own
+  trash, recoverable for thirty days) or deletes them outright.
+
+**Until then**, a store's files can be moved by hand — copy them to the new place, declare it under
+a new name, and `push` each asset to it, which needs the bytes on the pushing machine. That is
+exactly the limit this section exists to remove.
 
 ## Commands
 
@@ -641,4 +694,5 @@ For the folders the web server syncs (`TEXTDB_SYNC`), through the CLI as for syn
 
 Extracted text from PDF/Office for search; thumbnails; placeholder files or mounts; binary
 deltas; distributed copy-count enforcement; advisory locks; history rewrite of existing git
-repositories (documented as a separate, explicit step).
+repositories (documented as a separate, explicit step). Moving a store's bytes to another store has
+its own section above: designed, deliberately not built, and the edit that would fake it refused.

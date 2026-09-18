@@ -957,9 +957,26 @@ pub trait Store {
     fn asset_item_users(&mut self, _store: &str, _location: &str, _own: &str) -> Result<Option<ItemUsers>> {
         Ok(None)
     }
+    /// How many pointers name the asset store `store`, over every pointer this store holds rather
+    /// than the caller's view. `None` where a pointer could not be read at all, so no number is an
+    /// answer.
+    ///
+    /// What tells a store nothing needs any more from one a team's assets are in. `Some(0)` from a
+    /// store that cannot look at its pointers would say the wrong one of those, so the default is
+    /// `None`: not known, and nothing is done on the strength of it.
+    fn asset_store_users(&mut self, _store: &str) -> Result<Option<usize>> {
+        Ok(None)
+    }
+
     /// Declare an asset store, or change the one of that name.
+    ///
+    /// The owner's, and refused for a token session: a store row says where a name's bytes are
+    /// kept, for everyone, and pointing a name elsewhere moves every asset of that name for every
+    /// computer that has not bound it locally. Refused by the store rather than by the CLI, which
+    /// is not the only caller -- on Postgres by a trigger on the table, so a hand-written INSERT
+    /// meets the same rule.
     fn put_asset_store(&mut self, store: &AssetStore) -> Result<()>;
-    /// Remove an asset store's declaration; `false` when there was none.
+    /// Remove an asset store's declaration; `false` when there was none. The owner's, as above.
     fn remove_asset_store(&mut self, name: &str) -> Result<bool>;
 }
 

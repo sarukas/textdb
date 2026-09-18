@@ -3442,6 +3442,64 @@ fn a_folder_carries_the_authors_below_it() {
 
 /// A provider that answers and refuses is not a provider that could not be reached. The first is a
 /// durable fact about this computer's access, which no retry changes and somebody has to go and ask
+/// A store name cannot be pointed somewhere else, or taken away, while pointers name its files.
+///
+/// The bytes are where the old root says and every pointer of that store names them by it, so a
+/// configuration edit would leave each of those pointers naming nothing -- on every computer that
+/// has not bound the store locally, while the ones that have go on working, which is worse than all
+/// of them failing. Moving a store is a move of the bytes (docs/assets.md, "Moving a store"); until
+/// there is a command for that, the edit that would break it is refused rather than made.
+#[test]
+fn a_store_in_use_cannot_be_repointed_or_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let vault = tmp.path().join("vault");
+    let (bucket, elsewhere) = (tmp.path().join("bucket"), tmp.path().join("elsewhere"));
+    let config = tmp.path().join("config");
+    std::fs::create_dir_all(vault.join("img")).unwrap();
+    for d in [&bucket, &elsewhere] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(vault.join("img/a.png"), [137u8, 80, 78, 71, 0, 1]).unwrap();
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.env("TEXTDB_CONFIG_DIR", &config).args(args);
+        c
+    };
+    let (here, there) = (bucket.to_str().unwrap().to_string(), elsewhere.to_str().unwrap().to_string());
+    ok(&mut t(&["sync", "/", vault.to_str().unwrap()]), None);
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", &here]), None);
+
+    // Nothing names it yet: repointing it is an edit like any other, and so is removing it.
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", &there]), None);
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", &here]), None);
+    ok(&mut t(&["assets", "stores", "--remove", "team"]), None);
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", &here]), None);
+
+    ok(&mut t(&["assets", "push", "--dir", vault.to_str().unwrap()]), None);
+    // One pointer names it now. Both edits are refused, and both say how many and why.
+    for args in [vec!["--add", "team", "--root", &there], vec!["--remove", "team"]] {
+        let refused = run(&mut t(&[&["assets", "stores"], &args[..]].concat()), None);
+        assert_eq!(refused.status, 6, "stdout: {}\nstderr: {}", refused.stdout, refused.stderr);
+        assert!(refused.stderr.contains("1 pointer names its files"), "{}", refused.stderr);
+        assert!(refused.stderr.contains("Moving a store"), "{}", refused.stderr);
+    }
+    // Refused, not half-done: the row is what it was, and a pull still finds the bytes.
+    let rows = ok(&mut t(&["--json", "assets", "stores"]), None).json();
+    assert_eq!(rows[0]["root"].as_str(), Some(here.as_str()), "{rows}");
+    std::fs::remove_file(vault.join("img/a.png")).unwrap();
+    ok(&mut t(&["assets", "pull", "--dir", vault.to_str().unwrap()]), None);
+    assert_eq!(std::fs::read(vault.join("img/a.png")).unwrap(), [137u8, 80, 78, 71, 0, 1]);
+
+    // Re-declaring the same place is not a repoint, so it stays allowed while in use.
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", &here]), None);
+    // And once nothing names it, both edits are available again.
+    std::fs::remove_file(vault.join("img/a.png.tdbasset")).unwrap();
+    ok(&mut t(&["sync", "/", vault.to_str().unwrap()]), None);
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", &there]), None);
+    ok(&mut t(&["assets", "stores", "--remove", "team"]), None);
+}
+
 /// about; the second is worth trying again and says nothing about the asset. They arrive here
 /// looking alike -- a run that exited non-zero -- so the driver reads what was said, and a refusal
 /// carries `forbidden` the way the same answer about a document does.

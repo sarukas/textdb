@@ -31,8 +31,11 @@ implementer's view.
 ## Where the assets work does not fit it
 
 Until this branch there was not one `whoami` under `crates/textdb-cli/src/assets/`, and no test
-paired an asset with an account or a token. Five consequences: the first lost data and the second
-laid a store out differently for every caller, both now answered; the rest are open.
+paired an asset with an account or a token. Five consequences, four of them now answered: the first
+lost data, the second laid a store out differently for every caller, the third let a pointer name
+bytes it was never granted, and the fifth left a store's own row ownerless. What is open is the
+fourth — the provider being a second authority, which no rule inside textdb can settle — and the
+presentation of the states that come of it.
 
 ### 1. A delete can take away bytes another account still points at
 
@@ -127,10 +130,26 @@ should not share a message.
 
 ### 5. Store rows have no owner
 
-`kb.asset_store(name, driver, root, options)` is data in the store, and a pointer names its
-store by name. Whoever can write those rows can point a name somewhere else and thereby
-change where every asset of that name is read from and written to. Whether an account can see
-or change those rows at all is not currently stated anywhere, and should be.
+`kb.asset_store(name, driver, root, options)` was data in the store like any other, and a pointer
+names its store by name. Whoever could write those rows could point a name somewhere else and
+thereby change where every asset of that name is read from and written to. Whether an account could
+see or change them at all was stated nowhere.
+
+**Done, in two halves.** *Writing* a row is the owner's: `put_asset_store` and `remove_asset_store`
+are refused for a token session by the store rather than by the CLI — on SQLite in its store
+module, on Postgres by a trigger on `kb.asset_store` (`asset_store_owner_only`), so a hand-written
+`INSERT` meets the rule as well. M14 holds an account trying all three moves: a store of its own, the
+team's store pointed at a folder of its own, and the declaration taken away.
+
+*Reading* a row stays open to accounts, deliberately: the store names come from that table, so an
+account that cannot see it cannot pull at all, and what it learns — a folder or a remote path like
+`teamdrive:textdb` — is not a credential. Those stay per person (problem 4).
+
+Repointing is refused separately, and for a different reason: `--add` on a name whose row points
+elsewhere, and `--remove` of a name any pointer names, are refused while pointers name it, because
+the bytes are where the old root says. That is the owner being stopped from breaking their own
+store, not a boundary against an account; the thing that would do it properly is a store-to-store
+move of the bytes, written up as "Moving a store (not built)" in [`assets.md`](assets.md).
 
 ## What to do, in order
 
@@ -142,7 +161,11 @@ or change those rows at all is not currently stated anywhere, and should be.
 3. ~~Bind a pointer's item to what the account may name.~~ **Done**: `Store::may_name`, refused in
    pull, push and verify, with M12 covering it — and through a drive's id too, by resolving the
    id to the place the drive keeps it and asking after that.
-4. **Decide whether `asset_store` rows are visible to accounts**, and record who changed one.
+4. ~~Decide whether `asset_store` rows are visible to accounts, and record who changed one.~~
+   **Done**: readable by design (an account cannot pull otherwise), writable only by the owner, and
+   a repoint refused while pointers name the store. No audit row: after those two, the only caller
+   who can change one is the owner, and a repoint that would matter no longer happens. What a
+   record would be *for* arrives with the move that makes repointing legitimate.
 5. ~~Give a provider's denial its own state.~~ **Done**: the driver reads what the provider said
    (a 403 naming its reason, which rclone passes through), carries it as `forbidden` rather than
    as a failure, and an asset whose store refused this computer is `not-permitted` — over an `ok`
@@ -150,11 +173,11 @@ or change those rows at all is not currently stated anywhere, and should be.
    `unchecked:`. What remains of this row is presentation: the store-side states still read as
    facts about the asset where several of them are facts about this computer's access.
 
-Steps 4 and 5 are design choices.
+What is left is presentation (step 5) and, outside this file, the store-to-store move.
 
 ## What runs it
 
-`tests/access.rs` — the acceptance catalogue of delegated access, and M11 and M12 with it — sits
+`tests/access.rs` — the acceptance catalogue of delegated access, and M11, M12 and M14 with it — sits
 behind the `access-tests` feature, which for a while no CI job asked for: `TEXTDB_TEST_PG` was set
 only for `cli_pg`, so L5's own requirement that every scenario run on both engines was met nowhere,
 and the Postgres halves of these answers were exercised by nothing. It runs in the `pg-extension`

@@ -1216,7 +1216,20 @@ impl Store for SqliteStore {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql)
     }
 
+    /// How many pointers name the asset store, counted over every pointer the store holds: see the
+    /// trait. Unreadable pointers leave no answer, since a store's assets may be exactly those.
+    fn asset_store_users(&mut self, store: &str) -> Result<Option<usize>> {
+        let (named, unreadable) = self.every_pointer_names()?;
+        let users = named.iter().filter(|((s, _), _)| s == store).count();
+        Ok(match (users, unreadable) {
+            (0, 0) => Some(0),
+            (0, _) => None,
+            (n, _) => Some(n),
+        })
+    }
+
     fn put_asset_store(&mut self, s: &super::AssetStore) -> Result<()> {
+        self.admin_only("declare asset stores")?;
         self.conn
             .execute(
                 &format!(
@@ -1231,6 +1244,7 @@ impl Store for SqliteStore {
     }
 
     fn remove_asset_store(&mut self, name: &str) -> Result<bool> {
+        self.admin_only("remove asset stores")?;
         Ok(self
             .conn
             .execute(&format!("DELETE FROM {DEFAULT_PREFIX}asset_store WHERE name = ?1"), [name])

@@ -614,6 +614,26 @@ $$;
 -- recorded as the next step rather than half-done here.
 ALTER TABLE kb.node ENABLE ROW LEVEL SECURITY;
 CREATE POLICY node_visible ON kb.node USING (kb.visible(path));
+
+-- An asset store row is the owner's (docs/permissions.md). It says where a name's bytes are kept
+-- for every account and every computer, so pointing a name elsewhere -- or taking it away -- moves
+-- or orphans every asset of that name, and an account that could write one would do that to
+-- everybody. On the table rather than in a function, because the CLI reads and writes
+-- kb.asset_store directly (the table is older than this extension's copy of it) and a hand-written
+-- INSERT has to meet the rule as well. Which pointers name a store is a question about pointer
+-- documents, so that half of the rule is the CLI's; this half is the one that has to hold here.
+CREATE FUNCTION kb._asset_store_owner_only() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF kb.current_account() IS NOT NULL THEN
+    PERFORM kb._raise('TX005', 'only the owner of the store can declare or remove asset stores', NULL);
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER asset_store_owner_only BEFORE INSERT OR UPDATE OR DELETE ON kb.asset_store
+  FOR EACH ROW EXECUTE FUNCTION kb._asset_store_owner_only();
 "#,
     name = "kb_tables",
     bootstrap
