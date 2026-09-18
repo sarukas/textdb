@@ -103,6 +103,14 @@ export function App() {
     api.syncLinks().then(setSyncLinks, () => setSyncLinks(null));
   }, []);
   useEffect(loadSyncLinks, [loadSyncLinks]);
+  // The first ask can arrive before the server is up -- a page reopened while it restarts -- and
+  // nothing else asks again while there are no folders, so the app would say there are none until
+  // a reload. Asked again whenever the change feed connects, which is once per connection and not
+  // a poll: a server that answers "no folders" answers, and is not asked again.
+  const connected = connection === "live";
+  useEffect(() => {
+    if (connected && syncLinks === null) loadSyncLinks();
+  }, [connected, syncLinks, loadSyncLinks]);
   // Commits move the "changed here since" counts of synced folders.
   const hasSyncLinks = (syncLinks?.links.length ?? 0) > 0;
   useEffect(() => {
