@@ -51,11 +51,18 @@ needs one and no listing used to carry it.
 | 24 | `authors` | array | `[{author, commits, first_ts, last_ts}]`, most commits first | `[]` |
 | 25 | `share` | string \| absent | the alias of the share this row was reached through | same |
 | 26 | `rights` | string \| absent | `ro` or `rw`, that share's rights | same |
+| 27 | `shares` | array \| absent | only on an account's **root** row: `[{alias, rights}]`, in path order | — |
 
-`share` and `rights` are the access tier (#12) and appear **only in an account's view**. The
-owner reaches everything directly and holds no shares, so for them both keys are absent rather
-than null — the record is the twenty-four columns it has always been. A single-root account's
-`share` is the empty string: its root *is* the share.
+These three are the access tier (#12) and are about **whose view this is**. The owner reaches
+everything directly and holds no shares, so in the CLI's JSON all three are absent rather than null
+— the record is the twenty-four keys it has always been. A single-root account's `share` is the
+empty string: its root *is* the share.
+
+On the SQL surfaces they are columns, and a result set has the columns it has, so "absent" is `NULL`
+there: `textdb_ls`, `textdb_entry` and `kb.entry` carry twenty-seven columns whether or not the
+caller is an account. `shares` is JSON text there, `[]` on every row but an account's root. SQLite
+has no boolean, so a boolean in a SQL answer is `1` or `0` (as `asset` already is in a link row) and
+Postgres gives `true` and `false`; an SDK normalises both to a boolean.
 
 In an account's view `path`, `name`, `dir` and `depth` are that account's own, under its alias;
 `id` is the store's and means the same thing in every view, which is why it is the reference to
@@ -77,6 +84,22 @@ fetch them with `cat`, `meta get`, or the `kb` table), and `score` (a search pro
 
 The `kb` table (SQLite) and `kb.file` (Postgres) carry the **minimal tier** plus `id`, `dir`
 and `content` — they are the writable surfaces, not listings.
+
+### Who is asking
+
+The same question about the connection itself, in the same shape on both engines:
+`textdb_whoami()` on SQLite, `kb.whoami()` on Postgres, `textdb whoami` in the CLI,
+`Corpus.whoami()` in an SDK, `GET /api/whoami` over HTTP.
+
+`account`, `admin`, `kind`, `namespace`, then `alias`, `rights`, `node_id`, `dormant` — **one row
+per share**. The owner is a single row with `account` null, `admin` true, `kind` `"owner"` and
+`namespace` `"store"`: everything is not a list of shares. An account whose every share has been
+revoked is likewise one row, with its name and kind and no share. A revoked grant is left out; a
+*dormant* one is not, because a share the account still holds and cannot reach today is a different
+thing to say, and that difference is what stops a sync deleting a checkout.
+
+It never says where a share lives in the store. The alias exists to hide exactly that, and this is
+the easiest place to leak it back.
 
 ## The hit row
 

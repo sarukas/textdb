@@ -52,6 +52,7 @@ pub fn register(conn: &Connection, prefix: &str) -> Result<()> {
         ("textdb_entry", FnKind::Entry),
         ("textdb_links", FnKind::Links),
         ("textdb_backlinks", FnKind::Backlinks),
+        ("textdb_whoami", FnKind::Whoami),
     ] {
         conn.create_module(
             name,

@@ -23,9 +23,23 @@ import {
   type Link,
   type LinkOptions,
   type SearchHit,
+  type Share,
   type SortKey,
+  type Whoami,
   type WriteResult,
 } from './types.ts';
+
+/** One `textdb_whoami()` row: one share, or one row with none. */
+interface WhoamiRow {
+  account: string | null;
+  admin: number;
+  kind: string;
+  namespace: string;
+  alias: string | null;
+  rights: string | null;
+  node_id: number | null;
+  dormant: number | null;
+}
 import { type WatchOptions, Watcher } from './watch.ts';
 
 export interface OpenOptions {
@@ -208,13 +222,14 @@ export function openCorpus(options: OpenOptions): Corpus {
 /** The canonical `Entry` columns, in order. One list, so `ls`, `list` and `entry` agree. */
 const ENTRY_COLS =
   'path, name, kind, version, nbytes, nlines, updated_at, updated_by, id, dir, depth, ext, title, ' +
-  'nwords, nsections, nprops, nlinks, nlinks_broken, versions, created_at, files, folders, nauthors, authors';
+  'nwords, nsections, nprops, nlinks, nlinks_broken, versions, created_at, files, folders, nauthors, authors, ' +
+  'share, rights, shares';
 
-type EntryRow = Omit<Entry, 'authors'> & { authors: string };
+type EntryRow = Omit<Entry, 'authors' | 'shares'> & { authors: string; shares: string };
 
-function toEntry({ authors, ...row }: EntryRow & { total?: number }): Entry {
+function toEntry({ authors, shares, ...row }: EntryRow & { total?: number }): Entry {
   delete row.total;
-  return { ...row, authors: JSON.parse(authors) as AuthorCount[] };
+  return { ...row, authors: JSON.parse(authors) as AuthorCount[], shares: JSON.parse(shares) as Share[] };
 }
 
 /** A file's extension, lower-cased, '' for folders and names without one (SQL over `textdb_ls` rows). */
@@ -284,6 +299,30 @@ export class Corpus {
   /** The account this corpus authenticated as, or null for the owner. */
   get account(): string | null {
     return this.accountName;
+  }
+
+  /**
+   * Who this connection is and what it can reach (`docs/shapes.md`, "Who is asking").
+   *
+   * One row per share from the store, flattened here: the shape a caller wants is one record with
+   * a list, not a join it has to fold itself.
+   */
+  whoami(): Whoami {
+    const rows = this.sql.all<WhoamiRow>(
+      'SELECT account, admin, kind, namespace, alias, rights, node_id, dormant FROM textdb_whoami()',
+    );
+    const first = rows[0];
+    if (!first) throw new TextdbError('textdb_whoami() said nothing');
+    return {
+      account: first.account,
+      // SQLite has no boolean; `docs/shapes.md` says an SDK normalises it.
+      admin: Boolean(first.admin),
+      kind: first.kind,
+      namespace: first.namespace,
+      shares: rows
+        .filter((r): r is WhoamiRow & { alias: string; rights: string; node_id: number } => r.alias !== null)
+        .map((r) => ({ alias: r.alias, rights: r.rights, node_id: Number(r.node_id), dormant: Boolean(r.dormant) })),
+    };
   }
 
   info(): Info {

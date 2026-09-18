@@ -55,6 +55,46 @@ export interface Entry {
   nauthors: number;
   /** Who committed to it, most commits first; empty for a folder. */
   authors: AuthorCount[];
+
+  // The access tier (#12): whose view this row is. Null for the owner, who reaches everything
+  // directly and holds no shares.
+  /** The alias of the share this row was reached through; `''` for a single-root account. */
+  share: string | null;
+  /** `ro` or `rw`, that share's rights. */
+  rights: string | null;
+  /** Only on an account's root row, `[]` everywhere else: every share it holds, in path order. */
+  shares: Share[];
+}
+
+/** One share an account holds, as its root row and `whoami` report it. */
+export interface Share {
+  alias: string;
+  rights: string;
+}
+
+/**
+ * Who a connection is and what it can reach: one row per share, flattened into one record.
+ *
+ * `docs/shapes.md`, "Who is asking". Never says where a share lives in the store -- the alias
+ * exists to hide exactly that.
+ */
+export interface Whoami {
+  /** Null for the owner. */
+  account: string | null;
+  admin: boolean;
+  /** `owner`, or the account's kind: `agent`, `person`, `admin`. */
+  kind: string;
+  /** `store` for the owner, else `single-root` or `aliased`. */
+  namespace: string;
+  /** Empty for the owner, and for an account whose every share has been revoked. */
+  shares: WhoamiShare[];
+}
+
+export interface WhoamiShare extends Share {
+  /** The store's node id for the share root: stable across views. */
+  node_id: number;
+  /** Its folder is in the trash: still held, not reachable today. */
+  dormant: boolean;
 }
 
 export interface AuthorCount {

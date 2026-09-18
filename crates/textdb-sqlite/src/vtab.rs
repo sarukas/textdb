@@ -554,6 +554,7 @@ pub enum FnKind {
     Entry,
     Links,
     Backlinks,
+    Whoami,
 }
 
 pub struct FnSpec {
@@ -564,7 +565,7 @@ pub struct FnSpec {
 impl FnKind {
     fn schema(self) -> &'static CStr {
         match self {
-            FnKind::Ls => c"CREATE TABLE x(path TEXT, name TEXT, kind TEXT, version INTEGER, nbytes INTEGER, nlines INTEGER, updated_at TEXT, updated_by TEXT, id INTEGER, dir TEXT, depth INTEGER, ext TEXT, title TEXT, nwords INTEGER, nsections INTEGER, nprops INTEGER, nlinks INTEGER, nlinks_broken INTEGER, versions INTEGER, created_at TEXT, files INTEGER, folders INTEGER, nauthors INTEGER, authors TEXT, dir_arg TEXT HIDDEN, recursive INTEGER HIDDEN)",
+            FnKind::Ls => c"CREATE TABLE x(path TEXT, name TEXT, kind TEXT, version INTEGER, nbytes INTEGER, nlines INTEGER, updated_at TEXT, updated_by TEXT, id INTEGER, dir TEXT, depth INTEGER, ext TEXT, title TEXT, nwords INTEGER, nsections INTEGER, nprops INTEGER, nlinks INTEGER, nlinks_broken INTEGER, versions INTEGER, created_at TEXT, files INTEGER, folders INTEGER, nauthors INTEGER, authors TEXT, share TEXT, rights TEXT, shares TEXT, dir_arg TEXT HIDDEN, recursive INTEGER HIDDEN)",
             FnKind::Search => c"CREATE TABLE x(path TEXT, version INTEGER, line INTEGER, text TEXT, section TEXT, score REAL, more INTEGER, query TEXT HIDDEN, prefix TEXT HIDDEN, lim INTEGER HIDDEN, per_file INTEGER HIDDEN)",
             FnKind::History => c"CREATE TABLE x(version INTEGER, author TEXT, ts TEXT, message TEXT, kind TEXT, base_version INTEGER, nbytes INTEGER, nlines INTEGER, nwords INTEGER, path TEXT HIDDEN)",
             FnKind::Export => c"CREATE TABLE x(path TEXT, content TEXT, prefix TEXT HIDDEN)",
@@ -576,17 +577,20 @@ impl FnKind {
             FnKind::PropFind => c"CREATE TABLE x(path TEXT, nbytes INTEGER, updated_at TEXT, frontmatter TEXT, query TEXT HIDDEN, folder TEXT HIDDEN, lim INTEGER HIDDEN)",
             FnKind::Outline => c"CREATE TABLE x(path TEXT, heading TEXT, heading_path TEXT, level INTEGER, line_from INTEGER, line_to INTEGER, nwords INTEGER, nwords_total INTEGER, nbytes INTEGER, nlines INTEGER, file_nwords INTEGER, version INTEGER, updated_at TEXT, updated_by TEXT, prefix TEXT HIDDEN, heading_match TEXT HIDDEN, mode TEXT HIDDEN, max_level INTEGER HIDDEN, lim INTEGER HIDDEN)",
             FnKind::Headings => c"CREATE TABLE x(heading TEXT, sections INTEGER, docs INTEGER, prefix TEXT HIDDEN, starts TEXT HIDDEN, lim INTEGER HIDDEN)",
-            FnKind::Entry => c"CREATE TABLE x(path TEXT, name TEXT, kind TEXT, version INTEGER, nbytes INTEGER, nlines INTEGER, updated_at TEXT, updated_by TEXT, id INTEGER, dir TEXT, depth INTEGER, ext TEXT, title TEXT, nwords INTEGER, nsections INTEGER, nprops INTEGER, nlinks INTEGER, nlinks_broken INTEGER, versions INTEGER, created_at TEXT, files INTEGER, folders INTEGER, nauthors INTEGER, authors TEXT, path_arg TEXT HIDDEN)",
+            FnKind::Entry => c"CREATE TABLE x(path TEXT, name TEXT, kind TEXT, version INTEGER, nbytes INTEGER, nlines INTEGER, updated_at TEXT, updated_by TEXT, id INTEGER, dir TEXT, depth INTEGER, ext TEXT, title TEXT, nwords INTEGER, nsections INTEGER, nprops INTEGER, nlinks INTEGER, nlinks_broken INTEGER, versions INTEGER, created_at TEXT, files INTEGER, folders INTEGER, nauthors INTEGER, authors TEXT, share TEXT, rights TEXT, shares TEXT, path_arg TEXT HIDDEN)",
             FnKind::PathHistory => c"CREATE TABLE x(id INTEGER, ts TEXT, op TEXT, old_path TEXT, new_path TEXT, via TEXT, version INTEGER, author TEXT, path TEXT HIDDEN, node_id INTEGER HIDDEN)",
             // One shape for both directions: `backlinks` answers "who points here" with the
             // same row `links` answers "where does this point" with.
             FnKind::Links | FnKind::Backlinks => c"CREATE TABLE x(path TEXT, version INTEGER, line INTEGER, kind TEXT, target TEXT, anchor TEXT, alias TEXT, status TEXT, resolved TEXT, asset INTEGER, path_arg TEXT HIDDEN, status_arg TEXT HIDDEN, lim INTEGER HIDDEN)",
+            // One row per share, or one row with no share at all: the same shape as Postgres's
+            // `kb.whoami()`, so a client reads one answer from either backend.
+            FnKind::Whoami => c"CREATE TABLE x(account TEXT, admin INTEGER, kind TEXT, namespace TEXT, alias TEXT, rights TEXT, node_id INTEGER, dormant INTEGER)",
         }
     }
     /// Number of visible columns; hidden argument columns follow.
     fn visible(self) -> c_int {
         match self {
-            FnKind::Ls => 24,
+            FnKind::Ls => 27,
             FnKind::Search => 7,
             FnKind::History => 9,
             FnKind::Export => 2,
@@ -599,8 +603,9 @@ impl FnKind {
             FnKind::PropFind => 4,
             FnKind::Outline => 14,
             FnKind::Headings => 3,
-            FnKind::Entry => 24,
+            FnKind::Entry => 27,
             FnKind::Links | FnKind::Backlinks => 10,
+            FnKind::Whoami => 8,
         }
     }
     fn n_hidden(self) -> c_int {
@@ -620,6 +625,7 @@ impl FnKind {
             FnKind::Headings => 3,
             FnKind::Entry => 1,
             FnKind::Links | FnKind::Backlinks => 3,
+            FnKind::Whoami => 0,
         }
     }
 }
@@ -657,7 +663,22 @@ fn entry_row(e: crate::db::Entry) -> Vec<Value> {
         int(e.folders),
         Value::Integer(e.nauthors),
         Value::Text(serde_json::Value::Array(authors).to_string()),
+        // What #12 added to an entry, and what only the CLI could see until now: the share a row was
+        // reached through and its rights, and on an account's root row every share it holds.
+        // Postgres's `kb.entry` has carried all three from the start, so a SQL client asking either
+        // backend the same question got two different answers.
+        text(e.share),
+        text(e.rights),
+        Value::Text(shares_json(&e.shares)),
     ]
+}
+
+/// An account's shares as JSON: `[{"alias": "contracts", "rights": "rw"}, ...]`, `[]` for every row
+/// but an account's root. The same text `kb.entry.shares` gives, so one client reads both backends.
+fn shares_json(shares: &[(String, String)]) -> String {
+    let rows: Vec<serde_json::Value> =
+        shares.iter().map(|(alias, rights)| serde_json::json!({ "alias": alias, "rights": rights })).collect();
+    serde_json::Value::Array(rows).to_string()
 }
 
 /// A hidden argument as an integer, accepting the text form a bound parameter can arrive in.
@@ -886,6 +907,58 @@ unsafe impl VTabCursor for FnCursor<'_> {
                     })
                     .collect()
             }
+            // Who this connection is, and what it holds. The owner is one row saying so; an account
+            // is one row per share, and none of them says where the share lives in the store -- the
+            // alias exists to hide exactly that, and this is the easiest place to leak it back.
+            FnKind::Whoami => match view.name().map(str::to_string) {
+                // The owner: whose shares are not a list, since everything is not something to
+                // enumerate. One row saying so, as Postgres's `kb.whoami()` answers.
+                None => vec![vec![
+                    Value::Null,
+                    Value::Integer(1),
+                    Value::Text("owner".into()),
+                    Value::Text("store".into()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ]],
+                Some(name) => {
+                    let kind = crate::access::account_by_name(self.tab.conn(), &self.tab.prefix, &name)
+                        .map_err(map_err)?
+                        .map(|a| a.kind)
+                        .unwrap_or_default();
+                    let ns = match view.namespace() {
+                        textdb_core::access::Namespace::SingleRoot => "single-root",
+                        textdb_core::access::Namespace::Aliased => "aliased",
+                    };
+                    let row = |alias: Option<&str>, rights: Option<&str>, node: Option<i64>, dormant: Option<bool>| {
+                        vec![
+                            Value::Text(name.clone()),
+                            Value::Integer(0),
+                            Value::Text(kind.clone()),
+                            Value::Text(ns.to_string()),
+                            alias.map_or(Value::Null, |a| Value::Text(a.to_string())),
+                            rights.map_or(Value::Null, |r| Value::Text(r.to_string())),
+                            node.map_or(Value::Null, Value::Integer),
+                            dormant.map_or(Value::Null, |d| Value::Integer(d.into())),
+                        ]
+                    };
+                    // Revoked grants are left out and dormant ones are not: a dormant share is one the
+                    // account still holds and cannot reach today, which is a different thing to say.
+                    let rows: Vec<Vec<Value>> = view
+                        .grants()
+                        .iter()
+                        .filter(|g| !g.revoked)
+                        .map(|g| row(Some(&g.alias), Some(g.rights.as_str()), Some(g.node_id), Some(g.dormant)))
+                        .collect();
+                    match rows.is_empty() {
+                        // An account whose every share was revoked still has a name and a kind.
+                        true => vec![row(None, None, None, None)],
+                        false => rows,
+                    }
+                }
+            },
             FnKind::Headings => {
                 let prefix = s(&hidden[0]).unwrap_or_else(|| "/".into());
                 let starts = s(&hidden[1]).unwrap_or_default();

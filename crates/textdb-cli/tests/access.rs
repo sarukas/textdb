@@ -2118,6 +2118,81 @@ fn m_an_account_cannot_declare_or_remove_an_asset_store() {
     });
 }
 
+/// M15: a SQL client is told what the CLI is told -- the share a row was reached through, its
+/// rights, and who this connection is.
+///
+/// Postgres's `kb.entry` carried `share`, `rights` and `shares` from the start and SQLite's
+/// `textdb_ls` carried none of them, so the same question put to the two backends came back
+/// differently and no SQL client -- the Node SDK, the web app behind it, a person with `textdb sql`
+/// -- could show permissions at all. A UI that cannot ask has to re-derive the rule, which is the
+/// one thing #12 says not to do.
+#[test]
+fn m_a_sql_client_sees_the_share_a_row_came_through_and_who_it_is() {
+    scenarios!("M15");
+    on_each_engine(|f| {
+        let sqlite = f.engine() == Engine::Sqlite;
+        let ls_fn = if sqlite { "textdb_ls" } else { "kb.ls" };
+        let whoami_fn = if sqlite { "textdb_whoami" } else { "kb.whoami" };
+
+        // Each row says which share it came through and what may be done with it: `/contracts` is
+        // the account's `rw` share, `/products` its `ro` one.
+        let ls = ok(
+            f.as_("accounts-agent")
+                .args(["--json", "sql", &format!("SELECT path, share, rights FROM {ls_fn}('/') ORDER BY path")]),
+            None,
+        )
+        .json();
+        let rows: Vec<(&str, &str, &str)> = ls["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["path"].as_str().unwrap_or(""), r["share"].as_str().unwrap_or(""), r["rights"].as_str().unwrap_or("")))
+            .collect();
+        assert_eq!(
+            rows,
+            [("/contracts", "contracts", "rw"), ("/products", "products", "ro")],
+            "M15: the listing must say which share each row came through: {ls}"
+        );
+
+        // Deeper in, the rights are the share's: a file inside the read-only share reads `ro`.
+        let deep = ok(
+            f.as_("accounts-agent")
+                .args(["--json", "sql", &format!("SELECT rights FROM {ls_fn}('/products') ORDER BY path LIMIT 1")]),
+            None,
+        )
+        .json();
+        assert_eq!(deep["rows"][0]["rights"], "ro", "M15: {deep}");
+
+        // The owner reaches everything directly, so there is no share to name.
+        let owner = ok(f.as_("admin").args(["--json", "sql", &format!("SELECT path, share, rights FROM {ls_fn}('/') ORDER BY path LIMIT 1")]), None).json();
+        assert_eq!(owner["rows"][0]["share"], serde_json::Value::Null, "M15: {owner}");
+        assert_eq!(owner["rows"][0]["rights"], serde_json::Value::Null, "M15: {owner}");
+
+        // And who the connection is, in the same shape on both engines: one row per share for an
+        // account, one row saying `owner` for the owner, and never where a share lives in the store.
+        let who = ok(
+            f.as_("accounts-agent")
+                .args(["--json", "sql", &format!("SELECT account, admin, kind, namespace, alias, rights FROM {whoami_fn}() ORDER BY alias")]),
+            None,
+        )
+        .json();
+        let shares: Vec<(&str, &str)> = who["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["alias"].as_str().unwrap_or(""), r["rights"].as_str().unwrap_or("")))
+            .collect();
+        assert_eq!(shares, [("contracts", "rw"), ("products", "ro")], "M15: {who}");
+        assert_eq!(who["rows"][0]["account"], "accounts-agent", "M15: {who}");
+        assert_eq!(who["rows"][0]["namespace"], "aliased", "M15: {who}");
+        assert!(!who.to_string().contains("/legal"), "M15: whoami must not say where a share lives: {who}");
+
+        let mine = ok(f.as_("admin").args(["--json", "sql", &format!("SELECT account, kind, namespace FROM {whoami_fn}()")]), None).json();
+        assert_eq!(mine["rows"][0]["account"], serde_json::Value::Null, "M15: {mine}");
+        assert_eq!(mine["rows"][0]["kind"], "owner", "M15: {mine}");
+    });
+}
+
 /// L5: every scenario above runs on both engines. The harness does that by construction — this
 /// records the requirement and fails if the Postgres half was never exercised.
 #[test]
@@ -2144,7 +2219,7 @@ fn l_the_catalogue_runs_on_both_engines() {
 // happens.
 
 /// The working-loop rows, kept separate from `CATALOGUE` so neither list pretends to be the other.
-const EXTRA: &[&str] = &["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M12", "M13", "M14"];
+const EXTRA: &[&str] = &["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M12", "M13", "M14", "M15"];
 
 /// Two checkouts of one `rw` share, one per account: accounts-agent sees it at `contracts/`,
 /// contracts-agent is single-root and sees it at `/`. The pair every M row works with.

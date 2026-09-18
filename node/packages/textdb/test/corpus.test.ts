@@ -32,6 +32,18 @@ describe('corpus', () => {
     assert.throws(() => openCorpus({ db: tmp.db, token: 'tdb_nothing-of-the-kind' }), (e: unknown) => e instanceof Forbidden);
   });
 
+  // The access tier of the listing record and `whoami`, as this store has them: no accounts, so
+  // every row is the owner's and reaches everything directly. What an account sees is the
+  // catalogue's business (crates/textdb-cli/tests/access.rs, M15), on both engines.
+  test('a listing says whose view it is, and whoami says who that is', () => {
+    // The root, so this store is left exactly as it was: the tests below it read `last_seq`.
+    const row = kb.entry('/');
+    assert.equal(row.share, null);
+    assert.equal(row.rights, null);
+    assert.deepEqual(row.shares, []);
+    assert.deepEqual(kb.whoami(), { account: null, admin: true, kind: 'owner', namespace: 'store', shares: [] });
+  });
+
   test('opens and migrates an empty store, and reopens it', () => {
     assert.deepEqual(kb.info(), { db: tmp.db, files: 0, last_seq: 0 });
     const again = openCorpus({ db: tmp.db });

@@ -49,6 +49,38 @@ export interface Entry {
   folders: number | null;
   nauthors: number;
   authors: AuthorCount[];
+
+  // The access tier (docs/shapes.md): whose view this row is. Null for the owner, who reaches
+  // everything directly and holds no shares.
+  /** The alias of the share this row was reached through; `''` for a single-root account. */
+  share: string | null;
+  /** `ro` or `rw`, that share's rights. */
+  rights: string | null;
+  /** Only on an account's root row: every share it holds, in path order. */
+  shares: Share[];
+}
+
+export interface Share {
+  alias: string;
+  rights: string;
+}
+
+/** Who this session is and what it can reach; see docs/shapes.md, "Who is asking". */
+export interface Whoami {
+  /** Null for the owner. */
+  account: string | null;
+  admin: boolean;
+  /** `owner`, or the account's kind: `agent`, `person`, `admin`. */
+  kind: string;
+  /** `store` for the owner, else `single-root` or `aliased`. */
+  namespace: string;
+  shares: WhoamiShare[];
+}
+
+export interface WhoamiShare extends Share {
+  node_id: number;
+  /** Its folder is in the trash: still held, not reachable today. */
+  dormant: boolean;
 }
 
 /** The old name for {@link Entry}, kept so call sites read unchanged. */
