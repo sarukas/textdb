@@ -208,8 +208,9 @@ rights, tokens. The session chip is who the browser is -- the owner, or the acco
 it presented -- and every path shown is then that account's own, with a `ro` marked where a
 share is read-only. Nothing there re-derives the rule: what an account may not do arrives as
 the store's refusal, and a folder it was never granted is missing rather than forbidden. What
-the server keeps to itself is the machine it runs on: sync and every asset route are the
-owner's, which is §4 above made visible rather than hidden ([demo-app.md](demo-app.md),
+the server keeps to itself is the machine it runs on: sync and every asset route are the owner's
+-- or an `admin`-kind token's, which is what a hosted deployment has instead of an owner -- and
+that is §4 above made visible rather than hidden ([demo-app.md](demo-app.md),
 [live-app.md](live-app.md#who-is-asking)).
 
 ## Not in scope here

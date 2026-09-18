@@ -262,19 +262,23 @@ export class AssetService {
    * `AssetStores` runs the commands; these run as the owner, because the routes are the owner's --
    * see the comment on them. Each of the three that change something answers with the whole list,
    * because the CLI prints it after the change: one run, and one set of reachability checks.
+   *
+   * Through `slot` like every other run: a listing asks each store whether this machine can reach
+   * it, which for an rclone store is a remote round trip, so a page open in several tabs would
+   * otherwise spawn as many processes as there are tabs with nothing to hold them back.
    */
   stores(): Promise<AssetStoreRow[]> {
-    return this.assetStores.list();
+    return this.slot(() => this.assetStores.list());
   }
 
   putStore(name: string, driver: string, root: string): Promise<AssetStoreRow[]> {
-    return this.assetStores.put(argument('the store name', name)!, argument('the root', root)!, {
-      driver: argument('the driver', driver),
-    });
+    return this.slot(() =>
+      this.assetStores.put(argument('the store name', name)!, argument('the root', root)!, { driver: argument('the driver', driver) }),
+    );
   }
 
   removeStore(name: string): Promise<AssetStoreRow[]> {
-    return this.assetStores.remove(argument('the store name', name)!);
+    return this.slot(() => this.assetStores.remove(argument('the store name', name)!));
   }
 
   /**
@@ -297,7 +301,7 @@ export class AssetService {
     if (!declared.some((s) => s.name === wanted)) {
       throw new NotFound(`no asset store named ${wanted}: declare it before binding it to this machine`);
     }
-    return this.assetStores.bind(wanted, argument('the location', location) ?? '');
+    return this.slot(() => this.assetStores.bind(wanted, argument('the location', location) ?? ''));
   }
 
   /** Move the files of `moved-here` assets to their asset's own place in the store. */

@@ -65,7 +65,9 @@ version, body that is not JSON) is a 400 with code TX004.
 Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./kb.db`),
 `TEXTDB_SQLITE_EXT` (path of the loadable extension; otherwise found under
 `crates/textdb-sqlite-ext/target/release`), `PORT` (default 4317), `HOST` (default `127.0.0.1`),
-`TEXTDB_REQUIRE_TOKEN` (`1` to answer nothing without a bearer).
+`TEXTDB_REQUIRE_TOKEN` (`1` to answer nothing without a bearer — **on by default when `HOST` is
+not loopback**, since a server reachable from the network must not answer as the owner to whoever
+knocks; give that deployment an `admin`-kind account and a token).
 
 ### Who is asking
 
@@ -80,16 +82,18 @@ closed when idle, and every document route answers in that account's view: its o
 own shares, and a folder it was never granted is a 404 rather than a 403 (`docs/permissions.md`).
 A write into a `ro` share is a 403.
 
-Two groups of routes are the **owner's** and refuse a token session outright, with `TX005` and
-the reason:
+**Every** route under `/api/sync` and `/api/assets` is the **owner's**, and refuses anyone else
+with `TX005` and the reason. Both work on directories and drives of the *server's own machine*,
+configured by whoever started it, and run the CLI against them as the owner: an ordinary account's
+request would either escalate or mean something undefined — whose directory is `/notes` when
+`/notes` is an alias? A token whose account is `admin`-kind passes, and must: past loopback this
+server requires a token of every request, so otherwise the person who started it could not sync
+their own folders. The store is what says which session is the owner — `whoami().admin` — and this
+server knows nothing else about kinds.
 
-- **Sync and assets** (`/api/sync*`, `/api/assets*`). Both work on directories and drives of the
-  *server's own machine*, configured by whoever started it, and run the CLI against them: an
-  account's request would either escalate or mean something undefined — whose directory is
-  `/notes` when `/notes` is an alias?
-- **Nothing else.** The delegation routes (`/api/access/*`) are *not* refused here: they run the
-  CLI with the request's own bearer, so the store refuses whoever may not run them, and an
-  `admin`-kind account's token works.
+The delegation routes (`/api/access/*`) are **not** refused here: they run the CLI with the
+request's own bearer, so the store refuses whoever may not run them, and an `admin`-kind token
+works there for the same reason.
 
 | Method & path | Request | Response |
 |---|---|---|
@@ -116,6 +120,7 @@ the reason:
 | `GET /api/hunks?path=…&from=v1&to=v2` | | `[{ old_from, old_count, new_from, new_count, old_text, new_text }]` |
 | `GET /api/diff?path=…&from=v1&to=v2` | | `{ diff }` unified text |
 | `GET /api/search?q=…[&prefix=/][&limit=200][&per_file=10]` | | `[{ path, version, line, text, section, score, more }]`, one row per matching line |
+| `GET /api/links?path=/a[&status=…][&limit=10000]` · `GET /api/backlinks?path=…` | | The links written in a document (or everything below a folder), and the links written to it: `[{ path, version, line, kind, target, anchor, alias, status, resolved, asset }]` (`docs/shapes.md`). `status` keeps one kind — `ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store`, `external` — and anything else is a 400, not an empty answer |
 | `PUT /api/file` | `{ path, content, base_version?, author?, message? }` | `{ version, kind }` — rebased over concurrent commits; 409 with `conflict` when the same lines changed |
 | `POST /api/replace-lines` | `{ path, from, to, text, base_version?, author? }` | `{ version, kind }` |
 | `GET /api/stat?path=…`, `GET /api/entry?path=…` | | one full listing record (`docs/shapes.md`); `stat` is an alias of `entry`. A folder's figures are totals over everything below it |

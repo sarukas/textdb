@@ -84,7 +84,10 @@ export const NEEDS_ATTENTION: readonly LinkStatus[] = ["broken", "anchor-missing
 export function statusCounts(links: readonly Link[]): { status: LinkStatus | null; n: number }[] {
   const counts = new Map<LinkStatus | null, number>();
   for (const l of links) counts.set(l.status, (counts.get(l.status) ?? 0) + 1);
-  const order = (s: LinkStatus | null) => (s === null ? 99 : ["broken", "anchor-missing", "ambiguous", "not-in-store", "ok", "external"].indexOf(s));
+  // A status from a newer store than this app is neither known-bad nor fine: it goes after the
+  // ones this app can rank, next to the unresolved rows, rather than sorting above `broken`.
+  const known = ["broken", "anchor-missing", "ambiguous", "not-in-store", "ok", "external"];
+  const order = (s: LinkStatus | null) => (s === null ? 99 : known.indexOf(s) < 0 ? 98 : known.indexOf(s));
   return [...counts].map(([status, n]) => ({ status, n })).sort((a, b) => order(a.status) - order(b.status));
 }
 
@@ -97,6 +100,10 @@ export function statusCounts(links: readonly Link[]): { status: LinkStatus | nul
  */
 export function linkText(link: Pick<Link, "kind" | "target" | "anchor" | "alias">): string {
   const anchor = link.anchor ? `#${link.anchor}` : "";
+  // A URL or an address written on its own -- `<me@e.com>`, or a bare `https://…` the renderer
+  // linkifies -- is a markdown link with no text of its own. Written back as `[](me@e.com)` it
+  // would be a line nobody can find in the document, so it is shown as what was typed.
+  if (link.kind === "md" && link.alias === null) return `${link.target}${anchor}`;
   if (link.kind === "md" || link.kind === "image") {
     return `${link.kind === "image" ? "!" : ""}[${link.alias ?? ""}](${link.target}${anchor})`;
   }

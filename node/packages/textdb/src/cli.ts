@@ -17,28 +17,41 @@ import { type ErrorCode, TextdbError, errorOf } from './errors.ts';
  * a dash is a name or a token and not a flag.
  */
 
-/** The names the CLI would otherwise take from the environment; a caller's arguments decide. */
-const FROM_ARGUMENTS = ['TEXTDB_STORE', 'TEXTDB_AUTHOR', 'TEXTDB_PATH_HISTORY'];
+/**
+ * The names the CLI would otherwise take from the environment; a caller's arguments decide.
+ *
+ * `TEXTDB_TOKEN` above all: the CLI reads it as `--token`, so a shell that happens to have one
+ * exported would decide who a run with no token of its own is -- a server started from a terminal
+ * where somebody had been working as an account would answer its owner's requests as that account,
+ * and refuse them.
+ */
+const FROM_ARGUMENTS = ['TEXTDB_STORE', 'TEXTDB_AUTHOR', 'TEXTDB_PATH_HISTORY', 'TEXTDB_TOKEN'];
 
 /**
- * The CLI to run: the one named, else a build in this checkout's `target/`.
+ * The CLI to run: the one named, `TEXTDB_CLI`, else a build in this checkout's `target/`.
  *
- * Walks up from this module, so it finds the build whether the SDK is used from the repository, from
- * an app inside it, or from `node_modules` in one.
+ * The walk goes up from this module, so it finds the build whether the SDK is used from the
+ * repository, from an app inside it, or from `node_modules` in one -- and stops at a directory that
+ * is plainly not a checkout's, since walking to the drive root would eventually try `C:	arget`.
+ * Anyone outside a checkout names the CLI instead, which is what the error says to do.
  */
 export function findCli(explicit?: string | null): string | null {
-  if (explicit) return existsSync(explicit) ? explicit : null;
+  const named = explicit ?? process.env.TEXTDB_CLI;
+  if (named) return existsSync(named) ? named : null;
   const exe = process.platform === 'win32' ? 'textdb.exe' : 'textdb';
   let dir = fileURLToPath(new URL('.', import.meta.url));
-  for (;;) {
+  // Deep enough for `node_modules/@textdb/node/dist` inside a project inside a checkout, and short
+  // of the root on every layout that is not one.
+  for (let up = 0; up < 12; up++) {
     for (const profile of ['release', 'debug']) {
       const candidate = join(dir, 'target', profile, exe);
       if (existsSync(candidate)) return candidate;
     }
-    const up = dirname(dir);
-    if (up === dir) return null;
-    dir = up;
+    const above = dirname(dir);
+    if (above === dir) break;
+    dir = above;
   }
+  return null;
 }
 
 /** One run, with its exit status: a non-zero status is an answer here, not a throw. */
@@ -138,7 +151,7 @@ export class Cli {
     if (!this.cliPath) {
       throw errorOf('TX004', 'the textdb CLI was not found: build it (cargo build --release -p textdb-cli) or name it with TEXTDB_CLI');
     }
-    const global = ['--store', this.store, '--json'];
+    const global = [`--store=${nul('the store', this.store)}`, '--json'];
     if (this.token) global.push(`--token=${nul('the token', this.token)}`);
     if (this.author) global.push(`--author=${nul('the author', this.author)}`);
     const { stdout, stderr, status } = await runCli(this.cliPath, [...global, ...args]);

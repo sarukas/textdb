@@ -54,6 +54,14 @@ export interface ShareRow {
   dormant: boolean;
 }
 
+/**
+ * Every value a caller supplies goes after `--`, or in a `--flag=value`.
+ *
+ * A name, alias, label or path is data, and `-weird` is a name somebody chose. Passed as a bare
+ * argument it is a flag to the CLI's parser, which exits with a usage message and no JSON at all --
+ * a 500 out of a server, for what is a perfectly ordinary bad request. `--` ends the options, and
+ * `--flag=value` keeps a value that starts with a dash attached to its flag.
+ */
 export class Access {
   private readonly cli: Cli;
 
@@ -76,15 +84,16 @@ export class Access {
   }
 
   createAccount(name: string, options: { kind?: string; root?: string } = {}): Promise<{ account: string; kind: string; root: string | null }> {
-    const args = ['account', 'create', name];
-    if (options.kind) args.push('--kind', options.kind);
-    if (options.root) args.push('--root', options.root);
+    const args = ['account', 'create'];
+    if (options.kind) args.push(`--kind=${options.kind}`);
+    if (options.root) args.push(`--root=${options.root}`);
+    args.push('--', name);
     return this.cli.json(args);
   }
 
   /** Disabled: its tokens stop working, and its shares are kept for when it is enabled again. */
   setAccountEnabled(name: string, enabled: boolean): Promise<{ account: string; disabled: boolean }> {
-    return this.cli.json(['account', enabled ? 'enable' : 'disable', name]);
+    return this.cli.json(['account', enabled ? 'enable' : 'disable', '--', name]);
   }
 
   /**
@@ -94,14 +103,15 @@ export class Access {
    * root gains a `/<alias>` prefix, `alias` naming it (the folder's own name otherwise).
    */
   convertAccount(name: string, options: { alias?: string } = {}): Promise<unknown> {
-    const args = ['account', 'convert', name, '--multi'];
-    if (options.alias) args.push('--root-alias', options.alias);
+    const args = ['account', 'convert', '--multi'];
+    if (options.alias) args.push(`--root-alias=${options.alias}`);
+    args.push('--', name);
     return this.cli.json(args);
   }
 
   tokens(account?: string): Promise<TokenRow[]> {
     const args = ['token', 'ls'];
-    if (account) args.push(account);
+    if (account) args.push('--', account);
     return this.cli.json<TokenRow[]>(args);
   }
 
@@ -110,36 +120,38 @@ export class Access {
     account: string,
     options: { label?: string; expires?: string } = {},
   ): Promise<{ bearer: string; id: number; account: string; expires_at: string | null }> {
-    const args = ['token', 'create', account];
-    if (options.label) args.push('--label', options.label);
-    if (options.expires) args.push('--expires', options.expires);
+    const args = ['token', 'create'];
+    if (options.label) args.push(`--label=${options.label}`);
+    if (options.expires) args.push(`--expires=${options.expires}`);
+    args.push('--', account);
     return this.cli.json(args);
   }
 
   revokeToken(id: number): Promise<{ revoked: number }> {
-    return this.cli.json(['token', 'revoke', String(id)]);
+    return this.cli.json(['token', 'revoke', '--', String(id)]);
   }
 
   /** With an account, that account's shares; with a store path, who can reach it. */
   shares(of: { account?: string; path?: string } = {}): Promise<ShareRow[]> {
     const args = ['access', 'ls'];
-    if (of.account) args.push(of.account);
-    else if (of.path) args.push(of.path);
+    const which = of.account ?? of.path;
+    if (which) args.push('--', which);
     return this.cli.json<ShareRow[]>(args);
   }
 
   grant(account: string, path: string, rights: 'ro' | 'rw', options: { alias?: string } = {}): Promise<ShareRow> {
-    const args = ['access', 'grant', account, path, rights];
-    if (options.alias) args.push('--as', options.alias);
+    const args = ['access', 'grant'];
+    if (options.alias) args.push(`--as=${options.alias}`);
+    args.push('--', account, path, rights);
     return this.cli.json<ShareRow>(args);
   }
 
   /** The name the account knows the share by, which is not the path in the store. */
   renameShare(account: string, from: string, to: string): Promise<unknown> {
-    return this.cli.json(['access', 'rename', account, from, to]);
+    return this.cli.json(['access', 'rename', '--', account, from, to]);
   }
 
   revokeShare(account: string, alias: string): Promise<unknown> {
-    return this.cli.json(['access', 'revoke', account, alias]);
+    return this.cli.json(['access', 'revoke', '--', account, alias]);
   }
 }

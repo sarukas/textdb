@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, type Link, type OutlineEntry } from "../api";
-import { byDocument, linkStatusLabel, linkText, outlineTree, type OutlineNode } from "../doc/structure";
+import { byDocument, linkStatusLabel, linkText, NEEDS_ATTENTION, outlineTree, statusCounts, type OutlineNode } from "../doc/structure";
 import { baseName } from "../live/paths";
 
 interface Props {
@@ -34,26 +34,24 @@ export function MarkdownRail({ path, version, onOpen, onClose }: Props) {
   useEffect(() => {
     const ctl = new AbortController();
     setProblem(null);
-    Promise.all([
-      api.outline(path, { limit: 2000, signal: ctl.signal }),
-      api.links(path, { signal: ctl.signal }),
-      api.backlinks(path, { signal: ctl.signal }),
-    ]).then(
-      ([headings, written, pointing]) => {
-        setOutline(headings);
-        setOut(written);
-        setBack(pointing);
-      },
-      (error: unknown) => {
-        if (ctl.signal.aborted) return;
-        setProblem(error instanceof Error ? error.message : String(error));
-      },
-    );
+    // What was shown of the last document, or of the version before this commit, is not shown as
+    // this one's: the three lists go back to "reading" rather than standing as somebody else's.
+    setOutline(null);
+    setOut(null);
+    setBack(null);
+    const said = (error: unknown) => {
+      if (!ctl.signal.aborted) setProblem(error instanceof Error ? error.message : String(error));
+    };
+    // Three asks, not one: a document whose backlinks fail still has an outline worth showing, and
+    // one rejection of a `Promise.all` would have left all three reading forever.
+    api.outline(path, { limit: 2000, signal: ctl.signal }).then(setOutline, said);
+    api.links(path, { signal: ctl.signal }).then(setOut, said);
+    api.backlinks(path, { signal: ctl.signal }).then(setBack, said);
     return () => ctl.abort();
   }, [path, version]);
 
   const counts = (rows: Link[] | null) => (rows === null ? "" : ` ${rows.length}`);
-  const needs = (out ?? []).filter((l) => l.status === "broken" || l.status === "anchor-missing" || l.status === "ambiguous").length;
+  const needs = (out ?? []).filter((l) => NEEDS_ATTENTION.includes(l.status!)).length;
 
   return (
     <aside className="doc-rail" aria-label="Headings and links">
@@ -101,6 +99,18 @@ export function MarkdownRail({ path, version, onOpen, onClose }: Props) {
       {tab === "links" && (
         <div className="rail-body">
           <h3 className="rail-section">Links out</h3>
+          {out !== null && out.length > 0 && (
+            <p className="rail-counts">
+              {statusCounts(out).map(({ status, n }) => {
+                const label = linkStatusLabel(status);
+                return (
+                  <span key={status ?? "unresolved"} className={`rail-status link-${label.tone}`} title={label.hint}>
+                    {n} {label.label.toLowerCase()}
+                  </span>
+                );
+              })}
+            </p>
+          )}
           {out === null ? (
             <p className="muted rail-note">Reading the links…</p>
           ) : out.length === 0 ? (

@@ -10,6 +10,9 @@ interface Props {
   onClose: () => void;
 }
 
+/** What a row does: opens the document, and gets out of the way, since this is a modal. */
+type Opener = (path: string, line?: number) => void;
+
 type Tab = "headings" | "links";
 type Match = "exact" | "prefix" | "contains";
 
@@ -27,6 +30,7 @@ type Match = "exact" | "prefix" | "contains";
 export function MarkdownPanel({ scope, onOpen, onClose }: Props) {
   const [tab, setTab] = useState<Tab>("headings");
   const [where, setWhere] = useState(scope);
+  /** The last refusal, cleared by whatever answers next rather than left standing. */
   const [problem, setProblem] = useState<string | null>(null);
   const dialogRef = useRef<HTMLDialogElement | null>(null);
 
@@ -34,7 +38,15 @@ export function MarkdownPanel({ scope, onOpen, onClose }: Props) {
     dialogRef.current?.showModal();
   }, []);
 
-  const said = (error: unknown) => setProblem(error instanceof ApiError ? `${error.code}: ${error.message}` : String(error));
+  /** What went wrong, or `null` to say the question is being asked again. */
+  const said = (error: unknown | null) =>
+    setProblem(error === null ? null : error instanceof ApiError ? `${error.code}: ${error.message}` : String(error));
+  // A dialog opened with `showModal` leaves the page behind it inert, so a row that opened a
+  // document without closing looked like nothing had happened at all.
+  const open: Opener = (path, line) => {
+    onOpen(path, line);
+    onClose();
+  };
 
   return (
     <dialog
@@ -74,9 +86,9 @@ export function MarkdownPanel({ scope, onOpen, onClose }: Props) {
       {problem && <p className="access-problem">{problem}</p>}
 
       {tab === "headings" ? (
-        <Headings scope={where || "/"} onOpen={onOpen} onProblem={said} />
+        <Headings scope={where || "/"} onOpen={open} onProblem={said} />
       ) : (
-        <Links scope={where || "/"} onOpen={onOpen} onProblem={said} />
+        <Links scope={where || "/"} onOpen={open} onProblem={said} />
       )}
     </dialog>
   );
@@ -89,7 +101,7 @@ export function MarkdownPanel({ scope, onOpen, onClose }: Props) {
  * keystroke; `outline` then finds the sections themselves. `contains` is the one shape that has
  * to scan, and it says so where it is chosen.
  */
-function Headings({ scope, onOpen, onProblem }: { scope: string; onOpen: Props["onOpen"]; onProblem: (e: unknown) => void }) {
+function Headings({ scope, onOpen, onProblem }: { scope: string; onOpen: Opener; onProblem: (e: unknown | null) => void }) {
   const [starts, setStarts] = useState("");
   const [names, setNames] = useState<HeadingName[] | null>(null);
   const [chosen, setChosen] = useState<string | null>(null);
@@ -99,6 +111,8 @@ function Headings({ scope, onOpen, onProblem }: { scope: string; onOpen: Props["
   useEffect(() => {
     const ctl = new AbortController();
     const timer = setTimeout(() => {
+      // Whatever was refused last is not this answer's: cleared as the question is asked again.
+      onProblem(null);
       api.headingNames(scope, { starts, limit: 200, signal: ctl.signal }).then(setNames, (e: unknown) => {
         if (!ctl.signal.aborted) onProblem(e);
       });
@@ -116,6 +130,7 @@ function Headings({ scope, onOpen, onProblem }: { scope: string; onOpen: Props["
       return;
     }
     const ctl = new AbortController();
+    onProblem(null);
     api.outline(scope, { heading: chosen, match, limit: 500, signal: ctl.signal }).then(setSections, (e: unknown) => {
       if (!ctl.signal.aborted) onProblem(e);
     });
@@ -188,7 +203,7 @@ function Headings({ scope, onOpen, onProblem }: { scope: string; onOpen: Props["
 }
 
 /** The links of a folder, by status, grouped by the document they are written in. */
-function Links({ scope, onOpen, onProblem }: { scope: string; onOpen: Props["onOpen"]; onProblem: (e: unknown) => void }) {
+function Links({ scope, onOpen, onProblem }: { scope: string; onOpen: Opener; onProblem: (e: unknown | null) => void }) {
   /** `null` is every status worth attention, asked for one at a time and shown together. */
   const [status, setStatus] = useState<LinkStatus | null>(null);
   const [links, setLinks] = useState<Link[] | null>(null);
@@ -196,6 +211,7 @@ function Links({ scope, onOpen, onProblem }: { scope: string; onOpen: Props["onO
   useEffect(() => {
     const ctl = new AbortController();
     setLinks(null);
+    onProblem(null);
     const wanted = status === null ? NEEDS_ATTENTION : [status];
     Promise.all(wanted.map((s) => api.links(scope, { status: s, limit: 5000, signal: ctl.signal })))
       .then((answers) => setLinks(answers.flat()))

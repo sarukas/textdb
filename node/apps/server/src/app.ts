@@ -102,16 +102,23 @@ function accessService(access: AccessService | null | undefined): AccessService 
 }
 
 /**
- * Refuse a token session outright.
+ * Refuse a session that is not the store's owner's.
  *
- * For sync and assets, and for those only. Both work on directories of *this server's machine*,
- * configured by whoever started it, and both run the CLI against the store: an account's request
- * would either escalate (the CLI as the owner) or mean something not yet defined -- whose directory
- * is `/notes` when `/notes` is an alias? Said plainly rather than half-answered.
+ * For sync and assets, and for those only. Both work on directories and drives of *this server's
+ * machine*, configured by whoever started it, and both run the CLI against the store as the owner:
+ * an ordinary account's request would either escalate or mean something not yet defined -- whose
+ * directory is `/notes` when `/notes` is an alias? Said plainly rather than half-answered.
+ *
+ * No bearer is the owner, as everywhere. An **`admin`-kind token** is too, and must be: that kind
+ * exists for a deployment where nobody opens the file or connects as the owner, and past loopback
+ * this server requires a token of every request -- so without this the person who started it could
+ * not sync their own folders. It is the same authority either way, and the store is what says which
+ * kind an account is.
  */
-function ownerOnly(c: Context<Vars>, what: string): void {
+async function ownerOnly(c: Context<Vars>, what: string): Promise<void> {
   if (bearerOf(c) === undefined) return;
-  throw new CodedError('TX005', `${what} is the owner's: this server syncs directories of its own machine`);
+  if ((await kbOf(c).whoami()).admin) return;
+  throw new CodedError('TX005', `${what} is the owner's: this server works on directories and drives of its own machine`);
 }
 
 const MAX_BULK_PATHS = 10_000;
@@ -321,11 +328,11 @@ export function createApp(corpora: Corpora, hub: ChangeHub, options: AppOptions)
   // Sync with directories on this machine, configured by the operator (TEXTDB_SYNC).
   const sync = options.sync;
   app.get('/api/sync/links', async (c) => {
-    ownerOnly(c, 'syncing');
+    await ownerOnly(c, 'syncing');
     return c.json(sync ? await sync.list() : { available: false, reason: 'No folders are set up for sync: set TEXTDB_SYNC on the server.', links: [] });
   });
   app.post('/api/sync', async (c) => {
-    ownerOnly(c, 'syncing');
+    await ownerOnly(c, 'syncing');
     const body = await jsonBody(c);
     const report = await syncService(sync).run(bodyString(body, 'prefix'), {
       dryRun: body.dry_run === true,
@@ -335,8 +342,15 @@ export function createApp(corpora: Corpora, hub: ChangeHub, options: AppOptions)
     });
     return c.json(report);
   });
-  app.get('/api/sync/conflict', async (c) => c.json(await syncService(sync).conflict(queryString(c, 'prefix'), queryString(c, 'rel'))));
+  app.get('/api/sync/conflict', async (c) => {
+    // A file of a directory on this machine, and -- through `resolve` -- a sync run as the owner.
+    // Every route under /api/sync is the owner's for that reason; these two were not, which made
+    // them the way around the rule the others state.
+    await ownerOnly(c, 'the conflicts of a synced directory');
+    return c.json(await syncService(sync).conflict(queryString(c, 'prefix'), queryString(c, 'rel')));
+  });
   app.post('/api/sync/resolve', async (c) => {
+    await ownerOnly(c, 'resolving the conflicts of a synced directory');
     const body = await jsonBody(c);
     const keep = body.keep;
     if (keep !== 'textdb' && keep !== 'disk') throw badRequest('keep must be textdb or disk');
@@ -347,16 +361,16 @@ export function createApp(corpora: Corpora, hub: ChangeHub, options: AppOptions)
   // Assets of the synced folders: their state, pull and push, and their files to show or download.
   const assets = options.assets;
   app.get('/api/assets', async (c) => {
-    ownerOnly(c, 'the assets of a synced directory');
+    await ownerOnly(c, 'the assets of a synced directory');
     return c.json(await assetService(assets).status(queryString(c, 'prefix'), c.req.query('path') || undefined));
   });
   app.post('/api/assets/pull', async (c) => {
-    ownerOnly(c, 'pulling assets');
+    await ownerOnly(c, 'pulling assets');
     const body = await jsonBody(c);
     return c.json(await assetService(assets).pull(bodyString(body, 'prefix'), bodyPaths(body), bodyOptionalString(body, 'author')));
   });
   app.post('/api/assets/push', async (c) => {
-    ownerOnly(c, 'pushing assets');
+    await ownerOnly(c, 'pushing assets');
     const body = await jsonBody(c);
     const service = assetService(assets);
     return c.json(await service.push(bodyString(body, 'prefix'), bodyPaths(body), bodyOptionalString(body, 'message'), bodyOptionalString(body, 'author')));
@@ -370,11 +384,11 @@ export function createApp(corpora: Corpora, hub: ChangeHub, options: AppOptions)
   // this machine can reach it. That is what `ownerOnly` exists to keep to the person who started
   // the server, and an account reaching this server never pulls through it anyway.
   app.get('/api/assets/stores', async (c) => {
-    ownerOnly(c, 'the asset stores of this server');
+    await ownerOnly(c, 'the asset stores of this server');
     return c.json(await assetService(assets).stores());
   });
   app.post('/api/assets/stores', async (c) => {
-    ownerOnly(c, 'declaring an asset store');
+    await ownerOnly(c, 'declaring an asset store');
     const body = await jsonBody(c);
     // The CLI prints the whole list after it changes one, so this is one run and not two.
     const stores = await assetService(assets).putStore(
@@ -385,27 +399,27 @@ export function createApp(corpora: Corpora, hub: ChangeHub, options: AppOptions)
     return c.json({ stores });
   });
   app.post('/api/assets/stores/remove', async (c) => {
-    ownerOnly(c, 'removing an asset store');
+    await ownerOnly(c, 'removing an asset store');
     const body = await jsonBody(c);
     return c.json({ stores: await assetService(assets).removeStore(bodyString(body, 'name')) });
   });
   app.post('/api/assets/stores/bind', async (c) => {
-    ownerOnly(c, 'binding an asset store to this machine');
+    await ownerOnly(c, 'binding an asset store to this machine');
     const body = await jsonBody(c);
     const stores = await assetService(assets).bindStore(bodyString(body, 'name'), bodyOptionalString(body, 'location') ?? '');
     return c.json({ stores });
   });
   app.post('/api/assets/relocate', async (c) => {
-    ownerOnly(c, 'moving the files of assets in their store');
+    await ownerOnly(c, 'moving the files of assets in their store');
     const body = await jsonBody(c);
     return c.json(await assetService(assets).relocate(bodyString(body, 'prefix'), bodyPaths(body), bodyOptionalString(body, 'author')));
   });
   app.get('/api/assets/verify', async (c) => {
-    ownerOnly(c, 'verifying the assets of a synced directory');
+    await ownerOnly(c, 'verifying the assets of a synced directory');
     return c.json(await assetService(assets).verify(queryString(c, 'prefix'), c.req.query('path') || undefined));
   });
   app.get('/api/assets/file', async (c) => {
-    ownerOnly(c, 'the file of an asset on this server');
+    await ownerOnly(c, 'the file of an asset on this server');
     // Hono answers HEAD through this handler and drops the body: no file is opened for one.
     const head = c.req.method === 'HEAD';
     const f = await assetService(assets).file(queryString(c, 'prefix'), queryString(c, 'path'));

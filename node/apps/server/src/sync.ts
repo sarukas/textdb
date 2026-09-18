@@ -45,8 +45,9 @@ export function findCli(explicit: string | undefined): string | null {
 
 export function runCli(cli: string, args: string[]): Promise<{ stdout: string; stderr: string; status: number }> {
   const env = { ...process.env };
-  // The store, author and settings come from the arguments, never from the server's environment.
-  for (const name of ['TEXTDB_STORE', 'TEXTDB_AUTHOR', 'TEXTDB_PATH_HISTORY']) delete env[name];
+  // The store, the author, the settings and above all the *token* come from the arguments, never
+  // from the server's environment: an exported TEXTDB_TOKEN would otherwise decide who a run is.
+  for (const name of ['TEXTDB_STORE', 'TEXTDB_AUTHOR', 'TEXTDB_PATH_HISTORY', 'TEXTDB_TOKEN']) delete env[name];
   return new Promise((resolve, reject) => {
     execFile(cli, args, { env, maxBuffer: 256 * 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
       const code = (error as { code?: unknown } | null)?.code;

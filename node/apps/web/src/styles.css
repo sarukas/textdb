@@ -3485,3 +3485,23 @@ span.asset-problem {
   margin: 0;
   font-size: 0.9em;
 }
+
+.rail-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin: 0 0 0.4rem;
+}
+
+.rail-backlink {
+  margin-bottom: 0.5rem;
+}
+
+/* The panel's names column is narrow: a long heading is clipped there as it is in the rail. */
+.markdown-heading-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import { type RunningServer, startServer } from '../src/server.ts';
@@ -194,35 +195,64 @@ describe('a bearer per request', () => {
     );
   });
 
-  test('sync and the assets of a directory are the owner’s alone', async (t) => {
+  test('every sync and asset route is the owner’s alone', async (t) => {
     if (!cli) return t.skip('no textdb CLI build to create an account with');
-    // Both run the CLI against directories of this server's machine. An account's request would
-    // either escalate or mean something undefined, so it is refused rather than half-answered.
-    for (const url of ['/api/sync/links', '/api/assets?prefix=/notes', '/api/assets/stores', '/api/assets/verify?prefix=/notes']) {
-      const res = await call(url, bearer);
-      assert.equal(res.status, 403, url);
-      assert.equal(res.body.code, 'TX005', url);
-    }
-    // The stores too, and for the same reason: what this server would answer about them -- where
-    // this machine reaches each one, from which file, and whether it can -- is this machine's.
-    for (const url of ['/api/assets/stores', '/api/assets/stores/remove', '/api/assets/stores/bind']) {
-      const res = await fetch(`${server.url}${url}`, {
-        method: 'POST',
+
+    // Read from the source rather than listed by hand: a route added under these prefixes and not
+    // guarded is the way around the rule the others state, and a hand-list is exactly how two of
+    // them (`/api/sync/conflict` and `/api/sync/resolve`) stayed open while this test passed.
+    const source = readFileSync(new URL('../src/app.ts', import.meta.url), 'utf8');
+    const routes = [...source.matchAll(/app\.(get|post)\('(\/api\/(?:sync|assets)[^']*)'/g)].map((m) => ({
+      method: m[1]!.toUpperCase(),
+      url: m[2]!,
+    }));
+    assert.ok(routes.length >= 14, `expected every sync and asset route, found ${routes.length}`);
+
+    // Everything any of them needs, so a refusal is the only thing that can answer.
+    const body = JSON.stringify({ prefix: '/notes', rel: 'x.md', keep: 'textdb', name: 'team', root: tmp.dir, location: tmp.dir });
+    const query = 'prefix=/notes&rel=x.md&path=/notes/open.md';
+    for (const route of routes) {
+      const res = await fetch(`${server.url}${route.url}?${query}`, {
+        method: route.method,
         headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: 'team', root: tmp.dir, location: tmp.dir }),
+        ...(route.method === 'POST' ? { body } : {}),
       });
-      assert.equal(res.status, 403, url);
-      assert.equal(((await res.json()) as { code: string }).code, 'TX005', url);
+      const answered = (await res.json()) as { code?: string };
+      assert.equal(res.status, 403, `${route.method} ${route.url} answered ${res.status}`);
+      assert.equal(answered.code, 'TX005', `${route.method} ${route.url}`);
     }
+  });
+
+  test('an admin-kind token is the owner for them, which is what that kind is for', async (t) => {
+    if (!cli) return t.skip('no textdb CLI build to create an account with');
+    // Past loopback this server requires a token of every request, so without this the person who
+    // started it could not sync their own folders: there would be no bearer that is the owner.
+    const store = path.join(tmp.dir, 'kb.db');
+    execFileSync(cli, ['--store', store, 'account', 'create', 'ops', '--kind', 'admin'], { encoding: 'utf8' });
+    const ops = (
+      JSON.parse(execFileSync(cli, ['--store', store, '--json', 'token', 'create', 'ops'], { encoding: 'utf8' })) as { bearer: string }
+    ).bearer;
+
+    const links = await call('/api/sync/links', ops);
+    assert.equal(links.status, 200, JSON.stringify(links.body));
+    const stores = await call('/api/assets/stores', ops);
+    assert.equal(stores.status, 200, JSON.stringify(stores.body));
+    // The store presents such a session as the owner outright -- no account name, the store's own
+    // paths -- which is why this server can read `admin` and need know nothing about kinds.
+    const who = (await call('/api/whoami', ops)).body;
+    assert.deepEqual(who, { account: null, admin: true, kind: 'owner', namespace: 'store', shares: [] });
   });
 
   test('one corpus per account, and idle ones are closed', async (t) => {
     if (!cli) return t.skip('no textdb CLI build to create an account with');
     // A bearer belongs to a connection, so the pool holds one corpus for this account -- not one
     // per request, and never a shared connection re-authenticated between them.
+    const before = server.corpora.open;
     await call('/api/whoami', bearer);
     await call('/api/whoami', bearer);
-    assert.equal(server.corpora.open, 1);
+    // One more than whatever other accounts this suite has opened, not one in the world: an idle
+    // sweep closes them, and another test's account may still be held.
+    assert.ok(server.corpora.open <= Math.max(before, 1), `${server.corpora.open} corpora for one account`);
   });
 });
 

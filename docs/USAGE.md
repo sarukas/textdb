@@ -309,7 +309,9 @@ connection, so it keeps one corpus per token rather than re-authenticating a sha
 requests. A request with no bearer is the owner, which is right for a server someone runs beside
 their own store and wrong for anything else: `TEXTDB_REQUIRE_TOKEN=1` makes a request without one
 a 401. What that server adds on its own account -- syncing a directory, reading and writing an
-asset store, binding one to its machine -- is the **owner's alone**, and a token session is
+asset store, binding one to its machine -- is the **owner's alone**, and an ordinary account is
 refused it: those act on the machine the server runs on, with its credentials, not the account's.
+An `admin`-kind token passes, because past loopback the server takes a token from everyone and
+that kind is what such a deployment has in place of an owner.
 Everything else it passes through: the delegation commands run as the request's own session, so
 the store refuses whoever may not run them.

@@ -81,6 +81,39 @@ describe('access and asset stores', { skip: cli ? false : 'the textdb CLI is not
     assert.ok(revoked?.revoked_at, 'a revoked token says when it was revoked');
   });
 
+  test('a name that starts with a dash is a name, not a flag', async () => {
+    // Every value a caller supplies is data. Passed bare, `-weird` is a flag to the CLI's parser,
+    // which exits with a usage message and no JSON -- a 500 out of a server, for what is an
+    // ordinary request. The `--` and `--flag=value` forms are what keep that from happening.
+    const made = await access.createAccount('-weird', { kind: 'agent' });
+    assert.equal(made.account, '-weird');
+    const share = await access.grant('-weird', '/notes', 'ro', { alias: '-alias' });
+    assert.deepEqual([share.account, share.alias], ['-weird', '-alias']);
+    assert.deepEqual(
+      (await access.shares({ account: '-weird' })).map((s) => s.alias),
+      ['-alias'],
+    );
+    const minted = await access.createToken('-weird', { label: '-x' });
+    assert.match(minted.bearer, /^tdb_/);
+    assert.equal((await access.tokens('-weird'))[0]?.label, '-x');
+    await access.renameShare('-weird', '-alias', '-other');
+    await access.revokeShare('-weird', '-other');
+    await access.setAccountEnabled('-weird', false);
+    assert.equal((await access.accounts()).find((a) => a.name === '-weird')?.disabled, true);
+  });
+
+  test('a single-root account is converted to aliased shares', async () => {
+    // `--multi` is required by the command and was the bug this suite exists to have caught: the
+    // conversion is one way and changes every path the account sees, so it is spelled out.
+    await access.createAccount('one', { kind: 'agent', root: '/legal' });
+    assert.equal((await access.accounts()).find((a) => a.name === 'one')?.root, '/legal');
+    await access.convertAccount('one', { alias: 'legal' });
+    assert.deepEqual(
+      (await access.shares({ account: 'one' })).map((s) => [s.alias, s.path]),
+      [['legal', '/legal']],
+    );
+  });
+
   test('a store is declared for everyone and bound for this computer', async () => {
     assert.deepEqual(await stores.list(), []);
 

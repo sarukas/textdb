@@ -84,6 +84,16 @@ describe("linkText", () => {
     expect(linkText(link({ kind: "md", target: "./plan.md", alias: "the plan" }))).toBe("[the plan](./plan.md)");
     expect(linkText(link({ kind: "image", target: "img/a.png", alias: null }))).toBe("![](img/a.png)");
   });
+
+  it("writes a bare URL or an autolink as what was typed, not as an empty markdown link", () => {
+    // `<me@e.com>` and a linkified `https://e.com` come back as `md` links with no text of their
+    // own; `[](e.com)` would be a line nobody can find, and these are most of the `external` rows.
+    expect(linkText(link({ kind: "md", target: "me@e.com", alias: null, status: "external" }))).toBe("me@e.com");
+    expect(linkText(link({ kind: "md", target: "https://e.com", alias: null, status: "external" }))).toBe("https://e.com");
+    // An anchor still belongs to it, and a markdown link that does have text keeps its shape.
+    expect(linkText(link({ kind: "md", target: "plan.md", anchor: "Goals", alias: null }))).toBe("plan.md#Goals");
+    expect(linkText(link({ kind: "md", target: "plan.md", anchor: "Goals", alias: "the plan" }))).toBe("[the plan](plan.md#Goals)");
+  });
 });
 
 describe("statusCounts", () => {
@@ -102,6 +112,11 @@ describe("statusCounts", () => {
       { status: "external", n: 1 },
     ]);
     expect(statusCounts([])).toEqual([]);
+  });
+
+  it("puts a status it has never heard of after the ones it can rank, not above broken", () => {
+    const rows = [link({ status: "folder" as "broken" }), link({ status: "broken" }), link({ status: null })];
+    expect(statusCounts(rows).map((c) => c.status)).toEqual(["broken", "folder", null]);
   });
 });
 
