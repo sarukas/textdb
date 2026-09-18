@@ -387,6 +387,8 @@ the pointer's version before uploading as well as before committing.
 
 ## Moving a store (not built)
 
+Tracked as [#17](https://github.com/sarukas/textdb/issues/17).
+
 Moving a store's bytes somewhere else — a new drive, a different provider, a folder reorganised at
 the top — is a migration, not a configuration edit, which is why `--add` on a name whose row points
 elsewhere is refused while pointers name it. What is missing is the thing that would make it safe,
