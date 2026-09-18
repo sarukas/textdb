@@ -2503,6 +2503,11 @@ fn m_a_push_by_an_account_keeps_bytes_a_pointer_it_cannot_see_still_names() {
             .find_map(|l| l.strip_prefix("item: "))
             .unwrap_or_else(|| panic!("M10: the pointer does not say where its bytes are:\n{pointer}"))
             .to_string();
+        // The bytes belong where the owner's path for this asset says, not where the account's
+        // does: one store is one place, and its layout cannot be one caller's view of it. The
+        // account holds `/legal/contracts` as `/contracts`, and its push still lands under
+        // `legal/contracts`.
+        assert_eq!(item, "/legal/contracts/x.png", "M10: the store was laid out in the account's namespace");
         let held = bucket.join(item.trim_start_matches('/'));
         assert_eq!(std::fs::read(&held).unwrap(), [137u8, 80, 78, 71, 0, 1], "M10: the push did not put the bytes in the store");
 

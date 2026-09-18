@@ -31,8 +31,8 @@ implementer's view.
 ## Where the assets work does not fit it
 
 Until this branch there was not one `whoami` under `crates/textdb-cli/src/assets/`, and no test
-paired an asset with an account or a token. Five consequences, the first of which lost data and is
-now answered by the store; the rest are open.
+paired an asset with an account or a token. Five consequences: the first lost data and the second
+laid a store out differently for every caller, both now answered; the rest are open.
 
 ### 1. A delete can take away bytes another account still points at
 
@@ -67,15 +67,25 @@ Two things stay conservative for an account, deliberately: `verify` does not lis
 files (that needs the set-shaped question, not a count for one location), and a Postgres connection
 under an enforced policy is told "cannot tell", so it keeps the bytes.
 
-### 2. What a push records is in the caller's namespace
+### 2. What a push records is the owner's path
 
-A push records where it put the bytes, and names that place in the paths the caller uses. The same
-asset pushed by the owner lands at `<root>/legal/contracts/x.png`, and by an account holding
-`/legal/contracts` as `/contracts` at `<root>/contracts/x.png`. So a store's layout depends on who
-pushed, two accounts with different aliases for one folder fill two places in it, and a pointer's
-`item` means what it says only beside the view that wrote it. Nothing is lost by it — the pointer
-names the file it made — but it is not what "the store mirrors the vault" implies, and it should
-either be the store's own paths or be documented as the caller's.
+**Done.** A push puts an asset's bytes where the owner's path for it says, whoever pushed: the
+caller's path goes through `Store::owner_paths` first, which is lexical on both engines
+(`access::to_store`, `kb.to_store`), so it answers for a path nothing is at yet — which is where a
+push is when it asks.
+
+Before this, the same document's asset landed at `<root>/legal/contracts/x.png` for the owner and
+`<root>/contracts/x.png` for an account holding that folder as `/contracts`. A store's layout
+depended on who pushed to it, two accounts with different aliases for one folder filled two places
+with one asset, and an alias could collide with a real folder of the same name.
+
+What it costs: a pointer names its item explicitly, so an account's pointer carries the owner's
+path for its bytes — the layout its own paths are a projection of. Leaving the item out where it
+equals the asset's own place would hide that, and is wrong: a pointer is a document, so it is
+copied and it is moved, and an item meaning "wherever this pointer is now" would have a copy naming
+bytes nobody put there and a move quietly changing what an asset is made of. That disclosure is
+accepted, and worth knowing before granting a share to somebody who must not learn the central
+layout.
 
 ### 3. A pointer names bytes; nothing checks that they are the account's to name
 

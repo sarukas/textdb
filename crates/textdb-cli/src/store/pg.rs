@@ -1210,6 +1210,24 @@ impl Store for PgStore {
         Ok(self.client.query_one("SELECT kb.last_seq()", &[]).map_err(pg)?.get(0))
     }
 
+    fn owner_paths(&mut self, paths: &[String]) -> Result<Vec<String>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One statement for the whole vault rather than a round trip per asset. `kb.to_store` is
+        // lexical -- an alias stands for a subtree -- so it answers for a path nothing is at yet,
+        // which is where a push is when it asks.
+        let rows = self
+            .client
+            .query("SELECT kb.to_store(p) FROM unnest($1::text[]) WITH ORDINALITY AS t(p, i) ORDER BY i", &[&paths])
+            .map_err(pg)?;
+        Ok(paths
+            .iter()
+            .zip(rows)
+            .map(|(given, r)| r.get::<_, Option<String>>(0).unwrap_or_else(|| given.clone()))
+            .collect())
+    }
+
     fn asset_item_users(&mut self, store: &str, location: &str, own: &str) -> Result<Option<crate::store::ItemUsers>> {
         use crate::assets::pointer::{asset_path, SUFFIX};
         use crate::assets::{location_key, pointer_names};
@@ -1222,16 +1240,9 @@ impl Store for PgStore {
             return Ok(None);
         }
         let want = (store.to_string(), location_key(location));
-        // The asset's own path is the caller's; `kb.node` holds the store's. Translated here, or an
-        // account's own pointer counts as somebody else's and its bytes are never its own to
-        // replace.
-        let mine = self
-            .client
-            .query_one("SELECT kb.resolve($1)", &[&own])
-            .ok()
-            .and_then(|r| r.try_get::<_, Option<String>>(0).ok().flatten())
-            .unwrap_or_else(|| own.to_string());
-        let mine = location_key(&mine);
+        // `own` is already the owner's path, as `kb.node` holds: the assets it is compared with
+        // are the store's own, not a view's.
+        let mine = location_key(own);
         let like = format!("%{SUFFIX}");
         // `kb.node` and not a view: the views answer in the caller's namespace, which is the very
         // thing this question has to see past. Counts are all that leaves this method.

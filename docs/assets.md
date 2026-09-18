@@ -225,6 +225,10 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
   binding uses its root when that is an absolute path. `textdb assets stores` shows each binding
   and whether the store is reachable.
 - Layout: the asset at store path `/accounts/acme/arch.png` is kept at `<root>/accounts/acme/arch.png`.
+  Those are the owner's paths. Where a store delegates folders to accounts, an account's own paths
+  are a projection of them, and a push translates back before choosing where bytes go: one store is
+  one place, and its layout is the same whoever pushed to it. A pointer therefore names an item in
+  the owner's paths, which an account can read in its own pointers.
 - **local driver**: plain filesystem operations (works for a NAS, a USB disk, and Google Drive for
   Desktop / OneDrive clients in mirror mode). Item = path. Copies go through a hidden partial file
   (`.NAME.HOST-PID-NANOS.tdbpart`; one a process of this computer that is no longer running left

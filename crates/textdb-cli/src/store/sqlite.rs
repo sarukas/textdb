@@ -988,6 +988,13 @@ impl Store for SqliteStore {
         Ok(stats)
     }
 
+    fn owner_paths(&mut self, paths: &[String]) -> Result<Vec<String>> {
+        let db = self.db();
+        // Lexical: an alias stands for a subtree, so a path translates whether or not anything is
+        // there yet -- which is the case a push is in, naming where bytes are about to go.
+        Ok(paths.iter().map(|p| db.store_path(p).unwrap_or_else(|_| p.clone())).collect())
+    }
+
     fn asset_item_users(&mut self, store: &str, location: &str, own: &str) -> Result<Option<crate::store::ItemUsers>> {
         use crate::assets::pointer::{asset_path, SUFFIX};
         use crate::assets::{location_key, pointer_names};
@@ -996,10 +1003,9 @@ impl Store for SqliteStore {
         // every account of the store shares, and an answer from one account's view has it taking
         // away another's. Counts are all that leaves: the paths read here stay here.
         let want = (store.to_string(), location_key(location));
-        // The asset's own path is the caller's; the paths read below are the store's. Translated
-        // here, or an account's own pointer counts as somebody else's and its bytes are never its
-        // own to replace.
-        let mine = location_key(&self.db().store_path(own).unwrap_or_else(|_| own.to_string()));
+        // `own` is already the owner's path, as the paths read below are: the assets it is
+        // compared with are the store's own, not a view's.
+        let mine = location_key(own);
         let like = format!("%{SUFFIX}");
         let paths: Vec<String> = self
             .conn

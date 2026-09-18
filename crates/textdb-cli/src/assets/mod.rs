@@ -473,6 +473,12 @@ impl VaultCache {
 pub struct Item {
     /// The asset's path in the store.
     pub path: String,
+    /// The same asset in the owner's namespace, which is where its bytes belong in an asset store:
+    /// one store is shared by every account, so its layout cannot be one caller's view of it. Equal
+    /// to `path` for the owner, and never sent anywhere -- an account is not told the layout its
+    /// own paths are a projection of.
+    #[serde(skip)]
+    pub owner_path: String,
     /// `ok`, `new`, `modified`, `outdated`, `conflict`, `not-pulled`, `conflict-copy`, `orphan`,
     /// `invalid-pointer` or `invalid-path`; and from what the asset store itself holds,
     /// `moved-here` (the asset moved in textdb while its file stayed where it was),
@@ -527,6 +533,8 @@ impl Item {
     fn new(v: &Vault, rel: &str) -> Item {
         Item {
             path: store_path(&v.prefix, rel),
+            // The caller's until a store translates it, which is right for the owner already.
+            owner_path: store_path(&v.prefix, rel),
             state: "ok",
             size: None,
             store: None,
@@ -548,6 +556,17 @@ impl Item {
 
 fn in_scope(scope: &[String], path: &str) -> bool {
     scope.is_empty() || scope.iter().any(|s| under(s, path))
+}
+
+/// Where each of these assets belongs in an asset store: its path in the owner's namespace. Asked
+/// of the store in one go, and only of a store that answers -- for the owner every path is already
+/// its own.
+fn owner_places(st: &mut dyn Store, items: &mut [Item]) -> Result<()> {
+    let asked: Vec<String> = items.iter().map(|i| i.path.clone()).collect();
+    for (item, owner) in items.iter_mut().zip(st.owner_paths(&asked)?) {
+        item.owner_path = owner;
+    }
+    Ok(())
 }
 
 fn items(v: &Vault, scan: &Scan, cache: &mut VaultCache, scope: &[String]) -> Result<Vec<Item>> {
@@ -774,7 +793,7 @@ pub(crate) fn mark_store_states(items: &mut [Item], mut ask: impl FnMut(&str, &s
             Ok(Some(f)) => {
                 // Compared as the store compares its own locations: a path differing only in letter
                 // case is the same place, not a move that could never be settled.
-                let elsewhere = location_key(&f.path) != location_key(&item.path);
+                let elsewhere = location_key(&f.path) != location_key(&item.owner_path);
                 if elsewhere {
                     item.in_store = Some(f.path.clone());
                 }
@@ -866,6 +885,7 @@ pub fn status(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
     let mut cache = VaultCache::open(&v);
     let scope = scope_of(&path.map(str::to_string).into_iter().collect::<Vec<_>>())?;
     let mut items = items(&v, &scan, &mut cache, &scope)?;
+    owner_places(st, &mut items)?;
     // The stores are asked what they hold, so a file moved, replaced, trashed or doubled there
     // shows as its own state; a store that cannot be reached says so and changes nothing.
     let unasked = match StoreFiles::new(st) {
@@ -1155,12 +1175,12 @@ impl InUse {
             .pointer
             .as_ref()
             .filter(|p| p.store == store && !gone)
-            .map(|p| (p.item.clone().unwrap_or_else(|| item.path.clone()), p.sha256.as_str()));
+            .map(|p| (p.item.clone().unwrap_or_else(|| item.owner_path.clone()), p.sha256.as_str()));
         let Some((location, sha)) = own else {
-            return Ok((item.path.clone(), None));
+            return Ok((item.owner_path.clone(), None));
         };
-        match self.shared(st, store, &location, &item.path)? {
-            true => Ok((item.path.clone(), None)),
+        match self.shared(st, store, &location, &item.owner_path)? {
+            true => Ok((item.owner_path.clone(), None)),
             false => Ok((location, Some(sha))),
         }
     }
@@ -1215,7 +1235,7 @@ fn push_one(
         .filter(|p| p.store == store)
         .and_then(|p| p.item.as_deref())
         .filter(|i| !i.starts_with('/'))
-        .is_some_and(|i| matches!(d.size(&item.path, Some(i)), Ok(None)));
+        .is_some_and(|i| matches!(d.size(&item.owner_path, Some(i)), Ok(None)));
     // The target's lock is held until the pointer is committed, and which pointers name the
     // target is read again once it is held: a push that reuses bytes already there commits its
     // pointer before another push may decide to replace them.
@@ -1270,6 +1290,11 @@ fn push_one(
         size,
         media_type: pointer::media_type(&item.rel).to_string(),
         store: store.clone(),
+        // Always named, even where it is this asset's own place in the store. A pointer is a
+        // document: it is copied and it is moved, and an item left to mean "wherever this pointer
+        // is now" would have a copy naming bytes nobody put there and a move quietly renaming what
+        // an asset is made of. What it costs is that an account's pointer carries the owner's path
+        // for its bytes, which is the layout its own paths are a projection of.
         item: named,
         item_path,
         extra: old.map(|p| p.extra.clone()).unwrap_or_default(),
@@ -1441,7 +1466,8 @@ pub(crate) fn store_folders_inside(st: &mut dyn Store, dir: &Path) -> Vec<String
 pub(crate) fn not_pulled_after_conflict(st: &mut dyn Store, v: &Vault) -> Result<BTreeSet<String>> {
     let scan = scan(st, v)?;
     let mut cache = VaultCache::open(v);
-    let found = items(v, &scan, &mut cache, &[])?;
+    let mut found = items(v, &scan, &mut cache, &[])?;
+    owner_places(st, &mut found)?;
     cache.save();
     let originals: HashSet<String> = found.iter().filter(|i| i.state == "conflict-copy").filter_map(|i| pairing::original_of(&i.rel)).collect();
     Ok(found.iter().filter(|i| i.state == "not-pulled" && originals.contains(&i.rel)).map(|i| i.path.clone()).collect())
@@ -1457,6 +1483,7 @@ pub(crate) fn counts_and_moves(st: &mut dyn Store, v: &Vault, save: bool, stores
     let scan = scan(st, v)?;
     let mut cache = VaultCache::open(v);
     let mut found = items(v, &scan, &mut cache, &[])?;
+    owner_places(st, &mut found)?;
     // Whose stores to ask is the caller's to say, so a sync asks one set of them for its pull, its
     // states and its deletions alike. A dry run asks nothing of anyone's provider -- it says what a
     // sync would do here, and reaching a drive to tell of a move is not that -- so it passes none.
@@ -1551,7 +1578,8 @@ pub(crate) fn push_run(st: &mut dyn Store, v: &Vault, scope: &[String], o: &Push
     check_scope(v, scope)?;
     let scan = scan(st, v)?;
     let mut cache = VaultCache::open(v);
-    let found = items(v, &scan, &mut cache, scope)?;
+    let mut found = items(v, &scan, &mut cache, scope)?;
+    owner_places(st, &mut found)?;
     let mut drivers = Drivers::new(st)?;
     let names = drivers.names();
     // The pointers this directory's last sync had: one only on disk now was deleted in the store.
@@ -1665,6 +1693,7 @@ pub(crate) fn pull_run(
     let scan = scan(st, v)?;
     let mut cache = VaultCache::open(v);
     let mut found = items(v, &scan, &mut cache, scope)?;
+    owner_places(st, &mut found)?;
     // The caller's stores when it has them -- a sync's pull, states and deletions then list a drive
     // and open its drivers once between them -- and this command's own otherwise.
     let mut owned = None;
@@ -1740,7 +1769,7 @@ pub(crate) fn pull_run(
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
             .map_err(|e| e.to_string())
-            .and_then(|_| d.get(&item.path, p.item.as_deref(), &part).map_err(|e| e.message))
+            .and_then(|_| d.get(&item.owner_path, p.item.as_deref(), &part).map_err(|e| e.message))
             .and_then(|_| hash_file(&part).map_err(|e| e.to_string()))
             .and_then(|(sha, size)| match (follows_store, sha == p.sha256 && size == p.size) {
                 (false, false) => Err("the asset store holds other bytes than its pointer names (textdb assets verify)".to_string()),
@@ -1868,6 +1897,7 @@ pub(crate) fn relocate_run(st: &mut dyn Store, v: &Vault, scope: &[String], auth
     let scan = scan(st, v)?;
     let mut cache = VaultCache::open(v);
     let mut found = items(v, &scan, &mut cache, scope)?;
+    owner_places(st, &mut found)?;
     let mut files = StoreFiles::new(st)?;
     let mut r = RelocateReport::default();
     r.kept.extend(mark_store_states(&mut found, |store, item| files.found(store, item)));
@@ -1890,21 +1920,21 @@ pub(crate) fn relocate_run(st: &mut dyn Store, v: &Vault, scope: &[String], auth
         if dry_run {
             // What would keep the file where it is is known without moving anything, so a dry run
             // says `kept` for those rather than promising a move it would not make.
-            match files.keeps(st, &p.store, named, &item.path)? {
+            match files.keeps(st, &p.store, named, &item.owner_path)? {
                 Some(StoreCopy::LeftBecause(why)) => r.kept.push(format!("{}: {why}", item.path)),
                 Some(_) => r.kept.push(format!("{}: another pointer names those bytes, so they stay where they are", item.path)),
                 None => r.moved.push(row),
             }
             continue;
         }
-        match files.moved(st, &p.store, named, &item.path, &item.path) {
+        match files.moved(st, &p.store, named, &item.owner_path, &item.owner_path) {
             // The item the pointer names after the move: on Google Drive the file's id, which a move
             // leaves alone. The pointer is written all the same, because it records where the store
             // keeps the bytes, and that is what just changed -- against the version this scan saw,
             // so a pointer someone else committed meanwhile is not written over.
             Ok(StoreMove::Moved(now)) if now.as_deref().is_none_or(|now| now == named) => {
                 let mut settled = p.clone();
-                settled.item_path = Some(item.path.clone());
+                settled.item_path = Some(item.owner_path.clone());
                 let pointer_path = format!("{}{SUFFIX}", item.path);
                 // Read again right before writing, as a push does: a write against a version this
                 // scan saw would otherwise be merged line by line with a pointer someone else
@@ -1944,11 +1974,11 @@ pub(crate) fn relocate_run(st: &mut dyn Store, v: &Vault, scope: &[String], auth
     for item in found.iter().filter(|i| !dry_run && i.in_store.is_none() && !i.disk_differs) {
         let Some(p) = &item.pointer else { continue };
         let Some(named) = p.item.as_deref() else { continue };
-        if named.starts_with('/') || p.item_path.as_deref().is_none_or(|r| location_key(r) == location_key(&item.path)) {
+        if named.starts_with('/') || p.item_path.as_deref().is_none_or(|r| location_key(r) == location_key(&item.owner_path)) {
             continue;
         }
         let mut settled = p.clone();
-        settled.item_path = Some(item.path.clone());
+        settled.item_path = Some(item.owner_path.clone());
         let pointer_path = format!("{}{SUFFIX}", item.path);
         if st.stat(&pointer_path).ok().and_then(|s| s.version) != item.version {
             continue;
@@ -1971,7 +2001,8 @@ pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
     let scope = scope_of(&path.map(str::to_string).into_iter().collect::<Vec<_>>())?;
     let mut cache = VaultCache::open(&v);
     cache.fresh = true;
-    let found = items(&v, &scan, &mut cache, &scope)?;
+    let mut found = items(&v, &scan, &mut cache, &scope)?;
+    owner_places(st, &mut found)?;
     cache.save();
     let mut drivers = Drivers::new(st)?;
     let mut rows = Vec::new();
@@ -1986,7 +2017,7 @@ pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
             (Some(p), _) => {
                 let checked = match drivers.get(&p.store) {
                     Err(e) => Err(e),
-                    Ok(d) => d.hash(&item.path, p.item.as_deref()).map_err(|e| e.message),
+                    Ok(d) => d.hash(&item.owner_path, p.item.as_deref()).map_err(|e| e.message),
                 };
                 match checked {
                     Ok(Some((sha, _))) if sha == p.sha256 => "ok".to_string(),

@@ -903,6 +903,17 @@ pub trait Store {
     /// The asset stores declared in this store, by name.
     fn asset_stores(&mut self) -> Result<Vec<AssetStore>>;
 
+    /// The same paths in the owner's namespace: what an account's view is a projection of.
+    ///
+    /// An asset store is one place, shared by every account of the store, so where an asset's
+    /// bytes belong in it is the owner's path for that asset and not the caller's -- otherwise a
+    /// store's layout depends on who pushed to it, and one document's asset fills two places when
+    /// two accounts hold its folder under different names. A path that cannot be translated comes
+    /// back as it was given. Asked for a vault at a time, since a store may answer over a network.
+    fn owner_paths(&mut self, paths: &[String]) -> Result<Vec<String>> {
+        Ok(paths.to_vec())
+    }
+
     /// Whether any pointer other than the asset `own`'s names `location` in the asset store
     /// `store`, answered over every pointer this store holds and not the caller's view.
     ///
