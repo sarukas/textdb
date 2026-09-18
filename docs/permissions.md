@@ -175,10 +175,16 @@ move of the bytes, written up as "Moving a store (not built)" in [`assets.md`](a
    (a 403 naming its reason, which rclone passes through), carries it as `forbidden` rather than
    as a failure, and an asset whose store refused this computer is `not-permitted` — over an `ok`
    one, as the other store-side states are. `verify` says `refused:` where it used to say
-   `unchecked:`. What remains of this row is presentation: the store-side states still read as
-   facts about the asset where several of them are facts about this computer's access.
+   `unchecked:`. Whose fact it is, is said on every surface that shows it: the note beside the
+   state in `assets status` ("its asset store team refused *this computer* the file"), `verify`'s
+   two columns, the state table in [`assets.md`](assets.md), and in the web pane both the note and
+   the badge's own words. What is *not* done is structural, and is not obviously right: splitting an
+   asset's `state` into an asset-side field and a store-side one. `conflict` is what makes it
+   awkward — it is a here-state that only a store-side fact produces (changed here *and* there), so
+   two fields would have to be recombined by every reader to get back the one summary they are
+   given now.
 
-What is left is presentation (step 5) and, outside this file, the store-to-store move.
+What is left is the choice in step 5, and outside this file the store-to-store move.
 
 ## What runs it
 
