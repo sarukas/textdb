@@ -2772,3 +2772,120 @@ button.crumb:hover {
   font-size: 0.85em;
   font-style: italic;
 }
+
+/* ---------------------------------------------------------------- the session
+
+   Who this browser is talking as. The owner needs no token; an account holds shares, and what it
+   holds is worth showing, because every path on screen is then that account's own. */
+.session {
+  position: relative;
+}
+
+.session-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  max-width: 14rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.session-owner {
+  background: var(--accent, #6aa9ff);
+}
+
+.session-account {
+  background: #3fb950;
+}
+
+.session-panel {
+  position: absolute;
+  top: calc(100% + 0.4rem);
+  right: 0;
+  z-index: 40;
+  width: 20rem;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  background: var(--panel, #161b22);
+  border: 1px solid var(--border, #30363d);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 35%);
+}
+
+.session-who {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.session-kind,
+.session-dormant {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.session-shares {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.session-shares li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.rights {
+  font-size: 0.75em;
+  padding: 0.05rem 0.35rem;
+  border-radius: 999px;
+  border: 1px solid var(--border, #30363d);
+  color: var(--muted);
+}
+
+.rights-rw {
+  color: #3fb950;
+  border-color: #23863644;
+}
+
+.session-note,
+.session-problem {
+  margin: 0;
+  font-size: 0.85em;
+  color: var(--muted);
+}
+
+.session-problem {
+  color: #f85149;
+}
+
+.session-field input {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--mono, monospace);
+}
+
+.session-actions {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.store-backend {
+  color: var(--muted);
+  font-variant: small-caps;
+}

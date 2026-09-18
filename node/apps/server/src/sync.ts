@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { type Corpus, type ErrorCode, NotFound, type SyncState } from '@textdb/node';
+import { type CorpusApi, type ErrorCode, NotFound, type SyncState } from '@textdb/node';
 import type { SyncLinkConfig } from './config.ts';
 import { badRequest, CodedError } from './errors.ts';
 import { resolveMarkers } from './markers.ts';
@@ -63,11 +63,11 @@ export function runCli(cli: string, args: string[]): Promise<{ stdout: string; s
  */
 export class SyncService {
   readonly links: SyncLinkConfig[];
-  private readonly corpus: Corpus;
+  private readonly corpus: CorpusApi;
   private readonly cli: string | null;
   private readonly running = new Set<string>();
 
-  constructor(corpus: Corpus, links: SyncLinkConfig[], cli: string | null) {
+  constructor(corpus: CorpusApi, links: SyncLinkConfig[], cli: string | null) {
     this.corpus = corpus;
     this.links = links;
     this.cli = cli;
@@ -89,23 +89,30 @@ export class SyncService {
     }
   }
 
-  list(): SyncLinks {
+  async list(): Promise<SyncLinks> {
     return {
       available: this.cli !== null,
       reason: this.cli ? null : 'The textdb CLI was not found: build it (cargo build --release -p textdb-cli) or set TEXTDB_CLI.',
-      links: this.links.map((link) => ({
-        ...link,
-        exists: existsSync(link.dir),
-        running: this.running.has(link.prefix),
-        last: this.state(link),
-      })),
+      links: await Promise.all(
+        this.links.map(async (link) => ({
+          ...link,
+          exists: existsSync(link.dir),
+          running: this.running.has(link.prefix),
+          last: await this.state(link),
+        })),
+      ),
     };
+  }
+
+  /** Why syncing is unavailable, without asking the store anything. */
+  get unavailable(): string | null {
+    return this.cli ? null : 'The textdb CLI was not found: build it (cargo build --release -p textdb-cli) or set TEXTDB_CLI.';
   }
 
   async run(prefix: string, options: RunOptions): Promise<unknown> {
     const link = this.link(prefix);
     const cli = this.cli;
-    if (!cli) throw badRequest(this.list().reason ?? 'syncing is unavailable');
+    if (!cli) throw badRequest(this.unavailable ?? 'syncing is unavailable');
     if (options.base !== undefined && (!REV.test(options.base) || options.base.startsWith('-'))) {
       throw badRequest(`base must name a commit: ${options.base}`);
     }
@@ -134,13 +141,13 @@ export class SyncService {
   }
 
   /** A file the last sync left conflict markers in, as it is on disk. */
-  conflict(prefix: string, rel: string): { rel: string; text: string } {
-    return { rel, text: readFileSync(this.conflictFile(prefix, rel), 'utf8') };
+  async conflict(prefix: string, rel: string): Promise<{ rel: string; text: string }> {
+    return { rel, text: readFileSync(await this.conflictFile(prefix, rel), 'utf8') };
   }
 
   /** Keep one side of every conflict in `rel`, then sync, so the resolution reaches the store. */
   async resolve(prefix: string, rel: string, keep: 'textdb' | 'disk', author: string | undefined): Promise<unknown> {
-    const file = this.conflictFile(prefix, rel);
+    const file = await this.conflictFile(prefix, rel);
     if (this.running.has(prefix)) throw new CodedError('TX002', `${prefix} is being synced already; try again when it finishes`);
     writeFileSync(file, resolveMarkers(readFileSync(file, 'utf8'), keep));
     return this.run(prefix, { author });
@@ -153,7 +160,7 @@ export class SyncService {
     return link;
   }
 
-  private state(link: SyncLinkConfig): SyncState | null {
+  private async state(link: SyncLinkConfig): Promise<SyncState | null> {
     let dir = link.dir;
     try {
       dir = realpathSync.native(link.dir);
@@ -164,9 +171,9 @@ export class SyncService {
   }
 
   /** Only files the last sync recorded as conflicted can be read or rewritten. */
-  private conflictFile(prefix: string, rel: string): string {
+  private async conflictFile(prefix: string, rel: string): Promise<string> {
     const link = this.link(prefix);
-    if (!this.state(link)?.conflicts.includes(rel)) {
+    if (!(await this.state(link))?.conflicts.includes(rel)) {
       throw new NotFound(`${rel} has no conflict markers from a sync of ${prefix}`);
     }
     return path.join(link.dir, ...rel.split('/'));

@@ -189,7 +189,7 @@ export class AssetService {
   }
 
   async status(prefix: string, scope?: string): Promise<AssetStatus> {
-    const link = this.syncedLink(prefix);
+    const link = await this.syncedLink(prefix);
     const [target] = this.targets(link.prefix, scope === undefined ? [] : [scope]);
     const status = (await this.run(['assets', 'status', '--dir', link.dir, '--', target!], 'assets')) as unknown as AssetStatus;
     if (status.prefix !== link.prefix) {
@@ -201,8 +201,8 @@ export class AssetService {
     return status;
   }
 
-  pull(prefix: string, paths: string[], author: string | undefined): Promise<Record<string, unknown>> {
-    const link = this.syncedLink(prefix);
+  async pull(prefix: string, paths: string[], author: string | undefined): Promise<Record<string, unknown>> {
+    const link = await this.syncedLink(prefix);
     const targets = this.targets(link.prefix, paths);
     const who = argument('author', author);
     return this.sync.exclusive(link.prefix, async () => {
@@ -211,8 +211,8 @@ export class AssetService {
     });
   }
 
-  push(prefix: string, paths: string[], message: string | undefined, author: string | undefined): Promise<Record<string, unknown>> {
-    const link = this.syncedLink(prefix);
+  async push(prefix: string, paths: string[], message: string | undefined, author: string | undefined): Promise<Record<string, unknown>> {
+    const link = await this.syncedLink(prefix);
     const targets = this.targets(link.prefix, paths);
     const args = ['assets', 'push', '--dir', link.dir];
     const text = argument('message', message);
@@ -251,9 +251,10 @@ export class AssetService {
   }
 
   /** The folder as this server syncs it, once it has been synced (before, the CLI would take a path inside it for the folder). */
-  private syncedLink(prefix: string): SyncLinkConfig {
+  private async syncedLink(prefix: string): Promise<SyncLinkConfig> {
     const link = this.sync.link(prefix);
-    if (!this.sync.list().links.find((l) => l.prefix === link.prefix)?.last) {
+    const links = (await this.sync.list()).links;
+    if (!links.find((l) => l.prefix === link.prefix)?.last) {
       throw new CodedError('TX004', `${link.prefix} has not been synced with ${link.dir} yet: sync it first`);
     }
     return link;
@@ -284,7 +285,7 @@ export class AssetService {
    */
   private async run(args: string[], key: string, author?: string): Promise<Record<string, unknown>> {
     const cli = this.sync.cliPath;
-    if (!cli) throw badRequest(this.sync.list().reason ?? 'the textdb CLI was not found');
+    if (!cli) throw badRequest(this.sync.unavailable ?? 'the textdb CLI was not found');
     const global = ['--store', this.db, '--json'];
     // One argument, so a name starting with a dash is a name.
     if (author) global.push(`--author=${author}`);

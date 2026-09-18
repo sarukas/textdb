@@ -8,6 +8,7 @@ import {
   type PurgeStats,
   type Subscription,
   type SyncLinks,
+  type Whoami,
 } from "./api";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { AssetPane } from "./components/AssetPane";
@@ -68,6 +69,8 @@ export function App() {
   const [initial] = useState(() => parseHash(location.hash));
   const [author, setAuthor] = useAuthor();
   const [info, setInfo] = useState<Info | null>(null);
+  /** Who this session is: the owner, or the account whose token it presented. */
+  const [who, setWho] = useState<Whoami | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [lastSeq, setLastSeq] = useState(0);
   const [feed, setFeed] = useState<FeedItem[]>([]);
@@ -157,6 +160,10 @@ export function App() {
         const i = await api.info();
         if (stopped) return;
         setInfo(i);
+        api.whoami().then(
+          (w) => !stopped && setWho(w),
+          () => {},
+        );
         setLastSeq((s) => Math.max(s, i.last_seq));
         sub = subscribe(i.last_seq, {
           onEvent: (e) => {
@@ -264,6 +271,13 @@ export function App() {
   return (
     <div className={`app${feedOpen ? "" : " feed-collapsed"}`}>
       <Header
+        who={who}
+        onWho={(w) => {
+          setWho(w);
+          // Every path in the app is this session's own, so nothing that was fetched as somebody
+          // else can stay on screen.
+          location.reload();
+        }}
         info={info}
         connection={connection}
         lastSeq={lastSeq}

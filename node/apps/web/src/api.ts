@@ -6,6 +6,20 @@ export interface Info {
   db: string;
   files: number;
   last_seq: number;
+  /** Which engine answers: a client must not offer what this one cannot do. */
+  backend: "sqlite" | "postgres";
+  /** Null for the owner. */
+  account: string | null;
+  capabilities: Capabilities;
+}
+
+/** What this backend can do; see docs/shapes.md and the SDK's `Capabilities`. */
+export interface Capabilities {
+  /** The trash, and purging it: SQLite stores only. */
+  trash: boolean;
+  /** Undoing one `sql --write` batch: SQLite stores only. */
+  revertBatch: boolean;
+  syncState: boolean;
 }
 
 export type NodeKind = "file" | "folder";
@@ -388,8 +402,46 @@ export function assetFileUrl(prefix: string, path: string, download = false): st
   return `/api/assets/file?${qs({ prefix, path, download: download ? 1 : undefined })}`;
 }
 
+/**
+ * The bearer this session presents, or null for the owner.
+ *
+ * Kept in `sessionStorage`, so it lives as long as the tab and does not follow the browser into
+ * tomorrow: a token is a credential, and one left in `localStorage` outlives the reason it was
+ * pasted. The server answers as the owner without one, unless it was started to refuse that.
+ */
+let bearer: string | null = readToken();
+
+function readToken(): string | null {
+  try {
+    return sessionStorage.getItem("textdb.token");
+  } catch {
+    // A browser with storage switched off still works; it just forgets on reload.
+    return null;
+  }
+}
+
+export function token(): string | null {
+  return bearer;
+}
+
+/** Present this bearer from here on; null goes back to being the owner. */
+export function setToken(value: string | null): void {
+  bearer = value && value.trim() ? value.trim() : null;
+  try {
+    if (bearer) sessionStorage.setItem("textdb.token", bearer);
+    else sessionStorage.removeItem("textdb.token");
+  } catch {
+    // As above: the session still works, it just will not survive a reload.
+  }
+}
+
+/** Every request carries the bearer, so one place decides who is asking. */
+function authHeaders(): Record<string, string> {
+  return bearer ? { authorization: `Bearer ${bearer}` } : {};
+}
+
 async function request<T>(method: string, url: string, body?: unknown, signal?: AbortSignal): Promise<T> {
-  const init: RequestInit = { method, headers: { accept: "application/json" } };
+  const init: RequestInit = { method, headers: { accept: "application/json", ...authHeaders() } };
   if (signal) init.signal = signal;
   if (body !== undefined) {
     init.headers = { ...init.headers, "content-type": "application/json" };
@@ -438,6 +490,20 @@ export interface PropertyHit {
 
 export const api = {
   info: () => request<Info>("GET", "/api/info"),
+  /** Who this session is and what it can reach. */
+  whoami: () => request<Whoami>("GET", "/api/whoami"),
+  /**
+   * Log in with a bearer, or out with null.
+   *
+   * The server checks the token before it hands out a session, so a refusal here means the token
+   * does not work -- and the session it sets is a cookie the page cannot read, which is what the
+   * change feed and an asset's bytes travel on.
+   */
+  login: async (value: string | null): Promise<Whoami> => {
+    const who = await request<Whoami>("POST", "/api/session", { token: value });
+    setToken(value);
+    return who;
+  },
   ls: (path: string, signal?: AbortSignal) => request<LsEntry[]>("GET", `/api/ls?${qs({ path })}`, undefined, signal),
   list: (path: string, q: ListQuery, signal?: AbortSignal) =>
     request<ListPage>(
@@ -455,7 +521,10 @@ export const api = {
     request<{ hashes: { path: string; sha256: string }[] }>("POST", "/api/export/hashes", { paths }, signal),
   /** A file's stored bytes, unchanged. */
   exportBytes: async (path: string, signal?: AbortSignal): Promise<Uint8Array> => {
-    const res = await fetch(`/api/export/file?${qs({ path })}`, signal ? { signal } : {});
+    const res = await fetch(`/api/export/file?${qs({ path })}`, {
+      headers: authHeaders(),
+      ...(signal ? { signal } : {}),
+    });
     if (!res.ok) {
       const text = await res.text();
       let e: { code?: string; message?: string } = {};

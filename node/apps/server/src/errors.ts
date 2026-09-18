@@ -14,15 +14,30 @@ export interface ErrorBody {
 /** An error in the store's terms raised by the server itself, e.g. one the textdb CLI reported. */
 export class CodedError extends Error {
   readonly code: ErrorCode;
+  /** The status to answer with, where the code's own is not the right one. */
+  readonly status: number | undefined;
 
-  constructor(code: ErrorCode, message: string) {
+  constructor(code: ErrorCode, message: string, status?: number) {
     super(message);
     this.code = code;
+    this.status = status;
   }
 }
 
+/**
+ * No bearer, where this server takes none without one: 401, not 403.
+ *
+ * The difference is worth keeping: 401 says "say who you are", 403 says "you did, and no". The
+ * store's own codes have no word for the first, because the store is never asked without one.
+ */
+export function unauthorized(message: string): CodedError {
+  return new CodedError('TX005', message, 401);
+}
+
 export function errorResponse(c: Context, error: unknown): Response {
-  if (error instanceof CodedError) return c.json({ code: error.code, message: error.message }, STATUS[error.code]);
+  if (error instanceof CodedError) {
+    return c.json({ code: error.code, message: error.message }, (error.status ?? STATUS[error.code]) as 400);
+  }
   const err = toTextdbError(error);
   const body: ErrorBody = { code: err.code, message: err.message };
   if (err instanceof Conflict) body.conflict = err.payload;

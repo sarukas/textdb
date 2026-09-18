@@ -51,7 +51,7 @@ describe('sync with a directory', { skip: cli ? false : 'the textdb CLI is not b
     mkdirSync(notes);
     writeFileSync(path.join(notes, 'a.md'), 'one\ntwo\nthree\n');
     server = await startServer({
-      db: path.join(tmp.dir, 'kb.db'),
+      store: path.join(tmp.dir, 'kb.db'),
       port: 0,
       webDist: path.join(tmp.dir, 'web'),
       pingMs: 100,

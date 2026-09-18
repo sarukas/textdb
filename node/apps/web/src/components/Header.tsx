@@ -1,7 +1,8 @@
-import type { ConnectionState, Info } from "../api";
+import type { ConnectionState, Info, Whoami } from "../api";
 import { authorStyle } from "../live/color";
 import { baseName } from "../live/paths";
 import { effectiveAuthor } from "../state/useAuthor";
+import { SessionMenu } from "./SessionMenu";
 
 interface Props {
   info: Info | null;
@@ -10,6 +11,8 @@ interface Props {
   author: string;
   onAuthor: (name: string) => void;
   onImport: () => void;
+  who: Whoami | null;
+  onWho: (who: Whoami | null) => void;
 }
 
 const STATE_LABEL: Record<ConnectionState, string> = {
@@ -18,7 +21,7 @@ const STATE_LABEL: Record<ConnectionState, string> = {
   offline: "Offline",
 };
 
-export function Header({ info, connection, lastSeq, author, onAuthor, onImport }: Props) {
+export function Header({ info, connection, lastSeq, author, onAuthor, onImport, who, onWho }: Props) {
   const db = info?.db ?? "";
   return (
     <header className="header">
@@ -45,12 +48,17 @@ export function Header({ info, connection, lastSeq, author, onAuthor, onImport }
             <span title="Last change sequence number">
               seq <strong className="mono">{lastSeq}</strong>
             </span>
+            <span className="sep" aria-hidden="true" />
+            <span title={`This store is ${info.backend}`} className="store-backend">
+              {info.backend}
+            </span>
           </>
         )}
       </div>
       <button type="button" className="btn btn-small import-button" onClick={onImport}>
         Import folder…
       </button>
+      <SessionMenu who={who} onChange={onWho} />
       <label className="author-field">
         <span className="author-chip" style={authorStyle(effectiveAuthor(author))} aria-hidden="true" />
         <span className="visually-hidden">Author name</span>

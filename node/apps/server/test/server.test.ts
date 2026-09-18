@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { resolveExtension } from '@textdb/node';
 import { after, before, describe, test } from 'node:test';
 import type { Change, Hunk } from '@textdb/node';
 import { type RunningServer, startServer } from '../src/server.ts';
@@ -26,7 +27,9 @@ async function api(method: string, route: string, body?: unknown, headers: Recor
 function cli<T>(fn: (db: DatabaseSync) => T): T {
   const db = new DatabaseSync(server.corpus.db, { allowExtension: true });
   try {
-    db.loadExtension(server.corpus.extension);
+    // This store is SQLite, so its corpus is the synchronous one, which knows where the
+    // extension is. `resolveExtension` would find the same file.
+    db.loadExtension(resolveExtension());
     db.exec('PRAGMA busy_timeout=30000');
     return fn(db);
   } finally {
@@ -40,7 +43,7 @@ before(async () => {
   mkdirSync(path.join(webDist, 'assets'), { recursive: true });
   writeFileSync(path.join(webDist, 'index.html'), '<!doctype html><title>textdb</title>');
   writeFileSync(path.join(webDist, 'assets', 'app.js'), 'console.log("app")');
-  server = await startServer({ db: path.join(tmp.dir, 'kb.db'), port: 0, webDist, pingMs: 100, watchIntervalMs: 20 });
+  server = await startServer({ store: path.join(tmp.dir, 'kb.db'), port: 0, webDist, pingMs: 100, watchIntervalMs: 20 });
 });
 
 after(async () => {
@@ -52,7 +55,16 @@ describe('http api', () => {
   test('info on an empty store', async () => {
     const res = await api('GET', '/api/info');
     assert.equal(res.status, 200);
-    assert.deepEqual(res.body, { db: server.corpus.db, files: 0, last_seq: 0 });
+    // `/api/info` says which backend answers and what it can do, so a client can stop offering
+    // what would fail: the trash is SQLite's alone.
+    assert.deepEqual(res.body, {
+      db: server.corpus.db,
+      files: 0,
+      last_seq: 0,
+      backend: 'sqlite',
+      account: null,
+      capabilities: { trash: true, revertBatch: true, syncState: true },
+    });
   });
 
   test('write, read, list and inspect a file', async () => {
@@ -209,7 +221,7 @@ describe('http api', () => {
 
 describe('move and delete', () => {
   test('renames a file and moves a folder with everything below it, attributed', async () => {
-    const since = server.corpus.lastSeq();
+    const since = (await server.corpus.lastSeq());
     for (const p of ['/tree/a.md', '/tree/sub/b.md', '/tree/sub/deep/c.md']) {
       await api('PUT', '/api/file', { path: p, content: `${p}\n` });
     }
@@ -278,8 +290,7 @@ describe('move and delete', () => {
     res = await api('PUT', '/api/setting', { key: 'colour', value: 'blue' });
     assert.deepEqual([res.status, res.body.code], [400, 'TX004']);
 
-    const moves = server.corpus
-      .feed(since)
+    const moves = (await server.corpus.feed(since))
       .filter((c) => c.op === 'move' || c.op === 'delete')
       .map((c) => [c.op, c.path, c.old_path, c.node_kind, c.author]);
     assert.deepEqual(moves, [
@@ -323,8 +334,7 @@ describe('trash', () => {
     assert.equal(res.status, 200);
     res = await api('GET', '/api/trash');
     assert.deepEqual(res.body, []);
-    const purges = server.corpus
-      .feed(0)
+    const purges = (await server.corpus.feed(0))
       .filter((c) => (c.op as string) === 'purge')
       .map((c) => [c.path, c.author]);
     assert.deepEqual(purges[0], ['/bin', 'human']);
@@ -370,7 +380,7 @@ describe('event stream', () => {
   });
 
   test('since replays the backlog and joins the live stream without gaps or duplicates', async () => {
-    const since = server.corpus.lastSeq();
+    const since = (await server.corpus.lastSeq());
     for (let i = 0; i < 5; i++) await api('PUT', '/api/file', { path: `/replay/${i}.md`, content: `${i}\n` });
 
     // Keep committing from another process-like connection while the client connects.
@@ -382,7 +392,7 @@ describe('event stream', () => {
       // A slow machine may fit only a few writes in that time: the check below needs some.
       await waitFor(() => (n >= 6 ? true : undefined));
       clearInterval(writer);
-      const expected = server.corpus.feed(since).map((c) => c.seq);
+      const expected = (await server.corpus.feed(since)).map((c) => c.seq);
       await waitFor(() => (client.changes().length >= expected.length ? true : undefined));
       await new Promise((resolve) => setTimeout(resolve, 100));
       assert.deepEqual(client.changes<ChangeEvent>().map((c) => c.seq), expected);
@@ -394,7 +404,7 @@ describe('event stream', () => {
   });
 
   test('Last-Event-ID takes precedence over since', async () => {
-    const last = server.corpus.lastSeq();
+    const last = (await server.corpus.lastSeq());
     await api('PUT', '/api/file', { path: '/resume.md', content: 'one\n' });
     await api('PUT', '/api/file', { path: '/resume.md', content: 'two\n' });
     const client = await SseClient.connect(`${server.url}/api/events?since=0`, { 'Last-Event-ID': String(last + 1) });

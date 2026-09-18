@@ -8,8 +8,17 @@ export interface SyncLinkConfig {
 }
 
 export interface Config {
-  db: string;
+  /** A SQLite file, or a `postgres://` URL: whatever `TEXTDB_STORE` (or `TEXTDB_DB`) names. */
+  store: string;
   extension: string | undefined;
+  /**
+   * Answer nothing without a bearer (`TEXTDB_REQUIRE_TOKEN=1`).
+   *
+   * Off by default, where no bearer means the owner. On, every request carries a token and the
+   * owner arrives with one too, of an `admin`-kind account -- which is the deployment the
+   * extension's `admin` kind exists for.
+   */
+  requireToken: boolean;
   port: number;
   /** Interface to listen on. Loopback by default: the API has no authentication. */
   host: string;
@@ -22,11 +31,17 @@ export interface Config {
 }
 
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
+  const host = env.HOST || '127.0.0.1';
+  const loopback = ['127.0.0.1', 'localhost', '::1'].includes(host);
   return {
-    db: env.TEXTDB_DB || './kb.db',
+    // `TEXTDB_STORE` is what the CLI calls it; `TEXTDB_DB` is what this server always called it.
+    store: env.TEXTDB_STORE || env.TEXTDB_DB || './kb.db',
     extension: env.TEXTDB_SQLITE_EXT || undefined,
+    // Asked for, or implied by listening somewhere other than loopback: a server reachable from
+    // the network must not answer as the owner to whoever knocks.
+    requireToken: env.TEXTDB_REQUIRE_TOKEN === '1' || env.TEXTDB_REQUIRE_TOKEN === 'true' || !loopback,
     port: Number(env.PORT || 4317),
-    host: env.HOST || '127.0.0.1',
+    host,
     webDist: fileURLToPath(new URL('../../web/dist', import.meta.url)),
     sync: parseSyncLinks(env.TEXTDB_SYNC),
     cli: env.TEXTDB_CLI || undefined,

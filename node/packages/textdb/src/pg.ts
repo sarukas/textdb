@@ -454,14 +454,15 @@ export class PgCorpus implements CorpusApi {
   async links(path = '/', options: LinkOptions = {}): Promise<Link[]> {
     return this.rows<Link>(
       'SELECT path, version, line, kind, target, anchor, alias, status, resolved, asset FROM kb.links($1, $2, $3)',
-      [path, options.status ?? null, options.limit ?? 10000],
+      // '' is "every status", as the function's own default says; NULL would match nothing.
+      [path, options.status ?? '', options.limit ?? 10000],
     );
   }
 
   async backlinks(path = '/', options: LinkOptions = {}): Promise<Link[]> {
     return this.rows<Link>(
       'SELECT path, version, line, kind, target, anchor, alias, status, resolved, asset FROM kb.backlinks($1, $2, $3)',
-      [path, options.status ?? null, options.limit ?? 10000],
+      [path, options.status ?? '', options.limit ?? 10000],
     );
   }
 
@@ -534,7 +535,7 @@ export class PgCorpus implements CorpusApi {
 
   async propertyFind(query: string, options: { folder?: string; limit?: number } = {}): Promise<PropertyHit[]> {
     const rows = await this.rows<{ path: string; nbytes: number; updated_at: string; frontmatter: string | null }>(
-      `SELECT path, nbytes, ${utc('updated_at')} AS updated_at, frontmatter FROM kb.prop_find($1, $2, $3)`,
+      'SELECT path, nbytes, updated_at, frontmatter FROM kb.prop_find($1, $2, $3)',
       [query, options.folder ?? '/', options.limit ?? 500],
     );
     return rows as PropertyHit[];

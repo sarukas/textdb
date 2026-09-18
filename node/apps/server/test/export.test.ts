@@ -21,7 +21,7 @@ const CRLF = '﻿one\r\ntwo\r\n';
 
 before(async () => {
   tmp = tempDir();
-  server = await startServer({ db: path.join(tmp.dir, 'kb.db'), port: 0, webDist: path.join(tmp.dir, 'web'), pingMs: 100, watchIntervalMs: 20 });
+  server = await startServer({ store: path.join(tmp.dir, 'kb.db'), port: 0, webDist: path.join(tmp.dir, 'web'), pingMs: 100, watchIntervalMs: 20 });
   for (const [p, content] of [
     ['/repo/README.md', '# Readme\n'],
     ['/repo/docs/crlf.md', CRLF],

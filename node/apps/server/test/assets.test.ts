@@ -57,7 +57,7 @@ describe('assets of a synced folder', { skip: cli ? false : 'the textdb CLI is n
     writeFileSync(path.join(notes, 'a.md'), '![[pic.png]]\n');
     writeFileSync(path.join(notes, 'img', 'pic.png'), png);
     server = await startServer({
-      db,
+      store: db,
       port: 0,
       webDist: path.join(tmp.dir, 'web'),
       pingMs: 100,
