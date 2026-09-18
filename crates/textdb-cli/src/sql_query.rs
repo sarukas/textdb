@@ -10,9 +10,15 @@ use crate::{emit_json, out, Result};
 const CELL_MAX: usize = 60;
 
 /// Postgres tables behind `kb`; its views (`kb.file`, `kb.entry`, …) and functions stay usable.
+///
+/// Every table the extension has, so the rule reads the same on both engines: SQLite's half of this
+/// refuses any `kb_` name at all, and a list that left some out let a write in through one backend
+/// that the other refused. `asset_store`, `account`, `token` and `grant` are here for that reason --
+/// each carries a rule of its own (who may declare an asset store, who holds which share), and a
+/// statement that writes the row directly is a statement that skips the rule.
 const PG_INTERNAL: &[&str] = &[
     "node", "commit", "change", "chunk", "tree_node", "chunk_ref", "section", "link", "frontmatter", "checkpoint", "path_event",
-    "setting", "file_author", "folder_delta", "sync", "sync_file",
+    "setting", "file_author", "folder_delta", "sync", "sync_file", "asset_store", "account", "token", "grant",
 ];
 
 /// How `sql` prints rows.
@@ -273,6 +279,15 @@ mod tests {
         assert_eq!(internal_table("UPDATE kb SET content = 'x' WHERE path = '/a.md'", true), None);
         assert_eq!(internal_table("SELECT kb.edit(f, 'a', 'b') FROM kb.file f", false), None);
         assert_eq!(internal_table("delete from kb.node", false).as_deref(), Some("kb.node"));
+        // Tables carrying a rule of their own: writing the row directly is skipping the rule, which
+        // SQLite's half of this already refused (it refuses every `kb_` name).
+        for t in ["asset_store", "account", "token", "grant"] {
+            let pg = format!("insert into kb.{t} values (1)");
+            assert_eq!(internal_table(&pg, false), Some(format!("kb.{t}")), "{pg}");
+            assert_eq!(internal_table(&format!("insert into kb_{t} values (1)"), true), Some(format!("kb_{t}")));
+        }
+        // Its views and functions are the surface, and stay so.
+        assert_eq!(internal_table("select kb.account_ls()", false), None);
     }
 
     #[test]
