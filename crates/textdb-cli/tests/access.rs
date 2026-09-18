@@ -2455,3 +2455,84 @@ fn m_a_local_edit_follows_a_move_made_centrally() {
         );
     });
 }
+
+/// Every file an asset store holds, less the store's own trash, in path order.
+fn files_in(root: &std::path::Path) -> Vec<String> {
+    fn walk(root: &std::path::Path, at: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(at) else { return };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                if e.file_name() != std::ffi::OsStr::new(".textdb-trash") {
+                    walk(root, &path, out);
+                }
+            } else if let Ok(rel) = path.strip_prefix(root) {
+                out.push(rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// M10: two pointers name one file in an asset store, and only one of them is in the account's
+/// view. The account's push leaves the bytes the other names where they are -- its view cannot show
+/// that pointer, so the store is asked over every pointer it holds rather than over what this
+/// session can see -- and once nothing else names them, the same push replaces them in place again
+/// instead of going on beside them for ever.
+#[test]
+fn m_a_push_by_an_account_keeps_bytes_a_pointer_it_cannot_see_still_names() {
+    scenarios!("M10");
+    on_each_engine(|f| {
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket).unwrap();
+        ok(f.as_("admin").args(["assets", "stores", "--add", "bucket", "--driver", "local", "--root"]).arg(&bucket), None);
+
+        // The account's own checkout, with a binary in it, pushed to the store.
+        let a = tmp.path().join("a");
+        ok(f.as_("accounts-agent").args(["sync", "/"]).arg(&a), None);
+        std::fs::write(a.join("contracts/x.png"), [137u8, 80, 78, 71, 0, 1]).unwrap();
+        ok(f.as_("accounts-agent").args(["sync", "/"]).arg(&a), None);
+        ok(f.as_("accounts-agent").args(["assets", "push", "--dir"]).arg(&a), None);
+        let pointer = std::fs::read_to_string(a.join("contracts/x.png.tdbasset")).unwrap();
+        let item = pointer
+            .lines()
+            .find_map(|l| l.strip_prefix("item: "))
+            .unwrap_or_else(|| panic!("M10: the pointer does not say where its bytes are:\n{pointer}"))
+            .to_string();
+        let held = bucket.join(item.trim_start_matches('/'));
+        assert_eq!(std::fs::read(&held).unwrap(), [137u8, 80, 78, 71, 0, 1], "M10: the push did not put the bytes in the store");
+
+        // A second pointer naming those same bytes, in a folder granted to nobody: the pointer this
+        // account cannot see, which is the whole of the scenario.
+        ok(f.as_("admin").args(["write", "/hr/x.png.tdbasset"]), Some(&pointer));
+
+        // Changed here and pushed. The bytes in the store stay, because something still names them.
+        std::fs::write(a.join("contracts/x.png"), [137u8, 80, 78, 71, 0, 2]).unwrap();
+        ok(f.as_("accounts-agent").args(["sync", "/"]).arg(&a), None);
+        ok(f.as_("accounts-agent").args(["assets", "push", "--dir"]).arg(&a), None);
+        assert_eq!(
+            std::fs::read(&held).unwrap(),
+            [137u8, 80, 78, 71, 0, 1],
+            "M10: a push replaced bytes that a pointer outside this account's view still names"
+        );
+        let beside = files_in(&bucket);
+        assert_eq!(beside.len(), 2, "M10: the new bytes did not go beside the old ones: {beside:?}");
+
+        // Nothing names them now, and the store says so: the next push replaces the bytes where they
+        // stand rather than leaving a third copy beside them.
+        ok(f.as_("admin").args(["rm", "/hr/x.png.tdbasset"]), None);
+        std::fs::write(a.join("contracts/x.png"), [137u8, 80, 78, 71, 0, 3]).unwrap();
+        ok(f.as_("accounts-agent").args(["sync", "/"]).arg(&a), None);
+        ok(f.as_("accounts-agent").args(["assets", "push", "--dir"]).arg(&a), None);
+        let after = files_in(&bucket);
+        assert_eq!(
+            after.len(),
+            2,
+            "M10: the account's push never replaces its own bytes, even once nothing else names them: {after:?}"
+        );
+    });
+}

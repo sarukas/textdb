@@ -986,11 +986,21 @@ impl StoreFiles {
         // with somebody else's asset naming bytes on a thirty-day clock in a provider's trash. Until
         // the store can answer what no view hides, an account's session takes nothing away.
         if self.in_use.delegated.unwrap_or(true) {
-            return Ok(Some(StoreCopy::LeftBecause(
-                "this session is an account's, which sees only its own pointers, so whether another asset still needs these bytes is not known here".to_string(),
-            )));
+            // Asked of the store, which holds every pointer, and answered in counts: which asset
+            // needs the bytes, and where it is, is no part of what this session may learn.
+            return Ok(match st.asset_item_users(store, location, own)? {
+                None => Some(StoreCopy::LeftBecause(
+                    "this session is an account's, and this store cannot say whether another asset still needs these bytes".to_string(),
+                )),
+                Some(u) if u.unreadable > 0 => Some(StoreCopy::LeftBecause(match u.unreadable {
+                    1 => "a pointer in the store cannot be read, so what its bytes are for is not known".to_string(),
+                    n => format!("{n} pointers in the store cannot be read, so what their bytes are for is not known"),
+                })),
+                Some(u) if u.others > 0 => Some(StoreCopy::Left),
+                Some(_) => None,
+            });
         }
-        Ok(self.in_use.shared(store, location, own).then_some(StoreCopy::Left))
+        Ok(self.in_use.shared(st, store, location, own)?.then_some(StoreCopy::Left))
     }
 
     /// The file the asset `own`'s pointer names, moved in its store to `to` (the asset's own path
@@ -1058,7 +1068,16 @@ struct Written {
 /// A location as [`InUse`] compares it: a store path without case, since Windows and macOS keep
 /// `a.png` and `A.png` in the same file; a provider's file id (Google Drive's) as it is, since ids
 /// differing only in case are other files.
-fn location_key(location: &str) -> String {
+/// What a pointer document names: its asset store, and the location in it as locations are
+/// compared. `None` when the text is no pointer this build can read. The one place that is worked
+/// out, so a binding answering for a whole store agrees with the scan here.
+pub(crate) fn pointer_names(pointer_path: &str, text: &str) -> Option<(String, String)> {
+    let p = Pointer::parse(text.as_bytes()).ok()?;
+    let named = p.item.clone().unwrap_or_else(|| asset_path(pointer_path).to_string());
+    Some((p.store.clone(), location_key(&named)))
+}
+
+pub(crate) fn location_key(location: &str) -> String {
     if location.starts_with('/') {
         location.to_lowercase()
     } else {
@@ -1113,29 +1132,37 @@ impl InUse {
     }
 
     /// Whether a pointer other than the asset `own`'s names `location` in `store`.
-    fn shared(&self, store: &str, location: &str, own: &str) -> bool {
-        // Not knowing counts as shared (see `delegated`). A push then puts its bytes beside what is
-        // there rather than over it, which is what it already does for bytes another pointer names.
+    fn shared(&self, st: &mut dyn Store, store: &str, location: &str, own: &str) -> Result<bool> {
+        // An account sees its own pointers, so the store is asked instead -- and what it cannot
+        // answer counts as shared, which leaves a push putting its bytes beside what is there
+        // rather than over it, as it already does for bytes another pointer names.
         if self.delegated.unwrap_or(true) {
-            return true;
+            return Ok(st.asset_item_users(store, location, own)?.map_or(true, |u| u.others > 0 || u.unreadable > 0));
         }
         let key = (store.to_string(), location_key(location));
-        self.pointers
+        Ok(self
+            .pointers
             .iter()
-            .any(|(path, (_, names))| names.as_ref() == Some(&key) && location_key(asset_path(path)) != location_key(own))
+            .any(|(path, (_, names))| names.as_ref() == Some(&key) && location_key(asset_path(path)) != location_key(own)))
     }
 
     /// Where the upload of `item` goes, and the bytes it may replace there: the asset's own where
     /// they are kept (its path, or the item its pointer names), unless another pointer names them
     /// too or the asset store no longer has them (`gone`); otherwise the asset's path, next to
     /// anything already there.
-    fn target<'p>(&self, store: &str, item: &'p Item, gone: bool) -> (String, Option<&'p str>) {
-        item.pointer
+    fn target<'p>(&self, st: &mut dyn Store, store: &str, item: &'p Item, gone: bool) -> Result<(String, Option<&'p str>)> {
+        let own = item
+            .pointer
             .as_ref()
             .filter(|p| p.store == store && !gone)
-            .map(|p| (p.item.clone().unwrap_or_else(|| item.path.clone()), p.sha256.as_str()))
-            .filter(|(location, _)| !self.shared(store, location, &item.path))
-            .map_or_else(|| (item.path.clone(), None), |(location, sha)| (location, Some(sha)))
+            .map(|p| (p.item.clone().unwrap_or_else(|| item.path.clone()), p.sha256.as_str()));
+        let Some((location, sha)) = own else {
+            return Ok((item.path.clone(), None));
+        };
+        match self.shared(st, store, &location, &item.path)? {
+            true => Ok((item.path.clone(), None)),
+            false => Ok((location, Some(sha))),
+        }
     }
 }
 
@@ -1197,7 +1224,10 @@ fn push_one(
         if let Err(e) = in_use.refresh(st) {
             return Outcome::Failed(format!("{}: {}", item.path, e.message));
         }
-        let (target, _) = in_use.target(&store, item, gone);
+        let (target, _) = match in_use.target(st, &store, item, gone) {
+            Ok(t) => t,
+            Err(e) => return Outcome::Failed(format!("{}: {}", item.path, e.message)),
+        };
         let held = match d.lock(&target) {
             Ok(h) => h,
             Err(e) => return Outcome::Failed(format!("{}: {}", item.path, e.message)),
@@ -1208,7 +1238,10 @@ fn push_one(
         if let Err(e) = in_use.refresh(st) {
             return Outcome::Failed(format!("{}: {}", item.path, e.message));
         }
-        let (again, replaces) = in_use.target(&store, item, gone);
+        let (again, replaces) = match in_use.target(st, &store, item, gone) {
+            Ok(t) => t,
+            Err(e) => return Outcome::Failed(format!("{}: {}", item.path, e.message)),
+        };
         if again == target {
             decided = Some((target, replaces, held));
             break;

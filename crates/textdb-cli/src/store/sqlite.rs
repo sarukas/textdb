@@ -988,6 +988,42 @@ impl Store for SqliteStore {
         Ok(stats)
     }
 
+    fn asset_item_users(&mut self, store: &str, location: &str, own: &str) -> Result<Option<crate::store::ItemUsers>> {
+        use crate::assets::pointer::{asset_path, SUFFIX};
+        use crate::assets::{location_key, pointer_names};
+        // Every pointer this store holds, with no visibility predicate and no translation into the
+        // caller's paths: whether a provider's bytes are still needed is a question about bytes
+        // every account of the store shares, and an answer from one account's view has it taking
+        // away another's. Counts are all that leaves: the paths read here stay here.
+        let want = (store.to_string(), location_key(location));
+        // The asset's own path is the caller's; the paths read below are the store's. Translated
+        // here, or an account's own pointer counts as somebody else's and its bytes are never its
+        // own to replace.
+        let mine = location_key(&self.db().store_path(own).unwrap_or_else(|_| own.to_string()));
+        let like = format!("%{SUFFIX}");
+        let paths: Vec<String> = self
+            .conn
+            .prepare_cached(&format!("SELECT path FROM {DEFAULT_PREFIX}node WHERE deleted_at IS NULL AND kind = 1 AND path LIKE ?1"))
+            .map_err(sql)?
+            .query_map(rusqlite::params![like], |r| r.get(0))
+            .map_err(sql)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql)?;
+        // Attached without the view this connection reads through, since those paths are the
+        // store's own and reading them as the caller would find nothing.
+        let raw = TextDb::attach(&self.conn, DEFAULT_PREFIX, true).with_path_history(self.path_history);
+        let (mut others, mut unreadable) = (0, 0);
+        for path in paths {
+            let text = raw.read(&path).ok().and_then(|b| String::from_utf8(b).ok());
+            match text.as_deref().and_then(|t| pointer_names(&path, t)) {
+                None => unreadable += 1,
+                Some(names) if names == want && location_key(asset_path(&path)) != mine => others += 1,
+                Some(_) => {}
+            }
+        }
+        Ok(Some(crate::store::ItemUsers { others, unreadable }))
+    }
+
     fn file_heads(&mut self, prefix: &str) -> Result<Vec<FileHead>> {
         use rusqlite::types::Value;
         // What sync compares against disk, so it decides the shape of a checkout: the account's

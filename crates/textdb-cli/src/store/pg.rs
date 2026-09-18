@@ -1210,6 +1210,52 @@ impl Store for PgStore {
         Ok(self.client.query_one("SELECT kb.last_seq()", &[]).map_err(pg)?.get(0))
     }
 
+    fn asset_item_users(&mut self, store: &str, location: &str, own: &str) -> Result<Option<crate::store::ItemUsers>> {
+        use crate::assets::pointer::{asset_path, SUFFIX};
+        use crate::assets::{location_key, pointer_names};
+        // Row-level security is the caller's view made the table's own rule. Where it is enforced
+        // for this connection the raw table is filtered too, so the honest answer is that this
+        // cannot be told from here -- and nothing is then taken out of anybody's drive. A
+        // connection that owns the tables reads them whole, which is the deployment the CLI has.
+        let enforced: bool = self.client.query_one("SELECT row_security_active('kb.node')", &[]).map_err(pg)?.get(0);
+        if enforced {
+            return Ok(None);
+        }
+        let want = (store.to_string(), location_key(location));
+        // The asset's own path is the caller's; `kb.node` holds the store's. Translated here, or an
+        // account's own pointer counts as somebody else's and its bytes are never its own to
+        // replace.
+        let mine = self
+            .client
+            .query_one("SELECT kb.resolve($1)", &[&own])
+            .ok()
+            .and_then(|r| r.try_get::<_, Option<String>>(0).ok().flatten())
+            .unwrap_or_else(|| own.to_string());
+        let mine = location_key(&mine);
+        let like = format!("%{SUFFIX}");
+        // `kb.node` and not a view: the views answer in the caller's namespace, which is the very
+        // thing this question has to see past. Counts are all that leaves this method.
+        let rows = self
+            .client
+            .query(
+                "SELECT n.path, kb._materialize(n.root) FROM kb.node n \
+                 WHERE n.deleted_at IS NULL AND n.kind = 1 AND n.path LIKE $1",
+                &[&like],
+            )
+            .map_err(pg)?;
+        let (mut others, mut unreadable) = (0, 0);
+        for r in &rows {
+            let path: String = r.get(0);
+            let text: Option<String> = r.get(1);
+            match text.as_deref().and_then(|t| pointer_names(&path, t)) {
+                None => unreadable += 1,
+                Some(names) if names == want && location_key(asset_path(&path)) != mine => others += 1,
+                Some(_) => {}
+            }
+        }
+        Ok(Some(crate::store::ItemUsers { others, unreadable }))
+    }
+
     fn file_heads(&mut self, prefix: &str) -> Result<Vec<FileHead>> {
         let prefix = normalize_path(prefix)?;
         // The prefix has to resolve before anything is read: a folder outside the caller's shares

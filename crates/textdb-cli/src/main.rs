@@ -69,7 +69,7 @@ struct Cli {
     json: bool,
     /// A bearer token. Everything is then answered in that account's view: its own paths, its own
     /// shares, and nothing else. Without one the store is opened as its owner.
-    #[arg(long, short = 't', global = true, env = "TEXTDB_TOKEN", value_name = "BEARER")]
+    #[arg(long, global = true, env = "TEXTDB_TOKEN", value_name = "BEARER")]
     token: Option<String>,
     /// Record renames, moves and deletes in the history of what they touch: `on` or `off` for
     /// this command. Without it the store's `path_history` setting decides, which is on unless

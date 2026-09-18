@@ -673,6 +673,17 @@ pub struct TokenRow {
     pub live: bool,
 }
 
+/// How many pointers name one location in an asset store, counted over every pointer the store
+/// holds rather than the caller's view. Counts, and nothing else: which asset names those bytes,
+/// and where it is, stay inside the binding that looked.
+#[derive(Debug, Clone, Copy)]
+pub struct ItemUsers {
+    /// Pointers other than the asset's own that name the location.
+    pub others: usize,
+    /// Pointers this build could not read at all, so what their bytes are for is not known.
+    pub unreadable: usize,
+}
+
 pub trait Store {
     // ------------------------------------------------------------ accounts, tokens and shares
     //
@@ -891,6 +902,17 @@ pub trait Store {
     fn all_sync_bases(&mut self) -> Result<Vec<SyncBase>>;
     /// The asset stores declared in this store, by name.
     fn asset_stores(&mut self) -> Result<Vec<AssetStore>>;
+
+    /// Whether any pointer other than the asset `own`'s names `location` in the asset store
+    /// `store`, answered over every pointer this store holds and not the caller's view.
+    ///
+    /// A provider's bytes are shared by every account of a store, so whether they are still needed
+    /// is not a question one account's view can answer: answered from a view, a delete takes away
+    /// bytes another account's pointer still names. `None` where the store cannot answer it without
+    /// that view, and then nothing is taken away.
+    fn asset_item_users(&mut self, _store: &str, _location: &str, _own: &str) -> Result<Option<ItemUsers>> {
+        Ok(None)
+    }
     /// Declare an asset store, or change the one of that name.
     fn put_asset_store(&mut self, store: &AssetStore) -> Result<()>;
     /// Remove an asset store's declaration; `false` when there was none.
