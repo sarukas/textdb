@@ -96,6 +96,18 @@ Drive store the item is a file id, so the same move needs an id the account has 
 narrows it without closing it. The store root itself is the only boundary the driver enforces
 (`find_id` refuses ids outside it), and that root is exactly where every account's assets are.
 
+**Done for items that are paths.** A store addressing its files by path lays them out in the
+owner's paths, so an item is a path like any other, and `Store::may_name` asks the store the
+question it already answers about one: may this caller address it (`view.to_view` on SQLite,
+`kb.to_view` on Postgres). A pull refuses to fetch where it says no, a push refuses to write there
+— which matters more, since it would put bytes over somebody else's — and `verify` says so
+rather than reading it. M12 holds a pointer naming a folder the account was never granted, and
+watches the owner pull those same bytes afterwards.
+
+A drive's file id is not a place in a namespace, so this does not answer for one. Those are still
+bounded by the store root alone: an account would need an id it has seen, and ids are not listed to
+it, which is a narrower gap rather than none.
+
 ### 4. The provider is a second authority, and the two say nothing about each other
 
 rclone remotes are configured per computer with a person's own token. An account's rights in
@@ -119,28 +131,26 @@ or change those rows at all is not currently stated anywhere, and should be.
 
 1. ~~Refuse the unsafe decisions on a token session.~~ **Done**, and still what happens wherever
    the store cannot answer the question below.
-2. ~~Add the store-answered question.~~ **Done**: `Store::asset_item_users`, with M10 in the
-   access catalogue covering two accounts naming one file. Two gaps remain: `verify`'s unnamed
-   listing wants the set-shaped version of the same question, and nothing automated runs the
-   Postgres half — see "What no test covers".
-3. **Bind a pointer's item to what the account may name**: refuse to pull or push an item that
-   is neither the asset's own path nor an item already recorded by a pointer in the caller's
-   view.
+2. ~~Add the store-answered question.~~ **Done**: `Store::asset_item_users`, with M11 in the
+   access catalogue covering two accounts naming one file. One gap remains: `verify`'s unnamed
+   listing wants the set-shaped version of the same question.
+3. ~~Bind a pointer's item to what the account may name.~~ **Done** for items that are paths,
+   which is every store but a drive: `Store::may_name`, refused in pull, push and verify, with M12
+   covering it. A drive's ids are bounded by the store root only, as before.
 4. **Decide whether `asset_store` rows are visible to accounts**, and record who changed one.
 5. **Give a provider's denial its own state**, distinct from a store that could not be
    reached, and present the store-side states as facts about this computer's access.
 
-Steps 3 to 5 are design choices; 3 is the one that stops an account naming bytes outside its own
-share.
+Steps 4 and 5 are design choices.
 
-## What no test covers
+## What runs it
 
-`tests/access.rs` — the whole acceptance catalogue of delegated access, 87 tests and now M10 —
-sits behind the `access-tests` feature, and no CI job enables it. `TEXTDB_TEST_PG` is set only for
-`cli_pg`, so L5's own requirement that every scenario run on both engines is never met there
-either. The Postgres half of `asset_item_users` is therefore exercised by nothing automated.
-Running the catalogue in CI needs the extension installed, which is the `pg-extension` job — red
-on `main` at the time of writing, for an unrelated reason (`pg_messages_line_ranges_and_replacements`).
+`tests/access.rs` — the acceptance catalogue of delegated access, and M11 and M12 with it — sits
+behind the `access-tests` feature, which for a while no CI job asked for: `TEXTDB_TEST_PG` was set
+only for `cli_pg`, so L5's own requirement that every scenario run on both engines was met nowhere,
+and the Postgres halves of these answers were exercised by nothing. It runs in the `pg-extension`
+job now, which is the one with the extension installed and a server up, so both engines answer
+there.
 
 ## Not in scope here
 

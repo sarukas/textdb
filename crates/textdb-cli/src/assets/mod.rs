@@ -1270,6 +1270,14 @@ fn push_one(
     let Some((target, replaces, _held)) = decided else {
         return Outcome::Conflict(format!("{}: the pointers naming its bytes kept changing during this push; run it again", item.path));
     };
+    // As a pull does: bytes never go to a place this session cannot name, whatever its pointer says.
+    match st.may_name(&target) {
+        Ok(false) => {
+            return Outcome::Failed(format!("{}: its pointer names {target} in the asset store {store}, which this session may not write", item.path))
+        }
+        Err(e) => return Outcome::Failed(format!("{}: {}", item.path, e.message)),
+        Ok(true) => {}
+    }
     let (provider_item, _also_held) = match d.put(&target, &src, &sha, replaces) {
         Ok(put) => put,
         Err(e) => return Outcome::Failed(format!("{}: {}", item.path, e.message)),
@@ -1734,6 +1742,20 @@ pub(crate) fn pull_run(
             pulled.push(json!({ "path": item.path, "state": item.state, "size": p.size, "store": p.store }));
             continue;
         }
+        // A pointer names whatever it says, and an account with `rw` inside its own share can
+        // write one naming bytes of a folder it was never granted. The store is asked whether this
+        // session may name that place at all, before anything is fetched.
+        match p.item.as_deref().map(|named| (named, st.may_name(named))) {
+            Some((named, Ok(false))) => {
+                failed.push(format!("{}: its pointer names {named} in the asset store {}, which this session may not read", item.path, p.store));
+                continue;
+            }
+            Some((_, Err(e))) => {
+                failed.push(format!("{}: {}", item.path, e.message));
+                continue;
+            }
+            _ => {}
+        }
         let d = match files.driver(&p.store) {
             Ok(d) => d,
             Err(e) => {
@@ -2014,6 +2036,11 @@ pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
                 "-".to_string()
             }
             (None, _) => "not pushed".to_string(),
+            // Not this session's to name, so not read: what a pull and a push refuse, this says.
+            (Some(p), _) if p.item.as_deref().is_some_and(|named| matches!(st.may_name(named), Ok(false))) => {
+                problems += 1;
+                "not this session's to name".to_string()
+            }
             (Some(p), _) => {
                 let checked = match drivers.get(&p.store) {
                     Err(e) => Err(e),

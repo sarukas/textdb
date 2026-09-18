@@ -914,6 +914,18 @@ pub trait Store {
         Ok(paths.to_vec())
     }
 
+    /// Whether `location` -- a place in an asset store, which is laid out in the owner's paths --
+    /// is one this caller may name at all.
+    ///
+    /// A pointer's item is whatever the pointer says, and an account with `rw` inside its own share
+    /// can write one naming bytes of a folder it was never granted. Where a store addresses its
+    /// files by path those are the owner's paths, so this is the question the store already answers
+    /// about any other path: can the caller address it. `true` for the owner, and for an item no
+    /// path can be made of -- a drive's file id is not a place in a namespace.
+    fn may_name(&mut self, _location: &str) -> Result<bool> {
+        Ok(true)
+    }
+
     /// Whether any pointer other than the asset `own`'s names `location` in the asset store
     /// `store`, answered over every pointer this store holds and not the caller's view.
     ///

@@ -988,6 +988,15 @@ impl Store for SqliteStore {
         Ok(stats)
     }
 
+    fn may_name(&mut self, location: &str) -> Result<bool> {
+        // Not a path, so not this question's to answer: an id means a file, not a place.
+        if !location.starts_with('/') {
+            return Ok(true);
+        }
+        let at = normalize_path(location).unwrap_or_else(|_| location.to_string());
+        Ok(self.seen(&at).is_some())
+    }
+
     fn owner_paths(&mut self, paths: &[String]) -> Result<Vec<String>> {
         let db = self.db();
         // Lexical: an alias stands for a subtree, so a path translates whether or not anything is

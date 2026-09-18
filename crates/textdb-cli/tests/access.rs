@@ -2106,7 +2106,7 @@ fn l_the_catalogue_runs_on_both_engines() {
 // happens.
 
 /// The working-loop rows, kept separate from `CATALOGUE` so neither list pretends to be the other.
-const EXTRA: &[&str] = &["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10"];
+const EXTRA: &[&str] = &["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M12"];
 
 /// Two checkouts of one `rw` share, one per account: accounts-agent sees it at `contracts/`,
 /// contracts-agent is single-root and sees it at `/`. The pair every M row works with.
@@ -2477,14 +2477,14 @@ fn files_in(root: &std::path::Path) -> Vec<String> {
     out
 }
 
-/// M10: two pointers name one file in an asset store, and only one of them is in the account's
+/// M11: two pointers name one file in an asset store, and only one of them is in the account's
 /// view. The account's push leaves the bytes the other names where they are -- its view cannot show
 /// that pointer, so the store is asked over every pointer it holds rather than over what this
 /// session can see -- and once nothing else names them, the same push replaces them in place again
 /// instead of going on beside them for ever.
 #[test]
 fn m_a_push_by_an_account_keeps_bytes_a_pointer_it_cannot_see_still_names() {
-    scenarios!("M10");
+    scenarios!("M11");
     on_each_engine(|f| {
         let tmp = tempfile::tempdir().unwrap();
         let bucket = tmp.path().join("bucket");
@@ -2501,15 +2501,15 @@ fn m_a_push_by_an_account_keeps_bytes_a_pointer_it_cannot_see_still_names() {
         let item = pointer
             .lines()
             .find_map(|l| l.strip_prefix("item: "))
-            .unwrap_or_else(|| panic!("M10: the pointer does not say where its bytes are:\n{pointer}"))
+            .unwrap_or_else(|| panic!("M11: the pointer does not say where its bytes are:\n{pointer}"))
             .to_string();
         // The bytes belong where the owner's path for this asset says, not where the account's
         // does: one store is one place, and its layout cannot be one caller's view of it. The
         // account holds `/legal/contracts` as `/contracts`, and its push still lands under
         // `legal/contracts`.
-        assert_eq!(item, "/legal/contracts/x.png", "M10: the store was laid out in the account's namespace");
+        assert_eq!(item, "/legal/contracts/x.png", "M11: the store was laid out in the account's namespace");
         let held = bucket.join(item.trim_start_matches('/'));
-        assert_eq!(std::fs::read(&held).unwrap(), [137u8, 80, 78, 71, 0, 1], "M10: the push did not put the bytes in the store");
+        assert_eq!(std::fs::read(&held).unwrap(), [137u8, 80, 78, 71, 0, 1], "M11: the push did not put the bytes in the store");
 
         // A second pointer naming those same bytes, in a folder granted to nobody: the pointer this
         // account cannot see, which is the whole of the scenario.
@@ -2522,10 +2522,10 @@ fn m_a_push_by_an_account_keeps_bytes_a_pointer_it_cannot_see_still_names() {
         assert_eq!(
             std::fs::read(&held).unwrap(),
             [137u8, 80, 78, 71, 0, 1],
-            "M10: a push replaced bytes that a pointer outside this account's view still names"
+            "M11: a push replaced bytes that a pointer outside this account's view still names"
         );
         let beside = files_in(&bucket);
-        assert_eq!(beside.len(), 2, "M10: the new bytes did not go beside the old ones: {beside:?}");
+        assert_eq!(beside.len(), 2, "M11: the new bytes did not go beside the old ones: {beside:?}");
 
         // Nothing names them now, and the store says so: the next push replaces the bytes where they
         // stand rather than leaving a third copy beside them.
@@ -2537,7 +2537,50 @@ fn m_a_push_by_an_account_keeps_bytes_a_pointer_it_cannot_see_still_names() {
         assert_eq!(
             after.len(),
             2,
-            "M10: the account's push never replaces its own bytes, even once nothing else names them: {after:?}"
+            "M11: the account's push never replaces its own bytes, even once nothing else names them: {after:?}"
         );
+    });
+}
+
+/// M12: a pointer names whatever it says, and an account with `rw` in its own share can hold one
+/// naming bytes of a folder it was never granted. It does not get them: the place an item names is
+/// the owner's path for it, so whether this session may name it is the question the store answers
+/// about any other path. The owner, who may name it, still pulls it.
+#[test]
+fn m_a_pointer_cannot_fetch_bytes_from_a_folder_the_account_was_not_granted() {
+    scenarios!("M12");
+    on_each_engine(|f| {
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket).unwrap();
+        ok(f.as_("admin").args(["assets", "stores", "--add", "bucket", "--driver", "local", "--root"]).arg(&bucket), None);
+
+        // An asset in a folder granted to nobody, pushed by the owner.
+        let o = tmp.path().join("o");
+        ok(f.as_("admin").args(["sync", "/"]).arg(&o), None);
+        std::fs::create_dir_all(o.join("hr")).unwrap();
+        std::fs::write(o.join("hr/secret.png"), [137u8, 80, 78, 71, 0, 9]).unwrap();
+        ok(f.as_("admin").args(["sync", "/"]).arg(&o), None);
+        ok(f.as_("admin").args(["assets", "push", "--dir"]).arg(&o), None);
+        let secret = std::fs::read_to_string(o.join("hr/secret.png.tdbasset")).unwrap();
+        assert!(secret.contains("item: /hr/secret.png"), "M12: the owner's push did not put it there: {secret}");
+
+        // That same pointer, inside the account's share. However it got there -- copied by hand, or
+        // written by the account itself, which holds `rw` here -- it names bytes outside the share.
+        ok(f.as_("admin").args(["write", "/legal/contracts/steal.png.tdbasset"]), Some(&secret));
+
+        let a = tmp.path().join("a");
+        ok(f.as_("accounts-agent").args(["sync", "/"]).arg(&a), None);
+        assert!(a.join("contracts/steal.png.tdbasset").is_file(), "M12: the account did not receive the pointer");
+        let refused = run(f.as_("accounts-agent").args(["assets", "pull", "--dir"]).arg(&a), None);
+        assert_ne!(refused.status, 0, "M12: the pull was allowed\n{}{}", refused.stdout, refused.stderr);
+        let said = format!("{}{}", refused.stdout, refused.stderr);
+        assert!(said.contains("may not read"), "M12: the pull did not say why: {said}");
+        assert!(!a.join("contracts/steal.png").exists(), "M12: the bytes were fetched into the account's checkout");
+
+        // The owner names that place, so the owner still pulls it.
+        std::fs::remove_file(o.join("hr/secret.png")).unwrap();
+        ok(f.as_("admin").args(["assets", "pull", "--dir"]).arg(&o), None);
+        assert_eq!(std::fs::read(o.join("hr/secret.png")).unwrap(), [137u8, 80, 78, 71, 0, 9], "M12: the owner was refused its own bytes");
     });
 }

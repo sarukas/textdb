@@ -1210,6 +1210,17 @@ impl Store for PgStore {
         Ok(self.client.query_one("SELECT kb.last_seq()", &[]).map_err(pg)?.get(0))
     }
 
+    fn may_name(&mut self, location: &str) -> Result<bool> {
+        // Not a path, so not this question's to answer: an id means a file, not a place.
+        if !location.starts_with('/') {
+            return Ok(true);
+        }
+        // `kb.to_view` is NULL for a path the caller cannot address, and the path itself for the
+        // owner -- the same rule every other read of a path goes through.
+        let row = self.client.query_one("SELECT kb.to_view($1) IS NOT NULL", &[&location]).map_err(pg)?;
+        Ok(row.get(0))
+    }
+
     fn owner_paths(&mut self, paths: &[String]) -> Result<Vec<String>> {
         if paths.is_empty() {
             return Ok(Vec::new());
