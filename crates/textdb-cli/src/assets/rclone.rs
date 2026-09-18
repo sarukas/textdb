@@ -79,7 +79,32 @@ struct Listed {
 }
 
 /// What rclone said went wrong, without its log prefix.
+/// Whether what a provider said is a refusal rather than a failure.
+///
+/// From here the two look alike -- a run that exited non-zero -- and they are not alike at all: a
+/// failure is worth trying again and says nothing about the asset, while a refusal is a durable
+/// fact about this computer's access that no retry changes and that somebody has to go and ask
+/// for. Google's API reports one as a 403 naming its reason and rclone passes the text through. A
+/// bare 403 anywhere in a line is not enough, since a path or a byte count may hold those digits.
+fn refused(text: &str) -> bool {
+    let said = text.to_ascii_lowercase();
+    ["error 403", "error 401", " 403:", " 401:", "forbidden", "unauthorized", "permission denied", "insufficientpermissions", "insufficientfilepermissions", "accessnotconfigured"]
+        .iter()
+        .any(|m| said.contains(m))
+}
+
+/// What a failed run said, and whether it was a refusal: `forbidden` is what textdb calls the same
+/// answer about its own documents, so a refusal by a provider carries it too.
 fn failure(what: &str, out: &Output) -> StoreError {
+    let said = failure_said(what, out);
+    let (err, printed) = (String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout));
+    match refused(&err) || refused(&printed) {
+        true => StoreError::forbidden(said.message),
+        false => said,
+    }
+}
+
+fn failure_said(what: &str, out: &Output) -> StoreError {
     let last = |text: &str| {
         text.lines().rev().map(str::trim).find(|l| !l.is_empty()).map(|l| {
             let rest = l.split_once(" : ").or_else(|| l.split_once(": ")).map_or(l, |(_, rest)| rest);

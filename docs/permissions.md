@@ -142,8 +142,12 @@ or change those rows at all is not currently stated anywhere, and should be.
    which is every store but a drive: `Store::may_name`, refused in pull, push and verify, with M12
    covering it. A drive's ids are bounded by the store root only, as before.
 4. **Decide whether `asset_store` rows are visible to accounts**, and record who changed one.
-5. **Give a provider's denial its own state**, distinct from a store that could not be
-   reached, and present the store-side states as facts about this computer's access.
+5. ~~Give a provider's denial its own state.~~ **Done**: the driver reads what the provider said
+   (a 403 naming its reason, which rclone passes through), carries it as `forbidden` rather than
+   as a failure, and an asset whose store refused this computer is `not-permitted` — over an `ok`
+   one, as the other store-side states are. `verify` says `refused:` where it used to say
+   `unchecked:`. What remains of this row is presentation: the store-side states still read as
+   facts about the asset where several of them are facts about this computer's access.
 
 Steps 4 and 5 are design choices.
 

@@ -3431,3 +3431,42 @@ fn a_folder_carries_the_authors_below_it() {
     let a = ls.as_array().unwrap().iter().find(|e| e["path"] == "/notes/a").unwrap();
     assert_eq!((a["nauthors"].as_i64(), a["updated_by"].as_str()), (Some(3), Some("carol")));
 }
+
+/// A provider that answers and refuses is not a provider that could not be reached. The first is a
+/// durable fact about this computer's access, which no retry changes and somebody has to go and ask
+/// about; the second is worth trying again and says nothing about the asset. They arrive here
+/// looking alike -- a run that exited non-zero -- so the driver reads what was said, and a refusal
+/// carries `forbidden` the way the same answer about a document does.
+#[test]
+fn a_store_that_refuses_this_computer_is_told_apart_from_one_it_cannot_reach() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, vault, remote, config) = fake_rclone_vault(tmp.path(), "textdb");
+    std::fs::write(vault.join("img/arch.png"), b"\x89PNG first").unwrap();
+    let t = |args: &[&str]| with_fake_rclone(&store, &remote, &config, args);
+    let denied = |args: &[&str]| {
+        let mut c = with_fake_rclone(&store, &remote, &config, args);
+        c.env("TEXTDB_FAKE_RCLONE_DENY", "1");
+        c
+    };
+    let dir = vault.to_str().unwrap();
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "stores", "--add", "drive", "--driver", "rclone", "--root", "fake:textdb"]), None);
+    ok(&mut t(&["assets", "push", "--dir", dir]), None);
+    assert_eq!(ok(&mut t(&["--json", "assets", "verify", "--dir", dir]), None).json()["problems"], 0);
+
+    // The same store, now refusing. What it says is kept, and it is not called unreachable.
+    let refused = run(&mut denied(&["--json", "assets", "verify", "--dir", dir]), None);
+    assert_eq!(refused.status, 1, "{}{}", refused.stdout, refused.stderr);
+    // Two documents on stdout: the report, then the error that ended it.
+    let seen: serde_json::Value = serde_json::from_str(refused.stdout.lines().next().unwrap_or_default()).unwrap();
+    let said = seen["assets"][0]["asset_store"].as_str().unwrap_or_default().to_string();
+    assert!(said.starts_with("refused:"), "a refusal was reported as something else: {seen}");
+    assert!(said.contains("403") || said.contains("Insufficient permissions"), "what the provider said was lost: {seen}");
+
+    // A store that cannot be reached at all still reads as unchecked, not as a refusal.
+    std::fs::remove_dir_all(remote.join("textdb")).unwrap();
+    let gone = run(&mut t(&["--json", "assets", "verify", "--dir", dir]), None);
+    let told: serde_json::Value = serde_json::from_str(gone.stdout.lines().next().unwrap_or_default()).unwrap();
+    let missing = told["assets"][0]["asset_store"].as_str().unwrap_or_default().to_string();
+    assert!(!missing.starts_with("refused:"), "a store that is not there was called a refusal: {}", gone.stdout);
+}

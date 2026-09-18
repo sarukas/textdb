@@ -12,7 +12,7 @@ export interface AssetItem {
   /**
    * ok, new, modified, outdated, conflict, not-pulled, conflict-copy, orphan, invalid-pointer or
    * invalid-path; and from what the asset store itself holds, changed-in-store, moved-here,
-   * moved-in-store, trashed-in-store, ambiguous or invalid-item.
+   * moved-in-store, trashed-in-store, ambiguous, invalid-item or not-permitted.
    */
   state: string;
   type: string;
@@ -85,6 +85,9 @@ const SENDABLE = new Set([
   'trashed-in-store',
   'ambiguous',
   'invalid-item',
+  // The store refused this computer the file: a fact about this computer's access, which only
+  // ever replaces `ok` as the rest do, so the file on disk is still the asset's own bytes.
+  'not-permitted',
 ]);
 
 /** Folders textdb never reads assets from or writes them to; keep in step with IGNORED_DIRS in crates/textdb-cli/src/assets/classify.rs. */

@@ -99,6 +99,7 @@ from a pointer changed elsewhere:
 | yes | its store keeps the file in the provider's own trash | `trashed-in-store` (a pull still fetches it, until the provider empties it) |
 | yes | its store holds two files at that path (Google Drive allows it) | `ambiguous` (which one the pointer names cannot be said, so neither is read or written over) |
 | yes | its store has no file of that item at all | `invalid-item` (purged from the store's trash, or a file outside the store, which textdb never touches) |
+| yes | the store answered and refused this computer the file | `not-permitted` (a fact about this computer's access, not about the asset: nothing retries into it, and somebody has to be asked). A store addressing its files by path shows the same refusal as `refused: …` in `assets verify`, since a path needs no asking after |
 
 A store-side state goes over `ok` alone: what the bytes here say comes first, so a `modified`,
 `outdated` or `conflict` asset keeps that state and is told of the store's answer as well. The one

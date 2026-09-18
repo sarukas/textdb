@@ -202,7 +202,8 @@ export type AssetState =
   | "moved-in-store"
   | "trashed-in-store"
   | "ambiguous"
-  | "invalid-item";
+  | "invalid-item"
+  | "not-permitted";
 
 export interface AssetStatus {
   prefix: string;

@@ -666,7 +666,16 @@ pub fn open(store: &AssetStore) -> Result<Box<dyn Driver>> {
                 },
             };
             let d = super::rclone::RcloneDriver::new(super::rclone::executable(), root);
-            d.check().map_err(|e| StoreError::invalid(format!("asset store {}: {}", store.name, e.message)))?;
+            d.check().map_err(|e| {
+                // The answer the check got, kept as it was: a store that answered and refused this
+                // computer is forbidden, a store that could not be reached is not, and the two must
+                // not arrive above as one thing.
+                let said = format!("asset store {}: {}", store.name, e.message);
+                match e.code.as_str() {
+                    "TX005" => StoreError::forbidden(said),
+                    _ => StoreError::invalid(said),
+                }
+            })?;
             Ok(Box::new(d))
         }
         other => Err(StoreError::invalid(format!("asset store {}: unknown driver {other}", store.name))),

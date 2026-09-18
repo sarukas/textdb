@@ -483,7 +483,8 @@ pub struct Item {
     /// `invalid-pointer` or `invalid-path`; and from what the asset store itself holds,
     /// `moved-here` (the asset moved in textdb while its file stayed where it was),
     /// `moved-in-store`, `changed-in-store`, `trashed-in-store`, `ambiguous` (two files of one
-    /// name there) or `invalid-item` (no file of that item at all).
+    /// name there), `invalid-item` (no file of that item at all) or `not-permitted` (the store
+    /// refused this computer the file, which is about the computer and not the asset).
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
@@ -868,6 +869,16 @@ pub(crate) fn mark_store_states(items: &mut [Item], mut ask: impl FnMut(&str, &s
                     }
                 }
             }
+            // A store that refused is not a store that could not be reached. A failure is worth
+            // trying again and says nothing about the asset; a refusal is a durable fact about this
+            // computer's access, which no retry changes and somebody has to go and ask about. It
+            // takes an `ok` asset as the other store-side states do, and is told of either way.
+            Err(e) if e.code == "TX005" => {
+                if plain {
+                    item.state = "not-permitted";
+                }
+                also_told(item, format!("its asset store {} refused this computer the file: {}", p.store, e.message));
+            }
             Err(e) => {
                 unasked.entry(p.store.clone()).or_insert(e.message);
             }
@@ -924,11 +935,19 @@ pub struct PushOptions<'a> {
 struct Drivers {
     stores: Vec<AssetStore>,
     open: HashMap<String, std::result::Result<Box<dyn Driver>, String>>,
+    /// The stores that answered and refused rather than failing to answer. `get` hands back the
+    /// message alone, and those two read alike in it; this keeps them apart.
+    refused: HashSet<String>,
 }
 
 impl Drivers {
     fn new(st: &mut dyn Store) -> Result<Drivers> {
-        Ok(Drivers { stores: st.asset_stores()?, open: HashMap::new() })
+        Ok(Drivers { stores: st.asset_stores()?, open: HashMap::new(), refused: HashSet::new() })
+    }
+
+    /// Whether opening this store was refused rather than failing: see `refused`.
+    fn was_refused(&self, name: &str) -> bool {
+        self.refused.contains(name)
     }
 
     fn names(&self) -> Vec<String> {
@@ -938,7 +957,12 @@ impl Drivers {
     fn get(&mut self, name: &str) -> std::result::Result<&dyn Driver, String> {
         if !self.open.contains_key(name) {
             let opened = match self.stores.iter().find(|s| s.name == name) {
-                Some(s) => driver::open(s).map_err(|e| e.message),
+                Some(s) => driver::open(s).map_err(|e| {
+                    if e.code == "TX005" {
+                        self.refused.insert(name.to_string());
+                    }
+                    e.message
+                }),
                 None => Err(format!("no asset store named {name} is declared (textdb assets stores)")),
             };
             self.open.insert(name.to_string(), opened);
@@ -2043,8 +2067,14 @@ pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
             }
             (Some(p), _) => {
                 let checked = match drivers.get(&p.store) {
-                    Err(e) => Err(e),
-                    Ok(d) => d.hash(&item.owner_path, p.item.as_deref()).map_err(|e| e.message),
+                    Err(e) => Err((None, e)),
+                    Ok(d) => d.hash(&item.owner_path, p.item.as_deref()).map_err(|e| (Some(e.code.clone()), e.message)),
+                };
+                // A driver that would not open at all hands back its message and no code, so the
+                // store itself is asked whether that was a refusal.
+                let checked = match checked {
+                    Err((None, why)) if drivers.was_refused(&p.store) => Err((Some("TX005".to_string()), why)),
+                    said => said,
                 };
                 match checked {
                     Ok(Some((sha, _))) if sha == p.sha256 => "ok".to_string(),
@@ -2056,9 +2086,16 @@ pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
                         problems += 1;
                         "missing".to_string()
                     }
-                    Err(e) => {
+                    // A store that refused this computer is not a store that could not be reached:
+                    // one is durable and about this computer's access, the other is worth trying
+                    // again. Said apart here, since this is where a person looks to find out.
+                    Err((Some(code), why)) if code == "TX005" => {
                         problems += 1;
-                        format!("unchecked: {e}")
+                        format!("refused: {why}")
+                    }
+                    Err((_, why)) => {
+                        problems += 1;
+                        format!("unchecked: {why}")
                     }
                 }
             }

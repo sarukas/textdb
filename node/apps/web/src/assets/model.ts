@@ -63,6 +63,11 @@ const LABELS: Record<AssetState, StateLabel> = {
   },
   ambiguous: { label: "Two in store", tone: "problem", hint: "The asset store holds two files of that name: keep one of them there, and neither is read or written over until then." },
   "invalid-item": { label: "Not in store", tone: "problem", hint: "The asset store has no file of that item: purged from its trash, or a file outside the store." },
+  "not-permitted": {
+    label: "Not permitted",
+    tone: "problem",
+    hint: "The asset store refused this computer the file. That is about this computer's access, not the asset: ask whoever holds the store, then try again.",
+  },
 };
 
 export function stateLabel(state: string): StateLabel {
