@@ -13,6 +13,7 @@ interface Props {
   onImport: () => void;
   who: Whoami | null;
   onWho: (who: Whoami | null) => void;
+  onAccess: () => void;
 }
 
 const STATE_LABEL: Record<ConnectionState, string> = {
@@ -21,7 +22,7 @@ const STATE_LABEL: Record<ConnectionState, string> = {
   offline: "Offline",
 };
 
-export function Header({ info, connection, lastSeq, author, onAuthor, onImport, who, onWho }: Props) {
+export function Header({ info, connection, lastSeq, author, onAuthor, onImport, who, onWho, onAccess }: Props) {
   const db = info?.db ?? "";
   return (
     <header className="header">
@@ -58,7 +59,7 @@ export function Header({ info, connection, lastSeq, author, onAuthor, onImport, 
       <button type="button" className="btn btn-small import-button" onClick={onImport}>
         Import folder…
       </button>
-      <SessionMenu who={who} onChange={onWho} />
+      <SessionMenu who={who} onChange={onWho} onAccess={onAccess} />
       <label className="author-field">
         <span className="author-chip" style={authorStyle(effectiveAuthor(author))} aria-hidden="true" />
         <span className="visually-hidden">Author name</span>

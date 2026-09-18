@@ -10,6 +10,7 @@ import {
   type SyncLinks,
   type Whoami,
 } from "./api";
+import { AccessPanel } from "./components/AccessPanel";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { AssetPane } from "./components/AssetPane";
 import { DocumentPane, type Mode, type OpenDoc } from "./components/DocumentPane";
@@ -71,6 +72,8 @@ export function App() {
   const [info, setInfo] = useState<Info | null>(null);
   /** Who this session is: the owner, or the account whose token it presented. */
   const [who, setWho] = useState<Whoami | null>(null);
+  /** The access panel, and the folder it was opened from when it was opened from one. */
+  const [access, setAccess] = useState<{ folder: string | null } | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [lastSeq, setLastSeq] = useState(0);
   const [feed, setFeed] = useState<FeedItem[]>([]);
@@ -271,6 +274,7 @@ export function App() {
   return (
     <div className={`app${feedOpen ? "" : " feed-collapsed"}`}>
       <Header
+        onAccess={() => setAccess({ folder: folder })}
         who={who}
         onWho={(w) => {
           setWho(w);
@@ -285,6 +289,7 @@ export function App() {
         onAuthor={setAuthor}
         onImport={() => setImporting(true)}
       />
+      {access && <AccessPanel folder={access.folder} onClose={() => setAccess(null)} />}
       {importing && <ImportDialog author={author} onClose={() => setImporting(false)} onOpen={openFile} />}
       {exporting !== null && <ExportDialog key={exporting} path={exporting} onClose={() => setExporting(null)} />}
       {syncLink && (

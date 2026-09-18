@@ -2889,3 +2889,127 @@ button.crumb:hover {
   color: var(--muted);
   font-variant: small-caps;
 }
+
+/* ---------------------------------------------------------------- access
+
+   Accounts, shares and tokens. The owner's panel: an account that opens it sees the store's
+   refusal, which is the honest thing for a UI whose rules live somewhere else. */
+.access-dialog {
+  width: min(64rem, 92vw);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  overflow: auto;
+}
+
+.access-tabs {
+  display: flex;
+  gap: 0.35rem;
+  padding: 0 1rem;
+}
+
+.btn-on {
+  border-color: var(--accent, #6aa9ff);
+  color: var(--fg, #e6edf3);
+}
+
+.access-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 0 1rem 1rem;
+}
+
+.access-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92em;
+}
+
+.access-table th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border, #30363d);
+  padding: 0.3rem 0.5rem 0.3rem 0;
+}
+
+.access-table td {
+  padding: 0.35rem 0.5rem 0.35rem 0;
+  border-bottom: 1px solid var(--border-soft, #21262d);
+  vertical-align: middle;
+}
+
+.access-row-actions {
+  display: flex;
+  gap: 0.3rem;
+  justify-content: flex-end;
+}
+
+.access-off {
+  opacity: 0.55;
+}
+
+.access-tag {
+  margin-left: 0.4rem;
+  font-size: 0.75em;
+  color: var(--muted);
+  border: 1px solid var(--border, #30363d);
+  border-radius: 999px;
+  padding: 0.05rem 0.35rem;
+}
+
+.access-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+  padding-top: 0.4rem;
+  border-top: 1px dashed var(--border, #30363d);
+}
+
+.access-form input,
+.access-form select {
+  flex: 1 1 8rem;
+  min-width: 6rem;
+}
+
+.access-filter {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--muted);
+}
+
+.access-problem {
+  margin: 0 1rem;
+  padding: 0.4rem 0.6rem;
+  border-radius: 4px;
+  background: #f8514922;
+  color: #f85149;
+  font-size: 0.9em;
+}
+
+.access-minted {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid #3fb95055;
+  border-radius: 4px;
+  background: #3fb95011;
+}
+
+.access-minted p {
+  margin: 0;
+  flex: 1 1 100%;
+}
+
+.access-bearer {
+  font-family: var(--mono, monospace);
+  user-select: all;
+  word-break: break-all;
+  flex: 1 1 20rem;
+}

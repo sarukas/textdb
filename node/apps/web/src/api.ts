@@ -98,6 +98,40 @@ export interface WhoamiShare extends Share {
 }
 
 /** The old name for {@link Entry}, kept so call sites read unchanged. */
+
+/** One account of this store, as the owner sees it. */
+export interface AccountRow {
+  name: string;
+  kind: string;
+  root: string | null;
+  created_at: string;
+  disabled: boolean;
+  /** How many shares it holds. */
+  shares: number;
+}
+
+/** One token, without its bearer: that exists once, in the answer that minted it. */
+export interface TokenRow {
+  id: number;
+  account: string;
+  label: string | null;
+  created_at: string;
+  expires_at: string | null;
+  last_used_at: string | null;
+  revoked_at: string | null;
+}
+
+/** One share: which account holds which folder, under which name, by which rights. */
+export interface ShareRow {
+  account: string;
+  alias: string;
+  rights: string;
+  /** Where the share root is in the store. The owner sees this; an account never does. */
+  store_path: string | null;
+  node_id: number;
+  dormant?: boolean;
+}
+
 export type LsEntry = Entry;
 
 export interface AuthorCount {
@@ -492,6 +526,29 @@ export const api = {
   info: () => request<Info>("GET", "/api/info"),
   /** Who this session is and what it can reach. */
   whoami: () => request<Whoami>("GET", "/api/whoami"),
+
+  // Accounts, tokens and shares. Every one is the owner's, and the store is what refuses a token
+  // session -- these calls carry this session's bearer, so the answer comes from there.
+  accounts: () => request<AccountRow[]>("GET", "/api/access/accounts"),
+  createAccount: (body: { name: string; kind?: string; root?: string }) =>
+    request<{ accounts: AccountRow[] }>("POST", "/api/access/accounts", body),
+  setAccountEnabled: (name: string, enabled: boolean) =>
+    request<{ accounts: AccountRow[] }>("POST", "/api/access/accounts/enabled", { name, enabled }),
+  convertAccount: (name: string, alias?: string) =>
+    request<{ accounts: AccountRow[] }>("POST", "/api/access/accounts/convert", { name, alias }),
+  tokens: (account?: string) => request<TokenRow[]>("GET", `/api/access/tokens?${qs({ account })}`),
+  /** The bearer is in this answer and nowhere else: it is stored hashed and cannot be shown again. */
+  createToken: (body: { account: string; label?: string; expires?: string }) =>
+    request<{ bearer: string }>("POST", "/api/access/tokens", body),
+  revokeToken: (id: number) => request<{ tokens: TokenRow[] }>("POST", "/api/access/tokens/revoke", { id }),
+  /** With `account`, its shares; with `path`, the accounts that can reach that path. */
+  shares: (of: { account?: string; path?: string }) => request<ShareRow[]>("GET", `/api/access/shares?${qs(of)}`),
+  grant: (body: { account: string; path: string; rights: "ro" | "rw"; alias?: string }) =>
+    request<ShareRow>("POST", "/api/access/shares", body),
+  renameShare: (account: string, from: string, to: string) =>
+    request<{ shares: ShareRow[] }>("POST", "/api/access/shares/rename", { account, from, to }),
+  revokeShare: (account: string, alias: string) =>
+    request<{ shares: ShareRow[] }>("POST", "/api/access/shares/revoke", { account, alias }),
   /**
    * Log in with a bearer, or out with null.
    *

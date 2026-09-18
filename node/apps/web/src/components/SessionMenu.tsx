@@ -4,6 +4,8 @@ import { ApiError, api, token, type Whoami } from "../api";
 interface Props {
   who: Whoami | null;
   onChange: (who: Whoami | null) => void;
+  /** Open the access panel: accounts, shares and tokens. */
+  onAccess: () => void;
 }
 
 /**
@@ -17,7 +19,7 @@ interface Props {
  * The token is pasted once and sent to `POST /api/session`, which checks it before handing out the
  * session cookie the change feed and the asset bytes travel on. It is never rendered back.
  */
-export function SessionMenu({ who, onChange }: Props) {
+export function SessionMenu({ who, onChange, onAccess }: Props) {
   const [open, setOpen] = useState(false);
   const [value, setValue] = useState("");
   const [busy, setBusy] = useState(false);
@@ -107,6 +109,17 @@ export function SessionMenu({ who, onChange }: Props) {
           <div className="session-actions">
             <button type="button" className="btn btn-small" disabled={busy || !value.trim()} onClick={() => void signIn(value.trim())}>
               Sign in
+            </button>
+            <button
+              type="button"
+              className="btn btn-small"
+              onClick={() => {
+                setOpen(false);
+                onAccess();
+              }}
+              title="Accounts, shares and tokens — the owner's"
+            >
+              Access…
             </button>
             {token() && (
               <button type="button" className="btn btn-small" disabled={busy} onClick={() => void signIn(null)}>

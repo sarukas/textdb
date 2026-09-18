@@ -153,6 +153,58 @@ describe('a bearer per request', () => {
     assert.match(out.headers.get('set-cookie') ?? '', /Max-Age=0/);
   });
 
+  test('the delegation commands are the store’s to refuse, not this server’s', async (t) => {
+    if (!cli) return t.skip('no textdb CLI build to create an account with');
+
+    // The owner sees the account it made, and can mint and revoke for it.
+    const post = async (url: string, body: unknown, token?: string) => {
+      const res = await fetch(`${server.url}${url}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify(body),
+      });
+      return { status: res.status, body: await res.json() };
+    };
+    const accounts = await call('/api/access/accounts');
+    assert.deepEqual(
+      accounts.body.map((a: { name: string; shares: number }) => [a.name, a.shares]),
+      [['reader', 1]],
+    );
+    const shares = await call('/api/access/shares?path=/notes');
+    assert.deepEqual(
+      shares.body.map((s: { account: string; rights: string }) => [s.account, s.rights]),
+      [['reader', 'ro']],
+    );
+
+    // The account itself is refused every one of them, by the store: TX005, not a 500 and not a
+    // quiet success run as the owner.
+    const mine = await call('/api/access/accounts', bearer);
+    assert.equal(mine.status, 403);
+    assert.equal(mine.body.code, 'TX005');
+    const grabbed = await post('/api/access/shares', { account: 'reader', path: '/legal', rights: 'rw' }, bearer);
+    assert.equal(grabbed.status, 403);
+    const minted = await post('/api/access/tokens', { account: 'reader' }, bearer);
+    assert.equal(minted.status, 403);
+
+    // Nothing of it happened: the share it tried to grant itself is not there.
+    const after = await call('/api/access/shares?account=reader');
+    assert.deepEqual(
+      after.body.map((s: { alias: string }) => s.alias),
+      ['notes'],
+    );
+  });
+
+  test('sync and the assets of a directory are the owner’s alone', async (t) => {
+    if (!cli) return t.skip('no textdb CLI build to create an account with');
+    // Both run the CLI against directories of this server's machine. An account's request would
+    // either escalate or mean something undefined, so it is refused rather than half-answered.
+    for (const url of ['/api/sync/links', '/api/assets?prefix=/notes']) {
+      const res = await call(url, bearer);
+      assert.equal(res.status, 403, url);
+      assert.equal(res.body.code, 'TX005', url);
+    }
+  });
+
   test('one corpus per account, and idle ones are closed', async (t) => {
     if (!cli) return t.skip('no textdb CLI build to create an account with');
     // A bearer belongs to a connection, so the pool holds one corpus for this account -- not one

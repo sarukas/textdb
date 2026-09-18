@@ -6,8 +6,9 @@ import { Hono } from 'hono';
 import type { Corpora } from './corpora.ts';
 import { ZipFile } from 'yazl';
 import { cors } from 'hono/cors';
+import type { AccessService } from './access.ts';
 import { type AssetService, fileStream } from './assets.ts';
-import { badRequest, errorResponse, unauthorized } from './errors.ts';
+import { badRequest, CodedError, errorResponse, unauthorized } from './errors.ts';
 import { eventStream } from './events.ts';
 import type { ChangeHub } from './hub.ts';
 import {
@@ -32,6 +33,8 @@ export interface AppOptions {
   sync?: SyncService | null;
   /** The assets of those folders; null when none are set up. */
   assets?: AssetService | null;
+  /** Accounts, tokens and shares, run through the CLI. */
+  access?: AccessService | null;
   /** The interface the server listens on; on loopback, requests must name a loopback host. */
   host?: string;
   /**
@@ -91,6 +94,24 @@ function syncService(sync: SyncService | null | undefined): SyncService {
 function assetService(assets: AssetService | null | undefined): AssetService {
   if (!assets) throw new NotFound('no folders are set up for sync: set TEXTDB_SYNC on the server');
   return assets;
+}
+
+function accessService(access: AccessService | null | undefined): AccessService {
+  if (!access) throw new NotFound('this server cannot run the delegation commands: no textdb CLI was found');
+  return access;
+}
+
+/**
+ * Refuse a token session outright.
+ *
+ * For sync and assets, and for those only. Both work on directories of *this server's machine*,
+ * configured by whoever started it, and both run the CLI against the store: an account's request
+ * would either escalate (the CLI as the owner) or mean something not yet defined -- whose directory
+ * is `/notes` when `/notes` is an alias? Said plainly rather than half-answered.
+ */
+function ownerOnly(c: Context<Vars>, what: string): void {
+  if (bearerOf(c) === undefined) return;
+  throw new CodedError('TX005', `${what} is the owner's: this server syncs directories of its own machine`);
 }
 
 const MAX_BULK_PATHS = 10_000;
@@ -299,10 +320,12 @@ export function createApp(corpora: Corpora, hub: ChangeHub, options: AppOptions)
 
   // Sync with directories on this machine, configured by the operator (TEXTDB_SYNC).
   const sync = options.sync;
-  app.get('/api/sync/links', async (c) =>
-    c.json(sync ? await sync.list() : { available: false, reason: 'No folders are set up for sync: set TEXTDB_SYNC on the server.', links: [] }),
-  );
+  app.get('/api/sync/links', async (c) => {
+    ownerOnly(c, 'syncing');
+    return c.json(sync ? await sync.list() : { available: false, reason: 'No folders are set up for sync: set TEXTDB_SYNC on the server.', links: [] });
+  });
   app.post('/api/sync', async (c) => {
+    ownerOnly(c, 'syncing');
     const body = await jsonBody(c);
     const report = await syncService(sync).run(bodyString(body, 'prefix'), {
       dryRun: body.dry_run === true,
@@ -323,17 +346,23 @@ export function createApp(corpora: Corpora, hub: ChangeHub, options: AppOptions)
 
   // Assets of the synced folders: their state, pull and push, and their files to show or download.
   const assets = options.assets;
-  app.get('/api/assets', async (c) => c.json(await assetService(assets).status(queryString(c, 'prefix'), c.req.query('path') || undefined)));
+  app.get('/api/assets', async (c) => {
+    ownerOnly(c, 'the assets of a synced directory');
+    return c.json(await assetService(assets).status(queryString(c, 'prefix'), c.req.query('path') || undefined));
+  });
   app.post('/api/assets/pull', async (c) => {
+    ownerOnly(c, 'pulling assets');
     const body = await jsonBody(c);
     return c.json(await assetService(assets).pull(bodyString(body, 'prefix'), bodyPaths(body), bodyOptionalString(body, 'author')));
   });
   app.post('/api/assets/push', async (c) => {
+    ownerOnly(c, 'pushing assets');
     const body = await jsonBody(c);
     const service = assetService(assets);
     return c.json(await service.push(bodyString(body, 'prefix'), bodyPaths(body), bodyOptionalString(body, 'message'), bodyOptionalString(body, 'author')));
   });
   app.get('/api/assets/file', async (c) => {
+    ownerOnly(c, 'the file of an asset on this server');
     // Hono answers HEAD through this handler and drops the body: no file is opened for one.
     const head = c.req.method === 'HEAD';
     const f = await assetService(assets).file(queryString(c, 'prefix'), queryString(c, 'path'));
@@ -349,6 +378,88 @@ export function createApp(corpora: Corpora, hub: ChangeHub, options: AppOptions)
     if (f.type !== 'application/pdf') headers['Content-Security-Policy'] = "sandbox; default-src 'none'";
     if (head) return c.body(null, 200, headers);
     return c.body(fileStream(f.file, f.size), 200, headers);
+  });
+
+  // ------------------------------------------------------------ accounts, tokens and shares
+  //
+  // Every one of these is the owner's, and it is the *store* that refuses a token session, so each
+  // runs the CLI with this request's own bearer rather than as the owner. A rule re-decided here
+  // would be a second opinion; the one that counts is the store's (see `AccessService`).
+  const access = options.access;
+  app.get('/api/access/accounts', async (c) => c.json(await accessService(access).accounts(bearerOf(c))));
+  app.post('/api/access/accounts', async (c) => {
+    const body = await jsonBody(c);
+    await accessService(access).createAccount(
+      bodyString(body, 'name'),
+      bodyOptionalString(body, 'kind'),
+      bodyOptionalString(body, 'root'),
+      bearerOf(c),
+    );
+    return c.json({ accounts: await accessService(access).accounts(bearerOf(c)) });
+  });
+  app.post('/api/access/accounts/enabled', async (c) => {
+    const body = await jsonBody(c);
+    const enabled = body.enabled;
+    if (typeof enabled !== 'boolean') throw badRequest('enabled must be true or false');
+    await accessService(access).setAccountEnabled(bodyString(body, 'name'), enabled, bearerOf(c));
+    return c.json({ accounts: await accessService(access).accounts(bearerOf(c)) });
+  });
+  // Turning a single-root account into one that holds shares under aliases: every path it sees
+  // gains a `/<alias>` prefix, which is why it is a command and not a setting.
+  app.post('/api/access/accounts/convert', async (c) => {
+    const body = await jsonBody(c);
+    await accessService(access).convertAccount(bodyString(body, 'name'), bodyOptionalString(body, 'alias'), bearerOf(c));
+    return c.json({ accounts: await accessService(access).accounts(bearerOf(c)) });
+  });
+
+  app.get('/api/access/tokens', async (c) => c.json(await accessService(access).tokens(c.req.query('account') || undefined, bearerOf(c))));
+  /** The bearer is in this answer and nowhere else: it is stored hashed and cannot be shown again. */
+  app.post('/api/access/tokens', async (c) => {
+    const body = await jsonBody(c);
+    const minted = await accessService(access).createToken(
+      bodyString(body, 'account'),
+      bodyOptionalString(body, 'label'),
+      bodyOptionalString(body, 'expires'),
+      bearerOf(c),
+    );
+    return c.json(minted);
+  });
+  app.post('/api/access/tokens/revoke', async (c) => {
+    const body = await jsonBody(c);
+    await accessService(access).revokeToken(bodyInt(body, 'id'), bearerOf(c));
+    return c.json({ tokens: await accessService(access).tokens(undefined, bearerOf(c)) });
+  });
+
+  // With `account`, that account's shares; with `path`, who can reach that path -- which is the
+  // question a permissions view of a folder is asking.
+  app.get('/api/access/shares', async (c) =>
+    c.json(
+      await accessService(access).shares(
+        { account: c.req.query('account') || undefined, path: c.req.query('path') || undefined },
+        bearerOf(c),
+      ),
+    ),
+  );
+  app.post('/api/access/shares', async (c) => {
+    const body = await jsonBody(c);
+    const share = await accessService(access).grant(
+      bodyString(body, 'account'),
+      bodyString(body, 'path'),
+      bodyString(body, 'rights'),
+      bodyOptionalString(body, 'alias'),
+      bearerOf(c),
+    );
+    return c.json(share);
+  });
+  app.post('/api/access/shares/rename', async (c) => {
+    const body = await jsonBody(c);
+    await accessService(access).renameShare(bodyString(body, 'account'), bodyString(body, 'from'), bodyString(body, 'to'), bearerOf(c));
+    return c.json({ shares: await accessService(access).shares({ account: bodyString(body, 'account') }, bearerOf(c)) });
+  });
+  app.post('/api/access/shares/revoke', async (c) => {
+    const body = await jsonBody(c);
+    await accessService(access).revokeShare(bodyString(body, 'account'), bodyString(body, 'alias'), bearerOf(c));
+    return c.json({ shares: await accessService(access).shares({ account: bodyString(body, 'account') }, bearerOf(c)) });
   });
 
   // Export. A client compares what is on its disk with these, then fetches only what differs.

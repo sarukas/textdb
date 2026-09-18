@@ -2,6 +2,7 @@ import type { AddressInfo } from 'node:net';
 import { type ServerType, serve } from '@hono/node-server';
 import type { CorpusApi } from '@textdb/node';
 import { createApp } from './app.ts';
+import { AccessService } from './access.ts';
 import { AssetService } from './assets.ts';
 import type { SyncLinkConfig } from './config.ts';
 import { Corpora } from './corpora.ts';
@@ -44,6 +45,7 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
   const hub = new ChangeHub(corpus, { intervalMs: options.watchIntervalMs });
   const sync = options.sync?.length ? new SyncService(corpus, options.sync, findCli(options.cli)) : null;
   const assets = sync ? new AssetService(sync, options.store) : null;
+  const access = new AccessService(options.store, findCli(options.cli));
   const app = createApp(corpora, hub, {
     webDist: options.webDist,
     pingMs: options.pingMs ?? 15_000,
@@ -51,6 +53,7 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
     assets,
     host: options.host ?? '127.0.0.1',
     requireToken: options.requireToken,
+    access,
   });
 
   const host = options.host ?? '127.0.0.1';
