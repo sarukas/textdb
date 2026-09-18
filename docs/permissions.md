@@ -113,8 +113,13 @@ was never granted, and watches the owner pull those same bytes afterwards.
 A drive's file id is not a place in a namespace, so it is not what the question is asked of: the
 drive is asked where it keeps that file, and its answer — a store path, since the store is laid
 out in the owner's paths — is what has to be nameable. An id taken from another share's
-pointer therefore buys nothing: it resolves to a path this session may not name. A store that
-cannot place an id at all leaves its own root as the only bound, which is where this started.
+pointer therefore buys nothing: it resolves to a path this session may not name.
+
+A store with no file of that id has no place to ask after, and no bytes to reach either, so that
+passes and whatever comes next fails on its own account. A store that could not be *asked* is not
+the same answer and is not read as one: a listing that failed says nothing about who may name what,
+and it is carried up as the failure it is. Nothing is refused that a fetch would have gone on to do,
+since the fetch needs that same listing.
 
 ### 4. The provider is a second authority, and the two say nothing about each other
 

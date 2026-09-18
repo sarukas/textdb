@@ -1218,19 +1218,27 @@ impl InUse {
 /// any other. A drive that cannot say leaves the store's own root as the only bound, which is what
 /// it was before this asked at all.
 fn may_name_place(st: &mut dyn Store, d: &dyn Driver, item: &str) -> Result<bool> {
-    match place_of(d, item) {
+    match place_of(d, item)? {
         Some(place) => st.may_name(&place),
+        // No file of that item in the store, so there is no place to ask after, and nothing to
+        // fetch or write over either: whatever comes next fails on its own account.
         None => Ok(true),
     }
 }
 
 /// The place in the store the item `item` is in, to be asked after before any bytes move: the item
 /// itself where it is a store path, and where the store keeps that id otherwise. `None` where the
-/// store cannot say.
-fn place_of(d: &dyn Driver, item: &str) -> Option<String> {
+/// store has no file of that item at all.
+///
+/// A store that could not be asked is an error rather than a `None`. The two are not the same
+/// answer: nothing names the file of an id the store does not have, while a listing that failed
+/// says nothing about who may name what, and reading it as "no place to check" would let a failed
+/// listing stand in for permission. What comes next needs that same listing, so this refuses
+/// nothing a fetch would have gone on to do.
+fn place_of(d: &dyn Driver, item: &str) -> Result<Option<String>> {
     match item.starts_with('/') {
-        true => Some(item.to_string()),
-        false => d.found(item).ok().flatten().map(|found| found.path),
+        true => Ok(Some(item.to_string())),
+        false => Ok(d.found(item)?.map(|found| found.path)),
     }
 }
 
@@ -2493,8 +2501,9 @@ mod tests {
         assert_eq!(rel_under("/notes", "/notesx/a.png"), None);
     }
 
-    /// A store answering only where it keeps the file of an id, as a drive does.
-    struct Places(Option<&'static str>);
+    /// A store answering only where it keeps the file of an id, as a drive does: that place, no
+    /// file of that id, or no answer at all.
+    struct Places(std::result::Result<Option<&'static str>, ()>);
 
     impl Driver for Places {
         fn location(&self, path: &str) -> String {
@@ -2513,7 +2522,8 @@ mod tests {
             unimplemented!()
         }
         fn found(&self, _item: &str) -> Result<Option<driver::Found>> {
-            Ok(self.0.map(|path| driver::Found { path: path.to_string(), sha256: None, size: 1, trashed: false, two_of_a_name: false }))
+            let told = self.0.map_err(|()| StoreError::other("the asset store could not be listed"))?;
+            Ok(told.map(|path| driver::Found { path: path.to_string(), sha256: None, size: 1, trashed: false, two_of_a_name: false }))
         }
     }
 
@@ -2521,12 +2531,15 @@ mod tests {
     /// store is asked where it keeps that id, and its answer is what has to be nameable.
     #[test]
     fn the_place_to_ask_after_is_a_path_even_where_the_pointer_names_an_id() {
-        let drive = Places(Some("/legal/contracts/x.png"));
-        assert_eq!(place_of(&drive, "1a2b3c4d5e6f7g").as_deref(), Some("/legal/contracts/x.png"));
+        let drive = Places(Ok(Some("/legal/contracts/x.png")));
+        assert_eq!(place_of(&drive, "1a2b3c4d5e6f7g").unwrap().as_deref(), Some("/legal/contracts/x.png"));
         // A path item is the place it says, whatever the store would answer of an id.
-        assert_eq!(place_of(&drive, "/img/a.png").as_deref(), Some("/img/a.png"));
-        // Nothing to ask after where the store cannot place the id: the store's root still bounds it.
-        assert_eq!(place_of(&Places(None), "1a2b3c4d5e6f7g"), None);
+        assert_eq!(place_of(&drive, "/img/a.png").unwrap().as_deref(), Some("/img/a.png"));
+        // No file of that id in the store: no place to ask after, and no bytes to reach either.
+        assert_eq!(place_of(&Places(Ok(None)), "1a2b3c4d5e6f7g").unwrap(), None);
+        // A store that could not be asked is not a store that answered: the question stands, and
+        // is carried up as the failure it is rather than passed as though there were nothing to ask.
+        assert!(place_of(&Places(Err(())), "1a2b3c4d5e6f7g").is_err());
     }
 
     #[test]
