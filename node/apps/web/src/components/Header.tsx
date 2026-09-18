@@ -16,8 +16,6 @@ interface Props {
   onAccess: () => void;
   /** Open the assets panel: the stores, and where every asset’s bytes are. */
   onAssets: () => void;
-  /** Open the headings-and-links panel over the folder in view. */
-  onMarkdown: () => void;
 }
 
 const STATE_LABEL: Record<ConnectionState, string> = {
@@ -26,7 +24,7 @@ const STATE_LABEL: Record<ConnectionState, string> = {
   offline: "Offline",
 };
 
-export function Header({ info, connection, lastSeq, author, onAuthor, onImport, who, onWho, onAccess, onAssets, onMarkdown }: Props) {
+export function Header({ info, connection, lastSeq, author, onAuthor, onImport, who, onWho, onAccess, onAssets }: Props) {
   const db = info?.db ?? "";
   return (
     <header className="header">
@@ -70,14 +68,6 @@ export function Header({ info, connection, lastSeq, author, onAuthor, onImport, 
           Assets…
         </button>
       )}
-      <button
-        type="button"
-        className="btn btn-small"
-        onClick={onMarkdown}
-        title="Which headings are in use, and which links reach nothing"
-      >
-        Headings & links…
-      </button>
       <SessionMenu who={who} onChange={onWho} onAccess={onAccess} />
       <label className="author-field">
         <span className="author-chip" style={authorStyle(effectiveAuthor(author))} aria-hidden="true" />

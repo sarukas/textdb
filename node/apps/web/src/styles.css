@@ -3154,134 +3154,153 @@ span.asset-problem {
   padding-left: 1.1rem;
 }
 
-/* ---------------------------------------------------------------- markdown
 
-   Headings and links: rows the store writes at commit and keeps resolved, shown beside a document
-   (the rail) and across a folder (the panel). */
-.doc-main {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-}
+/* ---------------------------------------------------------------- headings and links
 
-.doc-main > .doc-body {
-  flex: 1;
-  min-width: 0;
-}
+   Rows the store writes at commit and keeps resolved, shown in two places: beside the open
+   document in the right-hand column, and as a way of looking at a whole folder. */
 
-.doc-rail {
-  width: 19rem;
-  flex: 0 0 auto;
-  border-left: 1px solid var(--border);
+/* ---- the document's zones, above the activity feed ---- */
+.activity-wrap {
   display: flex;
   flex-direction: column;
-  min-height: 0;
   overflow: hidden;
 }
 
-.rail-head {
+.activity-wrap > .activity {
+  flex: 1 1 auto;
+  /* Its own `height: 100%` would claim the whole column and squeeze the zones to nothing: in this
+     column it takes what is left. The feed keeps a few rows whatever the zones want. */
+  height: auto;
+  min-height: 9rem;
+}
+
+/* One scroll for both zones, not one each: two little scrollbars in a 300px column show four
+   lines at a time and hide the rest. Shrinks before the feed does. */
+.aside-zones {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.4rem;
-  padding: 6px 8px;
-  border-bottom: 1px solid var(--border);
-}
-
-.rail-needs {
-  margin-left: 0.3rem;
-  border-radius: 999px;
-  padding: 0 0.3rem;
-  background: color-mix(in srgb, var(--danger, #f85149) 22%, transparent);
-  color: var(--danger, #f85149);
-  font-size: 0.85em;
-}
-
-.rail-body {
-  overflow: auto;
-  padding: 6px 8px 12px;
+  flex-direction: column;
+  flex: 0 1 auto;
   min-height: 0;
+  border-bottom: 1px solid var(--border);
+  overflow: auto;
 }
 
-.rail-note,
-.rail-problem {
-  margin: 0.4rem 0;
-  font-size: 0.9em;
+.aside-zone {
+  display: flex;
+  flex-direction: column;
 }
 
-.rail-problem {
-  color: var(--danger, #f85149);
-  padding: 0 8px;
-}
-
-.rail-section {
-  margin: 0.8rem 0 0.3rem;
+.aside-zone h3,
+.aside-zone h4 {
+  margin: 0;
   font-size: 0.82em;
+  font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--muted);
 }
 
-.rail-section:first-child {
-  margin-top: 0.2rem;
+.aside-zone > h3 > button {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  width: 100%;
+  padding: 7px 12px;
+  background: none;
+  border: 0;
+  border-top: 1px solid var(--border-soft, #21262d);
+  color: inherit;
+  font: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+  text-align: left;
 }
 
-.rail-outline,
+.aside-zone > h3 > button:hover {
+  background: var(--hover, #1f2630);
+}
+
+.aside-caret {
+  width: 0.8em;
+  color: var(--faint, #6e7681);
+}
+
+.aside-count {
+  color: var(--faint, #6e7681);
+  font-variant-numeric: tabular-nums;
+}
+
+.aside-body {
+  padding: 2px 10px 10px;
+}
+
+/* ---- the heading tree, drawn the same in both places ---- */
+.outline-tree,
+.outline-tree ul,
 .rail-links,
-.rail-outline ul {
+.outline-matches {
   list-style: none;
   margin: 0;
   padding: 0;
 }
 
-.rail-outline ul {
+.outline-tree ul {
   padding-left: 0.7rem;
-  border-left: 1px solid var(--border-soft, #21262d);
   margin-left: 0.25rem;
+  border-left: 1px solid var(--border-soft, #21262d);
 }
 
-.rail-heading {
+.outline-heading {
   display: flex;
   width: 100%;
   gap: 0.4rem;
   align-items: baseline;
   text-align: left;
   padding: 2px 4px;
+  border: 0;
   border-radius: 3px;
   background: none;
-  border: 0;
   color: inherit;
   cursor: pointer;
 }
 
-.rail-heading:hover {
+.outline-heading:hover,
+.outline-heading.is-here {
   background: var(--hover, #1f2630);
 }
 
-.rail-heading-text {
+.outline-heading-text {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
   flex: 1;
 }
 
-.rail-h1 .rail-heading-text {
+.outline-h1 .outline-heading-text {
   font-weight: 600;
 }
 
-.rail-h3 .rail-heading-text,
-.rail-h4 .rail-heading-text,
-.rail-h5 .rail-heading-text,
-.rail-h6 .rail-heading-text {
+.outline-h3 .outline-heading-text,
+.outline-h4 .outline-heading-text,
+.outline-h5 .outline-heading-text,
+.outline-h6 .outline-heading-text {
   color: var(--muted);
 }
 
-.rail-words {
+.outline-words {
   font-size: 0.8em;
   color: var(--faint, #6e7681);
   font-variant-numeric: tabular-nums;
 }
 
+/* ---- link rows, in either place ---- */
 .rail-links li {
   display: flex;
   flex-wrap: wrap;
@@ -3313,10 +3332,18 @@ span.asset-problem {
   font-size: 0.85em;
 }
 
+.rail-target:disabled {
+  cursor: default;
+}
+
 .rail-doc {
   font-weight: 600;
   font-size: 0.9em;
   margin-top: 0.4rem;
+}
+
+.rail-backlink {
+  margin-bottom: 0.5rem;
 }
 
 .rail-asset {
@@ -3335,6 +3362,35 @@ span.asset-problem {
   white-space: nowrap;
 }
 
+.rail-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin: 0.3rem 0;
+}
+
+.rail-needs {
+  border-radius: 999px;
+  padding: 0 0.3rem;
+  background: color-mix(in srgb, var(--danger, #f85149) 22%, transparent);
+  color: var(--danger, #f85149);
+}
+
+.rail-note,
+.rail-problem {
+  margin: 0.4rem 0;
+  font-size: 0.9em;
+}
+
+.rail-problem {
+  color: var(--danger, #f85149);
+  padding: 0 12px;
+}
+
+.rail-section {
+  margin: 0.8rem 0 0.3rem;
+}
+
 .link-ok {
   color: #3fb950;
   border-color: #3fb95055;
@@ -3350,110 +3406,123 @@ span.asset-problem {
   border-color: #f8514955;
 }
 
-/* The panel: the same two questions over a folder. */
-.markdown-dialog {
-  width: min(70rem, 94vw);
-  max-height: 88vh;
+/* ---- the folder's own view of its markdown ---- */
+.outline-explorer {
   display: flex;
   flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.outline-bar {
+  display: flex;
+  align-items: center;
   gap: 0.6rem;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.outline-scope {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.outline-split {
+  display: flex;
+  gap: 0;
+  min-height: 0;
+  flex: 1;
+}
+
+.outline-names {
+  width: 16rem;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 8px;
+  border-right: 1px solid var(--border);
   overflow: auto;
 }
 
-.markdown-scope {
-  display: flex;
-  align-items: center;
-  gap: 0.35rem;
-  color: var(--muted);
-  margin-left: auto;
-}
-
-.markdown-section {
-  min-height: 0;
-}
-
-.markdown-bar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.35rem;
-  align-items: center;
-}
-
-.markdown-bar input {
-  flex: 1 1 14rem;
-}
-
-.markdown-split {
-  display: flex;
-  gap: 0.8rem;
-  align-items: flex-start;
-  min-height: 0;
-}
-
-.markdown-names {
+.outline-names ul {
   list-style: none;
   margin: 0;
   padding: 0;
-  width: 18rem;
-  flex: 0 0 auto;
-  max-height: 54vh;
   overflow: auto;
-  border-right: 1px solid var(--border, #30363d);
 }
 
-.markdown-name {
+.outline-name {
   display: flex;
   width: 100%;
   gap: 0.5rem;
   justify-content: space-between;
-  padding: 2px 6px 2px 0;
-  background: none;
+  padding: 2px 6px 2px 4px;
   border: 0;
+  border-radius: 3px;
+  background: none;
   color: inherit;
   cursor: pointer;
   text-align: left;
 }
 
-.markdown-name:hover,
-.markdown-name.is-chosen {
+.outline-name:hover,
+.outline-name.is-chosen {
   background: var(--hover, #1f2630);
 }
 
-.markdown-sections {
-  flex: 1;
-  min-width: 0;
-  max-height: 54vh;
-  overflow: auto;
+.outline-match {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--muted);
+  font-size: 0.9em;
+  margin-top: auto;
+  padding-top: 0.4rem;
 }
 
-.markdown-empty {
+.outline-sections,
+.outline-links {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: 8px 12px 16px;
+}
+
+.outline-count {
+  margin: 0 0 0.5rem;
+  font-size: 0.9em;
+}
+
+.outline-empty {
   padding: 0.3rem 0;
 }
 
-.markdown-doc {
-  margin-bottom: 0.7rem;
+.outline-doc {
+  margin-bottom: 0.9rem;
 }
 
-.markdown-doc ul {
-  list-style: none;
-  margin: 0;
-  padding: 0 0 0 0.8rem;
+.outline-doc > h3 {
+  margin: 0 0 0.2rem;
+  font-size: 0.95em;
 }
 
-.markdown-doc-name {
+.outline-doc > h3 > button {
   display: flex;
-  gap: 0.5rem;
   align-items: baseline;
-  background: none;
-  border: 0;
-  padding: 0;
-  color: inherit;
-  font-weight: 600;
-  cursor: pointer;
+  gap: 0.5rem;
   max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
 }
 
-.markdown-doc-name .muted {
+.outline-doc > h3 .muted {
   font-weight: 400;
   font-size: 0.85em;
   overflow: hidden;
@@ -3461,47 +3530,28 @@ span.asset-problem {
   white-space: nowrap;
 }
 
-.markdown-section-row,
-.markdown-link-row {
+.outline-match-row {
   display: flex;
   flex-wrap: wrap;
   gap: 0.5rem;
   align-items: baseline;
   width: 100%;
-  background: none;
+  padding: 2px 4px;
   border: 0;
-  padding: 2px 0;
+  border-radius: 3px;
+  background: none;
   color: inherit;
   cursor: pointer;
   text-align: left;
 }
 
-.markdown-section-row:hover,
-.markdown-link-row:hover {
+.outline-match-row:hover {
   background: var(--hover, #1f2630);
 }
 
-.markdown-count {
-  margin: 0;
-  font-size: 0.9em;
-}
-
-.rail-counts {
+.outline-statuses {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.3rem;
-  margin: 0 0 0.4rem;
-}
-
-.rail-backlink {
-  margin-bottom: 0.5rem;
-}
-
-/* The panel's names column is narrow: a long heading is clipped there as it is in the rail. */
-.markdown-heading-text {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-  flex: 1;
+  gap: 0.35rem;
+  margin-bottom: 0.6rem;
 }

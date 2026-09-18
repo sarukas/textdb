@@ -37,6 +37,7 @@ import { actionFor, count, type BulkAction, type PathAction } from "../tree/acti
 import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
 import { PathBar } from "./PathBar";
 import { MetaExplorer } from "./MetaExplorer";
+import { OutlineExplorer } from "./OutlineExplorer";
 import { SearchResults } from "./SearchResults";
 import { ensureRowVisible, VirtualList } from "./VirtualList";
 
@@ -121,6 +122,8 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
   const [filterText, setFilterText] = useState("");
   const [filter, setFilter] = useState(() => parseFilter(""));
   const [contents, setContents] = useState(false);
+  /** The folder's markdown structure: every document's headings, and the links that reach nothing. */
+  const [outline, setOutline] = useState(false);
   // Search by front-matter property, scoped to this folder.
   const [props, setProps] = useState(false);
   const [recursive, setRecursive] = useState(false);
@@ -748,9 +751,15 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
                 listRef.current?.focus();
               }
             }}
-            disabled={props}
+            disabled={props || outline}
             placeholder={
-              props ? "Use the query box below" : contents ? `Search the text of ${label}` : `Filter ${label}: name, author:…, type:…`
+              props
+                ? "Use the query box below"
+                : outline
+                  ? "Use the heading box below"
+                  : contents
+                    ? `Search the text of ${label}`
+                    : `Filter ${label}: name, author:…, type:…`
             }
             aria-label={contents ? `Search the text of files in ${label}` : `Filter ${label}`}
             spellCheck={false}
@@ -758,10 +767,11 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
           <div className="segmented" role="group" aria-label="Search in">
             <button
               type="button"
-              aria-pressed={!contents && !props}
+              aria-pressed={!contents && !props && !outline}
               onClick={() => {
                 setContents(false);
                 setProps(false);
+                setOutline(false);
               }}
               title="Filter by name, author and type"
             >
@@ -773,6 +783,7 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
               onClick={() => {
                 setContents(true);
                 setProps(false);
+                setOutline(false);
               }}
               title="Full-text search inside this folder"
             >
@@ -784,14 +795,27 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
               onClick={() => {
                 setProps(true);
                 setContents(false);
+                setOutline(false);
               }}
               title="Search by front-matter property, and browse what properties this vault uses"
             >
               Properties
             </button>
+            <button
+              type="button"
+              aria-pressed={outline}
+              onClick={() => {
+                setOutline(true);
+                setContents(false);
+                setProps(false);
+              }}
+              title="Every document's headings below this folder, and the links that reach nothing"
+            >
+              Headings
+            </button>
           </div>
           <label className="toggle" title="List everything below this folder, not only what is directly in it">
-            <input type="checkbox" checked={recursive} disabled={contents || props} onChange={(e) => setRecursive(e.target.checked)} />
+            <input type="checkbox" checked={recursive} disabled={contents || props || outline} onChange={(e) => setRecursive(e.target.checked)} />
             Subfolders
           </label>
           <ColumnChooser columns={columns} onChange={changeColumns} />
@@ -894,7 +918,9 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
         </div>
       )}
 
-      {props ? (
+      {outline ? (
+        <OutlineExplorer folder={path} onOpen={onOpenFile} />
+      ) : props ? (
         <MetaExplorer onOpen={onOpenFile} folder={path} />
       ) : contents ? (
         search ? (

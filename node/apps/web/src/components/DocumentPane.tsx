@@ -11,7 +11,6 @@ import { useNow } from "../state/useNow";
 import { ConflictPanel } from "./ConflictPanel";
 import { Editor } from "./Editor";
 import { History } from "./History";
-import { MarkdownRail } from "./MarkdownRail";
 import { Preview } from "./Preview";
 import { useToast } from "./Toasts";
 
@@ -34,16 +33,6 @@ interface Props {
   onPathChange: (path: string) => void;
   onAction: (action: PathAction) => void;
   onOpenFolder: (path: string) => void;
-  /** Open a document, at a line when one is given: what every heading and link row does. */
-  onOpenFile: (path: string, line?: number) => void;
-}
-
-function readRailOpen(): boolean {
-  try {
-    return localStorage.getItem("textdb.railOpen") === "1";
-  } catch {
-    return false;
-  }
 }
 
 const MODES: Array<{ id: Mode; label: string }> = [
@@ -53,7 +42,7 @@ const MODES: Array<{ id: Mode; label: string }> = [
 ];
 
 /** Mounted with `key={open.id}`: one controller per opened document. */
-export function DocumentPane({ open, mode, onMode, hub, own, author, onPathChange, onAction, onOpenFolder, onOpenFile }: Props) {
+export function DocumentPane({ open, mode, onMode, hub, own, author, onPathChange, onAction, onOpenFolder }: Props) {
   const toast = useToast();
   const authorRef = useRef(author);
   authorRef.current = author;
@@ -81,17 +70,6 @@ export function DocumentPane({ open, mode, onMode, hub, own, author, onPathChang
   useEffect(() => {
     controller?.setChunksEnabled(chunksOn && mode !== "history");
   }, [controller, chunksOn, mode, state?.status]);
-
-  // The rail of headings and links, remembered across documents and reloads: someone who works
-  // with it wants it on every note, and someone who does not never sees it again.
-  const [railOpen, setRailOpen] = useState(readRailOpen);
-  useEffect(() => {
-    try {
-      localStorage.setItem("textdb.railOpen", railOpen ? "1" : "0");
-    } catch {
-      // ignore
-    }
-  }, [railOpen]);
 
   const [editorMounted, setEditorMounted] = useState(false);
   useEffect(() => {
@@ -214,10 +192,6 @@ export function DocumentPane({ open, mode, onMode, hub, own, author, onPathChang
               Delete…
             </button>
           </span>
-          <label className="toggle" title="The document's headings, and the links it writes and receives">
-            <input type="checkbox" checked={railOpen} onChange={(e) => setRailOpen(e.target.checked)} />
-            Outline
-          </label>
           {mode !== "history" && (
             <label className="toggle" title="Show textdb's content-defined chunk boundaries">
               <input type="checkbox" checked={chunksOn} onChange={(e) => setChunksOn(e.target.checked)} />
@@ -271,17 +245,12 @@ export function DocumentPane({ open, mode, onMode, hub, own, author, onPathChang
         />
       )}
 
-      <div className="doc-main">
-        <div className="doc-body">
-          {mode === "preview" && <Preview controller={controller} state={state} chunksOn={chunksOn} focus={focus} />}
-          {editorMounted && (
-            <Editor controller={controller} state={state} visible={mode === "edit"} chunksOn={chunksOn} focus={mode === "edit" ? focus : null} />
-          )}
-          {mode === "history" && <History state={state} />}
-        </div>
-        {railOpen && (
-          <MarkdownRail path={state.path} version={state.version} onOpen={onOpenFile} onClose={() => setRailOpen(false)} />
+      <div className="doc-body">
+        {mode === "preview" && <Preview controller={controller} state={state} chunksOn={chunksOn} focus={focus} />}
+        {editorMounted && (
+          <Editor controller={controller} state={state} visible={mode === "edit"} chunksOn={chunksOn} focus={mode === "edit" ? focus : null} />
         )}
+        {mode === "history" && <History state={state} />}
       </div>
     </div>
   );

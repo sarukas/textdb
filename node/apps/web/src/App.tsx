@@ -14,7 +14,7 @@ import { AccessPanel } from "./components/AccessPanel";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { AssetPane } from "./components/AssetPane";
 import { AssetsPanel } from "./components/AssetsPanel";
-import { MarkdownPanel } from "./components/MarkdownPanel";
+import { DocumentAside } from "./components/DocumentAside";
 import { DocumentPane, type Mode, type OpenDoc } from "./components/DocumentPane";
 import { isPointer, syncLinkFor } from "./assets/model";
 import { ExportDialog } from "./components/ExportDialog";
@@ -78,8 +78,6 @@ export function App() {
   const [access, setAccess] = useState<{ folder: string | null } | null>(null);
   /** The assets panel, and the asset it was opened on when it was opened from one. */
   const [assetsAt, setAssetsAt] = useState<{ path: string | null } | null>(null);
-  /** The headings-and-links panel, over the folder it was opened from. */
-  const [markdownIn, setMarkdownIn] = useState<string | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [lastSeq, setLastSeq] = useState(0);
   const [feed, setFeed] = useState<FeedItem[]>([]);
@@ -290,7 +288,6 @@ export function App() {
       <Header
         onAccess={() => setAccess({ folder: folder })}
         onAssets={() => setAssetsAt({ path: null })}
-        onMarkdown={() => setMarkdownIn(folder ?? parentOf(open?.path ?? "/"))}
         who={who}
         onWho={(w) => {
           setWho(w);
@@ -306,7 +303,6 @@ export function App() {
         onImport={() => setImporting(true)}
       />
       {access && <AccessPanel folder={access.folder} onClose={() => setAccess(null)} />}
-      {markdownIn !== null && <MarkdownPanel scope={markdownIn} onOpen={openFile} onClose={() => setMarkdownIn(null)} />}
       {assetsAt && (
         <AssetsPanel
           links={syncLinks}
@@ -463,7 +459,6 @@ export function App() {
               onPathChange={onPathChange}
               onAction={onPathAction}
               onOpenFolder={openFolder}
-              onOpenFile={openFile}
             />
           ) : (
             <FolderView
@@ -480,7 +475,10 @@ export function App() {
             />
           )}
         </section>
-        <aside className="activity-wrap" aria-label="Activity feed">
+        <aside className="activity-wrap" aria-label={open ? "This document, and activity" : "Activity feed"}>
+          {/* What the store knows about the open document sits above the feed rather than behind a
+              toggle in the document's own bar, where nobody found it. */}
+          {open && feedOpen && <DocumentAside key={open.id} path={open.path} hub={hub} onOpen={openFile} />}
           <ActivityFeed items={feed} author={author} own={own} open={feedOpen} onToggle={toggleFeed} onOpen={openFile} />
         </aside>
       </main>
