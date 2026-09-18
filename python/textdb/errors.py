@@ -1,11 +1,11 @@
-"""Errors raised by textdb, mapped from the SQLSTATE-style codes TX001–TX004."""
+"""Errors raised by textdb, mapped from the SQLSTATE-style codes TX001–TX005."""
 
 import json
 from typing import Any, Dict, Optional
 
 
 class TextdbError(Exception):
-    """Base class. `code` is TX000–TX004; `payload` is the parsed JSON detail when present."""
+    """Base class. `code` is TX000–TX005; `payload` is the parsed JSON detail when present."""
 
     code = "TX000"
 
@@ -57,7 +57,23 @@ class InvalidEdit(TextdbError):
     code = "TX004"
 
 
-_BY_CODE = {"TX001": Conflict, "TX002": Contention, "TX003": NotFound, "TX004": InvalidEdit}
+class Forbidden(TextdbError):
+    """In your view and not yours to do: a read-only share written to, an owner-only operation.
+
+    Distinct from NotFound, which is what a path outside every share answers, and the difference
+    is the point of having both.
+    """
+
+    code = "TX005"
+
+
+_BY_CODE = {
+    "TX001": Conflict,
+    "TX002": Contention,
+    "TX003": NotFound,
+    "TX004": InvalidEdit,
+    "TX005": Forbidden,
+}
 
 
 def from_code(code: str, message: str, detail: Optional[str] = None) -> TextdbError:
@@ -73,7 +89,7 @@ def from_code(code: str, message: str, detail: Optional[str] = None) -> TextdbEr
 
 def from_message(message: str) -> Optional[TextdbError]:
     """Parse the SQLite form: 'TX001 conflict: {json}' / 'TX004 invalid edit: …'."""
-    for code in ("TX001", "TX002", "TX003", "TX004", "TX000"):
+    for code in ("TX001", "TX002", "TX003", "TX004", "TX005", "TX000"):
         idx = message.find(code)
         if idx >= 0:
             rest = message[idx + len(code):].strip()

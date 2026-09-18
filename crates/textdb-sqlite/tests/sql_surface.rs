@@ -523,6 +523,42 @@ fn sections_stay_findable_across_edits_that_do_not_change_structure() {
     assert!(section("Deep").unwrap().contains("delta"));
 }
 
+/// A connection's account does not outlive the connection.
+///
+/// `textdb_auth` leaves the view in a process-wide map keyed by the `sqlite3*` pointer, because the
+/// functions build a fresh `TextDb` per call and have nowhere else to keep it. Nothing cleared that
+/// map: `access::clear_session` existed and had no caller, so a closed connection left its account
+/// behind and the next connection allocated at the same address answered as that account. Asserted
+/// on the handle itself rather than by hoping the allocator reuses an address.
+#[test]
+fn a_connection_stops_being_an_account_when_it_closes() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kb.db");
+    let bearer = {
+        let conn = textdb_sqlite::open(file.to_str().unwrap()).unwrap();
+        let db = TextDb::open(&conn, "kb_").unwrap();
+        db.ensure_folder("/sales").unwrap();
+        db.create("/sales/a.md", b"alpha\n", None, None).unwrap();
+        let node = db.entry("/sales").unwrap().id;
+        drop(db);
+        let now = "2026-01-01T00:00:00.000Z";
+        let account = textdb_sqlite::access::create_account(&conn, "kb_", "agent", "agent", Some(node), now).unwrap();
+        let (bearer, _) = textdb_sqlite::access::create_token(&conn, "kb_", account.id, None, None, now).unwrap();
+        bearer
+    };
+
+    let handle = {
+        let conn = textdb_sqlite::open(file.to_str().unwrap()).unwrap();
+        let handle = unsafe { conn.handle() } as usize;
+        let who: String = conn.query_row("SELECT textdb_auth(?1)", [&bearer], |r| r.get(0)).unwrap();
+        assert_eq!(who, "agent");
+        assert!(!textdb_sqlite::access::session(handle).is_admin(), "the connection is the account while it is open");
+        handle
+    };
+    // Closed: whatever is allocated at that address next is the owner, as any fresh connection is.
+    assert!(textdb_sqlite::access::session(handle).is_admin(), "a closed connection must not leave its account behind");
+}
+
 /// The scalar functions borrow a handle a `textdb` table registered. With no table on the
 /// connection there is nothing to borrow, and they must still work on their own — this is
 /// the fallback path in `with_db`, which nothing else exercises.

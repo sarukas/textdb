@@ -175,6 +175,21 @@ fn with_db<T>(
     f(&db).map_err(map_err)
 }
 
+/// What a connection's session is bound to: dropped when SQLite destroys the function that holds
+/// it, which is when the connection closes. It carries the prefix so that the closure genuinely
+/// uses it -- a 2021 closure captures only what its body names, and a guard nothing names would not
+/// be captured at all.
+struct Ending {
+    prefix: String,
+    handle: usize,
+}
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        crate::access::clear_session(self.handle);
+    }
+}
+
 pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY;
     // See `with_db`: the handle these functions belong to, captured once.
@@ -185,8 +200,14 @@ pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
     // the SQLite half of #12 §4; Postgres has `SET textdb.token`. Returns the account name.
     // Called with NULL it goes back to being the owner, which is what the store is to anyone who
     // can open the file anyway (#12 L1).
-    let p = prefix.to_string();
+    // The session outlives nothing: `Ending` carries the prefix this closure needs, and dropping
+    // it clears the connection's view. SQLite destroys a function's data when the connection
+    // closes, which is the only moment there is to hear about -- `clear_session` had no caller at
+    // all, so a view stayed in the map after its connection was gone, and the next connection
+    // allocated at that address inherited whatever account the last one had authenticated as.
+    let ending = Ending { prefix: prefix.to_string(), handle: h };
     conn.create_scalar_function("textdb_auth", 1, flags, move |ctx| {
+        let p = &ending.prefix;
         if ctx.get_raw(0) == ValueRef::Null {
             crate::access::set_session(h, textdb_core::access::View::admin());
             return Ok(None);
@@ -194,13 +215,17 @@ pub fn register_functions(conn: &Connection, prefix: &str) -> Result<()> {
         let bearer = arg_str(ctx, 0)?;
         let conn = unsafe { ctx.get_connection()? };
         let now = crate::storage::SqliteStorage::now();
-        match crate::access::authenticate(&conn, &p, &bearer, &now).map_err(map_err)? {
+        match crate::access::authenticate(&conn, p, &bearer, &now).map_err(map_err)? {
             Ok(view) => {
                 let name = view.name().unwrap_or_default().to_string();
                 crate::access::set_session(h, view);
                 Ok(Some(name))
             }
-            Err(e) => Err(Error::UserFunctionError(e.to_string().into())),
+            // Carrying the code, as every other refusal on this surface does: a bearer that is
+            // not usable is `forbidden`, which is what the CLI's store module and Postgres's
+            // `kb.auth` both answer. Without it a SQL client got an untyped error and read a
+            // refusal as a fault of its own.
+            Err(e) => Err(Error::UserFunctionError(format!("TX005 {e}").into())),
         }
     })?;
 

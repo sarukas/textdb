@@ -19,6 +19,7 @@ export {
   type ConflictPayload,
   Contention,
   type ErrorCode,
+  Forbidden,
   InvalidEdit,
   NotFound,
   TextdbError,

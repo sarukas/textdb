@@ -35,6 +35,15 @@ export interface OpenOptions {
   extension?: string;
   /** Default author for writes that do not name one. */
   author?: string;
+  /**
+   * A bearer token. Every answer is then that account's view: its own paths, its own shares and
+   * nothing else. Without one the store is opened as its owner, which is what anyone able to open
+   * the file is anyway.
+   *
+   * A bearer belongs to a connection, so one `Corpus` is one account. Serving several accounts
+   * means one `Corpus` each, not re-authenticating a shared one between requests.
+   */
+  token?: string;
 }
 
 export interface WriteOptions {
@@ -184,7 +193,16 @@ export function openCorpus(options: OpenOptions): Corpus {
     sql.conn.close();
     throw error;
   }
-  return new Corpus(sql, db, extension, options.author ?? null);
+  const corpus = new Corpus(sql, db, extension, options.author ?? null);
+  if (options.token !== undefined) {
+    try {
+      corpus.authenticate(options.token);
+    } catch (error) {
+      corpus.close();
+      throw error;
+    }
+  }
+  return corpus;
 }
 
 /** The canonical `Entry` columns, in order. One list, so `ls`, `list` and `entry` agree. */
@@ -237,12 +255,35 @@ export class Corpus {
   readonly extension: string;
   readonly author: string | null;
   private readonly sql: Sql;
+  private accountName: string | null = null;
 
   constructor(sql: Sql, db: string, extension: string, author: string | null) {
     this.sql = sql;
     this.db = db;
     this.extension = extension;
     this.author = author;
+  }
+
+  /**
+   * Present a bearer: every answer from here on is that account's view. `null` goes back to being
+   * the owner. Returns the account's name, or null for the owner.
+   *
+   * The bearer is bound to this corpus's own connection, so switching it changes what every later
+   * call answers -- including calls already in flight on the same connection. A server serving
+   * several accounts opens one corpus per account rather than switching one between them.
+   *
+   * Throws `Forbidden` where the bearer is unknown, expired or revoked: one answer for all three,
+   * so a caller cannot tell which it was.
+   */
+  authenticate(bearer: string | null): string | null {
+    const name = this.sql.value('SELECT textdb_auth(?)', bearer);
+    this.accountName = typeof name === 'string' && name.length > 0 ? name : null;
+    return this.accountName;
+  }
+
+  /** The account this corpus authenticated as, or null for the owner. */
+  get account(): string | null {
+    return this.accountName;
   }
 
   info(): Info {

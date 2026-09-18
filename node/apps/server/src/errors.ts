@@ -1,7 +1,9 @@
 import { Conflict, type ErrorCode, InvalidEdit, toTextdbError } from '@textdb/node';
 import type { Context } from 'hono';
 
-const STATUS = { TX000: 500, TX001: 409, TX002: 503, TX003: 404, TX004: 400 } as const satisfies Record<ErrorCode, number>;
+// TX005 is 403 and TX003 is 404, and that distinction is the whole point of having both: a path
+// outside every share is not there, one inside a share you may not write is refused.
+const STATUS = { TX000: 500, TX001: 409, TX002: 503, TX003: 404, TX004: 400, TX005: 403 } as const satisfies Record<ErrorCode, number>;
 
 export interface ErrorBody {
   code: ErrorCode;

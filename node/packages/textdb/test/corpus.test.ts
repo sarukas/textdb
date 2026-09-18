@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
-import { Conflict, type Corpus, InvalidEdit, NotFound, TextdbError, fromMessage, openCorpus } from '../src/index.ts';
+import { Conflict, type Corpus, Forbidden, InvalidEdit, NotFound, TextdbError, fromMessage, openCorpus } from '../src/index.ts';
 import { type TempDir, tempStore } from './helpers.ts';
 
 describe('corpus', () => {
@@ -15,6 +15,21 @@ describe('corpus', () => {
   after(() => {
     kb.close();
     tmp.remove();
+  });
+
+  // A store nobody has delegated has no accounts, so what there is to check here is the wiring: a
+  // bearer reaches `textdb_auth`, an unusable one is refused as `Forbidden` (TX005) rather than as
+  // a fault of the caller's, and the owner is what no bearer means. The account's own view is the
+  // catalogue's business (tests/access.rs), on both engines.
+  test('a bearer is presented to the store, and an unusable one is forbidden', () => {
+    assert.equal(kb.account, null);
+    assert.equal(kb.authenticate(null), null);
+    assert.throws(() => kb.authenticate('tdb_nothing-of-the-kind'), (e: unknown) => e instanceof Forbidden && (e as Forbidden).code === 'TX005');
+    // Refused leaves the corpus as it was: still the owner, still answering.
+    assert.equal(kb.account, null);
+    assert.equal(kb.lastSeq() >= 0, true);
+    // And the same on the way in, where the corpus is closed again rather than handed back broken.
+    assert.throws(() => openCorpus({ db: tmp.db, token: 'tdb_nothing-of-the-kind' }), (e: unknown) => e instanceof Forbidden);
   });
 
   test('opens and migrates an empty store, and reopens it', () => {

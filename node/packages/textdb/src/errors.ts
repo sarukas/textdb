@@ -1,4 +1,4 @@
-export type ErrorCode = 'TX000' | 'TX001' | 'TX002' | 'TX003' | 'TX004';
+export type ErrorCode = 'TX000' | 'TX001' | 'TX002' | 'TX003' | 'TX004' | 'TX005';
 
 export class TextdbError extends Error {
   readonly code: ErrorCode;
@@ -43,13 +43,27 @@ export class NotFound extends TextdbError {
   }
 }
 
+/**
+ * It is in your view and you may not do it: a read-only share written to, a folder never granted
+ * (under an alias you hold), an owner-only operation on a token session.
+ *
+ * Not the same as `NotFound`, which is what a path outside every share answers -- the difference is
+ * the point of it, so the two must not be collapsed by a caller either.
+ */
+export class Forbidden extends TextdbError {
+  constructor(message: string, payload: Record<string, unknown> = {}) {
+    super(message, 'TX005', payload);
+    this.name = 'Forbidden';
+  }
+}
+
 export class InvalidEdit extends TextdbError {
   constructor(message: string, payload: Record<string, unknown> = {}) {
     super(message, 'TX004', payload);
   }
 }
 
-const CODES = ['TX001', 'TX002', 'TX003', 'TX004', 'TX000'] as const;
+const CODES = ['TX001', 'TX002', 'TX003', 'TX004', 'TX005', 'TX000'] as const;
 
 function fromCode(code: ErrorCode, message: string, detail?: string): TextdbError {
   let payload: Record<string, unknown> = {};
@@ -69,6 +83,8 @@ function fromCode(code: ErrorCode, message: string, detail?: string): TextdbErro
       return new NotFound(message, payload);
     case 'TX004':
       return new InvalidEdit(message, payload);
+    case 'TX005':
+      return new Forbidden(message, payload);
     default:
       return new TextdbError(message, code, payload);
   }

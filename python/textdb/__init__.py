@@ -10,7 +10,7 @@
 """
 
 from .corpus import SORT_KEYS, HeadingName, OutlineEntry, PropertyHit, PropertyKey, PropertyValue, Corpus, Entry, Hit, Commit, Link
-from .errors import TextdbError, Conflict, Contention, NotFound, InvalidEdit
+from .errors import TextdbError, Conflict, Contention, NotFound, InvalidEdit, Forbidden
 
 __all__ = [
     "SORT_KEYS",
@@ -20,6 +20,6 @@ __all__ = [
     "OutlineEntry",
     "PropertyHit",
     "Corpus", "Entry", "Hit", "Commit", "Link",
-    "TextdbError", "Conflict", "Contention", "NotFound", "InvalidEdit",
+    "TextdbError", "Conflict", "Contention", "NotFound", "InvalidEdit", "Forbidden",
 ]
 __version__ = "0.1.0"
