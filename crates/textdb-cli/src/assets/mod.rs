@@ -2407,6 +2407,17 @@ fn in_use_or(st: &mut dyn Store, name: &str, subject: &str, what: &str) -> Resul
 }
 
 pub fn stores(st: &mut dyn Store, o: StoresOptions, json: bool) -> Result<()> {
+    // Before anything else a declaration does. The store refuses a session that is not the owner's
+    // when the row is written, at the end -- by which time this has already made the root folder on
+    // this computer and read every pointer in the store to see whether the old one is in use. A
+    // refusal is not a refusal if the work it refuses has already happened, so it is asked for
+    // first, and the store is still the one that says it.
+    if (o.add.is_some() || o.remove.is_some()) && !st.whoami()?.admin {
+        return Err(StoreError::forbidden(format!(
+            "only the owner of the store can {} asset stores",
+            if o.add.is_some() { "declare" } else { "remove" }
+        )));
+    }
     if let Some(name) = &o.add {
         if !pointer::valid_store_name(name) {
             return Err(StoreError::invalid(format!("{name}: an asset store name is letters, digits, _, - and .")));

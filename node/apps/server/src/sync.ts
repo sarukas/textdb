@@ -134,7 +134,8 @@ export class SyncService {
       }
       // A report comes back whatever the exit status: conflicts (3) and blocked names (6) included.
       if (parsed && 'to_disk' in parsed) return parsed;
-      const code = typeof parsed?.code === 'string' && /^TX00[0-4]$/.test(parsed.code) ? (parsed.code as ErrorCode) : 'TX000';
+      // TX005 included: a store that refuses a session is not this server failing.
+      const code = typeof parsed?.code === 'string' && /^TX00[0-5]$/.test(parsed.code) ? (parsed.code as ErrorCode) : 'TX000';
       const message = typeof parsed?.message === 'string' ? parsed.message : (stderr || stdout).trim().slice(0, 2000);
       throw new CodedError(code, message || `textdb sync exited with status ${status}`);
     });

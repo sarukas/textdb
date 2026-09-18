@@ -279,6 +279,25 @@ describe('asset stores over HTTP', { skip: cli ? false : 'the textdb CLI is not 
     assert.deepEqual((await call('GET', '/api/assets/stores')).body.map((s: { name: string }) => s.name), ['team']);
   });
 
+  test('what cannot be a command line argument is refused as a bad request', async () => {
+    // A NUL cannot be in an argument at all, and Node throws an internal TypeError when one is:
+    // that is a 400 about the request, not a 500 about this server.
+    const nul = await call('POST', '/api/assets/stores', { name: 'a b', root: bucket });
+    assert.equal(nul.status, 400, JSON.stringify(nul.body));
+    assert.equal(nul.body.code, 'TX004');
+
+    // `--bind` splits its argument at the first `=`, so a name carrying one would bind a different
+    // store and leave it pointing at nothing.
+    const equals = await call('POST', '/api/assets/stores/bind', { name: 'team=evil', location: 'z' });
+    assert.equal(equals.status, 400, JSON.stringify(equals.body));
+    assert.deepEqual((await call('GET', '/api/assets/stores')).body.map((s: Record<string, unknown>) => [s.name, s.bound_to]), [['team', null]]);
+
+    // And a binding is only ever written for a store that is declared: a typo otherwise lands in
+    // this machine's config file where nothing shows it again.
+    const typo = await call('POST', '/api/assets/stores/bind', { name: 'teem', location: bucket });
+    assert.equal(typo.status, 404, JSON.stringify(typo.body));
+  });
+
   test('verify answers both sides of every asset, and the store’s files no pointer names', async () => {
     const verified = await call('GET', '/api/assets/verify?prefix=/notes');
     assert.equal(verified.status, 200, JSON.stringify(verified.body));
@@ -311,5 +330,67 @@ describe('asset stores over HTTP', { skip: cli ? false : 'the textdb CLI is not 
     const relocated = await call('POST', '/api/assets/relocate', { prefix: '/notes', author: 'web' });
     assert.equal(relocated.status, 200, JSON.stringify(relocated.body));
     assert.deepEqual([relocated.body.moved, relocated.body.failed], [[], []]);
+  });
+});
+
+/**
+ * A server that syncs no folder still configures where the bytes live.
+ *
+ * Asset stores belong to the textdb store, not to a folder this server happens to sync, and the
+ * binding belongs to this machine. Someone setting a vault up declares them before there is
+ * anything to pull, so refusing the whole panel for want of `TEXTDB_SYNC` would refuse the first
+ * step. The folder-scoped calls still say there are no folders, because there are none.
+ */
+describe('asset stores without a synced folder', { skip: cli ? false : 'the textdb CLI is not built (or set TEXTDB_CLI)' }, () => {
+  let tmp: ReturnType<typeof tempDir>;
+  let server: RunningServer;
+  const previousConfig = process.env.TEXTDB_CONFIG_DIR;
+
+  before(async () => {
+    tmp = tempDir();
+    process.env.TEXTDB_CONFIG_DIR = path.join(tmp.dir, 'config');
+    server = await startServer({
+      store: path.join(tmp.dir, 'kb.db'),
+      port: 0,
+      webDist: path.join(tmp.dir, 'web'),
+      cli: cli ?? undefined,
+    });
+  });
+
+  after(async () => {
+    await server.close();
+    tmp.remove();
+    if (previousConfig === undefined) delete process.env.TEXTDB_CONFIG_DIR;
+    else process.env.TEXTDB_CONFIG_DIR = previousConfig;
+  });
+
+  test('the stores are listed and declared; the folder calls say there is no folder', async () => {
+    const get = async (url: string) => {
+      const res = await fetch(`${server.url}${url}`);
+      return { status: res.status, body: (await res.json()) as Record<string, any> };
+    };
+    const post = async (url: string, body: unknown) => {
+      const res = await fetch(`${server.url}${url}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      return { status: res.status, body: (await res.json()) as Record<string, any> };
+    };
+
+    const empty = await get('/api/assets/stores');
+    assert.equal(empty.status, 200, JSON.stringify(empty.body));
+    assert.deepEqual(empty.body, []);
+
+    const added = await post('/api/assets/stores', { name: 'team', root: path.join(tmp.dir, 'bucket') });
+    assert.equal(added.status, 200, JSON.stringify(added.body));
+    assert.deepEqual(added.body.stores.map((s: { name: string }) => s.name), ['team']);
+    // Bound to this machine, which is this server's own file and nothing to do with a folder.
+    const bound = await post('/api/assets/stores/bind', { name: 'team', location: tmp.dir });
+    assert.equal(bound.body.stores[0].bound_to, tmp.dir);
+
+    const status = await get('/api/assets?prefix=/notes');
+    assert.equal(status.status, 404);
+    assert.match(status.body.message, /TEXTDB_SYNC/);
   });
 });

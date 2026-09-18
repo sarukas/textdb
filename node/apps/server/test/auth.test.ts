@@ -198,10 +198,21 @@ describe('a bearer per request', () => {
     if (!cli) return t.skip('no textdb CLI build to create an account with');
     // Both run the CLI against directories of this server's machine. An account's request would
     // either escalate or mean something undefined, so it is refused rather than half-answered.
-    for (const url of ['/api/sync/links', '/api/assets?prefix=/notes']) {
+    for (const url of ['/api/sync/links', '/api/assets?prefix=/notes', '/api/assets/stores', '/api/assets/verify?prefix=/notes']) {
       const res = await call(url, bearer);
       assert.equal(res.status, 403, url);
       assert.equal(res.body.code, 'TX005', url);
+    }
+    // The stores too, and for the same reason: what this server would answer about them -- where
+    // this machine reaches each one, from which file, and whether it can -- is this machine's.
+    for (const url of ['/api/assets/stores', '/api/assets/stores/remove', '/api/assets/stores/bind']) {
+      const res = await fetch(`${server.url}${url}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'team', root: tmp.dir, location: tmp.dir }),
+      });
+      assert.equal(res.status, 403, url);
+      assert.equal(((await res.json()) as { code: string }).code, 'TX005', url);
     }
   });
 

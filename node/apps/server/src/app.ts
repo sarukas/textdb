@@ -361,27 +361,39 @@ export function createApp(corpora: Corpora, hub: ChangeHub, options: AppOptions)
     const service = assetService(assets);
     return c.json(await service.push(bodyString(body, 'prefix'), bodyPaths(body), bodyOptionalString(body, 'message'), bodyOptionalString(body, 'author')));
   });
-  // The asset stores this textdb store declares: the owner's to change, and it is the store that
-  // says so. A binding is this server's own machine and needs nothing of the store.
-  app.get('/api/assets/stores', async (c) => c.json(await assetService(assets).stores(bearerOf(c))));
+  // The asset stores this textdb store declares, and where this machine reaches each one.
+  //
+  // The owner's, like every other asset route here, and refused here rather than at the store.
+  // The store's own rule is narrower on purpose -- it lets any session *read* the rows, because an
+  // account on its own computer cannot pull without them -- but every field this server adds to
+  // them is about the machine it runs on: where the store is bound, which file said so, whether
+  // this machine can reach it. That is what `ownerOnly` exists to keep to the person who started
+  // the server, and an account reaching this server never pulls through it anyway.
+  app.get('/api/assets/stores', async (c) => {
+    ownerOnly(c, 'the asset stores of this server');
+    return c.json(await assetService(assets).stores());
+  });
   app.post('/api/assets/stores', async (c) => {
+    ownerOnly(c, 'declaring an asset store');
     const body = await jsonBody(c);
-    const service = assetService(assets);
-    await service.putStore(bodyString(body, 'name'), bodyOptionalString(body, 'driver') ?? 'local', bodyString(body, 'root'), bearerOf(c));
-    return c.json({ stores: await service.stores(bearerOf(c)) });
+    // The CLI prints the whole list after it changes one, so this is one run and not two.
+    const stores = await assetService(assets).putStore(
+      bodyString(body, 'name'),
+      bodyOptionalString(body, 'driver') ?? 'local',
+      bodyString(body, 'root'),
+    );
+    return c.json({ stores });
   });
   app.post('/api/assets/stores/remove', async (c) => {
+    ownerOnly(c, 'removing an asset store');
     const body = await jsonBody(c);
-    const service = assetService(assets);
-    await service.removeStore(bodyString(body, 'name'), bearerOf(c));
-    return c.json({ stores: await service.stores(bearerOf(c)) });
+    return c.json({ stores: await assetService(assets).removeStore(bodyString(body, 'name')) });
   });
   app.post('/api/assets/stores/bind', async (c) => {
     ownerOnly(c, 'binding an asset store to this machine');
     const body = await jsonBody(c);
-    const service = assetService(assets);
-    await service.bindStore(bodyString(body, 'name'), bodyOptionalString(body, 'location') ?? '');
-    return c.json({ stores: await service.stores() });
+    const stores = await assetService(assets).bindStore(bodyString(body, 'name'), bodyOptionalString(body, 'location') ?? '');
+    return c.json({ stores });
   });
   app.post('/api/assets/relocate', async (c) => {
     ownerOnly(c, 'moving the files of assets in their store');

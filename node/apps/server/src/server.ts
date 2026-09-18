@@ -44,7 +44,9 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
   const corpus = await corpora.owner();
   const hub = new ChangeHub(corpus, { intervalMs: options.watchIntervalMs });
   const sync = options.sync?.length ? new SyncService(corpus, options.sync, findCli(options.cli)) : null;
-  const assets = sync ? new AssetService(sync, options.store) : null;
+  // Always, even with no folder synced: the asset stores are the textdb store's, and telling this
+  // machine where they are is what someone does before there is anything to pull.
+  const assets = new AssetService(sync, options.store, findCli(options.cli));
   const access = new AccessService(options.store, findCli(options.cli));
   const app = createApp(corpora, hub, {
     webDist: options.webDist,

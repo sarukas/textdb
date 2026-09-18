@@ -8,7 +8,7 @@ import {
   type AssetVerification,
   type SyncLinks,
 } from "../api";
-import { stateLabel } from "../assets/model";
+import { stateLabel, syncLinkFor } from "../assets/model";
 import { formatBytes } from "../import/select";
 import { effectiveAuthor } from "../state/useAuthor";
 
@@ -43,7 +43,18 @@ const size = (n: number | undefined) => (n === undefined ? "—" : formatBytes(n
  */
 export function AssetsPanel({ links, onClose, path, author }: Props) {
   const usable = (links?.links ?? []).filter((l) => l.last);
-  const [prefix, setPrefix] = useState(() => usable.find((l) => path?.startsWith(l.prefix))?.prefix ?? usable[0]?.prefix ?? "");
+  // The folder an asset is in is the innermost one that holds it, which is what `syncLinkFor`
+  // answers: `/notes` and `/notesx` are different folders, and nesting means the longest wins.
+  const [prefix, setPrefix] = useState("");
+  const wanted = (path && syncLinkFor(path, usable)?.prefix) || usable[0]?.prefix || "";
+  // The links arrive after the first render when the page has just loaded, so the folder is picked
+  // when they do rather than once, which left the panel saying there were none. The folders are
+  // compared as their names, since the array itself is new on every render.
+  const available = JSON.stringify(usable.map((l) => l.prefix));
+  useEffect(() => {
+    const folders = JSON.parse(available) as string[];
+    setPrefix((had) => (had && folders.includes(had) ? had : wanted));
+  }, [wanted, available]);
   const [status, setStatus] = useState<AssetStatus | null>(null);
   const [stores, setStores] = useState<AssetStoreRow[] | null>(null);
   const [verification, setVerification] = useState<AssetVerification | null>(null);
@@ -54,18 +65,25 @@ export function AssetsPanel({ links, onClose, path, author }: Props) {
   const [busy, setBusy] = useState(false);
   const who = effectiveAuthor(author);
   const dialogRef = useRef<HTMLDialogElement | null>(null);
+  // A verify hashes every asset here and in its store and can run for a while; closing the panel
+  // gives up on it rather than leaving it to answer into a component that has gone.
+  const running = useRef<AbortController | null>(null);
+  useEffect(() => () => running.current?.abort(), []);
 
   useEffect(() => {
     dialogRef.current?.showModal();
   }, []);
 
-  const guard = useCallback(async (run: () => Promise<void>) => {
+  /** Runs one call, shows whatever it refuses with, and says whether it got through. */
+  const guard = useCallback(async (run: () => Promise<void>): Promise<boolean> => {
     setBusy(true);
     setProblem(null);
     try {
       await run();
+      return true;
     } catch (error) {
       setProblem(error instanceof ApiError ? `${error.code}: ${error.message}` : String(error));
+      return false;
     } finally {
       setBusy(false);
     }
@@ -84,6 +102,13 @@ export function AssetsPanel({ links, onClose, path, author }: Props) {
     void reload();
   }, [reload]);
 
+  // What was said about the folder that was on screen is not said about the next one.
+  useEffect(() => {
+    setVerification(null);
+    setNote(null);
+    setWhere((at) => (at && prefix && (at === prefix || at.startsWith(`${prefix}/`)) ? at : null));
+  }, [prefix]);
+
   const selected = status?.assets.find((a) => a.path === where) ?? null;
   const storeOf = (name: string | undefined) => stores?.find((s) => s.name === name) ?? null;
 
@@ -94,12 +119,14 @@ export function AssetsPanel({ links, onClose, path, author }: Props) {
       aria-labelledby="assets-title"
       onCancel={(e) => {
         e.preventDefault();
-        if (!busy) onClose();
+        onClose();
       }}
     >
       <div className="dialog-head">
         <h2 id="assets-title">Assets</h2>
-        <button type="button" className="btn btn-ghost btn-small" onClick={onClose} disabled={busy} aria-label="Close">
+        {/* Closing is never refused: a verify hashes every asset here and in its store, and a
+            panel that holds someone until that finishes is a worse answer than a closed one. */}
+        <button type="button" className="btn btn-ghost btn-small" onClick={onClose} aria-label="Close">
           ✕
         </button>
       </div>
@@ -259,7 +286,14 @@ export function AssetsPanel({ links, onClose, path, author }: Props) {
                 className="btn btn-small"
                 disabled={busy}
                 title="Hash every asset here and in its store, and list the store's files no pointer names"
-                onClick={() => void guard(async () => setVerification(await api.verifyAssets(prefix)))}
+                onClick={() =>
+                  void guard(async () => {
+                    running.current?.abort();
+                    const ctl = new AbortController();
+                    running.current = ctl;
+                    setVerification(await api.verifyAssets(prefix, undefined, ctl.signal));
+                  })
+                }
               >
                 Verify
               </button>
@@ -412,7 +446,7 @@ function Whereabouts({ item, store, dir }: { item: AssetItem; store: AssetStoreR
   );
 }
 
-function NewStore({ busy, onAdd }: { busy: boolean; onAdd: (body: { name: string; driver: string; root: string }) => void }) {
+function NewStore({ busy, onAdd }: { busy: boolean; onAdd: (body: { name: string; driver: string; root: string }) => Promise<boolean> }) {
   const [name, setName] = useState("");
   const [driver, setDriver] = useState("local");
   const [root, setRoot] = useState("");
@@ -421,7 +455,13 @@ function NewStore({ busy, onAdd }: { busy: boolean; onAdd: (body: { name: string
       className="access-form"
       onSubmit={(e) => {
         e.preventDefault();
-        if (name.trim() && root.trim()) onAdd({ name: name.trim(), driver, root: root.trim() });
+        if (!name.trim() || !root.trim()) return;
+        // Cleared only once it is declared: a failed one is still on screen to be corrected.
+        void onAdd({ name: name.trim(), driver, root: root.trim() }).then((declared) => {
+          if (!declared) return;
+          setName("");
+          setRoot("");
+        });
       }}
     >
       <input value={name} placeholder="store name" onChange={(e) => setName(e.target.value)} spellCheck={false} />

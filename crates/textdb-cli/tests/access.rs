@@ -2112,6 +2112,29 @@ fn m_an_account_cannot_declare_or_remove_an_asset_store() {
         assert_eq!(names, vec!["bucket"], "M14: {seen}");
         assert_eq!(seen[0]["root"].as_str(), bucket.to_str(), "M14: {seen}");
 
+        // The refusal comes before anything a declaration does on this computer. The store has the
+        // last word, at the row -- but a declaration makes a local root on the way there and reads
+        // every pointer in the store to see whether the old one is still in use, and work that has
+        // already happened is not refused by being told "no" afterwards.
+        let untouched = tmp.path().join("made-by-an-account");
+        let early = run(
+            f.as_("accounts-agent").args(["assets", "stores", "--add", "mine", "--driver", "local", "--root"]).arg(&untouched),
+            None,
+        );
+        refused(&early, FORBIDDEN, "TX005");
+        assert!(!untouched.exists(), "M14: a refused declaration made {} on this computer anyway", untouched.display());
+        // Nor is it told what the store holds: how many pointers name a store is the owner's to
+        // know, and an account asking for a removal hears the refusal and nothing else.
+        let removal = run(f.as_("accounts-agent").args(["assets", "stores", "--remove", "bucket"]), None);
+        assert!(
+            !removal.stderr.contains("pointer") && !removal.stdout.contains("pointer"),
+            "M14: the refusal told an account what the store holds
+stdout: {}
+stderr: {}",
+            removal.stdout,
+            removal.stderr
+        );
+
         // Reading them is not refused, and must not be: an account cannot pull without the row.
         let told = ok(f.as_("accounts-agent").args(["--json", "assets", "stores"]), None).json();
         assert_eq!(told[0]["name"], "bucket", "M14: {told}");
