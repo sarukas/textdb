@@ -1210,6 +1210,30 @@ impl InUse {
     }
 }
 
+/// Whether this session may name the place `item` is in the store `store`.
+///
+/// A store addressing its files by path names the place outright. A drive's id does not: an id is
+/// no place in a namespace, so the drive is asked where it keeps that file and the answer is what
+/// has to be nameable -- the store is laid out in the owner's paths, so that answer is a path like
+/// any other. A drive that cannot say leaves the store's own root as the only bound, which is what
+/// it was before this asked at all.
+fn may_name_place(st: &mut dyn Store, d: &dyn Driver, item: &str) -> Result<bool> {
+    match place_of(d, item) {
+        Some(place) => st.may_name(&place),
+        None => Ok(true),
+    }
+}
+
+/// The place in the store the item `item` is in, to be asked after before any bytes move: the item
+/// itself where it is a store path, and where the store keeps that id otherwise. `None` where the
+/// store cannot say.
+fn place_of(d: &dyn Driver, item: &str) -> Option<String> {
+    match item.starts_with('/') {
+        true => Some(item.to_string()),
+        false => d.found(item).ok().flatten().map(|found| found.path),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_one(
     st: &mut dyn Store,
@@ -1295,7 +1319,7 @@ fn push_one(
         return Outcome::Conflict(format!("{}: the pointers naming its bytes kept changing during this push; run it again", item.path));
     };
     // As a pull does: bytes never go to a place this session cannot name, whatever its pointer says.
-    match st.may_name(&target) {
+    match may_name_place(st, d, &target) {
         Ok(false) => {
             return Outcome::Failed(format!("{}: its pointer names {target} in the asset store {store}, which this session may not write", item.path))
         }
@@ -1766,20 +1790,6 @@ pub(crate) fn pull_run(
             pulled.push(json!({ "path": item.path, "state": item.state, "size": p.size, "store": p.store }));
             continue;
         }
-        // A pointer names whatever it says, and an account with `rw` inside its own share can
-        // write one naming bytes of a folder it was never granted. The store is asked whether this
-        // session may name that place at all, before anything is fetched.
-        match p.item.as_deref().map(|named| (named, st.may_name(named))) {
-            Some((named, Ok(false))) => {
-                failed.push(format!("{}: its pointer names {named} in the asset store {}, which this session may not read", item.path, p.store));
-                continue;
-            }
-            Some((_, Err(e))) => {
-                failed.push(format!("{}: {}", item.path, e.message));
-                continue;
-            }
-            _ => {}
-        }
         let d = match files.driver(&p.store) {
             Ok(d) => d,
             Err(e) => {
@@ -1787,6 +1797,21 @@ pub(crate) fn pull_run(
                 continue;
             }
         };
+        // A pointer names whatever it says, and an account with `rw` inside its own share can
+        // write one naming bytes of a folder it was never granted. Asked before anything is
+        // fetched, and through a drive's id as well as a path.
+        let named = p.item.as_deref().unwrap_or(&item.owner_path);
+        match may_name_place(st, d, named) {
+            Ok(false) => {
+                failed.push(format!("{}: its pointer names {named} in the asset store {}, which this session may not read", item.path, p.store));
+                continue;
+            }
+            Err(e) => {
+                failed.push(format!("{}: {}", item.path, e.message));
+                continue;
+            }
+            Ok(true) => {}
+        }
         let file = item.file.clone().unwrap_or_else(|| item.rel.clone());
         // Never through a link or junction already in the directory: its folder may be anywhere.
         if through_link(&v.dir, &file) || through_link(&v.dir, ".textdb/trash/x") {
@@ -2435,6 +2460,42 @@ mod tests {
         assert!(under("/", "/a") && under("/a", "/a/b") && !under("/a", "/ab"));
         assert_eq!(rel_under("/notes", "/notes/img/a.png").as_deref(), Some("img/a.png"));
         assert_eq!(rel_under("/notes", "/notesx/a.png"), None);
+    }
+
+    /// A store answering only where it keeps the file of an id, as a drive does.
+    struct Places(Option<&'static str>);
+
+    impl Driver for Places {
+        fn location(&self, path: &str) -> String {
+            path.to_string()
+        }
+        fn size(&self, _path: &str, _item: Option<&str>) -> Result<Option<u64>> {
+            unimplemented!()
+        }
+        fn hash(&self, _path: &str, _item: Option<&str>) -> Result<Option<(String, u64)>> {
+            unimplemented!()
+        }
+        fn put(&self, _path: &str, _src: &Path, _sha256: &str, _replaces: Option<&str>) -> Result<(Option<String>, driver::Held)> {
+            unimplemented!()
+        }
+        fn get(&self, _path: &str, _item: Option<&str>, _dest: &Path) -> Result<()> {
+            unimplemented!()
+        }
+        fn found(&self, _item: &str) -> Result<Option<driver::Found>> {
+            Ok(self.0.map(|path| driver::Found { path: path.to_string(), sha256: None, size: 1, trashed: false, two_of_a_name: false }))
+        }
+    }
+
+    /// What a session may name is asked of the place the bytes are in, and an id is no place: the
+    /// store is asked where it keeps that id, and its answer is what has to be nameable.
+    #[test]
+    fn the_place_to_ask_after_is_a_path_even_where_the_pointer_names_an_id() {
+        let drive = Places(Some("/legal/contracts/x.png"));
+        assert_eq!(place_of(&drive, "1a2b3c4d5e6f7g").as_deref(), Some("/legal/contracts/x.png"));
+        // A path item is the place it says, whatever the store would answer of an id.
+        assert_eq!(place_of(&drive, "/img/a.png").as_deref(), Some("/img/a.png"));
+        // Nothing to ask after where the store cannot place the id: the store's root still bounds it.
+        assert_eq!(place_of(&Places(None), "1a2b3c4d5e6f7g"), None);
     }
 
     #[test]

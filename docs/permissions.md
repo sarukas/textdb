@@ -100,17 +100,18 @@ Drive store the item is a file id, so the same move needs an id the account has 
 narrows it without closing it. The store root itself is the only boundary the driver enforces
 (`find_id` refuses ids outside it), and that root is exactly where every account's assets are.
 
-**Done for items that are paths.** A store addressing its files by path lays them out in the
-owner's paths, so an item is a path like any other, and `Store::may_name` asks the store the
-question it already answers about one: may this caller address it (`view.to_view` on SQLite,
-`kb.to_view` on Postgres). A pull refuses to fetch where it says no, a push refuses to write there
-— which matters more, since it would put bytes over somebody else's — and `verify` says so
-rather than reading it. M12 holds a pointer naming a folder the account was never granted, and
-watches the owner pull those same bytes afterwards.
+**Done.** A store lays its files out in the owner's paths, so an item is a path like any other, and
+`Store::may_name` asks the store the question it already answers about one: may this caller address
+it (`view.to_view` on SQLite, `kb.to_view` on Postgres). A pull refuses to fetch where it says no, a
+push refuses to write there — which matters more, since it would put bytes over somebody else's
+— and `verify` says so rather than reading it. M12 holds a pointer naming a folder the account
+was never granted, and watches the owner pull those same bytes afterwards.
 
-A drive's file id is not a place in a namespace, so this does not answer for one. Those are still
-bounded by the store root alone: an account would need an id it has seen, and ids are not listed to
-it, which is a narrower gap rather than none.
+A drive's file id is not a place in a namespace, so it is not what the question is asked of: the
+drive is asked where it keeps that file, and its answer — a store path, since the store is laid
+out in the owner's paths — is what has to be nameable. An id taken from another share's
+pointer therefore buys nothing: it resolves to a path this session may not name. A store that
+cannot place an id at all leaves its own root as the only bound, which is where this started.
 
 ### 4. The provider is a second authority, and the two say nothing about each other
 
@@ -138,9 +139,9 @@ or change those rows at all is not currently stated anywhere, and should be.
 2. ~~Add the store-answered question.~~ **Done**, in both shapes: `Store::asset_item_users` for
    one place (M11, two accounts naming one file) and `Store::asset_items_named` for a store's
    whole listing (M13, `verify` telling an account what nothing needs).
-3. ~~Bind a pointer's item to what the account may name.~~ **Done** for items that are paths,
-   which is every store but a drive: `Store::may_name`, refused in pull, push and verify, with M12
-   covering it. A drive's ids are bounded by the store root only, as before.
+3. ~~Bind a pointer's item to what the account may name.~~ **Done**: `Store::may_name`, refused in
+   pull, push and verify, with M12 covering it — and through a drive's id too, by resolving the
+   id to the place the drive keeps it and asking after that.
 4. **Decide whether `asset_store` rows are visible to accounts**, and record who changed one.
 5. ~~Give a provider's denial its own state.~~ **Done**: the driver reads what the provider said
    (a 403 naming its reason, which rclone passes through), carries it as `forbidden` rather than
