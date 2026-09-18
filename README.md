@@ -16,6 +16,14 @@ This repository is the proof of concept described in [`docs/spec.md`](docs/spec.
   files, front matter, sections, links and commits, and `sync` to
   reconcile a folder with a git checkout both ways (three-way merge, conflict markers, git authors, commit trailers).
   [Working with an external agent](docs/cli.md#working-with-an-external-agent).
+- **Delegated access:** [`docs/cli.md`](docs/cli.md#delegating-folders-to-accounts) — one central store, with
+  folders shared to **accounts** that hold bearer tokens. A share is a folder and everything below it, and the
+  account sees it at its own root under an alias of its own: `/legal/contracts` is `/contracts/` to whoever
+  holds it, so a local checkout is a working vault rather than a slice of someone else's tree. Rights are `ro`
+  or `rw`, links are rewritten into each reader's paths and hidden targets become `textdb:<id>` references that
+  disclose nothing, and a revoked share answers `forbidden` rather than `not found` so nobody's checkout is
+  emptied by a permission change. The same model on both engines: `textdb_auth()` on SQLite, `SET textdb.token`
+  on Postgres.
 - **Demo app:** [`docs/demo-app.md`](docs/demo-app.md) — build, start and configure the live corpus app: a Node
   server and web UI where an agent's edits appear in the open viewer or editor as they land, attributed, with
   history and diffs. A GitHub-style folder view lists any folder with infinite scroll, sortable by name, type,
@@ -44,11 +52,11 @@ This repository is the proof of concept described in [`docs/spec.md`](docs/spec.
 
 | Path | What |
 |---|---|
-| `crates/textdb-core` | Engine-agnostic algorithms: FastCDC chunker with newline snap, BLAKE3 prolly tree, `Storage` trait, materialize/locate, localised edit, tree diff, diff3, commit-with-rebase |
+| `crates/textdb-core` | Engine-agnostic algorithms: FastCDC chunker with newline snap, BLAKE3 prolly tree, `Storage` trait, materialize/locate, localised edit, tree diff, diff3, commit-with-rebase, and the access model (shares, path translation, link projection) both bindings share |
 | `crates/textdb-md` | Markdown `StructureExtractor` (sections, wikilinks, frontmatter) |
 | `crates/textdb-sqlite` | SQLite binding: shadow tables, `CREATE VIRTUAL TABLE kb USING textdb(...)`, table-valued and scalar functions, FTS5 on chunks |
 | `crates/textdb-sqlite-ext` | Loadable SQLite extension (`libtextdb_sqlite_ext.so`) for Python, the `sqlite3` shell, any language |
-| `crates/textdb-pg` | Postgres 16 extension (pgrx): schema `kb`, updatable views `kb.file`/`kb.folder`/`kb.file_version`, functions, SQLSTATEs `TX001`/`TX002` |
+| `crates/textdb-pg` | Postgres 16 extension (pgrx): schema `kb`, updatable views `kb.file`/`kb.folder`/`kb.file_version`, functions, SQLSTATEs `TX001`/`TX002`/`TX005`, accounts and grants with `kb.auth` |
 | `crates/textdb-cli` | The `textdb` command line, over SQLite (compiled in) or Postgres |
 | `node/` | Live corpus app: `packages/textdb` (client over `node:sqlite`), `apps/server` (HTTP + server-sent events), `apps/web` (React + CodeMirror UI) |
 | `python/` | Python library `textdb` with swappable Postgres/SQLite backends, loaders, CLI |
@@ -133,3 +141,7 @@ survives a create/read/delete round-trip, and afterwards every document is compa
 against a reference model. A cell that fails one publishes no timings at all, so a broken
 backend cannot post a fast number. See [`bench/README.md`](bench/README.md) for the knobs,
 the ten test families and what each measures.
+
+Front-matter property search is documented in [`docs/properties.md`](docs/properties.md), and
+markdown heading outlines in [`docs/outlines.md`](docs/outlines.md). What every listing and
+search surface returns, key for key, is [`docs/shapes.md`](docs/shapes.md).

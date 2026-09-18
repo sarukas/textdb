@@ -3,9 +3,14 @@
 //! ```text
 //! textdb-bench run  [--tests DIR] [--out DIR] [--backends a,b] [--profile poc|spec]
 //!                   [--size xs|s|m|l] [--mode fast|durable] [--filter RT,XL-01] [--seed N]
-//!                   [--pg URL] [--drop-caches]
+//!                   [--pg URL] [--drop-caches] [--as-account]
 //! textdb-bench report [--out DIR]
 //! ```
+//!
+//! `--as-account` runs the whole matrix a second time as a delegated account holding one share,
+//! alongside the owner and in the same invocation — `textdb-pg` and `textdb-pg@account` become
+//! two columns of one run rather than two runs to be compared across time. Nothing else about
+//! the suite changes: the account's paths are the suite's paths (see `backends::delegate`).
 
 use std::path::PathBuf;
 
@@ -28,6 +33,14 @@ fn main() -> anyhow::Result<()> {
             let backends: Vec<String> = arg(&args, "--backends")
                 .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
                 .unwrap_or_else(|| textdb_bench::backends::ALL.iter().map(|s| s.to_string()).collect());
+            // One extra parameter, and it changes nothing else: every textdb backend asked for
+            // gains a delegated twin right beside it, so both are measured on the same host in
+            // the same run. `--backends textdb-pg@account` names one directly.
+            let backends = if args.iter().any(|a| a == "--as-account") {
+                textdb_bench::backends::with_accounts(&backends)
+            } else {
+                backends
+            };
             let profile = arg(&args, "--profile").unwrap_or_else(|| "poc".into());
             let size = match arg(&args, "--size") {
                 Some(s) => Size::parse(&s).ok_or_else(|| anyhow::anyhow!("--size must be one of xs, s, m, l (got {})", s))?,

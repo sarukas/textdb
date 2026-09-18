@@ -25,7 +25,7 @@ learns about the CLI's commits from the store's change feed.
 | `textdb_last_seq()` | newest `seq` (0 when empty) |
 | `textdb_hunks(path[, v1[, v2]])` | `old_from, old_count, new_from, new_count, old_text, new_text` — line hunks turning `v1` into `v2`, 1-based lines, a zero count is an insertion/deletion in front of that line. Defaults: `v2` = HEAD, `v1` = `v2 - 1`. Version 0 is the empty document |
 | `textdb_chunks(path[, version])` | `ord, hash, byte_from, nbytes, line_from, nlines` — the document's chunks in order; unchanged content keeps its hash across versions |
-| `textdb_history(path)` | `version, author, ts, message, nbytes, kind, base_version` |
+| `textdb_history(path)` | `version, author, ts, message, kind, base_version, nbytes, nlines, nwords` |
 | `textdb_write(path, content[, base_version[, author[, message]]])` | JSON `{"version": n, "kind": "direct"\|"rebased"\|"merged"\|"noop"}`; creates the file if missing |
 | `textdb_replace_lines(path, from, to, text[, base_version[, author]])` | same JSON; lines refer to `base_version` (HEAD if NULL); `to = from - 1` inserts |
 | `textdb_move(from, to[, author])` | `1`; moves or renames a file, or a folder with everything below it (missing parent folders are created). History moves with the files. TX003 when `from` is missing, TX004 when `to` exists, is inside `from`, or either is the root |
@@ -88,13 +88,13 @@ Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./
 | `GET /api/assets/file?prefix=/a&path=/a/img/b.png[&download=1]` | | the asset's file from inside the folder's directory (404 when it is not there: pull it first), only when it is the asset's own: state ok, modified, outdated, new, orphan or conflict copy (409 TX001 otherwise, e.g. for a file a pointer merely names). HEAD sends the headers alone. Images, PDF, audio and video are sent inline with their type; anything else, SVG included, and any file with `download=1`, as an `application/octet-stream` attachment. Always `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`; a sandboxing `Content-Security-Policy` unless a PDF |
 | `GET /api/file?path=/a/b.md[&version=n]` | | `{ path, version, head_version, content, nbytes, nlines, updated_at, updated_by }` |
 | `GET /api/chunks?path=…[&version=n]` | | `[{ ord, hash, byte_from, nbytes, line_from, nlines }]` |
-| `GET /api/history?path=…` | | `[{ version, author, ts, message, nbytes, kind, base_version }]` oldest first |
+| `GET /api/history?path=…` | | `[{ version, author, ts, message, kind, base_version, nbytes, nlines, nwords }]` oldest first |
 | `GET /api/hunks?path=…&from=v1&to=v2` | | `[{ old_from, old_count, new_from, new_count, old_text, new_text }]` |
 | `GET /api/diff?path=…&from=v1&to=v2` | | `{ diff }` unified text |
-| `GET /api/search?q=…[&prefix=/][&limit=50]` | | `[{ path, line, snippet, rank }]` |
+| `GET /api/search?q=…[&prefix=/][&limit=200][&per_file=10]` | | `[{ path, version, line, text, section, score, more }]`, one row per matching line |
 | `PUT /api/file` | `{ path, content, base_version?, author?, message? }` | `{ version, kind }` — rebased over concurrent commits; 409 with `conflict` when the same lines changed |
 | `POST /api/replace-lines` | `{ path, from, to, text, base_version?, author? }` | `{ version, kind }` |
-| `GET /api/stat?path=…` | | `{ path, kind, files, folders, nbytes }` — for a folder, everything below it (`folders` does not count the folder itself) |
+| `GET /api/stat?path=…`, `GET /api/entry?path=…` | | one full listing record (`docs/shapes.md`); `stat` is an alias of `entry`. A folder's figures are totals over everything below it |
 | `POST /api/move` | `{ from, to, author? }` | `{ from, to }` — a file or a whole folder; one `move` change for the moved node |
 | `POST /api/delete` | `{ path, author? }` | `{ path }` — a file or a whole folder; one `delete` change for the deleted node |
 | `GET /api/path-history?path=…` or `?id=…` | | `[{ id, ts, op, old_path, new_path, via, version, author }]`, see `textdb_path_history` |
@@ -102,10 +102,16 @@ Configuration by environment: `TEXTDB_DB` (path of the SQLite store, default `./
 | `PUT /api/setting` | `{ key, value }` (`value` null clears) | `{ key, value }` |
 | `GET /api/trash[?parent=id]` | | trash entries, see `textdb_trash` |
 | `GET /api/trash/file?id=…[&version=n]` | | `{ entry, version, content }` |
-| `GET /api/trash/history?id=…` | | `[{ version, author, ts, message, nbytes, kind, base_version }]` |
+| `GET /api/trash/history?id=…` | | `[{ version, author, ts, message, kind, base_version, nbytes, nlines, nwords }]` |
 | `POST /api/trash/purge` | `{ id, author? }` | `{ items, files, folders, versions, chunks, tree_nodes, bytes }` |
 | `POST /api/trash/empty` | `{ author? }` | the same, for the whole trash |
 | `POST /api/import` | `{ files: [{ path, content }], author? }` (at most 5000 files) | `{ created, updated, unchanged, failed, failures: [{ path, code, message }] }` — one transaction, message `import`; unchanged files make no version; a refused file is listed and the rest still land |
+| `GET /api/outline?path=…[&heading=…&match=…&level=…&limit=…]` | | markdown headings under a path, with each document's own figures; see `docs/outlines.md` |
+| `GET /api/outline/names?path=…[&starts=…&limit=…]` | | the distinct headings in use, for autosuggest |
+| `GET /api/meta/keys[?prefix=…&limit=…]` | | front-matter property names in use, most-used first |
+| `GET /api/meta/values?key=…[&prefix=…&limit=…]` | | the values one property takes |
+| `GET /api/meta/find?q=…[&folder=…&limit=…]` | | documents matching a property query; see `docs/properties.md` |
+| `GET /api/trash/entry?id=…` | | one trash entry |
 | `GET /api/events[?since=seq]` | `Last-Event-ID` honoured | Server-sent events, see below |
 
 ### `GET /api/events`

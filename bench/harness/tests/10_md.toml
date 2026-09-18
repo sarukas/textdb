@@ -1,0 +1,132 @@
+# MD — the structure sidecar: markdown links, front matter, sections, change feed.
+#
+# Not a comparison. `fs` and the `sql-text-*` stores keep no derived index, so every cell
+# here is N/A for them with its reason recorded; the family exists to establish what these
+# operations cost on the bindings that have them, and — in MD-01 — what maintaining them
+# costs the write path every other family measures.
+
+[[test]]
+id = "MD-01"
+family = "MD"
+kind = "markdown"
+reps = 3
+note = "the same bytes as .md (extracted) and .txt (not), at 0/8/64 links per document (all with front matter and 8 headings): what the sidecar costs create and replace"
+[test.spec]
+variant = "extract"
+n_files = 2000
+file_size = 16384
+headings = 8
+densities = "0,8,64"
+[test.poc]
+n_files = 300
+file_size = 8192
+
+[[test]]
+id = "MD-02"
+family = "MD"
+kind = "markdown"
+reps = 3
+note = "link graph with planted dangling targets: outbound links per document, whole-subtree query, backlinks, broken-link validation"
+[test.spec]
+variant = "link_query"
+n_files = 5000
+file_size = 8192
+links_per_file = 8
+broken_per_file = 2
+backlink_probes = 500
+[test.poc]
+n_files = 600
+file_size = 4096
+backlink_probes = 100
+
+[[test]]
+id = "MD-03"
+family = "MD"
+kind = "markdown"
+reps = 1
+note = "rename a file N others point at, under link_updates off/report/rewrite: latency and documents rewritten per move"
+[test.spec]
+variant = "move_relink"
+fan_in = 1000
+file_size = 4096
+[test.poc]
+fan_in = 200
+
+[[test]]
+id = "MD-04"
+family = "MD"
+kind = "markdown"
+reps = 3
+note = "front matter: parsed-block read per document, and setting one key with the rest of the document byte-identical"
+[test.spec]
+variant = "frontmatter"
+n_files = 5000
+file_size = 8192
+meta_writes = 1000
+[test.poc]
+n_files = 600
+file_size = 4096
+meta_writes = 200
+
+[[test]]
+id = "MD-05"
+family = "MD"
+kind = "markdown"
+reps = 3
+note = "documents with 32 headings: section listing, and fetching one section's body by heading"
+[test.spec]
+variant = "sections"
+n_files = 2000
+file_size = 65536
+headings = 32
+[test.poc]
+n_files = 250
+file_size = 16384
+
+[[test]]
+id = "MD-06"
+family = "MD"
+kind = "markdown"
+reps = 1
+note = "change feed: a watcher polling after every write, and one catching up from zero"
+[test.spec]
+variant = "feed"
+n_files = 1000
+n_changes = 20000
+file_size = 4096
+[test.poc]
+n_files = 200
+n_changes = 2000
+file_size = 2048
+
+[[test]]
+id = "MD-07"
+family = "MD"
+kind = "markdown"
+reps = 3
+note = "front-matter property search: what the vault uses, what a property holds, and queries over both — with the autosuggest calls timed separately, since they run per keystroke"
+[test.spec]
+variant = "property_search"
+n_files = 20000
+file_size = 4096
+[test.poc]
+n_files = 2000
+file_size = 2048
+
+[[test]]
+id = "MD-08"
+family = "MD"
+kind = "markdown"
+reps = 3
+note = "headings above one document: a whole vault in one call, a heading query as exact/prefix/contains, the level filter, and the per-keystroke autosuggest"
+[test.spec]
+variant = "outline"
+n_files = 20000
+file_size = 4096
+depth = 3
+probes = 200
+vault_reps = 5
+[test.poc]
+n_files = 2000
+file_size = 2048
+probes = 100

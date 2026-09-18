@@ -1,0 +1,38 @@
+45 tests, backends ["fs", "sql-text-sqlite", "sql-text-pg", "textdb-sqlite", "textdb-pg"], profile poc, size s (x0.3), mode fast
+== MD-01 (markdown) the same bytes as .md (extracted) and .txt (not), at 0/8/64 links per document (all with front matter and 8 headings): what the sidecar costs create and replace
+   fs                   0.1s
+   sql-text-sqlite      0.3s
+   sql-text-pg          0.8s
+   textdb-sqlite        3.6s
+   textdb-pg           16.5s
+== MD-02 (markdown) link graph with planted dangling targets: outbound links per document, whole-subtree query, backlinks, broken-link validation
+   fs                   0.0s
+   sql-text-sqlite      0.1s
+   sql-text-pg          0.4s
+   textdb-sqlite        0.8s
+   textdb-pg            4.7s
+== MD-03 (markdown) rename a file N others point at, under link_updates off/report/rewrite: latency and documents rewritten per move
+   fs                   0.0s
+   sql-text-sqlite      0.0s
+   sql-text-pg          0.1s
+   textdb-sqlite        0.6s
+   textdb-pg            3.7s
+== MD-04 (markdown) front matter: parsed-block read per document, and setting one key with the rest of the document byte-identical
+   fs                   0.0s
+   sql-text-sqlite      0.2s
+   sql-text-pg          0.4s
+   textdb-sqlite        1.5s
+   textdb-pg            5.7s
+== MD-05 (markdown) documents with 32 headings: section listing, and fetching one section's body by heading
+   fs                   0.0s
+   sql-text-sqlite      0.2s
+   sql-text-pg          0.5s
+   textdb-sqlite        0.4s
+   textdb-pg            1.9s
+== MD-06 (markdown) change feed: a watcher polling after every write, and one catching up from zero
+   fs                   0.0s
+   sql-text-sqlite      0.0s
+   sql-text-pg          0.1s
+   textdb-sqlite        2.3s
+   textdb-pg            6.6s
+wrote bench/out-mdfull/results.jsonl and report.md

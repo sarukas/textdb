@@ -2400,3 +2400,375 @@ button.crumb:hover {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* ---- property search and explorer ---------------------------------------------------------- */
+/* Two panes: the vault's own schema on the left, the query and its results on the right. The
+   rail is what makes this explorable rather than only searchable — you can see what there is
+   to filter on without knowing it in advance. */
+.meta {
+  display: grid;
+  grid-template-columns: minmax(180px, 260px) 1fr;
+  gap: 16px;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+  padding: 12px 16px 16px;
+}
+.meta-rail {
+  overflow-y: auto;
+  border-right: 1px solid var(--border);
+  padding-right: 12px;
+}
+.meta-rail h3 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+.meta-keys,
+.meta-values {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.meta-key,
+.meta-value {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.meta-key:hover,
+.meta-value:hover {
+  background: var(--hover);
+}
+.meta-key.on {
+  background: var(--accent-weak);
+  color: var(--accent);
+}
+.meta-key-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.meta-values {
+  margin: 2px 0 6px 10px;
+  border-left: 1px solid var(--border);
+  padding-left: 6px;
+}
+.meta-value {
+  font-size: 13px;
+  justify-content: space-between;
+}
+.meta-any {
+  color: var(--muted);
+  font-style: italic;
+}
+.meta-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.meta-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.meta-tabs button {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  border-radius: 6px;
+  padding: 4px 12px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.meta-tabs button.on {
+  background: var(--accent-weak);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* The query box. The dropdown is positioned against the box rather than the page so it tracks
+   the input when the pane scrolls. */
+.metaq {
+  position: relative;
+}
+.metaq-box {
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.metaq-box:focus-within {
+  border-color: var(--accent);
+  box-shadow: var(--focus);
+}
+.metaq-input {
+  flex: 1;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 8px 10px;
+  outline: none;
+}
+.metaq-clear {
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 10px;
+  cursor: pointer;
+}
+.metaq-list {
+  position: absolute;
+  z-index: 30;
+  left: 0;
+  right: 0;
+  top: calc(100% + 4px);
+  max-height: 320px;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+}
+.metaq-group {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--faint);
+  padding: 6px 8px 2px;
+}
+.metaq-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.metaq-item.on {
+  background: var(--accent-weak);
+}
+.metaq-label {
+  flex: 1;
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.metaq-kind {
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--panel-2);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.metaq-count {
+  font-size: 12px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.metaq-status,
+.metaq-error {
+  margin: 6px 2px 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.metaq-error {
+  color: var(--danger, #b91c1c);
+}
+
+/* The clause builder, for people who would rather not learn the syntax first. */
+.meta-builder {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+.meta-clause {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.meta-clause select {
+  max-width: 170px;
+}
+.meta-clause input {
+  min-width: 0;
+  flex: 1 1 140px;
+}
+.meta-clause select,
+.meta-clause input {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  padding: 4px 6px;
+}
+.meta-not {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.meta-not.on {
+  background: var(--warn-weak);
+  border-color: var(--warn);
+  color: var(--warn);
+}
+.meta-drop,
+.meta-add {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  padding: 3px 9px;
+  cursor: pointer;
+}
+.meta-asText {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.meta-asText code {
+  font-family: var(--mono);
+}
+
+.meta-cols {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 10px 0 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.meta-col {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 9px;
+  cursor: pointer;
+}
+.meta-col.on {
+  background: var(--accent-weak);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.meta-results {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  margin-top: 4px;
+}
+.meta-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.meta-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+  text-align: left;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.meta-table td {
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.meta-table tr:hover td {
+  background: var(--hover);
+}
+.meta-path {
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+}
+.meta-empty {
+  color: var(--muted);
+  font-size: 13px;
+  padding: 12px 2px;
+}
+
+/* One column on a narrow screen: the rail becomes a strip above the results rather than
+   squeezing both into nothing. */
+@media (max-width: 720px) {
+  .meta {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+  }
+  .meta-rail {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    max-height: 180px;
+    padding-right: 0;
+    padding-bottom: 8px;
+  }
+}
+
+/* A hit's heading path and the count of lines `per_file` held back: both are new columns on
+   the canonical hit row, and both say something the path and line number cannot. */
+.hit-section {
+  color: var(--muted);
+  font-size: 0.85em;
+  margin-left: 0.5em;
+}
+.hit-more {
+  color: var(--muted);
+  font-size: 0.85em;
+  font-style: italic;
+}

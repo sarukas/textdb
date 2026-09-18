@@ -38,7 +38,7 @@ Postgres extension: absolute `/` paths, folders on demand, tombstone deletes, fu
 | `head -20` / `tail -20` | `SELECT textdb_lines(p, 1, 20)` / `SELECT textdb_lines(path, nlines - 19, nlines) FROM kb WHERE path = p` |
 | `wc -l` / `wc -c` | `SELECT nlines, nbytes FROM kb WHERE path = '/clients/acme/notes.md';` |
 | `awk '/^## Open questions/,/^## /'` (a section) | `SELECT textdb_section('/clients/acme/notes.md', 'Open questions');` |
-| `grep -rn -w pricing /clients` | `SELECT path, line, snippet FROM textdb_search('pricing', '/clients');` |
+| `grep -rn -w pricing /clients` | `SELECT path, line, text FROM textdb_search('pricing', '/clients');` |
 | `grep -rl pricing \| xargs grep -l renewal` | `SELECT path FROM textdb_search('pricing renewal', '/clients');` |
 | `grep -rn '"quarterly review"'` | `SELECT path, line FROM textdb_search('"quarterly review"', '/');` |
 | `grep -rn 'renew'` (prefix) | `SELECT path, line FROM textdb_search('renew*', '/');` |
@@ -57,6 +57,18 @@ Postgres extension: absolute `/` paths, folders on demand, tombstone deletes, fu
 | `cp -r /clients ./export` | `SELECT * FROM textdb_export('/clients');` or `textdb-corpus export kb.db ./export` |
 | `rsync ./notes/ /clients/` (import; unchanged files make no version) | `textdb-corpus import ./notes kb.db` or Python `Corpus.load_folder` |
 
+## If you were given a token
+
+```sql
+SELECT textdb_auth('tdb_…');   -- your account name, or an error if the token is not usable
+SELECT path FROM textdb_ls('/');
+```
+
+You then see only the folders shared with you, each at your own root under a name of its own:
+what the owner calls `/legal/contracts` may be `/contracts/` to you. Use the paths `textdb_ls`
+shows. Your writes are attributed to your account. Without a token you are the owner and see the
+store's own paths — which is what being able to open the file already means.
+
 ## Read
 
 ```sql
@@ -66,7 +78,10 @@ SELECT id, path, kind, version, nbytes, nlines FROM kb WHERE path >= '/clients/'
 SELECT content, version FROM kb WHERE path = '/clients/acme/notes.md';
 SELECT textdb_lines('/clients/acme/notes.md', 40, 60);
 SELECT textdb_section('/clients/acme/notes.md', 'Open questions');
-SELECT path, line, snippet FROM textdb_search('pricing renewal', '/clients', 50);
+SELECT path, version, line, text FROM textdb_search('pricing renewal', '/clients', 50);
+SELECT * FROM textdb_links('/clients/acme/notes.md');                        -- what it points at
+SELECT * FROM textdb_links('/clients', 'broken');                            -- what does not resolve
+SELECT path, line FROM textdb_backlinks('/clients/acme/notes.md');           -- what points at it
 ```
 
 ## Change
@@ -90,6 +105,7 @@ Errors are SQLite error messages beginning with a code:
 | `TX002` | Retry budget exhausted | Wait briefly, retry |
 | `TX003` | Path/version not found | List the folder |
 | `TX004` | `old` missing or not unique / bad path | Read and choose a unique anchor |
+| `TX005` | Forbidden: it is in your view and you may not do this — a read-only share, or one taken away | `SELECT textdb_auth(...)` first, then check your shares. Not the same as `TX003`, which means it is outside your shares and cannot be told from a path that never existed |
 
 ## History
 

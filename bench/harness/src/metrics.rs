@@ -19,6 +19,10 @@ impl Latencies {
     pub fn extend(&mut self, other: &Latencies) {
         self.samples.extend_from_slice(&other.samples);
     }
+    /// Median, for suites that form a ratio between two sets of samples.
+    pub fn p50(&self) -> Option<f64> {
+        self.pct(0.5)
+    }
     fn pct(&self, p: f64) -> Option<f64> {
         if self.samples.is_empty() {
             return None;
@@ -163,6 +167,25 @@ impl<'a> Cell<'a> {
         }
     }
 
+    /// A failure detail, cut to something a person and a log file can both hold.
+    ///
+    /// A conflict's `Debug` is the contested region as a decimal byte array, which at XL sizes is
+    /// the whole document: ten failures on a 100 MiB case wrote a **1.9 GB** log, took the disk
+    /// from 15 GB free to 6 GB, and killed the Postgres cluster and the run with it. The first
+    /// line and a few hundred characters identify a failure; the bytes never did.
+    fn cut(detail: &str) -> String {
+        const MAX: usize = 400;
+        let line = detail.lines().next().unwrap_or_default();
+        if line.len() <= MAX {
+            return line.to_string();
+        }
+        let mut end = MAX;
+        while end > 0 && !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}… ({} more characters)", &line[..end], line.len() - end)
+    }
+
     pub fn metric(&self, case: &str, metric: &str, value: f64) {
         self.push(case, metric, Some(value), "ok");
     }
@@ -170,6 +193,7 @@ impl<'a> Cell<'a> {
         self.push(case, metric, None, note);
     }
     pub fn fail(&self, case: &str, metric: &str, detail: &str) {
+        let detail = &Self::cut(detail);
         eprintln!("    FAIL {} {} [{}] {}: {}", self.test, self.backend, case, metric, detail);
         self.mark_failed(&format!("{} {}: {}", case, metric, detail));
         self.push(case, metric, Some(1.0), &format!("FAIL: {}", detail));

@@ -95,7 +95,20 @@ fn markdown_link(text: &str, r: &Range<usize>, link_type: LinkType, dest: &str, 
         },
         _ => (None, false),
     };
-    Some(LinkSpan { kind, target, anchor, alias: None, external, range, offset: r.start, angle })
+    // The text between `[` and `](`: the words a reader clicks. Without it every markdown link
+    // rendered as `[](target)` — the same four characters for every link in a document.
+    let alias = link_text(text, r);
+    Some(LinkSpan { kind, target, anchor, alias, external, range, offset: r.start, angle })
+}
+
+/// The display text of a markdown link or image: what sits between `[` (or `![`) and `](`.
+///
+/// `None` when it is empty, so `[](x.md)` stays aliasless rather than carrying `""`.
+fn link_text(text: &str, r: &Range<usize>) -> Option<String> {
+    let src = text.get(r.clone())?;
+    let open = src.find('[')? + 1;
+    let close = src.rfind("](")?;
+    (close > open).then(|| src[open..close].trim().to_string()).filter(|t| !t.is_empty())
 }
 
 /// Every link in `bytes`, in document order.
@@ -182,14 +195,16 @@ mod tests {
                 ("wiki", s("Note").unwrap(), s("Next steps"), s("steps"), false, s("Note")),
                 ("embed", s("diagram.png").unwrap(), None, None, false, s("diagram.png")),
                 ("wiki", String::new(), s("Local"), None, false, s("")),
-                ("md", s("../proposals/My Plan.md").unwrap(), s("goals"), None, false, s("../proposals/My%20Plan.md")),
-                ("md", s("a b.md").unwrap(), None, None, false, s("a b.md")),
-                ("md", String::new(), None, None, true, s("")),
-                ("md", s("mailto:a@b.c").unwrap(), None, None, true, s("mailto:a@b.c")),
-                ("md", s("a@b.c").unwrap(), None, None, true, s("a@b.c")),
-                ("md", s("1").unwrap(), None, None, true, s("1")),
-                ("md", s("https://x.y/z").unwrap(), None, None, true, s("https://x.y/z")),
-                ("image", s("./img/p.png").unwrap(), None, None, false, s("./img/p.png")),
+                // A markdown link's display text is its alias, the way a wiki link's is: without
+                // it every one of these rendered as `[](target)` in `textdb links`.
+                ("md", s("../proposals/My Plan.md").unwrap(), s("goals"), s("p"), false, s("../proposals/My%20Plan.md")),
+                ("md", s("a b.md").unwrap(), None, s("q"), false, s("a b.md")),
+                ("md", String::new(), None, s("g"), true, s("")),
+                ("md", s("mailto:a@b.c").unwrap(), None, s("m"), true, s("mailto:a@b.c")),
+                ("md", s("a@b.c").unwrap(), None, s("e"), true, s("a@b.c")),
+                ("md", s("1").unwrap(), None, s("n"), true, s("1")),
+                ("md", s("https://x.y/z").unwrap(), None, s("w"), true, s("https://x.y/z")),
+                ("image", s("./img/p.png").unwrap(), None, s("i"), false, s("./img/p.png")),
             ]
         );
     }

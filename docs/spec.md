@@ -199,9 +199,19 @@ Trait `StructureExtractor { fn extract(&self, bytes) -> Structure }` producing s
 
 - Loadable extension via `rusqlite` `vtab` module.
 - `CREATE VIRTUAL TABLE kb USING textdb(store='kb_')` creates shadow tables `kb_node`, `kb_chunk`, `kb_tree_node`, `kb_commit`, `kb_section`, `kb_link`, and `kb_fts` (FTS5, external-content on `kb_chunk`).
-- Virtual table columns: `id, path, name, parent_path, kind, content, version, nbytes, nlines, updated_at`.
+- Virtual table columns: the minimal listing tier plus what only the writable table has —
+  `path, name, kind, version, nbytes, nlines, updated_at, updated_by, id, dir, content`. A folder's
+  `nbytes`/`nlines` are the totals below it, not NULL.
 - `xUpdate` implements INSERT (create, `mkdir -p`), UPDATE of `content` (diff OLD/NEW → edit set → commit with rebase), UPDATE of `path` (move), DELETE (tombstone).
-- Table-valued functions: `textdb_ls(path[, recursive])` (with word counts, authors and folder totals, see `docs/live-app.md`), `textdb_search(query, prefix)`, `textdb_history(path)`, `textdb_lines(path, from, to)`, `textdb_section(path, heading)`, `textdb_diff(path, v1, v2)`, `textdb_content(path, version)`.
+- Table-valued functions: `textdb_ls(path[, recursive])` and `textdb_entry(path)`, both returning the
+  full listing record `path, name, kind, version, nbytes, nlines, updated_at, updated_by, id, dir, depth, ext, title, nwords, nsections, nprops, nlinks, nlinks_broken, versions, created_at, files, folders, nauthors, authors` in that order;
+  `textdb_search(query, prefix, limit, per_file)` returning one row per matching line as
+  `path, version, line, text, section, score, more`; `textdb_history(path)`, `textdb_lines(path, from, to)`,
+  `textdb_section(path, heading)`, `textdb_outline(path, heading, match, level, limit)`,
+  `textdb_headings(path, starts, limit)`, `textdb_links(path, status, limit)` and
+  `textdb_backlinks(path, status, limit)` returning `path, version, line, kind, target, anchor,
+  alias, status, resolved, asset`, `textdb_prop_keys/values/find`, `textdb_diff(path, v1, v2)`,
+  `textdb_content(path, version)`.
 - Single writer per connection is accepted; this stage validates algorithms, not concurrency.
 
 ### 7.2 Postgres (`textdb-pg`) — Stage 3
@@ -211,9 +221,8 @@ pgrx extension. Schema `kb`.
 Views (updatable via `INSTEAD OF` triggers):
 
 ```
-kb.folder       (id, path, name, parent_path, n_children, nbytes_total, updated_at)
-kb.file         (id, path, name, parent_path, content, version, nbytes, nlines,
-                 frontmatter, updated_at, updated_by)
+kb.entry        the full listing record (below); kb.folder is it filtered to folders
+kb.file         the minimal tier plus id, dir, content, frontmatter, base_version
 kb.file_version (id, path, version, content, parent_version, author, ts, message)
 ```
 
@@ -227,13 +236,30 @@ edit(kb.file, old text, new text) → bigint   -- strict: old must be unique; ra
 append(kb.file, text) → bigint
 diff(kb.file, bigint, bigint) → text
 kb.ls(path, recursive boolean DEFAULT false) → SETOF kb.entry
-                                        -- id, parent_id, path, name, kind, nbytes, nlines, nwords, versions,
-                                        -- updated_at, updated_by, created_at, files, folders, nauthors, authors jsonb;
-                                        -- a folder's figures total everything below it
+                                        -- path, name, kind, version, nbytes, nlines, updated_at, updated_by,
+                                        -- id, dir, depth, ext, title, nwords, nsections, nprops, nlinks,
+                                        -- nlinks_broken, versions, created_at, files, folders, nauthors,
+                                        -- authors jsonb — the same columns in the same order as SQLite's
+                                        -- textdb_ls. A folder's figures total everything below it.
 kb.compact_folder_totals() → bigint     -- fold kb.folder_delta into the folder rows (maintenance)
 kb.rebuild_folder_totals() → void       -- recompute every folder's totals from its files
-kb.search(tsquery text, prefix text) → TABLE(path, line, snippet, rank)
-kb.history(path) → TABLE(version, author, ts, message)
+kb.search(query text, prefix text DEFAULT '/', lim bigint DEFAULT 200,
+       per_file bigint DEFAULT 10) → TABLE(path, version, line, text, section, score, more)
+                                        -- one row per matching line, the same columns in the same
+                                        -- order as SQLite's textdb_search; score is higher-is-better
+                                        -- on both engines, and `more` is the lines per_file held back
+kb.outline(prefix, heading, mode, max_level, lim) → TABLE(path, heading, heading_path, level,
+       line_from, line_to, nwords, nwords_total, nbytes, nlines, file_nwords, version,
+       updated_at, updated_by)         -- as SQLite's textdb_outline
+kb.headings(prefix, starts, lim) → TABLE(heading, sections, docs)
+kb.links(path, status, lim) → TABLE(path, version, line, kind, target, anchor, alias,
+       status, resolved, asset)            -- links written under path; kb.backlinks is the
+                                        -- same row for the links pointing at it. As SQLite's
+                                        -- textdb_links / textdb_backlinks
+kb.backlinks(path, status, lim) → the same
+kb.analyze_store() → void               -- refresh planner statistics after a bulk load
+kb.rebuild_headings() → bigint          -- backfill section headings for stores written before them
+kb.history(path) → TABLE(version, author, ts, message, kind, base_version, nbytes, nlines, nwords)
 kb.content(path, version) → text
 kb.export(prefix) → TABLE(path, content)
 ```
@@ -258,6 +284,34 @@ Isolation: READ COMMITTED is sufficient; correctness rests on `cas_root` (`UPDAT
 ### 7.3 Dolt harness (`bench/dolt`) — Stage 2
 
 Independent of core except the chunker. Schema `chunks(file_id, ordinal_key varchar, hash, text)` with fractional ordinal keys. Each simulated agent works on its own branch and merges to main. Measures conflicts detected by Dolt's cell-level merge for the same workload used in §9.3. Purpose: external evidence for claim 2 before the Postgres binding exists.
+
+### 7.4 Delegated access (both bindings) — after the POC
+
+Added by issue #12, after this spec was written, and shaped so the rest of it is unchanged: a
+store with no accounts behaves exactly as §7.1 and §7.2 describe.
+
+Three tables in each binding — `account`, `token`, `grant` — and one question per connection:
+who is this? SQLite answers it with `textdb_auth('<bearer>')`, Postgres with
+`SET textdb.token` (or `kb.auth`), and from then on every surface filters to that account's
+shares and speaks its paths. A **share** is one folder with everything below it; the account
+sees it at its own root under an **alias** fixed when the grant is made, so its paths never move
+when another share is added or taken away.
+
+Both bindings call the same code — `textdb_core::access` — for what a grant means, which path a
+caller's path is, and how links are rewritten across the boundary. Two hand-written
+implementations would agree on the day they were written; one algorithm with two persistences
+cannot drift.
+
+Two rules carry more weight than the rest:
+
+- **`TX005 forbidden` is distinct from `TX003 not found`,** because `sync` deletes from disk what
+  the store no longer has and leaves alone what it may not touch. Conflating them empties a
+  checkout when a share is revoked, which is why a revoked grant keeps its row rather than being
+  deleted.
+- **The store holds exactly one canonical text per version.** Root-absolute links are projected
+  into each reader's paths at the boundary and un-projected on save, and a link to a document the
+  reader cannot see reads as `textdb:<id>`. Only the byte spans the extractor already recorded
+  are rewritten, so nothing re-parses free text and line numbers are identical in every view.
 
 ## 8. Concurrency model (normative)
 

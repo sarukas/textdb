@@ -1,0 +1,27 @@
+{
+  "backends": [
+    "textdb-sqlite",
+    "textdb-pg"
+  ],
+  "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+  "cpus": 4,
+  "disk": "0",
+  "filesystem": "ext4 (/dev/vda)",
+  "git": "git version 2.43.0",
+  "harness_commit": "fe93d57e311c926dcc04e2272f328b4ca6ec4bbc",
+  "host": "vm",
+  "kernel": "6.18.44-fc-v33",
+  "mode": "fast",
+  "note": "Container environment: page-cache drop may be unavailable (cache column then says warm); dolt harness N/A (no binary reachable).",
+  "os": "",
+  "postgres": "PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit",
+  "profile": "poc",
+  "ram_gib": 15.718669891357422,
+  "rg": "ripgrep 14.1.0",
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "scale": 1.0,
+  "seed": 20260912,
+  "size": "m",
+  "sqlite": "3.53.2",
+  "started": "2026-09-16T05:54:52Z"
+}

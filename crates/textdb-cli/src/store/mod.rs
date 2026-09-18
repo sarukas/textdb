@@ -46,6 +46,19 @@ impl StoreError {
         Self::new("TX001", message)
     }
 
+    /// It is in your view and you may not do this (#12). Distinct from `not_found` on purpose:
+    /// `sync` deletes what is absent from the store and leaves alone what it is merely forbidden,
+    /// so conflating the two is what would empty a checkout when a share is revoked.
+    pub fn forbidden(message: impl std::fmt::Display) -> Self {
+        Self::new("TX005", message)
+    }
+
+    /// Someone else holds what this needs right now, and retrying shortly is the answer.
+    /// Exit 4, which a hook can branch on without parsing the message.
+    pub fn contention(message: impl std::fmt::Display) -> Self {
+        Self::new("TX002", message)
+    }
+
     /// Process exit status, distinct per code so a script can branch without parsing output.
     pub fn exit_code(&self) -> i32 {
         match self.code.as_str() {
@@ -53,6 +66,7 @@ impl StoreError {
             "TX002" => 4,
             "TX003" => 5,
             "TX004" => 6,
+            "TX005" => 7,
             _ => 1,
         }
     }
@@ -78,32 +92,70 @@ impl From<std::io::Error> for StoreError {
     }
 }
 
+/// One listing row, the same twenty-four keys on every surface and in this order.
+///
+/// Every key is always present: a value that does not apply is `null`, never omitted. The
+/// old shape skipped `nwords`, `versions`, `authors` and others when absent, which left a
+/// consumer unable to tell "not applicable" from "this build does not have it".
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Entry {
+    // The minimal tier: what every surface carries, whatever the command or format.
     pub path: String,
     pub name: String,
     /// `file` or `folder`.
     pub kind: String,
-    /// In `ls`, a folder's size, lines, words and versions are totals over every file below it.
-    pub nbytes: Option<i64>,
-    pub nlines: Option<i64>,
-    pub updated_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nwords: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub versions: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// A file's current version — what `cat -n` shows and `--base-version` takes. `null` for
+    /// a folder, which has no version of its own.
+    pub version: Option<i64>,
+    /// A file's own size; a folder's total over the live files below it.
+    pub nbytes: i64,
+    pub nlines: i64,
+    pub updated_at: String,
     pub updated_by: Option<String>,
-    /// Folder: files and folders anywhere below it.
-    #[serde(skip_serializing_if = "Option::is_none")]
+
+    // The rest of the full tier.
+    pub id: i64,
+    /// The parent folder; `null` for the root.
+    pub dir: Option<String>,
+    pub depth: i64,
+    /// Lower case, no dot; `null` for a folder or a name without one.
+    pub ext: Option<String>,
+    /// Front matter `title`, else the first level-1 heading, else `null`.
+    pub title: Option<String>,
+    pub nwords: i64,
+    pub nsections: i64,
+    pub nprops: i64,
+    pub nlinks: i64,
+    pub nlinks_broken: i64,
+    pub versions: i64,
+    pub created_at: String,
+    /// Folder: live files and folders anywhere below it; `null` for a file.
     pub files: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub folders: Option<i64>,
-    /// File: who committed to it, most commits first.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub nauthors: i64,
+    /// Who committed to it, most commits first. Empty for a folder.
     pub authors: Vec<Author>,
+
+    // The access tier (#12): present only in an account's view, absent for the owner, whose
+    // paths are the store's own and who holds no shares.
+    /// The alias of the share this row was reached through; `""` for a single-root account,
+    /// whose root is the share.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<String>,
+    /// `ro` or `rw`, the rights of that share.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rights: Option<String>,
+    /// Only on an account's root row (`kind: "root"`): its shares, in path order. The root is
+    /// not a node, so this is the only place a caller can read what it is made of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shares: Option<Vec<Share>>,
+}
+
+/// One share as a root row lists it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Share {
+    pub alias: String,
+    pub rights: String,
 }
 
 /// One author's commits to a file.
@@ -116,26 +168,25 @@ pub struct Author {
     pub last_ts: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct Stat {
-    pub path: String,
-    pub kind: String,
-    pub version: i64,
-    pub nbytes: Option<i64>,
-    pub nlines: Option<i64>,
-    pub updated_at: Option<String>,
-    pub updated_by: Option<String>,
-}
 
 #[derive(Debug, Serialize)]
+/// One version of a file, in the order the `commits` view and `textdb_history` use — one
+/// order on both engines and in every SDK. `SELECT *` consumed positionally used to swap
+/// `nbytes` and `kind` between them.
 pub struct Commit {
     pub version: i64,
     pub author: Option<String>,
     pub ts: String,
     pub message: Option<String>,
-    pub nbytes: Option<i64>,
+    /// How the commit landed: `direct`, `rebased` or `merged`.
     pub kind: Option<String>,
+    /// The version the writer started from; `None` for a file's first version.
     pub base_version: Option<i64>,
+    pub nbytes: Option<i64>,
+    /// Lines and words as of this version. `nwords` is absent on commits written before the
+    /// column existed.
+    pub nlines: Option<i64>,
+    pub nwords: Option<i64>,
 }
 
 /// A rename, move or delete as it touched one file or folder.
@@ -155,12 +206,37 @@ pub struct PathEvent {
     pub author: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+/// One matching line, the same seven keys from `search`, `grep` and the SQL functions.
+///
+/// One row per matching *line* on every surface. `search` used to return one row per document
+/// with a best-guess line on three of the four surfaces that carried the same column name.
+#[derive(Debug, Clone, Serialize)]
 pub struct Hit {
     pub path: String,
+    /// The version the line number belongs to — what `--base-version` takes. Without it a
+    /// caller that searched and then edited by line had nothing to pass.
+    pub version: i64,
     pub line: i64,
-    pub snippet: String,
-    pub rank: f64,
+    /// The whole matching line, cut at one length everywhere. Replaces `snippet` on `search`
+    /// and `text` on `grep`, which were the same thing under two names and two cuts.
+    pub text: String,
+    /// The heading path the line sits under (`API Guide / Errors`), so a caller can jump
+    /// with `cat --section`. `None` outside any heading, or in a file with none.
+    pub section: Option<String>,
+    /// Relevance, higher is better, `None` for `grep`. Replaces `rank`, whose sign was raw
+    /// engine output and flipped between SQLite and Postgres.
+    pub score: Option<f64>,
+    /// Matching lines in this file not listed because of `--per-file`; 0 otherwise. Makes
+    /// truncation visible to a JSON consumer, which only ever saw it on stderr.
+    pub more: i64,
+}
+
+/// One document a search matched, for the paths-only and count modes.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileHit {
+    pub path: String,
+    pub version: i64,
+    pub matches: i64,
 }
 
 /// A link that pointed at what a move took elsewhere and no longer reaches it.
@@ -176,6 +252,10 @@ pub struct MovedLink {
     pub now_at: String,
     /// The version the link was rewritten in; absent when only reported.
     pub version: Option<i64>,
+    /// The linking file is outside the caller's shares, so it was left alone and `path` is empty.
+    /// Counted, never named: the path would be the layout an alias exists to hide (#12 D14).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outside: bool,
 }
 
 /// A link as `links` and `backlinks` list it.
@@ -183,6 +263,10 @@ pub struct MovedLink {
 pub struct LinkRow {
     /// The file the link is written in.
     pub path: String,
+    /// The version the line number belongs to. Every row that carries a `line` carries one:
+    /// the whole contract is that a line number belongs to a version, and an agent that reads
+    /// a link and then edits by line had nothing to pass as `--base-version`.
+    pub version: i64,
     pub line: i64,
     /// `wiki`, `embed`, `md` or `image`.
     pub kind: String,
@@ -194,8 +278,12 @@ pub struct LinkRow {
     /// The file it points to; for an asset, the asset (its pointer is that with `.tdbasset`).
     pub resolved: Option<String>,
     /// It resolves to an asset.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub asset: bool,
+    /// The store's id for the document it reached. Not printed: it is what turns a target the
+    /// reader may not see into its `textdb:<id>` form, and the id is already the `resolved` row's
+    /// own elsewhere.
+    #[serde(skip)]
+    pub resolved_id: Option<i64>,
 }
 
 /// A link row as a store holds it, with a link to an asset's pointer shown as the asset.
@@ -401,6 +489,15 @@ pub struct SyncBase {
     pub git: Option<GitState>,
     /// The include rules the sync used, as JSON; `None` for a base an older build saved.
     pub rules: Option<String>,
+    /// What this base was at when it was read. Saving checks it and bumps it, so a sync that
+    /// started from a base another one has since replaced aborts instead of overwriting it.
+    /// The directory lock is local; this is what catches a second machine sharing the folder.
+    #[serde(skip)]
+    pub generation: i64,
+    /// The directory's own name for itself (`.textdb/config`), so a directory that moves is
+    /// recognised by it rather than by a path that has changed.
+    #[serde(skip)]
+    pub dir_id: Option<String>,
     #[serde(skip)]
     pub files: Vec<BaseFile>,
 }
@@ -432,20 +529,268 @@ pub struct ImportStats {
 }
 
 /// A textdb store. Paths are `/folder/file.md`; versions are per file and consecutive.
+/// A property name in use across the store.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PropKey {
+    pub key: String,
+    pub docs: i64,
+    pub values: i64,
+    /// `number`, `text` or `mixed`.
+    pub kind: String,
+}
+
+/// One value a property takes.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PropValue {
+    pub value: Option<String>,
+    pub docs: i64,
+}
+
+/// A document a property query matched.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PropHit {
+    pub path: String,
+    pub nbytes: i64,
+    pub updated_at: String,
+    /// The document's whole front matter, so a table view needs no query per row.
+    pub frontmatter: Option<serde_json::Value>,
+}
+
+/// One heading, with its document's own figures alongside.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OutlineRow {
+    pub path: String,
+    /// The last component, as written.
+    pub heading: String,
+    /// The breadcrumb, `Parent / Child`.
+    pub heading_path: String,
+    pub level: i64,
+    pub line_from: i64,
+    pub line_to: i64,
+    /// Words in the section's own lines, and in it plus everything nested under it.
+    pub nwords: Option<i64>,
+    pub nwords_total: Option<i64>,
+    pub nbytes: Option<i64>,
+    pub nlines: Option<i64>,
+    pub file_nwords: Option<i64>,
+    pub version: i64,
+    pub updated_at: String,
+    pub updated_by: Option<String>,
+}
+
+/// A distinct heading in use, for autosuggest.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HeadingName {
+    pub heading: String,
+    pub sections: i64,
+    pub docs: i64,
+}
+
+
+// ---------------------------------------------------------------- accounts, tokens and shares
+
+/// One share as a caller sees it listed: the account's own name for it, the rights, and — only
+/// for the admin — where it actually is in the store.
+#[derive(Debug, Serialize)]
+pub struct ShareRow {
+    pub account: String,
+    pub alias: String,
+    pub rights: String,
+    /// The share root's store path. `None` in an account's own `whoami`, where naming it would
+    /// disclose the layout the alias exists to hide. Serialised as `path`, the name every other
+    /// row in this CLI gives to "where this is".
+    #[serde(rename = "path", skip_serializing_if = "Option::is_none")]
+    pub store_path: Option<String>,
+    pub node_id: i64,
+    /// The share root is in the trash: the alias is not listed, but the grant is still there.
+    pub dormant: bool,
+}
+
+/// One item in the trash: what it was, and the delete it went with.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrashRow {
+    pub id: i64,
+    pub name: String,
+    /// `file` or `folder`.
+    pub kind: String,
+    /// Where it was when it was deleted, in the caller's own paths.
+    pub path: String,
+    pub version: i64,
+    pub nbytes: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nlines: Option<i64>,
+    /// 1 for a file; for a folder, the files deleted with it.
+    pub files: i64,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
+    /// Empty for an entry that has just been restored.
+    pub deleted_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_by: Option<String>,
+}
+
+/// Who this connection is.
+#[derive(Debug, Serialize)]
+pub struct Whoami {
+    /// `None` for the owner, who opened the store without a token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    pub admin: bool,
+    /// `agent`, `person`, or `owner` for the admin.
+    pub kind: String,
+    /// `aliased` or `single-root`.
+    pub namespace: String,
+    pub shares: Vec<ShareRow>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AccountRow {
+    pub name: String,
+    pub kind: String,
+    /// The store path of a single-root account's root, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    pub created_at: String,
+    pub disabled: bool,
+    pub shares: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TokenRow {
+    pub id: i64,
+    pub account: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+    /// Usable right now: not revoked, not expired.
+    pub live: bool,
+}
+
 pub trait Store {
+    // ------------------------------------------------------------ accounts, tokens and shares
+    //
+    // Every one of these is the admin's, and each implementation refuses it for a token session
+    // rather than leaving that to the CLI: the store is where the rule has to hold, because the
+    // CLI is not the only caller (#12 §4).
+
+    /// Present a bearer for this connection. Everything afterwards is answered in that account's
+    /// view. Called once, before any other operation.
+    fn authenticate(&mut self, _bearer: &str) -> Result<()> {
+        Err(StoreError::invalid("this store does not support tokens"))
+    }
+
+    /// Who this connection is, and what it can see.
+    fn whoami(&mut self) -> Result<Whoami>;
+
+    fn account_create(&mut self, name: &str, kind: &str, root: Option<&str>) -> Result<()>;
+    fn account_ls(&mut self) -> Result<Vec<AccountRow>>;
+    /// Stop an account without forgetting it: its tokens stop working and its grants stay, so
+    /// enabling it again is one command rather than a re-grant of everything it held.
+    fn account_disable(&mut self, name: &str, disabled: bool) -> Result<()>;
+    /// Turn a single-root account into a multi-share one, keeping its share under `alias`. An
+    /// explicit change: every path the account sees gains a `/<alias>` prefix.
+    fn account_convert(&mut self, name: &str, alias: Option<&str>) -> Result<String>;
+
+    /// Mint a bearer. Returned once, stored hashed, and not recoverable afterwards.
+    fn token_create(&mut self, account: &str, label: Option<&str>, expires_at: Option<&str>) -> Result<(String, i64)>;
+    fn token_ls(&mut self, account: Option<&str>) -> Result<Vec<TokenRow>>;
+    fn token_revoke(&mut self, id: i64) -> Result<()>;
+
+    /// Share `path` and everything below it with `account`, under `alias` (the folder's own name
+    /// by default). Every rule the model decides at grant time is applied here.
+    fn access_grant(&mut self, account: &str, path: &str, rights: &str, alias: Option<&str>) -> Result<ShareRow>;
+    /// Rename a share in one account's namespace. A move for that account, not a delete.
+    fn access_rename(&mut self, account: &str, from: &str, to: &str) -> Result<()>;
+    fn access_revoke(&mut self, account: &str, alias: &str) -> Result<()>;
+    /// Every share; with an account name, that account's; with a store path, who can see it.
+    fn access_ls(&mut self, who: Option<&str>) -> Result<Vec<ShareRow>>;
+
+    /// This connection's shares that exist but may not be used — revoked, or with their folder in
+    /// the trash — as the aliases they occupy in its own namespace.
+    ///
+    /// `sync` needs this and nothing else needs it. A revoked share's files vanish from every
+    /// listing, which is indistinguishable from their having been deleted, and sync deletes from
+    /// disk what the store no longer has. Without this it would empty a checkout the moment a
+    /// share was taken away — the one case in #12 that destroys data. Empty for the owner.
+    fn denied_shares(&mut self) -> Result<Vec<String>> {
+        Ok(self.share_state()?.into_iter().filter(|(_, s)| s == "denied").map(|(a, _)| a).collect())
+    }
+
+    /// Every share of this connection as `(alias, "ro" | "rw" | "denied")`.
+    ///
+    /// `sync` is the only caller and needs all three: it must not try to push a file under a
+    /// read-only share (the store would refuse it file by file, which reads as a failure rather
+    /// than as the rule it is), and it must not delete from disk what a denied share left there.
+    /// Empty for the owner, who writes everywhere.
+    fn share_state(&mut self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+
     fn backend(&self) -> &'static str;
     /// Make the store usable: create what is missing, upgrade what is old.
     fn init(&mut self) -> Result<()>;
     /// Every folder and file under `prefix` (not `prefix` itself unless it is a file).
+    /// The trash: what was deleted and not yet purged, newest delete first; with `parent`, the
+    /// entries that went to the trash inside that trashed folder.
+    ///
+    /// SQLite only. Postgres has no trash yet (docs/assets.md), so the backend says so rather
+    /// than answering an empty list, which would read as "nothing is deleted".
+    fn trash(&mut self, _parent: Option<i64>) -> Result<Vec<TrashRow>> {
+        Err(StoreError::invalid("this store has no trash"))
+    }
+
+    /// Put a trash entry back where it was, with everything that went to the trash with it.
+    fn trash_restore(&mut self, _id: i64, _author: Option<&str>) -> Result<TrashRow> {
+        Err(StoreError::invalid("this store has no trash"))
+    }
+
     fn nodes(&mut self, prefix: &str) -> Result<Vec<Entry>>;
     /// The folder's entries by name, or with `recursive` everything below it by path. A folder's
     /// size, lines, words and versions are totals over the files below it.
     fn ls(&mut self, path: &str, recursive: bool) -> Result<Vec<Entry>>;
-    fn stat(&mut self, path: &str) -> Result<Stat>;
+    /// One full `Entry` for one path — the same record `ls` returns for it.
+    fn stat(&mut self, path: &str) -> Result<Entry>;
     /// Content at `version` (HEAD when `None`) and the version it is.
     fn read(&mut self, path: &str, version: Option<i64>) -> Result<(Vec<u8>, i64)>;
     fn section(&mut self, path: &str, heading: &str) -> Result<Option<Vec<u8>>>;
-    fn search(&mut self, query: &str, prefix: &str, limit: i64) -> Result<Vec<Hit>>;
+    /// Matching lines, at most `per_file` from any one document. `limit` counts rows.
+    fn search(&mut self, query: &str, prefix: &str, limit: i64, per_file: i64) -> Result<Vec<Hit>>;
+    /// A file's heading spans as `(line_from, line_to, heading_path)`, for naming the section
+    /// a line falls in. Empty for a file with no headings.
+    fn sections_of(&mut self, path: &str) -> Result<Vec<(i64, i64, String)>>;
+    /// Front-matter property names in use, most-used first; `prefix` narrows them.
+    fn property_keys(&mut self, prefix: &str, limit: i64) -> Result<Vec<PropKey>>;
+    /// The values one property takes, most-used first.
+    fn property_values(&mut self, key: &str, prefix: &str, limit: i64) -> Result<Vec<PropValue>>;
+    /// Documents matching a property query, under `folder`.
+    fn property_find(&mut self, query: &str, folder: &str, limit: i64) -> Result<Vec<PropHit>>;
+    /// Headings under `prefix`, in document order. `heading` narrows to one, matched folded;
+    /// `mode` is `exact`, `prefix` or `contains`. `max_level` caps the depth.
+    fn outline(&mut self, prefix: &str, heading: Option<&str>, mode: &str, max_level: Option<i64>, limit: i64) -> Result<Vec<OutlineRow>>;
+    /// Distinct headings under `prefix` starting with `starts`, most-used first.
+    fn heading_names(&mut self, prefix: &str, starts: &str, limit: i64) -> Result<Vec<HeadingName>>;
+    /// Create a folder and any missing parents; returns without complaint if it is already there.
+    fn mkdir(&mut self, path: &str) -> Result<()>;
+    /// Called after a bulk load — `import`, `sync` — so the store can get itself ready.
+    ///
+    /// Postgres needs it: a store built in one burst keeps whatever planner statistics
+    /// autovacuum worked out while the tables were nearly empty, because autovacuum's
+    /// threshold is a share of the rows it already knows about. A heading query over 2,000
+    /// notes then plans as a nested loop and takes 74 ms instead of 7.7. SQLite's planner
+    /// does not depend on statistics this way, so its implementation does nothing.
+    ///
+    /// Best effort: a store that will not analyse is slower, not broken, so a failure here
+    /// is reported and the command still succeeds.
+    fn settle(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn write(
         &mut self,
         path: &str,

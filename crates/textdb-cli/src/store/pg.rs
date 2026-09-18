@@ -11,43 +11,50 @@ use postgres::{Client, NoTls, Row};
 use textdb_sqlite::normalize_path;
 
 use super::{
-    BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, LineRange, LinkRow, MovedBack, MovedLink,
-    PathEvent, RestoredFile, Result, RevertOutcome, SqlResult, Stat, Store, StoreError, SyncBase, Written,
+    AccountRow, BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, LineRange, LinkRow,
+    MovedBack, MovedLink, PathEvent, RestoredFile, Result, RevertOutcome, ShareRow, SqlResult, Store, StoreError, SyncBase, TokenRow,
+    Whoami, Written,
 };
 
 /// The views `textdb sql` offers, as in SQLite: the live store by path. Temporary, so they live
 /// in this session only.
 const SQL_VIEWS: &str = "\
+-- `files` and `folders` are the canonical listing record filtered by kind, the same columns
+-- in the same order as kb.entry and SQLite's. `folders.parent` is `dir` now.
 CREATE OR REPLACE TEMP VIEW files AS
-  SELECT id, path, name,
-         CASE WHEN length(path) = length(name) + 1 THEN '/' ELSE left(path, length(path) - length(name) - 1) END AS dir,
-         length(path) - length(replace(path, '/', '')) AS depth,
-         CASE WHEN name ~ '^.+\\.[^.]*$' THEN lower(substring(name from '\\.([^.]*)$')) ELSE '' END AS ext,
-         version, nbytes, nlines, nwords, nauthors, created_at, updated_at, updated_by
-  FROM kb.node WHERE kind = 1 AND deleted_at IS NULL;
+  SELECT * FROM kb.entry WHERE kind = 'file';
 CREATE OR REPLACE TEMP VIEW folders AS
-  SELECT id, path, name,
-         CASE WHEN path = '/' THEN NULL WHEN length(path) = length(name) + 1 THEN '/'
-              ELSE left(path, length(path) - length(name) - 1) END AS parent,
-         CASE WHEN path = '/' THEN 0 ELSE length(path) - length(replace(path, '/', '')) END AS depth,
-         files, folders, nbytes, nlines, nwords, versions, updated_at FROM kb.entry WHERE kind = 'folder';
+  SELECT * FROM kb.entry WHERE kind = 'folder';
+-- Every one of these joins `kb.entry`, never `kb.node`: the view speaks the caller's paths and
+-- holds only what it can see, so each of these inherits both. Joining the table gave an account
+-- the store's paths on every surface but the two above (#12 K1, K5).
 CREATE OR REPLACE TEMP VIEW frontmatter AS
-  SELECT n.path, f.data FROM kb.frontmatter f JOIN kb.node n ON n.id = f.file_id AND n.deleted_at IS NULL;
+  SELECT n.path, f.data FROM kb.frontmatter f JOIN kb.entry n ON n.id = f.file_id;
+CREATE OR REPLACE TEMP VIEW properties AS
+  SELECT n.path, r.key, r.val_txt AS value, r.val_num AS number, r.ord
+  FROM kb.property r JOIN kb.entry n ON n.id = r.file_id;
 CREATE OR REPLACE TEMP VIEW sections AS
-  SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to
-  FROM kb.section s JOIN kb.node n ON n.id = s.file_id AND n.deleted_at IS NULL;
+  SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to,
+         s.heading AS title, s.nwords, s.nwords_total,
+         n.nbytes, n.nlines, n.nwords AS file_nwords, n.version, n.updated_at, n.updated_by
+  FROM kb.section s JOIN kb.entry n ON n.id = s.file_id;
 CREATE OR REPLACE TEMP VIEW links AS
-  SELECT n.path, l.target_path AS target, l.line, l.kind, l.anchor, l.alias, l.status,
+  SELECT n.path, n.version, l.line, coalesce(l.kind, '') AS kind,
+         -- A target this account cannot see is the id reference its content reads as, never the
+         -- path the link was written with (#12 E).
+         CASE WHEN l.resolved_id IS NOT NULL AND r.id IS NULL THEN 'textdb:' || l.resolved_id
+              ELSE l.target_path END AS target,
+         l.anchor, l.alias, l.status,
          CASE WHEN lower(r.path) LIKE '%.tdbasset' THEN left(r.path, -9) ELSE r.path END AS resolved,
          coalesce(lower(r.path) LIKE '%.tdbasset', false) AS asset
-  FROM kb.link l JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL
-  LEFT JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL;
+  FROM kb.link l JOIN kb.entry n ON n.id = l.file_id
+  LEFT JOIN kb.entry r ON r.id = l.resolved_id;
 CREATE OR REPLACE TEMP VIEW commits AS
-  SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines, c.batch
-  FROM kb.commit c JOIN kb.node n ON n.id = c.file_id AND n.deleted_at IS NULL;
+  SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines, c.nwords, c.batch
+  FROM kb.commit c JOIN kb.entry n ON n.id = c.file_id;
 CREATE OR REPLACE TEMP VIEW authors AS
   SELECT n.path, nullif(a.author, '') AS author, a.commits, a.first_ts, a.last_ts
-  FROM kb.file_author a JOIN kb.node n ON n.id = a.file_id AND n.deleted_at IS NULL;";
+  FROM kb.file_author a JOIN kb.entry n ON n.id = a.file_id;";
 
 /// The sync base tables, as the extension defines them, for stores installed before they were.
 const SYNC_TABLES: &str = "\
@@ -63,9 +70,11 @@ CREATE TABLE IF NOT EXISTS kb.sync_file (
   conflict boolean NOT NULL DEFAULT false,
   PRIMARY KEY (sync_id, rel)
 );
-ALTER TABLE kb.sync ADD COLUMN IF NOT EXISTS rules text;";
+ALTER TABLE kb.sync ADD COLUMN IF NOT EXISTS rules text;
+ALTER TABLE kb.sync ADD COLUMN IF NOT EXISTS generation bigint NOT NULL DEFAULT 0;
+ALTER TABLE kb.sync ADD COLUMN IF NOT EXISTS dir_id text;";
 
-const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at::text, author, git_commit, git_branch, git_remote, git_clean, rules";
+const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at::text, author, git_commit, git_branch, git_remote, git_clean, rules, generation, dir_id";
 
 /// The asset store table, as the extension defines it, for stores installed before it was.
 const ASSET_TABLES: &str = "\
@@ -91,6 +100,8 @@ fn sync_row(r: &Row) -> (i64, SyncBase) {
                 clean,
             }),
             rules: r.get(10),
+            generation: r.get(11),
+            dir_id: r.get(12),
             files: Vec::new(),
         },
     )
@@ -109,23 +120,75 @@ pub struct PgStore {
 
 /// Keep the extension's `TX00n` SQLSTATEs, and the conflict payload it puts in `DETAIL`.
 fn pg(e: postgres::Error) -> StoreError {
+    let of = |code: String, db: &postgres::error::DbError| StoreError {
+        conflict: (code == "TX001").then(|| db.detail().and_then(|d| serde_json::from_str(d).ok())).flatten(),
+        message: db.message().trim_start_matches(&code).trim_start().to_string(),
+        code,
+    };
     match e.as_db_error() {
-        Some(db) if db.code().code().starts_with("TX") => {
-            let code = db.code().code().to_string();
-            let conflict = if code == "TX001" {
-                db.detail().and_then(|d| serde_json::from_str(d).ok())
-            } else {
-                None
-            };
-            StoreError {
-                code,
-                message: db.message().to_string(),
-                conflict,
-            }
+        Some(db) if db.code().code().starts_with("TX") => of(db.code().code().to_string(), db),
+        // An error the extension raised inside SPI arrives as `XX000`: the re-raise on the way out
+        // of a `#[pg_extern]` keeps the message and drops the SQLSTATE. `raise` puts the code in
+        // front of the message for exactly this case, so a refusal is still a refusal here and not
+        // an internal error (#12 C, H).
+        Some(db) if db.message().len() > 5 && db.message().starts_with("TX") && db.message()[2..5].bytes().all(|c| c.is_ascii_digit()) => {
+            of(db.message()[..5].to_string(), db)
         }
         Some(db) => StoreError::other(format!("{} (SQLSTATE {})", db.message(), db.code().code())),
         None => StoreError::other(e),
     }
+}
+
+/// Refuse a token session the store's own tables (#12 K2).
+///
+/// `kb.entry`, `kb.ls`, the `textdb sql` views and the `kb.*` functions are the surface; `kb.node`,
+/// `kb.commit`, `kb.grant` and the rest are the owner's, and reading them walks straight past every
+/// filter this feature adds.
+///
+/// This reads the statement, not the plan. The plan cannot answer the question: Postgres inlines a
+/// view into the plan of the query that reads it, so `SELECT * FROM files` and `SELECT * FROM
+/// kb.node` both come out as a scan of `kb.node`, and a check on the plan would refuse the
+/// sanctioned surface along with the raw one. What the statement *names* is therefore what decides,
+/// and the limit of that is written down rather than implied: a caller that reaches a table under
+/// another name — through `search_path`, a quoted spelling, or a view of its own — is not caught
+/// here. The mechanism that does catch it is Postgres's own, a role with no privilege on the tables
+/// and `SECURITY DEFINER` on the functions that need them, and that is the follow-up this guard
+/// stands in for. Nothing about it is a substitute for the extension's filtering, which is where a
+/// row is actually kept back; this is about the raw tables having no business being read at all.
+fn refuse_raw_tables(tx: &mut postgres::Transaction<'_>, query: &str) -> Result<()> {
+    let account: Option<String> = tx
+        .query_one("SELECT (SELECT a.name FROM kb.account a WHERE a.id = kb.current_account())", &[])
+        .map_err(pg)?
+        .get(0);
+    if account.is_none() {
+        return Ok(());
+    }
+    // Every table of the extension's schema; its views are not in this list, and are the surface.
+    let rows = tx
+        .query(
+            "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'kb' AND c.relkind IN ('r', 'p')",
+            &[],
+        )
+        .map_err(pg)?;
+    let words: Vec<&str> = query.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')).collect();
+    for t in rows.iter().map(|r| r.get::<_, String>(0)) {
+        if words.iter().any(|w| w.eq_ignore_ascii_case(&format!("kb.{t}"))) {
+            return Err(StoreError::forbidden(format!(
+                "kb.{t} is the store's own table and is not yours to read; the views and kb.* are \
+                 (files, folders, commits, links, properties, sections, authors, frontmatter)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The statuses a `links` call asked for, when it asked for more than the one `kb.links` takes.
+fn keep_statuses(rows: Vec<LinkRow>, statuses: &[&str]) -> Vec<LinkRow> {
+    if statuses.len() < 2 {
+        return rows;
+    }
+    rows.into_iter().filter(|l| l.status.as_deref().is_some_and(|s| statuses.contains(&s))).collect()
 }
 
 /// Postgres stores content as `text`.
@@ -138,38 +201,66 @@ fn written(json: &str) -> Result<Written> {
     serde_json::from_str(json).map_err(|e| StoreError::other(format!("unexpected write result {json}: {e}")))
 }
 
+/// One `kb.entry` row selected with [`ENTRY_COLS`], as the CLI's `Entry`.
+///
+/// One conversion for every listing path, matching the SQLite store's, so the twenty-four
+/// keys mean the same thing on either backend.
 fn entry(r: &Row) -> Entry {
+    let authors: Option<String> = r.get(23);
     Entry {
         path: r.get(0),
         name: r.get(1),
         kind: r.get(2),
-        nbytes: r.get(3),
-        nlines: r.get(4),
-        updated_at: r.get(5),
-        ..Entry::default()
-    }
-}
-
-const ENTRY_COLS: &str =
-    "n.path, n.name, CASE n.kind WHEN 1 THEN 'file' ELSE 'folder' END, n.nbytes, n.nlines, n.updated_at::text";
-
-/// A row of `kb.entry` selected with [`LISTING_COLS`].
-fn listed(r: &Row) -> Entry {
-    let authors: Option<String> = r.get(12);
-    Entry {
-        nwords: r.get(6),
-        versions: r.get(7),
-        created_at: r.get(8),
-        updated_by: r.get(9),
-        files: r.get(10),
-        folders: r.get(11),
+        version: r.get(3),
+        nbytes: r.get(4),
+        nlines: r.get(5),
+        updated_at: r.get(6),
+        updated_by: r.get(7),
+        id: r.get(8),
+        dir: r.get(9),
+        depth: r.get(10),
+        ext: r.get(11),
+        title: r.get(12),
+        nwords: r.get(13),
+        nsections: r.get(14),
+        nprops: r.get(15),
+        nlinks: r.get(16),
+        nlinks_broken: r.get(17),
+        versions: r.get(18),
+        created_at: r.get(19),
+        files: r.get(20),
+        folders: r.get(21),
+        nauthors: r.get(22),
+        // The share a row was reached through, when the connection has one. `try_get`, because
+        // the same `entry()` reads rows from queries written before these columns existed.
+        share: r.try_get("share").ok().flatten(),
+        rights: r.try_get("rights").ok().flatten(),
+        shares: r
+            .try_get::<_, Option<String>>("shares")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok()),
         authors: authors.and_then(|a| serde_json::from_str(&a).ok()).unwrap_or_default(),
-        ..entry(r)
     }
 }
 
-const LISTING_COLS: &str = "e.path, e.name, e.kind, e.nbytes, e.nlines, e.updated_at::text, e.nwords, e.versions, \
-     e.created_at::text, e.updated_by, e.files, e.folders, e.authors::text";
+/// Timestamps are rendered to ISO-8601 UTC in SQL rather than left to `::text`, which would
+/// give `2026-09-16 05:08:32.033+00` in the session's time zone — a different spelling of the
+/// same field from the one the SQLite backend returns.
+pub(crate) fn utc(col: &str) -> String {
+    format!("to_char({col} AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')")
+}
+
+/// The canonical `Entry` columns of `kb.entry`, in order.
+fn entry_cols() -> String {
+    format!(
+        "e.path, e.name, e.kind, e.version, e.nbytes, e.nlines, {upd}, e.updated_by, e.id, e.dir, e.depth, e.ext, \
+         e.title, e.nwords, e.nsections, e.nprops, e.nlinks, e.nlinks_broken, e.versions, {cre}, e.files, e.folders, \
+         e.nauthors, e.authors::text, e.share, e.rights, e.shares::text",
+        upd = utc("e.updated_at"),
+        cre = utc("e.created_at"),
+    )
+}
 
 impl PgStore {
     pub fn connect(url: &str) -> Result<Self> {
@@ -180,6 +271,38 @@ impl PgStore {
             sql_views_ready: false,
             assets_ready: false,
         })
+    }
+
+    /// Why a `kb.entry` lookup found nothing: forbidden, or simply not there.
+    ///
+    /// `kb.entry` holds only what the caller can see, so a path under a share whose folder is in
+    /// the trash — or whose grant was taken away — is missing from it exactly as a path that never
+    /// existed is. The difference is the whole of TX005, and `kb.resolve` is what knows it: sync
+    /// deletes what the store no longer has and leaves alone what it merely may not have, so a
+    /// revocation reported as absence is what would empty a checkout (#12 D11, H6).
+    fn why_missing(&mut self, path: &str) -> StoreError {
+        match self.client.query_one("SELECT kb.resolve($1)", &[&path]) {
+            Err(e) => pg(e),
+            // It resolves, so there is no node at it.
+            Ok(_) => StoreError::not_found(format!("not found: {path}")),
+        }
+    }
+
+    /// A path as this connection's own, resolving an `id:1234` reference to the path that names
+    /// the same document here.
+    ///
+    /// Every query below addresses `kb.entry`, whose `path` is the caller's, and an id reference
+    /// is not a path in any view — so it has to become one before it can be compared. Only an id
+    /// costs the round trip; an ordinary path is already what it will be matched against.
+    fn own_path(&mut self, path: &str) -> Result<String> {
+        if !path.trim_start_matches('/').starts_with("id:") {
+            return Ok(path.to_string());
+        }
+        let row = self.client.query_one("SELECT kb.to_view(kb.resolve($1))", &[&path]).map_err(pg)?;
+        row.try_get::<_, Option<String>>(0)
+            .ok()
+            .flatten()
+            .ok_or_else(|| StoreError::not_found(format!("not found: {path}")))
     }
 
     fn ensure_asset_tables(&mut self) -> Result<()> {
@@ -198,33 +321,42 @@ impl PgStore {
         Ok(())
     }
 
-    /// Links of live files matching `cond` (over `n`, the file written in, `l` and `r`, the file
-    /// resolved to), in path and line order.
-    fn link_rows(&mut self, cond: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<LinkRow>> {
+    /// Links as `kb.links` or `kb.backlinks` reports them, in path and line order.
+    ///
+    /// Through the extension, never over `kb.link` and `kb.node`: those hold the store's own paths
+    /// and no view of them, so a hand-written join here answered an account in the store's paths
+    /// and reported a hidden target by naming it. The header's rule again — every operation is a
+    /// call into `kb.*`.
+    fn link_rows(&mut self, incoming: bool, path: &str, statuses: &[&str]) -> Result<Vec<LinkRow>> {
+        let which = if incoming { "kb.backlinks" } else { "kb.links" };
+        // `kb.links` narrows to one status. Asked for several — `--broken` is broken,
+        // anchor-missing and not-in-store — it is asked for all of them and `keep_statuses` picks,
+        // because narrowing to the first would drop the other two.
+        let one = if statuses.len() == 1 { statuses[0] } else { "" };
         let rows = self
             .client
             .query(
                 &format!(
-                    "SELECT n.path, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status, r.path \
-                     FROM kb.link l JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL \
-                     LEFT JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL \
-                     WHERE {cond} ORDER BY n.path COLLATE \"C\", l.line, l.id"
+                    "SELECT path, version, line, kind, target, anchor, alias, status, resolved, asset \
+                     FROM {which}($1, $2) ORDER BY path COLLATE \"C\", line"
                 ),
-                params,
+                &[&path, &one],
             )
             .map_err(pg)?;
         Ok(rows
             .iter()
             .map(|r| LinkRow {
                 path: r.get(0),
-                line: r.get(1),
-                kind: r.get(2),
-                target: r.get(3),
-                anchor: r.get(4),
-                alias: r.get(5),
-                status: r.get(6),
-                resolved: r.get(7),
-                asset: false,
+                version: r.get(1),
+                line: r.get(2),
+                kind: r.get(3),
+                target: r.get(4),
+                anchor: r.get(5),
+                alias: r.get(6),
+                status: r.get(7),
+                resolved: r.get(8),
+                asset: r.get(9),
+                resolved_id: None,
             })
             .map(super::asset_link)
             .collect())
@@ -341,8 +473,13 @@ fn statement_error(e: postgres::Error, write: bool) -> StoreError {
     let Some(db) = e.as_db_error() else { return pg(e) };
     let read_only = db.code().code() == "25006" || db.message().contains("read-only transaction");
     let mut err = pg(e);
-    err.code = "TX004".to_string();
-    err.conflict = None;
+    // The SQL is the caller's, so a *SQL* error is invalid input — but a refusal the store raised
+    // from inside the statement keeps its own kind, as it does on SQLite: a row refused for want of
+    // rights exits 7, and a path the caller cannot address exits 5 (#12 C18, K4).
+    if !err.code.starts_with("TX") || err.code == "TX000" {
+        err.code = "TX004".to_string();
+        err.conflict = None;
+    }
     if read_only && !write {
         err.message = format!("{}: this statement changes the store; run it with --write", err.message);
     }
@@ -383,6 +520,195 @@ fn batch_change(v: &serde_json::Value) -> BatchChange {
 }
 
 impl Store for PgStore {
+    // ------------------------------------------------------------ accounts, tokens and shares
+    //
+    // Every one of these is one call into `kb.*`, as with everything else in this module: the
+    // rules and the refusals are the extension's, so a client that talks to the database without
+    // going through this CLI gets exactly the same answers.
+
+    fn authenticate(&mut self, bearer: &str) -> Result<()> {
+        self.client.query_one("SELECT kb.auth($1)", &[&bearer]).map_err(pg)?;
+        Ok(())
+    }
+
+    fn whoami(&mut self) -> Result<Whoami> {
+        let rows = self.client.query("SELECT * FROM kb.whoami()", &[]).map_err(pg)?;
+        let first = rows.first().ok_or_else(|| StoreError::other("kb.whoami() said nothing"))?;
+        let account: Option<String> = first.get(0);
+        let admin: bool = first.get(1);
+        let kind: String = first.get(2);
+        let namespace: String = first.get(3);
+        let shares = rows
+            .iter()
+            .filter_map(|r| {
+                let alias: Option<String> = r.get(4);
+                alias.map(|alias| ShareRow {
+                    account: account.clone().unwrap_or_default(),
+                    alias,
+                    rights: r.get::<_, Option<String>>(5).unwrap_or_default(),
+                    // An account is never told where its shares live in the store.
+                    store_path: None,
+                    node_id: r.get::<_, Option<i64>>(6).unwrap_or_default(),
+                    dormant: r.get::<_, Option<bool>>(7).unwrap_or(false),
+                })
+            })
+            .collect();
+        Ok(Whoami { account, admin, kind, namespace, shares })
+    }
+
+    fn account_create(&mut self, name: &str, kind: &str, root: Option<&str>) -> Result<()> {
+        self.client
+            .query_one("SELECT kb.account_create($1, $2, $3)", &[&name, &kind, &root])
+            .map_err(pg)?;
+        Ok(())
+    }
+
+    fn account_disable(&mut self, name: &str, disabled: bool) -> Result<()> {
+        self.client
+            .query_one("SELECT kb.account_disable($1, $2)", &[&name, &disabled])
+            .map_err(pg)?;
+        Ok(())
+    }
+
+    fn account_ls(&mut self) -> Result<Vec<AccountRow>> {
+        let rows = self
+            .client
+            .query(
+                &format!("SELECT name, kind, root, {}, disabled, shares FROM kb.account_ls()", utc("created_at")),
+                &[],
+            )
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| AccountRow {
+                name: r.get(0),
+                kind: r.get(1),
+                root: r.get(2),
+                created_at: r.get(3),
+                disabled: r.get(4),
+                shares: r.get::<_, i64>(5) as usize,
+            })
+            .collect())
+    }
+
+    fn account_convert(&mut self, name: &str, alias: Option<&str>) -> Result<String> {
+        Ok(self
+            .client
+            .query_one("SELECT kb.account_convert($1, $2)", &[&name, &alias])
+            .map_err(pg)?
+            .get(0))
+    }
+
+    fn token_create(&mut self, account: &str, label: Option<&str>, expires_at: Option<&str>) -> Result<(String, i64)> {
+        // `$3::text::timestamptz`, not `$3::timestamptz`. A bare parameter under a single cast
+        // is inferred as the cast's *target*, so Postgres declares `$3` a timestamptz and
+        // rust-postgres then refuses to send a string for it ("error serializing parameter 2").
+        // The first cast pins the parameter to text, which is what the expiry actually is.
+        let row = self
+            .client
+            .query_one(
+                "SELECT bearer, id FROM kb.token_create($1, $2, $3::text::timestamptz)",
+                &[&account, &label, &expires_at],
+            )
+            .map_err(pg)?;
+        Ok((row.get(0), row.get(1)))
+    }
+
+    fn token_ls(&mut self, account: Option<&str>) -> Result<Vec<TokenRow>> {
+        let rows = self
+            .client
+            .query(
+                &format!(
+                    "SELECT id, account, label, {c}, {e}, {r}, {u}, live FROM kb.token_ls($1)",
+                    c = utc("created_at"),
+                    e = utc("expires_at"),
+                    r = utc("revoked_at"),
+                    u = utc("last_used_at"),
+                ),
+                &[&account],
+            )
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| TokenRow {
+                id: r.get(0),
+                account: r.get(1),
+                label: r.get(2),
+                created_at: r.get(3),
+                expires_at: r.get(4),
+                revoked_at: r.get(5),
+                last_used_at: r.get(6),
+                live: r.get(7),
+            })
+            .collect())
+    }
+
+    fn token_revoke(&mut self, id: i64) -> Result<()> {
+        self.client.query_one("SELECT kb.token_revoke($1)", &[&id]).map_err(pg)?;
+        Ok(())
+    }
+
+    fn access_grant(&mut self, account: &str, path: &str, rights: &str, alias: Option<&str>) -> Result<ShareRow> {
+        let row = self
+            .client
+            .query_one(
+                "SELECT alias, rights, store_path, node_id FROM kb.access_grant($1, $2, $3, $4)",
+                &[&account, &path, &rights, &alias],
+            )
+            .map_err(pg)?;
+        Ok(ShareRow {
+            account: account.to_string(),
+            alias: row.get(0),
+            rights: row.get(1),
+            store_path: Some(row.get(2)),
+            node_id: row.get(3),
+            dormant: false,
+        })
+    }
+
+    fn access_rename(&mut self, account: &str, from: &str, to: &str) -> Result<()> {
+        self.client
+            .query_one("SELECT kb.access_rename($1, $2, $3)", &[&account, &from, &to])
+            .map_err(pg)?;
+        Ok(())
+    }
+
+    fn access_revoke(&mut self, account: &str, alias: &str) -> Result<()> {
+        self.client
+            .query_one("SELECT kb.access_revoke($1, $2)", &[&account, &alias])
+            .map_err(pg)?;
+        Ok(())
+    }
+
+    fn share_state(&mut self) -> Result<Vec<(String, String)>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT alias, CASE WHEN dormant THEN 'denied' ELSE rights END FROM kb.my_grant ORDER BY alias",
+                &[],
+            )
+            .map_err(pg)?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    fn access_ls(&mut self, who: Option<&str>) -> Result<Vec<ShareRow>> {
+        let rows = self
+            .client
+            .query("SELECT account, alias, rights, store_path, node_id, dormant FROM kb.access_ls($1)", &[&who])
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| ShareRow {
+                account: r.get(0),
+                alias: r.get(1),
+                rights: r.get(2),
+                store_path: Some(r.get(3)),
+                node_id: r.get(4),
+                dormant: r.get(5),
+            })
+            .collect())
+    }
+
     fn backend(&self) -> &'static str {
         "postgres"
     }
@@ -409,53 +735,46 @@ impl Store for PgStore {
         if prefix != "/" {
             self.stat(&prefix)?;
         }
+        // The same query `ls -R` runs, so every listing command returns the same row.
+        self.ls(&prefix, true)
+    }
+
+    fn ls(&mut self, path: &str, recursive: bool) -> Result<Vec<Entry>> {
+        let path = self.own_path(&normalize_path(path)?)?;
+        self.stat(&path)?;
         let rows = self
             .client
-            .query(
-                &format!(
-                    "SELECT {ENTRY_COLS} FROM kb.node n WHERE n.deleted_at IS NULL AND n.path <> '/' \
-                     AND ($1 = '/' OR n.path LIKE kb._subtree_like($1) OR (n.path = $1 AND n.kind = 1))"
-                ),
-                &[&prefix],
-            )
+            .query(&format!("SELECT {} FROM kb.ls($1, $2) e", entry_cols()), &[&path, &recursive])
             .map_err(pg)?;
         Ok(rows.iter().map(entry).collect())
     }
 
-    fn ls(&mut self, path: &str, recursive: bool) -> Result<Vec<Entry>> {
-        let path = normalize_path(path)?;
-        self.stat(&path)?;
-        let rows = self
-            .client
-            .query(&format!("SELECT {LISTING_COLS} FROM kb.ls($1, $2) e"), &[&path, &recursive])
-            .map_err(pg)?;
-        Ok(rows.iter().map(listed).collect())
+    fn mkdir(&mut self, path: &str) -> Result<()> {
+        self.client.query_one("SELECT kb.mkdir($1)", &[&path]).map_err(pg)?;
+        Ok(())
     }
 
-    fn stat(&mut self, path: &str) -> Result<Stat> {
-        let path = normalize_path(path)?;
+    fn stat(&mut self, path: &str) -> Result<Entry> {
+        let path = self.own_path(&normalize_path(path)?)?;
         let row = self
             .client
             .query_opt(
-                "SELECT path, CASE kind WHEN 1 THEN 'file' ELSE 'folder' END, version, nbytes, nlines, \
-                 updated_at::text, updated_by FROM kb.node WHERE path = $1 AND deleted_at IS NULL",
+                &format!(
+                    "SELECT {c} FROM (SELECT * FROM kb.entry UNION ALL SELECT * FROM kb.root_entry) e WHERE e.path = $1",
+                    c = entry_cols()
+                ),
                 &[&path],
             )
-            .map_err(pg)?
-            .ok_or_else(|| StoreError::not_found(format!("not found: {path}")))?;
-        Ok(Stat {
-            path: row.get(0),
-            kind: row.get(1),
-            version: row.get(2),
-            nbytes: row.get(3),
-            nlines: row.get(4),
-            updated_at: row.get(5),
-            updated_by: row.get(6),
-        })
+            .map_err(pg)?;
+        let row = match row {
+            Some(row) => row,
+            None => return Err(self.why_missing(&path)),
+        };
+        Ok(entry(&row))
     }
 
     fn read(&mut self, path: &str, version: Option<i64>) -> Result<(Vec<u8>, i64)> {
-        let path = normalize_path(path)?;
+        let path = self.own_path(&normalize_path(path)?)?;
         match version {
             Some(v) => {
                 let text: String = self.client.query_one("SELECT kb.content($1, $2)", &[&path, &v]).map_err(pg)?.get(0);
@@ -463,15 +782,25 @@ impl Store for PgStore {
             }
             None => {
                 // One statement, so the content and its version come from the same snapshot.
+                //
+                // A view, not `kb.node`: the raw table holds store paths, and the caller's path
+                // is its own. Everything this module sends is in the caller's namespace and the
+                // extension translates — reaching past it to a table was a leak waiting to
+                // happen and, once accounts existed, simply failed to find anything.
+                //
+                // `kb.file` rather than `kb.entry`, because `kb.file` already *has* the content
+                // column and builds it from the row it found. `kb.content(path)` off `kb.entry`
+                // resolved the caller's path a second time and looked the node up again, on the
+                // hottest read there is, to reach the row the outer query was already standing
+                // on.
                 let row = self
                     .client
-                    .query_opt(
-                        "SELECT kb.content(path, NULL::bigint), version FROM kb.node \
-                         WHERE path = $1 AND kind = 1 AND deleted_at IS NULL",
-                        &[&path],
-                    )
-                    .map_err(pg)?
-                    .ok_or_else(|| StoreError::not_found(format!("not found: {path}")))?;
+                    .query_opt("SELECT content, version FROM kb.file WHERE path = $1", &[&path])
+                    .map_err(pg)?;
+                let row = match row {
+                    Some(row) => row,
+                    None => return Err(self.why_missing(&path)),
+                };
                 let text: String = row.get(0);
                 Ok((text.into_bytes(), row.get(1)))
             }
@@ -487,23 +816,141 @@ impl Store for PgStore {
         Ok(text.map(String::into_bytes))
     }
 
-    fn search(&mut self, query: &str, prefix: &str, limit: i64) -> Result<Vec<Hit>> {
+    fn property_keys(&mut self, prefix: &str, limit: i64) -> Result<Vec<crate::store::PropKey>> {
+        let rows = self
+            .client
+            .query("SELECT key, docs, values_n, kind FROM kb.prop_keys($1, $2)", &[&prefix, &limit.max(1)])
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::store::PropKey {
+                key: r.get(0),
+                docs: r.get(1),
+                values: r.get(2),
+                kind: r.get(3),
+            })
+            .collect())
+    }
+    fn property_values(&mut self, key: &str, prefix: &str, limit: i64) -> Result<Vec<crate::store::PropValue>> {
+        let rows = self
+            .client
+            .query("SELECT value, docs FROM kb.prop_values($1, $2, $3)", &[&key, &prefix, &limit.max(1)])
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::store::PropValue {
+                value: r.get(0),
+                docs: r.get(1),
+            })
+            .collect())
+    }
+    fn property_find(&mut self, query: &str, folder: &str, limit: i64) -> Result<Vec<crate::store::PropHit>> {
         let rows = self
             .client
             .query(
-                "SELECT path, line, snippet, rank::float8 FROM kb.search($1, $2, $3)",
-                &[&query, &prefix, &limit.max(1)],
+                "SELECT path, nbytes, updated_at, frontmatter FROM kb.prop_find($1, $2, $3)",
+                &[&query, &folder, &limit.max(1)],
+            )
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::store::PropHit {
+                path: r.get(0),
+                nbytes: r.get(1),
+                updated_at: r.get(2),
+                frontmatter: r.get::<_, Option<String>>(3).and_then(|t| serde_json::from_str(&t).ok()),
+            })
+            .collect())
+    }
+    fn outline(
+        &mut self,
+        prefix: &str,
+        heading: Option<&str>,
+        mode: &str,
+        max_level: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<crate::store::OutlineRow>> {
+        // `updated_at` comes back as text so the two engines print the same thing: the SQLite
+        // binding stores the ISO-8601 string, and Postgres would otherwise render its own.
+        let rows = self
+            .client
+            .query(
+                "SELECT path, heading, heading_path, level, line_from, line_to, nwords, nwords_total, \
+                        nbytes, nlines, file_nwords, version, \
+                        to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), updated_by \
+                   FROM kb.outline($1, $2, $3, $4, $5)",
+                &[&prefix, &heading, &mode, &max_level, &limit.max(1)],
+            )
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::store::OutlineRow {
+                path: r.get(0),
+                heading: r.get(1),
+                heading_path: r.get(2),
+                level: r.get(3),
+                line_from: r.get(4),
+                line_to: r.get(5),
+                nwords: r.get(6),
+                nwords_total: r.get(7),
+                nbytes: r.get(8),
+                nlines: r.get(9),
+                file_nwords: r.get(10),
+                version: r.get(11),
+                updated_at: r.get(12),
+                updated_by: r.get(13),
+            })
+            .collect())
+    }
+    fn settle(&mut self) -> Result<()> {
+        self.client.execute("SELECT kb.analyze_store()", &[]).map_err(pg)?;
+        Ok(())
+    }
+    fn heading_names(&mut self, prefix: &str, starts: &str, limit: i64) -> Result<Vec<crate::store::HeadingName>> {
+        let rows = self
+            .client
+            .query("SELECT heading, sections, docs FROM kb.headings($1, $2, $3)", &[&prefix, &starts, &limit.max(1)])
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::store::HeadingName {
+                heading: r.get(0),
+                sections: r.get(1),
+                docs: r.get(2),
+            })
+            .collect())
+    }
+    fn search(&mut self, query: &str, prefix: &str, limit: i64, per_file: i64) -> Result<Vec<Hit>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT path, version, line, text, section, score::float8, more FROM kb.search($1, $2, $3, $4)",
+                &[&query, &prefix, &limit.max(1), &per_file.max(1)],
             )
             .map_err(pg)?;
         Ok(rows
             .iter()
             .map(|r| Hit {
                 path: r.get(0),
-                line: r.get(1),
-                snippet: r.get(2),
-                rank: r.get(3),
+                version: r.get(1),
+                line: r.get(2),
+                text: r.get(3),
+                section: r.get(4),
+                score: r.get(5),
+                more: r.get(6),
             })
             .collect())
+    }
+
+    fn sections_of(&mut self, path: &str) -> Result<Vec<(i64, i64, String)>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT line_from, line_to, heading_path FROM kb.outline($1, NULL, 'exact', NULL, 10000)",
+                &[&path],
+            )
+            .map_err(pg)?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect())
     }
 
     fn write(
@@ -567,7 +1014,13 @@ impl Store for PgStore {
     fn history(&mut self, path: &str) -> Result<Vec<Commit>> {
         let rows = self
             .client
-            .query("SELECT version, author, ts::text, message, kind, base_version, nbytes FROM kb.history($1)", &[&path])
+            .query(
+                &format!(
+                    "SELECT version, author, {ts}, message, kind, base_version, nbytes, nlines, nwords FROM kb.history($1)",
+                    ts = utc("ts")
+                ),
+                &[&path],
+            )
             .map_err(pg)?;
         Ok(rows
             .iter()
@@ -576,9 +1029,11 @@ impl Store for PgStore {
                 author: r.get(1),
                 ts: r.get(2),
                 message: r.get(3),
-                nbytes: r.get(6),
                 kind: r.get(4),
                 base_version: r.get(5),
+                nbytes: r.get(6),
+                nlines: r.get(7),
+                nwords: r.get(8),
             })
             .collect())
     }
@@ -672,6 +1127,7 @@ impl Store for PgStore {
                         target: l["target"].as_str().unwrap_or_default().to_string(),
                         now_at: l["now_at"].as_str().unwrap_or_default().to_string(),
                         version: l["version"].as_i64(),
+                        outside: l["outside"].as_bool().unwrap_or(false),
                     })
                     .collect()
             })
@@ -680,19 +1136,13 @@ impl Store for PgStore {
 
     fn links(&mut self, path: &str, statuses: &[&str]) -> Result<Vec<LinkRow>> {
         let path = normalize_path(path)?;
-        let statuses: Vec<&str> = statuses.to_vec();
-        self.link_rows(
-            "($1 = '/' OR n.path = $1 OR n.path LIKE kb._subtree_like($1)) AND (cardinality($2::text[]) = 0 OR l.status = ANY($2::text[]))",
-            &[&path, &statuses],
-        )
+        let rows = self.link_rows(false, &path, statuses)?;
+        Ok(keep_statuses(rows, statuses))
     }
 
     fn backlinks(&mut self, path: &str) -> Result<Vec<LinkRow>> {
         let path = normalize_path(path)?;
-        self.link_rows(
-            "l.target_path <> '' AND r.kind = 1 AND ($1 = '/' OR r.path = $1 OR r.path = $1 || '.tdbasset' OR r.path LIKE kb._subtree_like($1))",
-            &[&path],
-        )
+        self.link_rows(true, &path, &[])
     }
 
     /// A move that leaves links as they are (a sync's move follows one made on disk).
@@ -762,11 +1212,20 @@ impl Store for PgStore {
 
     fn file_heads(&mut self, prefix: &str) -> Result<Vec<FileHead>> {
         let prefix = normalize_path(prefix)?;
+        // The prefix has to resolve before anything is read: a folder outside the caller's shares
+        // is not an empty sync, it is not found, and `kb.entry` filtering it away would have made
+        // a sync of someone else's folder look like a successful sync of nothing (#12 G17, L4).
+        if prefix != "/" {
+            self.client.query_one("SELECT kb.resolve($1)", &[&prefix]).map_err(pg)?;
+        }
+        // `kb.entry`, not `kb.node`: the raw table holds the store's paths, and a sync reconciles
+        // the caller's. Reading the table here gave a checkout the store's layout — `legal/` as a
+        // top-level directory — and then failed to read back what it had just written.
         let rows = self
             .client
             .query(
-                "SELECT path, version, updated_by FROM kb.node \
-                 WHERE deleted_at IS NULL AND kind = 1 AND ($1 = '/' OR path LIKE kb._subtree_like($1))",
+                "SELECT path, version, updated_by FROM kb.entry \
+                 WHERE kind = 'file' AND ($1 = '/' OR path = $1 OR path LIKE kb._subtree_like($1))",
                 &[&prefix],
             )
             .map_err(pg)?;
@@ -928,6 +1387,7 @@ impl Store for PgStore {
         }
         let fail = |e| statement_error(e, write);
         let mut tx = self.client.build_transaction().read_only(!write).start().map_err(pg)?;
+        refuse_raw_tables(&mut tx, query)?;
         let batch: Option<String> = if write {
             let id: String = tx.query_one(NEW_BATCH_ID, &[]).map_err(pg)?.get(0);
             tx.execute("SELECT set_config('textdb.batch', $1, true)", &[&id]).map_err(pg)?;
@@ -1010,17 +1470,37 @@ impl Store for PgStore {
         );
         let clean = git.map(|g| g.clean);
         let mut tx = self.client.transaction().map_err(pg)?;
+        // Compare-and-swap, as on SQLite: the row must still be at the generation this sync read.
+        // `WHERE` on the conflict clause makes a stale save return no row rather than overwrite.
+        // As there, this runs after the writes: it protects the next sync's starting point, not
+        // this one's output.
         let id: i64 = tx
-            .query_one(
-                "INSERT INTO kb.sync(prefix, dir, seq, author, git_commit, git_branch, git_remote, git_clean, rules) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+            .query_opt(
+                "INSERT INTO kb.sync(prefix, dir, seq, author, git_commit, git_branch, git_remote, git_clean, rules, generation, dir_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::bigint + 1, $11) \
                  ON CONFLICT (prefix, dir) DO UPDATE SET seq = excluded.seq, synced_at = now(), author = excluded.author, \
                  git_commit = excluded.git_commit, git_branch = excluded.git_branch, git_remote = excluded.git_remote, \
-                 git_clean = excluded.git_clean, rules = excluded.rules RETURNING id",
-                &[&base.prefix, &base.dir, &base.seq, &base.author, &commit, &branch, &remote, &clean, &base.rules],
+                 git_clean = excluded.git_clean, rules = excluded.rules, generation = kb.sync.generation + 1, \
+                 dir_id = excluded.dir_id \
+                 WHERE kb.sync.generation = $10::bigint RETURNING id",
+                &[&base.prefix, &base.dir, &base.seq, &base.author, &commit, &branch, &remote, &clean, &base.rules, &base.generation, &base.dir_id],
             )
             .map_err(pg)?
+            .ok_or_else(|| {
+                StoreError::contention(format!(
+                    "{} and {} were synced by another process while this one was running, so this run's base was \
+                     not recorded. What it wrote is in the store and on disk; run sync again to reconcile against \
+                     the base that process left",
+                    base.prefix, base.dir
+                ))
+            })?
             .get(0);
+        // As in the SQLite store: a sync that changed nothing still arrives with the whole
+        // base, and rewriting it cost a DELETE and an INSERT of every row for a run whose
+        // answer was "nothing to do". One indexed read to find that out instead.
+        if same_sync_files(&mut tx, id, &base.files)? {
+            return tx.commit().map_err(pg);
+        }
         tx.execute("DELETE FROM kb.sync_file WHERE sync_id = $1", &[&id]).map_err(pg)?;
         let rels: Vec<&str> = base.files.iter().map(|f| f.rel.as_str()).collect();
         let versions: Vec<Option<i64>> = base.files.iter().map(|f| f.version).collect();
@@ -1185,4 +1665,25 @@ mod tests {
         assert_eq!(rewrite("SELECT 'unterminated :author"), ("SELECT 'unterminated :author".into(), 0));
         assert_eq!(rewrite("SELECT $10 FROM t$1"), ("SELECT $10 FROM t$1".into(), 10));
     }
+}
+
+/// Do the stored `kb.sync_file` rows for `id` already say exactly what `want` says?
+fn same_sync_files(tx: &mut postgres::Transaction<'_>, id: i64, want: &[BaseFile]) -> Result<bool> {
+    type Row = (Option<i64>, String, Option<i64>, Option<i64>, bool);
+    let rows = tx
+        .query(
+            "SELECT rel, version, blob, disk_size, disk_mtime, conflict FROM kb.sync_file WHERE sync_id = $1",
+            &[&id],
+        )
+        .map_err(pg)?;
+    if rows.len() != want.len() {
+        return Ok(false);
+    }
+    let have: std::collections::HashMap<String, Row> = rows
+        .iter()
+        .map(|r| (r.get(0), (r.get(1), r.get(2), r.get(3), r.get(4), r.get(5))))
+        .collect();
+    Ok(want
+        .iter()
+        .all(|f| have.get(&f.rel) == Some(&(f.version, f.blob.clone(), f.disk_size, f.disk_mtime, f.conflict))))
 }

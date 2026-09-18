@@ -81,6 +81,66 @@ pub struct Entry {
 pub struct Hit {
     pub path: String,
     pub line: u64,
+    /// The text the store shows for this hit, when it produces one.
+    ///
+    /// `None` means the backend has no snippet to give — `fs` and the `sql-text-*` stores
+    /// return the matching line themselves, so they do; a backend that returned nothing would
+    /// be recorded as not having the capability rather than as wrong. What is checked is that
+    /// a snippet, where there is one, actually contains a term that was searched for: a fast
+    /// search that shows the wrong line is not a working search.
+    pub snippet: Option<String>,
+}
+
+/// One heading as an outline query returns it, with the file columns that come alongside.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutlineRow {
+    pub path: String,
+    pub heading: String,
+    pub level: u32,
+    pub line_from: u64,
+    /// Words in the section's own lines, and in it plus everything nested under it.
+    pub nwords: Option<u64>,
+    pub nwords_total: Option<u64>,
+    /// The document's own byte count, repeated on each of its rows — the point of the call
+    /// is that a caller does not have to ask for it separately.
+    pub file_nbytes: Option<u64>,
+}
+
+/// One recorded link, as the store resolved it.
+///
+/// `status` is the store's own verdict (`ok`, `ambiguous`, `anchor-missing`, `broken`,
+/// `not-in-store`, `external`), not something the harness recomputes — the suite's oracle
+/// compares it against the link graph the generator wrote, so a backend that resolves
+/// wrongly fails the check rather than merely looking fast.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkRow {
+    pub path: String,
+    pub target: String,
+    pub line: u64,
+    pub status: String,
+    pub resolved: Option<String>,
+}
+
+/// What one `sync` run did, from its own JSON report.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncStats {
+    /// Documents written into the store from disk.
+    pub to_store: u64,
+    /// Files written to disk from the store.
+    pub to_disk: u64,
+    /// Files whose two sides both changed and were merged.
+    pub merged: u64,
+    /// Merges whose changes overlapped, so the file on disk carries conflict markers.
+    pub conflicted: u64,
+}
+
+/// One heading and the line range it covers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SectionRow {
+    pub heading: String,
+    pub level: u64,
+    pub line_from: u64,
+    pub line_to: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +203,90 @@ pub trait Backend: Send + Sync {
     fn search(&self, query: &str, prefix: &str) -> R<Vec<Hit>>;
     fn history(&self, path: &str) -> R<Vec<Version>>;
 
+    // structure sidecar (textdb only; every other backend records N/A)
+    //
+    // These have no baseline equivalent, so the default is `NotSupported` and the MD family
+    // reports N/A for `fs` and the `sql-text-*` stores. That is the point of the family:
+    // it establishes what these operations cost, not who wins.
+
+    /// Links recorded for every document at or below `prefix`.
+    fn links(&self, _prefix: &str) -> R<Vec<LinkRow>> {
+        Err(BackendError::NotSupported("no link index"))
+    }
+    /// Links in any document that resolve to `path`.
+    fn backlinks(&self, _path: &str) -> R<Vec<LinkRow>> {
+        Err(BackendError::NotSupported("no link index"))
+    }
+    /// Front matter of `path` as JSON text, `None` when the document has none.
+    fn frontmatter(&self, _path: &str) -> R<Option<String>> {
+        Err(BackendError::NotSupported("no front-matter index"))
+    }
+    /// Set one top-level front-matter key, leaving the rest of the document untouched.
+    fn set_meta(&self, _path: &str, _key: &str, _value: &str) -> R<Version> {
+        Err(BackendError::NotSupported("no front-matter editing"))
+    }
+    /// Headings of `path` with the line range each covers.
+    fn sections(&self, _path: &str) -> R<Vec<SectionRow>> {
+        Err(BackendError::NotSupported("no section index"))
+    }
+    /// The body of one section, addressed by its heading path.
+    /// Headings under `prefix`, optionally only those matching `heading` in `mode`
+    /// (`exact`, `prefix` or `contains`) and no deeper than `max_level`.
+    /// Called once after a corpus is loaded and before it is queried: whatever a store does
+    /// to be ready, which a real deployment would do too.
+    ///
+    /// It exists because a store built in one burst is not the same store as one that grew:
+    /// `textdb-pg` is left with the planner statistics autovacuum worked out while the tables
+    /// were nearly empty, and a heading query over 2,000 notes then plans as a nested loop and
+    /// takes 69 ms instead of 2.1 ms. Measuring the un-analysed store would be measuring a
+    /// misconfiguration, and measuring without offering every backend the same chance would
+    /// be unfair; this is the same chance, taken by whoever needs it. Untimed, on purpose.
+    fn settle(&self) -> R<()> {
+        Ok(())
+    }
+    fn outline(&self, _prefix: &str, _heading: Option<&str>, _mode: &str, _max_level: Option<u32>) -> R<Vec<OutlineRow>> {
+        Err(BackendError::NotSupported("no section index"))
+    }
+    /// The distinct headings in use under `prefix` that start with `starts`.
+    fn heading_names(&self, _prefix: &str, _starts: &str) -> R<Vec<(String, u64, u64)>> {
+        Err(BackendError::NotSupported("no section index"))
+    }
+    fn section(&self, _path: &str, _heading: &str) -> R<Option<Vec<u8>>> {
+        Err(BackendError::NotSupported("no section index"))
+    }
+    /// Select what a move does to links that pointed at what moved: `off`, `report` or
+    /// `rewrite`. A store setting rather than an argument, so the suite sets it outside the
+    /// timed span and then times an ordinary `rename` — which is what isolates each mode's
+    /// cost on the same operation.
+    fn set_link_mode(&self, _mode: &str) -> R<()> {
+        Err(BackendError::NotSupported("no link rewriting"))
+    }
+    /// Front-matter property names in use, as `(key, documents)`.
+    fn property_keys(&self, _prefix: &str) -> R<Vec<(String, u64)>> {
+        Err(BackendError::NotSupported("no property index"))
+    }
+    /// The values one property takes, as `(value, documents)`.
+    fn property_values(&self, _key: &str, _prefix: &str) -> R<Vec<(String, u64)>> {
+        Err(BackendError::NotSupported("no property index"))
+    }
+    /// Paths matching a property query.
+    fn property_find(&self, _query: &str) -> R<Vec<String>> {
+        Err(BackendError::NotSupported("no property index"))
+    }
+
+    /// Reconcile the store folder `prefix` with the directory `dir`, both ways.
+    ///
+    /// No baseline has this: `fs` *is* a directory, and the `sql-text-*` stores have no
+    /// notion of a working copy to reconcile with. Only textdb records N/A elsewhere.
+    fn sync_dir(&self, _prefix: &str, _dir: &std::path::Path) -> R<SyncStats> {
+        Err(BackendError::NotSupported("no directory sync"))
+    }
+
+    /// Change-feed rows after `seq`, as `(highest seq seen, rows read)`.
+    fn changes_since(&self, _seq: u64) -> R<(u64, u64)> {
+        Err(BackendError::NotSupported("no change feed"))
+    }
+
     // measurement hooks
     fn storage_bytes(&self) -> R<u64>;
     fn bytes_written_since_reset(&self) -> R<u64>;
@@ -154,6 +298,14 @@ pub trait Backend: Send + Sync {
     /// Backend-specific structural counters, e.g. textdb leaf/chunk counts.
     fn extra_stats(&self, _path: &str) -> R<Vec<(&'static str, f64)>> {
         Ok(vec![])
+    }
+    /// Leaf chunk hashes of a document at HEAD, for "how many leaves did this edit change".
+    ///
+    /// `None` from a backend that has no leaves — the ME-04 counters are simply not reported
+    /// for it. A chunked backend that returns `None` silently withholds the measurement claim
+    /// 1 is judged on, which is how `textdb-pg` came to look like a failure.
+    fn leaf_hashes(&self, _path: &str) -> R<Option<std::collections::HashSet<textdb_core::Hash>>> {
+        Ok(None)
     }
     /// Cheap warm-up so first-use costs (thread-local connections) stay out of timings.
     fn warm(&self) -> R<()> {

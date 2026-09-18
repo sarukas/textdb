@@ -15,7 +15,7 @@ use rusqlite::vtab::{
 use rusqlite::{Connection, Error, Result};
 use textdb_core::TextdbError;
 
-use crate::db::{normalize_path, parent_of, TextDb, DEFAULT_PREFIX};
+use crate::db::{normalize_path, TextDb, DEFAULT_PREFIX};
 
 pub fn map_err(e: TextdbError) -> Error {
     match &e {
@@ -70,11 +70,15 @@ fn ref_i64(v: ValueRef<'_>) -> Option<i64> {
 // kb virtual table
 // ---------------------------------------------------------------------------
 
-const KB_SCHEMA: &CStr = c"CREATE TABLE x(id INTEGER, path TEXT, name TEXT, parent_path TEXT, kind TEXT, content TEXT, version INTEGER, nbytes INTEGER, nlines INTEGER, updated_at TEXT, updated_by TEXT, base_version INTEGER HIDDEN, author TEXT HIDDEN, message TEXT HIDDEN)";
+/// The minimal listing tier plus what only the writable table has: `id`, `dir` and the
+/// content itself. `parent_path` is spelled `dir` here as everywhere else.
+const KB_SCHEMA: &CStr = c"CREATE TABLE x(path TEXT, name TEXT, kind TEXT, version INTEGER, nbytes INTEGER, nlines INTEGER, updated_at TEXT, updated_by TEXT, id INTEGER, dir TEXT, content TEXT, base_version INTEGER HIDDEN, author TEXT HIDDEN, message TEXT HIDDEN)";
 
 const COL_ID: c_int = 0;
-const COL_PATH: c_int = 1;
-const COL_CONTENT: c_int = 5;
+// Indexes into KB_SCHEMA. They moved when the table took the canonical column order, so they
+// are derived from that list rather than written twice.
+const COL_PATH: c_int = 0;
+const COL_CONTENT: c_int = 10;
 const COL_BASE_VERSION: usize = 11;
 const COL_AUTHOR: usize = 12;
 const COL_MESSAGE: usize = 13;
@@ -283,17 +287,14 @@ impl UpdateVTab<'_> for KbTab {
     fn delete(&mut self, arg: ValueRef<'_>) -> Result<()> {
         let id = ref_i64(arg).ok_or_else(|| Error::ModuleError("bad rowid".into()))?;
         let conn = self.conn();
-        let db = TextDb::attach(&conn, &self.prefix, false);
-        let n = db
-            .node_by_id(id)
-            .map_err(map_err)?
-            .ok_or_else(|| Error::ModuleError(format!("TX003 not found: id {}", id)))?;
-        db.delete(&n.path).map_err(map_err)
+        let db = TextDb::attach(&conn, &self.prefix, false).with_view(crate::access::session(unsafe { conn.handle() } as usize));
+        let path = db.path_in_view(id).map_err(map_err)?.ok_or_else(|| Error::ModuleError(format!("TX003 not found: id {}", id)))?;
+        db.delete(&path).map_err(map_err)
     }
 
     fn insert(&mut self, args: &Inserts<'_>) -> Result<i64> {
         let conn = self.conn();
-        let db = TextDb::attach(&conn, &self.prefix, false);
+        let db = TextDb::attach(&conn, &self.prefix, false).with_view(crate::access::session(unsafe { conn.handle() } as usize));
         let path = value_str(args.get::<Value>(2 + COL_PATH as usize)?)
             .ok_or_else(|| Error::ModuleError("TX004 path is required".into()))?;
         let path = normalize_path(&path).map_err(map_err)?;
@@ -305,27 +306,29 @@ impl UpdateVTab<'_> for KbTab {
             return db.ensure_folder(&path).map_err(map_err);
         }
         let body = content.unwrap_or_default();
-        // INSERT OR REPLACE / upsert semantics: existing path with content → update.
-        if db.node_by_path(&path).map_err(map_err)?.is_some() {
+        // INSERT OR REPLACE / upsert semantics: existing path with content → update. The path is
+        // the caller's, so what is there is asked for in the caller's own terms: reaching past
+        // the view to the node table with it would find nothing and make every write a create.
+        if db.entry(&path).is_ok() {
             db.update_content(&path, &body, None, author.as_deref(), message.as_deref())
                 .map_err(map_err)?;
         } else {
             db.create(&path, &body, author.as_deref(), message.as_deref())
                 .map_err(map_err)?;
         }
-        let n = db.node_by_path(&path).map_err(map_err)?.unwrap();
-        Ok(n.id)
+        Ok(db.entry(&path).map_err(map_err)?.id)
     }
 
     fn update(&mut self, args: &Updates<'_>) -> Result<()> {
         let conn = self.conn();
-        let db = TextDb::attach(&conn, &self.prefix, false);
+        let db = TextDb::attach(&conn, &self.prefix, false).with_view(crate::access::session(unsafe { conn.handle() } as usize));
         let id = value_i64(args.get::<Value>(0)?).ok_or_else(|| Error::ModuleError("bad rowid".into()))?;
         let n = db
             .node_by_id(id)
             .map_err(map_err)?
             .ok_or_else(|| Error::ModuleError(format!("TX003 not found: id {}", id)))?;
-        let mut path = n.path.clone();
+        // In the caller's own terms from here on, so every method below translates once.
+        let mut path = db.path_in_view(id).map_err(map_err)?.ok_or_else(|| Error::ModuleError(format!("TX003 not found: id {}", id)))?;
         if let Some(new_path) = value_str(args.get::<Value>(2 + COL_PATH as usize)?) {
             let new_path = normalize_path(&new_path).map_err(map_err)?;
             if new_path != path {
@@ -358,6 +361,10 @@ struct KbRow {
     nlines: Option<i64>,
     updated_at: String,
     updated_by: Option<String>,
+    /// A folder's totals below it, so its `nbytes`/`nlines` are numbers here too rather than
+    /// the NULLs this table used to give a row `textdb_ls` measured.
+    t_bytes: i64,
+    t_lines: i64,
 }
 
 #[repr(C)]
@@ -371,19 +378,39 @@ pub struct KbCursor<'vtab> {
 unsafe impl VTabCursor for KbCursor<'_> {
     fn filter(&mut self, idx_num: c_int, _idx_str: Option<&str>, args: &Filters<'_>) -> Result<()> {
         let prefix = &self.tab.prefix;
-        let cols = "id, path, name, kind, root, version, nbytes, nlines, updated_at, updated_by";
+        let cols = "id, path, name, kind, root, version, nbytes, nlines, updated_at, updated_by, t_bytes, t_lines";
+        // This connection's account. Every path below is that account's, in and out: the equality
+        // it was given is one of its paths, the rows it gets back carry its paths, and what it
+        // cannot see is not in the answer at all (#12 K).
+        let view = crate::access::session(unsafe { self.tab.conn().handle() } as usize);
+        // A range or a scan cannot be narrowed by bounds written in the account's paths — they
+        // are not the store's — so it becomes a scan of what the account can see and SQLite
+        // applies the bounds itself, which it does anyway because `best_index` omits neither.
+        let idx_num = if view.is_admin() || idx_num == IDX_PATH_EQ || idx_num == IDX_ID_EQ { idx_num } else { IDX_SCAN };
+        let vis = crate::access::visible_sql(&view, "path");
+        let scan_where = match &vis {
+            None => "deleted_at IS NULL AND path <> '/'".to_string(),
+            Some((pred, _)) => format!("deleted_at IS NULL AND path <> '/' AND ({pred})"),
+        };
+        let scan_args: Vec<Value> = vis.as_ref().map(|(_, a)| a.clone()).unwrap_or_default();
         let (sql, params): (String, Vec<Value>) = match idx_num {
-            IDX_PATH_EQ => (
-                format!("SELECT {} FROM {}node WHERE path = ?1 AND deleted_at IS NULL", cols, prefix),
-                vec![Value::Text(
-                    normalize_path(&value_str(args.get::<Value>(0)?).unwrap_or_default()).unwrap_or_default(),
-                )],
-            ),
+            IDX_PATH_EQ => {
+                let asked = normalize_path(&value_str(args.get::<Value>(0)?).unwrap_or_default()).unwrap_or_default();
+                // Outside every share, or under one that may not be used: no such row here.
+                let store = match crate::access::to_store(&view, &asked) {
+                    Ok(p) => p,
+                    Err(_) => String::new(),
+                };
+                (
+                    format!("SELECT {} FROM {}node WHERE path = ?1 AND deleted_at IS NULL", cols, prefix),
+                    vec![Value::Text(store)],
+                )
+            }
             IDX_ID_EQ => (
                 format!("SELECT {} FROM {}node WHERE id = ?1 AND deleted_at IS NULL", cols, prefix),
                 vec![Value::Integer(value_i64(args.get::<Value>(0)?).unwrap_or(-1))],
             ),
-            n if n & IDX_PATH_RANGE != 0 => {
+            n if n & IDX_PATH_RANGE != 0 && view.is_admin() => {
                 // The bounds are widened to `>=` / `<=` whatever the caller wrote; `omit` was
                 // left false in `best_index` so SQLite re-applies the exact comparison.
                 let mut where_ = String::from("deleted_at IS NULL AND path <> '/'");
@@ -404,11 +431,8 @@ unsafe impl VTabCursor for KbCursor<'_> {
                 )
             }
             _ => (
-                format!(
-                    "SELECT {} FROM {}node WHERE deleted_at IS NULL AND path <> '/' ORDER BY path",
-                    cols, prefix
-                ),
-                Vec::new(),
+                format!("SELECT {} FROM {}node WHERE {} ORDER BY path", cols, prefix, scan_where),
+                scan_args,
             ),
         };
         // `prepare_cached` on the *table's* connection: the cache lives as long as the
@@ -428,11 +452,27 @@ unsafe impl VTabCursor for KbCursor<'_> {
                 nlines: r.get(7)?,
                 updated_at: r.get(8)?,
                 updated_by: r.get(9)?,
+                t_bytes: r.get(10)?,
+                t_lines: r.get(11)?,
             })
         };
-        self.rows = stmt
-            .query_map(rusqlite::params_from_iter(params), map)?
-            .collect::<Result<Vec<_>>>()?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), map)?.collect::<Result<Vec<_>>>()?;
+        // Out in the account's paths, and never a row it cannot see: an id equality and a scan
+        // both reach the whole table, so this is the filter as much as the translation. The
+        // owner's rows are already what they will be, and go through untouched — translating them
+        // would be two string allocations a row for an answer identical to the one in hand.
+        self.rows = if view.is_admin() {
+            rows
+        } else {
+            rows.into_iter()
+                .filter_map(|mut r| {
+                    let p = view.to_view(&r.path)?;
+                    r.name = if p == "/" { "/".to_string() } else { crate::db::name_of(&p).to_string() };
+                    r.path = p;
+                    Some(r)
+                })
+                .collect()
+        };
         self.i = 0;
         Ok(())
     }
@@ -449,12 +489,19 @@ unsafe impl VTabCursor for KbCursor<'_> {
     fn column(&self, ctx: &mut Context, i: c_int) -> Result<()> {
         let r = &self.rows[self.i];
         match i {
-            0 => ctx.set_result(&r.id),
-            1 => ctx.set_result(&r.path),
-            2 => ctx.set_result(&r.name),
-            3 => ctx.set_result(&parent_of(&r.path)),
-            4 => ctx.set_result(&if r.kind == 1 { "file" } else { "folder" }),
-            5 => {
+            0 => ctx.set_result(&r.path),
+            1 => ctx.set_result(&r.name),
+            2 => ctx.set_result(&if r.kind == 1 { "file" } else { "folder" }),
+            3 => ctx.set_result(&(r.kind == 1).then_some(r.version)),
+            // A folder's size and lines are the totals below it, as on every other listing
+            // surface; they used to be NULL here while `textdb_ls` gave the same row a number.
+            4 => ctx.set_result(&if r.kind == 1 { r.nbytes.unwrap_or(0) } else { r.t_bytes }),
+            5 => ctx.set_result(&if r.kind == 1 { r.nlines.unwrap_or(0) } else { r.t_lines }),
+            6 => ctx.set_result(&r.updated_at),
+            7 => ctx.set_result(&r.updated_by),
+            8 => ctx.set_result(&r.id),
+            9 => ctx.set_result(&crate::db::dir_of(&r.path)),
+            10 => {
                 if ctx.no_change() {
                     return Ok(());
                 }
@@ -462,9 +509,9 @@ unsafe impl VTabCursor for KbCursor<'_> {
                     Some(root) if r.kind == 1 => {
                         let st = crate::storage::SqliteStorage::new(self.tab.conn(), &self.tab.prefix);
                         let (bytes, utf8) = st.document(&root).map_err(map_err)?;
-                        // The UTF-8 check already ran for exactly these bytes, and the
-                        // root hash they are keyed by is derived from them, so the answer
-                        // cannot belong to different content.
+                        // The UTF-8 check already ran for exactly these bytes, and the root
+                        // hash they are keyed by is derived from them, so the answer cannot
+                        // belong to different content.
                         ctx.set_result(&if utf8 {
                             Value::Text(unsafe { String::from_utf8_unchecked(bytes.to_vec()) })
                         } else {
@@ -474,11 +521,6 @@ unsafe impl VTabCursor for KbCursor<'_> {
                     _ => ctx.set_result(&Value::Null),
                 }
             }
-            6 => ctx.set_result(&r.version),
-            7 => ctx.set_result(&r.nbytes),
-            8 => ctx.set_result(&r.nlines),
-            9 => ctx.set_result(&r.updated_at),
-            10 => ctx.set_result(&r.updated_by),
             _ => ctx.set_result(&Value::Null),
         }
     }
@@ -504,6 +546,14 @@ pub enum FnKind {
     Hunks,
     Chunks,
     PathHistory,
+    PropKeys,
+    PropValues,
+    PropFind,
+    Outline,
+    Headings,
+    Entry,
+    Links,
+    Backlinks,
 }
 
 pub struct FnSpec {
@@ -514,41 +564,100 @@ pub struct FnSpec {
 impl FnKind {
     fn schema(self) -> &'static CStr {
         match self {
-            FnKind::Ls => c"CREATE TABLE x(name TEXT, kind TEXT, nbytes INTEGER, nlines INTEGER, updated_at TEXT, path TEXT, nwords INTEGER, versions INTEGER, created_at TEXT, updated_by TEXT, nauthors INTEGER, authors TEXT, files INTEGER, folders INTEGER, id INTEGER, dir TEXT HIDDEN, recursive INTEGER HIDDEN)",
-            FnKind::Search => c"CREATE TABLE x(path TEXT, line INTEGER, snippet TEXT, rank REAL, query TEXT HIDDEN, prefix TEXT HIDDEN, lim INTEGER HIDDEN)",
-            FnKind::History => c"CREATE TABLE x(version INTEGER, author TEXT, ts TEXT, message TEXT, nbytes INTEGER, kind TEXT, base_version INTEGER, path TEXT HIDDEN)",
+            FnKind::Ls => c"CREATE TABLE x(path TEXT, name TEXT, kind TEXT, version INTEGER, nbytes INTEGER, nlines INTEGER, updated_at TEXT, updated_by TEXT, id INTEGER, dir TEXT, depth INTEGER, ext TEXT, title TEXT, nwords INTEGER, nsections INTEGER, nprops INTEGER, nlinks INTEGER, nlinks_broken INTEGER, versions INTEGER, created_at TEXT, files INTEGER, folders INTEGER, nauthors INTEGER, authors TEXT, dir_arg TEXT HIDDEN, recursive INTEGER HIDDEN)",
+            FnKind::Search => c"CREATE TABLE x(path TEXT, version INTEGER, line INTEGER, text TEXT, section TEXT, score REAL, more INTEGER, query TEXT HIDDEN, prefix TEXT HIDDEN, lim INTEGER HIDDEN, per_file INTEGER HIDDEN)",
+            FnKind::History => c"CREATE TABLE x(version INTEGER, author TEXT, ts TEXT, message TEXT, kind TEXT, base_version INTEGER, nbytes INTEGER, nlines INTEGER, nwords INTEGER, path TEXT HIDDEN)",
             FnKind::Export => c"CREATE TABLE x(path TEXT, content TEXT, prefix TEXT HIDDEN)",
             FnKind::Feed => c"CREATE TABLE x(seq INTEGER, ts TEXT, op TEXT, path TEXT, old_path TEXT, node_kind TEXT, version INTEGER, base_version INTEGER, commit_kind TEXT, author TEXT, message TEXT, since INTEGER HIDDEN, lim INTEGER HIDDEN)",
             FnKind::Hunks => c"CREATE TABLE x(old_from INTEGER, old_count INTEGER, new_from INTEGER, new_count INTEGER, old_text TEXT, new_text TEXT, path TEXT HIDDEN, v1 INTEGER HIDDEN, v2 INTEGER HIDDEN)",
             FnKind::Chunks => c"CREATE TABLE x(ord INTEGER, hash TEXT, byte_from INTEGER, nbytes INTEGER, line_from INTEGER, nlines INTEGER, path TEXT HIDDEN, version INTEGER HIDDEN)",
+            FnKind::PropKeys => c"CREATE TABLE x(key TEXT, docs INTEGER, values_n INTEGER, kind TEXT, prefix TEXT HIDDEN, lim INTEGER HIDDEN)",
+            FnKind::PropValues => c"CREATE TABLE x(value TEXT, docs INTEGER, key TEXT HIDDEN, prefix TEXT HIDDEN, lim INTEGER HIDDEN)",
+            FnKind::PropFind => c"CREATE TABLE x(path TEXT, nbytes INTEGER, updated_at TEXT, frontmatter TEXT, query TEXT HIDDEN, folder TEXT HIDDEN, lim INTEGER HIDDEN)",
+            FnKind::Outline => c"CREATE TABLE x(path TEXT, heading TEXT, heading_path TEXT, level INTEGER, line_from INTEGER, line_to INTEGER, nwords INTEGER, nwords_total INTEGER, nbytes INTEGER, nlines INTEGER, file_nwords INTEGER, version INTEGER, updated_at TEXT, updated_by TEXT, prefix TEXT HIDDEN, heading_match TEXT HIDDEN, mode TEXT HIDDEN, max_level INTEGER HIDDEN, lim INTEGER HIDDEN)",
+            FnKind::Headings => c"CREATE TABLE x(heading TEXT, sections INTEGER, docs INTEGER, prefix TEXT HIDDEN, starts TEXT HIDDEN, lim INTEGER HIDDEN)",
+            FnKind::Entry => c"CREATE TABLE x(path TEXT, name TEXT, kind TEXT, version INTEGER, nbytes INTEGER, nlines INTEGER, updated_at TEXT, updated_by TEXT, id INTEGER, dir TEXT, depth INTEGER, ext TEXT, title TEXT, nwords INTEGER, nsections INTEGER, nprops INTEGER, nlinks INTEGER, nlinks_broken INTEGER, versions INTEGER, created_at TEXT, files INTEGER, folders INTEGER, nauthors INTEGER, authors TEXT, path_arg TEXT HIDDEN)",
             FnKind::PathHistory => c"CREATE TABLE x(id INTEGER, ts TEXT, op TEXT, old_path TEXT, new_path TEXT, via TEXT, version INTEGER, author TEXT, path TEXT HIDDEN, node_id INTEGER HIDDEN)",
+            // One shape for both directions: `backlinks` answers "who points here" with the
+            // same row `links` answers "where does this point" with.
+            FnKind::Links | FnKind::Backlinks => c"CREATE TABLE x(path TEXT, version INTEGER, line INTEGER, kind TEXT, target TEXT, anchor TEXT, alias TEXT, status TEXT, resolved TEXT, asset INTEGER, path_arg TEXT HIDDEN, status_arg TEXT HIDDEN, lim INTEGER HIDDEN)",
         }
     }
     /// Number of visible columns; hidden argument columns follow.
     fn visible(self) -> c_int {
         match self {
-            FnKind::Ls => 15,
-            FnKind::Search => 4,
-            FnKind::History => 7,
+            FnKind::Ls => 24,
+            FnKind::Search => 7,
+            FnKind::History => 9,
             FnKind::Export => 2,
             FnKind::Feed => 11,
             FnKind::Hunks => 6,
             FnKind::Chunks => 6,
             FnKind::PathHistory => 8,
+            FnKind::PropKeys => 4,
+            FnKind::PropValues => 2,
+            FnKind::PropFind => 4,
+            FnKind::Outline => 14,
+            FnKind::Headings => 3,
+            FnKind::Entry => 24,
+            FnKind::Links | FnKind::Backlinks => 10,
         }
     }
     fn n_hidden(self) -> c_int {
         match self {
             FnKind::Ls => 2,
-            FnKind::Search => 3,
+            FnKind::Search => 4,
             FnKind::History => 1,
             FnKind::Export => 1,
             FnKind::Feed => 2,
             FnKind::Hunks => 3,
             FnKind::Chunks => 2,
             FnKind::PathHistory => 2,
+            FnKind::PropKeys => 2,
+            FnKind::PropValues => 3,
+            FnKind::PropFind => 3,
+            FnKind::Outline => 5,
+            FnKind::Headings => 3,
+            FnKind::Entry => 1,
+            FnKind::Links | FnKind::Backlinks => 3,
         }
     }
+}
+
+/// One `Entry` as the canonical column order, shared by `textdb_ls` and `textdb_entry`.
+///
+/// One function so the two cannot drift: a caller that learns the shape from either knows it
+/// for both, and adding a column is one edit rather than two.
+fn entry_row(e: crate::db::Entry) -> Vec<Value> {
+    let int = |v: Option<i64>| v.map_or(Value::Null, Value::Integer);
+    let text = |v: Option<String>| v.map_or(Value::Null, Value::Text);
+    let authors: Vec<_> = e.authors.iter().map(crate::db::AuthorCount::to_json).collect();
+    vec![
+        Value::Text(e.path),
+        Value::Text(e.name),
+        Value::Text(if e.kind == 1 { "file".into() } else { "folder".into() }),
+        int(e.version),
+        Value::Integer(e.nbytes),
+        Value::Integer(e.nlines),
+        Value::Text(e.updated_at),
+        text(e.updated_by),
+        Value::Integer(e.id),
+        text(e.dir),
+        Value::Integer(e.depth),
+        text(e.ext),
+        text(e.title),
+        Value::Integer(e.nwords),
+        Value::Integer(e.nsections),
+        Value::Integer(e.nprops),
+        Value::Integer(e.nlinks),
+        Value::Integer(e.nlinks_broken),
+        Value::Integer(e.versions),
+        Value::Text(e.created_at),
+        int(e.files),
+        int(e.folders),
+        Value::Integer(e.nauthors),
+        Value::Text(serde_json::Value::Array(authors).to_string()),
+    ]
 }
 
 /// A hidden argument as an integer, accepting the text form a bound parameter can arrive in.
@@ -679,49 +788,155 @@ unsafe impl VTabCursor for FnCursor<'_> {
                 _ => None,
             }
         };
-        let db = TextDb::attach(self.tab.conn(), &self.tab.prefix, false);
+        // This connection's account. `db` carries it for the surfaces built on `TextDb`; the
+        // three that call a helper directly — outline, headings, links — take it as an argument,
+        // because a helper handed a bare `Connection` speaks store paths and filters nothing.
+        // Those three used to do exactly that: `textdb_outline` asked for an account's own folder
+        // and found nothing, and asked for `/` and was handed the store.
+        let view = crate::access::session(unsafe { self.tab.conn().handle() } as usize);
+        let db = TextDb::attach(self.tab.conn(), &self.tab.prefix, false).with_view(view.clone());
         self.rows = match self.kind {
             FnKind::Ls => {
                 let dir = s(&hidden[0]).unwrap_or_else(|| "/".into());
                 let recursive = hidden_i64(&hidden[1]).unwrap_or(0) != 0;
-                let int = |v: Option<i64>| v.map_or(Value::Null, Value::Integer);
-                db.list(&dir, recursive)
-                    .map_err(map_err)?
-                    .into_iter()
-                    .map(|e| {
-                        let file = e.kind == 1;
-                        let authors: Vec<_> = e.authors.iter().map(crate::db::AuthorCount::to_json).collect();
-                        vec![
-                            Value::Text(e.name),
-                            Value::Text(if file { "file".into() } else { "folder".into() }),
-                            int(e.nbytes),
-                            int(e.nlines),
-                            Value::Text(e.updated_at),
-                            Value::Text(e.path),
-                            int(e.nwords),
-                            Value::Integer(e.versions),
-                            Value::Text(e.created_at),
-                            e.updated_by.map_or(Value::Null, Value::Text),
-                            if file { Value::Integer(authors.len() as i64) } else { Value::Null },
-                            Value::Text(serde_json::Value::Array(authors).to_string()),
-                            int(e.files),
-                            int(e.folders),
-                            Value::Integer(e.id),
-                        ]
-                    })
-                    .collect()
+                db.list(&dir, recursive).map_err(map_err)?.into_iter().map(entry_row).collect()
+            }
+            FnKind::Entry => {
+                let path = s(&hidden[0]).unwrap_or_else(|| "/".into());
+                vec![entry_row(db.entry(&path).map_err(map_err)?)]
             }
             FnKind::Search => {
                 let q = s(&hidden[0]).unwrap_or_default();
                 let prefix = s(&hidden[1]).unwrap_or_else(|| "/".into());
-                let lim = match hidden_i64(&hidden[2]) {
-                    Some(i) => i.max(0) as usize,
-                    _ => 100,
-                };
-                db.search(&q, &prefix, lim)
+                let lim = hidden_i64(&hidden[2]).map_or(100, |i| i.max(0) as usize);
+                let per_file = hidden_i64(&hidden[3]).map_or(usize::MAX, |i| i.max(1) as usize);
+                db.search_lines(&q, &prefix, lim, per_file)
                     .map_err(map_err)?
                     .into_iter()
-                    .map(|h| vec![Value::Text(h.path), Value::Integer(h.line), Value::Text(h.snippet), Value::Real(h.rank)])
+                    .map(|h| {
+                        vec![
+                            Value::Text(h.path),
+                            Value::Integer(h.version),
+                            Value::Integer(h.line),
+                            Value::Text(h.text),
+                            h.section.map_or(Value::Null, Value::Text),
+                            Value::Real(h.score),
+                            Value::Integer(h.more),
+                        ]
+                    })
+                    .collect()
+            }
+            FnKind::Outline => {
+                let prefix = s(&hidden[0]).unwrap_or_else(|| "/".into());
+                let heading = s(&hidden[1]);
+                let mode = crate::sections::Match::parse(&s(&hidden[2]).unwrap_or_default());
+                let max_level = hidden_i64(&hidden[3]);
+                let lim = hidden_i64(&hidden[4]).map_or(1000, |i| i.max(0) as usize);
+                let int = |v: Option<i64>| v.map_or(Value::Null, Value::Integer);
+                crate::sections::outline(self.tab.conn(), &self.tab.prefix, &view, &prefix, heading.as_deref(), mode, max_level, lim)
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(|r| {
+                        vec![
+                            Value::Text(r.path),
+                            Value::Text(r.heading),
+                            Value::Text(r.heading_path),
+                            Value::Integer(r.level),
+                            Value::Integer(r.line_from),
+                            Value::Integer(r.line_to),
+                            int(r.nwords),
+                            int(r.nwords_total),
+                            int(r.file_nbytes),
+                            int(r.file_nlines),
+                            int(r.file_nwords),
+                            Value::Integer(r.file_version),
+                            Value::Text(r.updated_at),
+                            r.updated_by.map_or(Value::Null, Value::Text),
+                        ]
+                    })
+                    .collect()
+            }
+            FnKind::Links | FnKind::Backlinks => {
+                use crate::links::Direction;
+                let path = s(&hidden[0]).unwrap_or_else(|| "/".into());
+                let path = crate::db::normalize_path(&path).map_err(map_err)?;
+                // One status per call, which is what `--broken` and the SDKs ask for; the rest
+                // of the set is a `WHERE status IN (...)` away for a caller writing SQL.
+                let status = s(&hidden[1]).unwrap_or_default();
+                let only: Vec<&str> = if status.is_empty() { Vec::new() } else { vec![status.as_str()] };
+                let lim = hidden_i64(&hidden[2]).map_or(10_000, |i| i.max(0) as usize);
+                let dir = if self.tab.kind == FnKind::Links { Direction::Out } else { Direction::In };
+                crate::links::rows(self.tab.conn(), &self.tab.prefix, &view, &path, dir, &only, lim)
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(|r| {
+                        let text = |v: Option<String>| v.map_or(Value::Null, Value::Text);
+                        vec![
+                            Value::Text(r.path),
+                            Value::Integer(r.version),
+                            Value::Integer(r.line),
+                            Value::Text(r.kind),
+                            Value::Text(r.target),
+                            text(r.anchor),
+                            text(r.alias),
+                            text(r.status),
+                            text(r.resolved),
+                            Value::Integer(r.asset as i64),
+                        ]
+                    })
+                    .collect()
+            }
+            FnKind::Headings => {
+                let prefix = s(&hidden[0]).unwrap_or_else(|| "/".into());
+                let starts = s(&hidden[1]).unwrap_or_default();
+                let lim = hidden_i64(&hidden[2]).map_or(100, |i| i.max(0) as usize);
+                crate::sections::heading_names(self.tab.conn(), &self.tab.prefix, &view, &prefix, &starts, lim)
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(|(h, n, d)| vec![Value::Text(h), Value::Integer(n), Value::Integer(d)])
+                    .collect()
+            }
+            FnKind::PropKeys => {
+                let prefix = s(&hidden[0]).unwrap_or_default();
+                let lim = hidden_i64(&hidden[1]).map(|i| i.max(0) as usize).unwrap_or(200);
+                db.property_keys(&prefix, lim)
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(|k| {
+                        vec![
+                            Value::Text(k.key),
+                            Value::Integer(k.docs),
+                            Value::Integer(k.values),
+                            Value::Text(k.kind),
+                        ]
+                    })
+                    .collect()
+            }
+            FnKind::PropValues => {
+                let key = s(&hidden[0]).ok_or_else(|| Error::ModuleError("TX004 key is required".into()))?;
+                let prefix = s(&hidden[1]).unwrap_or_default();
+                let lim = hidden_i64(&hidden[2]).map(|i| i.max(0) as usize).unwrap_or(200);
+                db.property_values(&key, &prefix, lim)
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(|v| vec![v.value.map(Value::Text).unwrap_or(Value::Null), Value::Integer(v.docs)])
+                    .collect()
+            }
+            FnKind::PropFind => {
+                let q = s(&hidden[0]).unwrap_or_default();
+                let folder = s(&hidden[1]).unwrap_or_else(|| "/".into());
+                let lim = hidden_i64(&hidden[2]).map(|i| i.max(0) as usize).unwrap_or(500);
+                db.property_find(&q, &folder, lim)
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(|h| {
+                        vec![
+                            Value::Text(h.path),
+                            Value::Integer(h.nbytes),
+                            Value::Text(h.updated_at),
+                            h.frontmatter.map(Value::Text).unwrap_or(Value::Null),
+                        ]
+                    })
                     .collect()
             }
             FnKind::History => {
@@ -735,9 +950,11 @@ unsafe impl VTabCursor for FnCursor<'_> {
                             c.author.map_or(Value::Null, Value::Text),
                             Value::Text(c.ts),
                             c.message.map_or(Value::Null, Value::Text),
-                            c.nbytes.map_or(Value::Null, Value::Integer),
                             c.kind.map_or(Value::Null, Value::Text),
                             c.base_version.map_or(Value::Null, Value::Integer),
+                            c.nbytes.map_or(Value::Null, Value::Integer),
+                            c.nlines.map_or(Value::Null, Value::Integer),
+                            c.nwords.map_or(Value::Null, Value::Integer),
                         ]
                     })
                     .collect()

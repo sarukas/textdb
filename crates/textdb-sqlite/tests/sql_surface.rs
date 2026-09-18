@@ -19,7 +19,7 @@ fn create_read_update_history_diff() {
     .unwrap();
     let (content, version, kind, parent): (String, i64, String, String) = conn
         .query_row(
-            "SELECT content, version, kind, parent_path FROM kb WHERE path = '/notes/a.md'",
+            "SELECT content, version, kind, dir FROM kb WHERE path = '/notes/a.md'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
@@ -169,7 +169,7 @@ fn folders_rename_delete_ls_export_search() {
     );
     // Search: 2-term AND, prefix-restricted.
     let hits: Vec<(String, i64, String)> = conn
-        .prepare("SELECT path, line, snippet FROM textdb_search('quick fox', '/a/sub1')")
+        .prepare("SELECT path, line, text FROM textdb_search('quick fox', '/a/sub1')")
         .unwrap()
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .unwrap()
@@ -549,4 +549,361 @@ fn scalar_functions_work_without_a_virtual_table() {
     assert_eq!(v, 2);
     conn.close().unwrap();
     std::fs::remove_file(&file).expect("file must be deletable with no table registered either");
+}
+
+/// A vault with a repeated heading, a nested tree, and a document that shares no heading, so
+/// scope, matching and the level filter can each be told apart from the others.
+fn outline_vault() -> Connection {
+    let conn = setup();
+    let docs = [
+        (
+            "/notes/a.md",
+            "---\ntitle: A\n---\n# Alpha\nintro words here\n\n## Goals\nwe want things\n\n### Detail\nfine print\n\n## Next Steps\nship it\n",
+        ),
+        ("/notes/b.md", "# Beta\nbody\n\n## next steps\nlater\n"),
+        ("/other/c.md", "# Gamma\nonly words\n"),
+    ];
+    for (path, body) in docs {
+        conn.execute("INSERT INTO kb(path, content) VALUES (?1, ?2)", params![path, body]).unwrap();
+    }
+    conn
+}
+
+fn headings(conn: &Connection, sql: &str) -> Vec<String> {
+    let mut st = conn.prepare(sql).unwrap();
+    let rows = st
+        .query_map([], |r| Ok(format!("{}:{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .unwrap();
+    rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+}
+
+#[test]
+fn outline_scopes_to_a_document_a_folder_or_the_vault() {
+    let conn = outline_vault();
+    assert_eq!(
+        headings(&conn, "SELECT path, heading FROM textdb_outline('/notes/a.md')"),
+        ["/notes/a.md:Alpha", "/notes/a.md:Goals", "/notes/a.md:Detail", "/notes/a.md:Next Steps"]
+    );
+    // A folder takes everything below it and nothing beside it.
+    assert_eq!(
+        headings(&conn, "SELECT path, heading FROM textdb_outline('/other')"),
+        ["/other/c.md:Gamma"]
+    );
+    // The vault is every document, in path order, and each document in line order.
+    let all = headings(&conn, "SELECT path, heading FROM textdb_outline('/')");
+    assert_eq!(all.len(), 7);
+    assert_eq!(all[0], "/notes/a.md:Alpha");
+    assert_eq!(all[6], "/other/c.md:Gamma");
+}
+
+#[test]
+fn outline_matches_headings_folded_and_by_shape() {
+    let conn = outline_vault();
+    // Exact, ignoring case: "Next Steps" and "next steps" are the same heading.
+    assert_eq!(
+        headings(&conn, "SELECT path, heading FROM textdb_outline('/', 'NEXT STEPS')"),
+        ["/notes/a.md:Next Steps", "/notes/b.md:next steps"]
+    );
+    assert_eq!(
+        headings(&conn, "SELECT path, heading FROM textdb_outline('/', 'next', 'prefix')"),
+        ["/notes/a.md:Next Steps", "/notes/b.md:next steps"]
+    );
+    assert_eq!(
+        headings(&conn, "SELECT path, heading FROM textdb_outline('/', 'tep', 'contains')"),
+        ["/notes/a.md:Next Steps", "/notes/b.md:next steps"]
+    );
+    // A prefix that matches nothing is empty rather than everything.
+    assert!(headings(&conn, "SELECT path, heading FROM textdb_outline('/', 'zzz', 'prefix')").is_empty());
+    // `%` and `_` in a contains pattern mean themselves, not wildcards.
+    assert!(headings(&conn, "SELECT path, heading FROM textdb_outline('/', 'n%t', 'contains')").is_empty());
+}
+
+#[test]
+fn outline_caps_depth_and_carries_file_metadata() {
+    let conn = outline_vault();
+    assert_eq!(
+        headings(&conn, "SELECT path, heading FROM textdb_outline('/', NULL, 'exact', 1)"),
+        ["/notes/a.md:Alpha", "/notes/b.md:Beta", "/other/c.md:Gamma"]
+    );
+    // Every row carries its document's own figures, so a table needs no query per row.
+    let (nbytes, nlines, file_words, version): (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT nbytes, nlines, file_nwords, version FROM textdb_outline('/notes/a.md') LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    let (real_bytes, real_lines): (i64, i64) = conn
+        .query_row("SELECT nbytes, nlines FROM kb WHERE path = '/notes/a.md'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!((nbytes, nlines, version), (real_bytes, real_lines, 1));
+    assert!(file_words > 0);
+}
+
+#[test]
+fn section_word_counts_compose_and_follow_edits() {
+    let conn = outline_vault();
+    let counts = |conn: &Connection| -> Vec<(String, i64, i64)> {
+        let mut st = conn
+            .prepare("SELECT heading, nwords, nwords_total FROM textdb_outline('/notes/a.md')")
+            .unwrap();
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    };
+    let before = counts(&conn);
+    // Alpha's total is its own words plus every nested section's own words.
+    let nested: i64 = before[1..].iter().map(|(_, own, _)| own).sum();
+    assert_eq!(before[0].2, before[0].1 + nested);
+    // A leaf's two figures agree.
+    assert_eq!(before[2].1, before[2].2);
+
+    // A body edit that leaves every heading where it is still refreshes the counts.
+    conn.execute(
+        "UPDATE kb SET content = replace(content, 'ship it', 'ship it and then celebrate') WHERE path = '/notes/a.md'",
+        [],
+    )
+    .unwrap();
+    let after = counts(&conn);
+    assert_eq!(after[3].1, before[3].1 + 3, "Next Steps gained three words");
+    assert_eq!(after[0].2, before[0].2 + 3, "and so did the root's total");
+    // The heading tree itself did not move.
+    let names: Vec<_> = after.iter().map(|(h, _, _)| h.clone()).collect();
+    assert_eq!(names, before.iter().map(|(h, _, _)| h.clone()).collect::<Vec<_>>());
+}
+
+#[test]
+fn heading_names_counts_sections_and_documents() {
+    let conn = outline_vault();
+    let mut st = conn.prepare("SELECT heading, sections, docs FROM textdb_headings('/', 'ne')").unwrap();
+    let rows: Vec<(String, i64, i64)> = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    // The two spellings fold to one entry, counted across both documents.
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].1, rows[0].2), (2, 2));
+    // Folder scope narrows the same call.
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM textdb_headings('/other', '')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn word_count_has_history_the_way_bytes_and_lines_do() {
+    let conn = setup();
+    conn.execute("INSERT INTO kb(path, content) VALUES ('/a.md', 'one two three\n')", []).unwrap();
+    conn.execute("UPDATE kb SET content = 'one two three four five\n' WHERE path = '/a.md'", []).unwrap();
+    let mut st = conn.prepare("SELECT version, nlines, nwords FROM textdb_history('/a.md')").unwrap();
+    let rows: Vec<(i64, i64, i64)> = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows, [(1, 1, 3), (2, 1, 5)]);
+}
+
+#[test]
+fn a_deleted_document_leaves_the_outline() {
+    let conn = outline_vault();
+    conn.execute("DELETE FROM kb WHERE path = '/notes/b.md'", []).unwrap();
+    let all = headings(&conn, "SELECT path, heading FROM textdb_outline('/')");
+    assert!(all.iter().all(|h| !h.starts_with("/notes/b.md")), "{all:?}");
+    // And its heading no longer counts towards the shared one.
+    let docs: i64 = conn
+        .query_row("SELECT docs FROM textdb_headings('/', 'next')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(docs, 1);
+}
+
+#[test]
+fn a_hit_found_through_folding_shows_the_line_that_matched() {
+    // The index tokenises with fts5's `unicode61`, which strips diacritics, so `facade`
+    // finds a document holding `façade`. Choosing the line to show used to compare raw text,
+    // find nothing and fall back to the top of the chunk: the document was right and the
+    // line was wrong. See `textdb_core::fold`.
+    let conn = setup();
+    conn.execute(
+        "INSERT INTO kb(path, content) VALUES ('/a.md', ?1)",
+        params!["# Doc\n\nfiller line one\nthe word façade appears on this line\nfiller two\n"],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO kb(path, content) VALUES ('/b.md', ?1)",
+        params!["# Kita\n\nnieko\nčia ąžuolas auga\n"],
+    )
+    .unwrap();
+
+    for (query, want_line, want_in_snippet) in [
+        ("facade", 4, "façade"),
+        ("façade", 4, "façade"),
+        ("azuolas", 4, "ąžuolas"),
+        ("ąžuolas", 4, "ąžuolas"),
+    ] {
+        let (line, snippet): (i64, String) = conn
+            .query_row(
+                "SELECT line, text FROM textdb_search(?1, '/', 10)",
+                params![query],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        assert_eq!(line, want_line, "{query} showed the wrong line: {snippet:?}");
+        assert!(snippet.contains(want_in_snippet), "{query} showed {snippet:?}");
+    }
+}
+
+#[test]
+fn a_snippet_shows_the_match_however_the_query_was_written() {
+    let conn = setup();
+    let pad = "filler word here ".repeat(30);
+    conn.execute(
+        "INSERT INTO kb(path, content) VALUES ('/a.md', ?1)",
+        params![format!("---\ntitle: T\ndraft: false\n---\n# Head\n{pad}NEEDLE appears late{pad}\n")],
+    )
+    .unwrap();
+
+    let hit = |q: &str| -> (i64, String) {
+        conn.query_row("SELECT line, text FROM textdb_search(?1, '/', 5)", params![q], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap_or_else(|e| panic!("{q}: {e}"))
+    };
+
+    // A match past the cut length of a long line is still shown: the text is a window around
+    // it, not the head of the line, and says so at the end it cut.
+    let (line, snippet) = hit("needle");
+    assert_eq!(line, 6);
+    assert!(snippet.contains("NEEDLE appears late"), "{snippet:?}");
+    assert!(snippet.starts_with('…') && snippet.ends_with('…'), "{snippet:?}");
+
+    // A quoted phrase is matched word by word, so punctuation between the words does not
+    // hide it: `query_terms` keeps the phrase as one term with a space in it.
+    let (line, snippet) = hit("\"draft false\"");
+    assert_eq!(line, 3);
+    assert_eq!(snippet, "draft: false");
+
+    // A line that fits is shown whole, with no ellipsis.
+    let (_, snippet) = hit("head");
+    assert_eq!(snippet, "# Head");
+}
+
+#[test]
+fn a_heading_dense_document_stays_under_the_parameter_limit() {
+    // SQLite allows 32,766 bound parameters per statement. The section insert batches rows,
+    // and the bound is on *parameters*: 4,000 rows fitted at six columns per row and did not
+    // at ten, so the batch size is derived from the column count rather than written down.
+    let conn = setup();
+    let mut body = String::from("---\ntitle: Big\n---\n");
+    for i in 0..5000 {
+        body.push_str(&format!("# Heading {i}\n\nbody line {i}\n\n"));
+    }
+    conn.execute("INSERT INTO kb(path, content) VALUES ('/big.md', ?1)", params![body]).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT nsections FROM textdb_entry('/big.md')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 5000);
+    // And an edit that leaves the heading tree alone takes the counts-only path, whose batch
+    // has the same bound.
+    conn.execute("UPDATE kb SET content = replace(content, 'body line 0', 'body line zero') WHERE path = '/big.md'", [])
+        .unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM textdb_outline('/big.md', NULL, 'exact', NULL, 100000)", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 5000);
+}
+
+/// `textdb_links` and `textdb_backlinks` answer with the one canonical row, in both directions.
+#[test]
+fn links_and_backlinks_are_table_valued_functions() {
+    let conn = setup();
+    let put = |path: &str, body: &str| {
+        conn.execute("INSERT INTO kb(path, content) VALUES (?1, ?2)", params![path, body]).unwrap();
+    };
+    put("/g/index.md", "# Guide\n\nSee [the limits page](limits.md) and [[Missing]].\n");
+    put("/g/limits.md", "# Limits\n");
+
+    let cols: Vec<String> = conn
+        .prepare("SELECT * FROM textdb_links('/g')")
+        .unwrap()
+        .column_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(cols, ["path", "version", "line", "kind", "target", "anchor", "alias", "status", "resolved", "asset"]);
+
+    let rows: Vec<(String, i64, i64, String, String, Option<String>, Option<String>)> = conn
+        .prepare("SELECT path, version, line, kind, target, alias, status FROM textdb_links('/g')")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("/g/index.md".into(), 1, 3, "md".into(), "limits.md".into(), Some("the limits page".into()), Some("ok".into())),
+            ("/g/index.md".into(), 1, 3, "wiki".into(), "Missing".into(), None, Some("broken".into())),
+        ]
+    );
+
+    let broken: Vec<String> = conn
+        .prepare("SELECT target FROM textdb_links('/g', 'broken')")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(broken, ["Missing"]);
+
+    let back: Vec<(String, i64)> = conn
+        .prepare("SELECT path, line FROM textdb_backlinks('/g/limits.md')")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(back, [("/g/index.md".to_string(), 3)]);
+
+    // A status the store never writes is a mistake, not an empty result. The vtab filters on
+    // the first row, so the error arrives when the rows are drawn rather than at prepare time.
+    let bad = conn
+        .prepare("SELECT * FROM textdb_links('/g', 'nope')")
+        .unwrap()
+        .query_map([], |_| Ok(()))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>();
+    assert!(bad.is_err(), "{bad:?}");
+}
+
+/// A search scoped to a folder must find what is in it, however large the store around it.
+///
+/// The FTS index is over chunks and the ranker has no early termination, so the retrieval used to
+/// take the best `limit * 50` chunks *globally* and apply the folder and visibility filters to
+/// what was left. Past that many matches elsewhere, a scoped search returned nothing at all: a
+/// five-document folder whose every document held the word answered empty, and so did an account
+/// whose entire vault was that folder. Wrong answers, arriving only once a store got big.
+///
+/// 3,000 documents is comfortably past `10 * 50` and small enough to stay a unit test.
+#[test]
+fn a_scoped_search_is_not_truncated_by_the_rest_of_the_store() {
+    let conn = setup();
+    let db = TextDb::attach(&conn, "kb_", false);
+    for i in 0..3_000 {
+        db.create(&format!("/bulk/{}/{i}.md", i / 500), format!("common filler text, bulk {i}\n").as_bytes(), None, None)
+            .unwrap();
+    }
+    for i in 0..5 {
+        db.create(&format!("/tiny/{i}.md"), format!("common filler text, tiny {i}\n").as_bytes(), None, None).unwrap();
+    }
+
+    // Unscoped, the store answers with whatever ranks best; that has always worked.
+    assert_eq!(db.search_lines("common", "/", 10, 1).unwrap().len(), 10, "unscoped");
+
+    // Scoped to the small folder, every one of its documents matches and all five must come back.
+    let hits = db.search_lines("common", "/tiny", 10, 1).unwrap();
+    assert_eq!(hits.len(), 5, "a folder of five matching documents inside a store of 3,000");
+    assert!(hits.iter().all(|h| h.path.starts_with("/tiny/")), "{:?}", hits.iter().map(|h| &h.path).collect::<Vec<_>>());
 }

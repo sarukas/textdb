@@ -37,8 +37,8 @@ psycopg, JDBC, …). Python: `pip install -e python/` from the repo gives `textd
 | `head -20 notes.md` / `tail -20 notes.md` | `SELECT kb.lines(p, 1, 20)` / `SELECT kb.lines(p, nlines - 19, nlines) FROM kb.file WHERE path = p` |
 | `wc -l notes.md` / `wc -c` | `SELECT nlines, nbytes FROM kb.file WHERE path = '/clients/acme/notes.md';` |
 | `awk '/^## Open questions/,/^## /' notes.md` (a section) | `SELECT kb.section('/clients/acme/notes.md', 'Open questions');` |
-| `grep -rn -w pricing /clients` | `SELECT path, line, snippet FROM kb.search('pricing', '/clients');` |
-| `grep -rl pricing /clients \| xargs grep -l renewal` (both words in a file) | `SELECT path FROM kb.search('pricing renewal', '/clients');` |
+| `grep -rn -w pricing /clients` | `SELECT path, line, text FROM kb.search('pricing', '/clients');` |
+| `grep -rl pricing /clients \| xargs grep -l renewal` (both words in a file) | `SELECT DISTINCT path FROM kb.search('pricing renewal', '/clients');` |
 | `grep -rn '"quarterly review"'` | `SELECT path, line FROM kb.search('"quarterly review"');` |
 | `grep -rn 'renew' --include='*'` (prefix) | `SELECT path, line FROM kb.search('renew*');` |
 | `sed -i 's/pending/signed/' notes.md` (one unique occurrence) | `SELECT kb.edit('/clients/acme/notes.md', 'pending', 'signed', 'me');` |
@@ -62,18 +62,33 @@ psycopg, JDBC, …). Python: `pip install -e python/` from the repo gives `textd
 
 Differences to remember: `sed -i`/`echo >>` on files are last-writer-wins and unversioned;
 the SQL forms are transactional, versioned, and (with `kb.edit`/`base_version`) rebased over
-concurrent writes. `grep` is line-based; `kb.search` is document-based for AND and reports
-the first matching line.
+concurrent writes. `kb.search` is line-based too: one row per line that really holds the
+terms, with the `version` that line number belongs to.
+
+## If you were given a token
+
+```sql
+SET textdb.token = 'tdb_…';            -- or SELECT kb.auth('tdb_…')
+SELECT * FROM kb.whoami();             -- your shares, each with its alias and rights
+```
+
+You then see only the folders shared with you, each at your own root under a name of its own:
+what the owner calls `/legal/contracts` may be `/contracts/` to you. Use the paths `kb.whoami()`
+and `kb.ls('/')` show. Your writes are attributed to your account. Without a token you are the
+owner of the store and see its own paths, which is what connecting to the database already means.
 
 ## Find and read
 
 ```sql
 SELECT * FROM kb.ls('/clients');
 SELECT path, nbytes, updated_at FROM kb.file WHERE path LIKE '/clients/acme/%' ORDER BY path;
-SELECT path, line, snippet FROM kb.search('pricing renewal', '/clients');   -- AND of terms per document
+SELECT path, version, line, text FROM kb.search('pricing renewal', '/clients');  -- one row per matching line
 SELECT content, version FROM kb.file WHERE path = '/clients/acme/notes.md';  -- remember version
 SELECT kb.lines('/clients/acme/notes.md', 40, 60);                           -- 1-based inclusive
 SELECT kb.section('/clients/acme/notes.md', 'Open questions');               -- heading path "A / B" or last component
+SELECT * FROM kb.links('/clients/acme/notes.md');                            -- what it points at
+SELECT * FROM kb.links('/clients', 'broken');                                -- what does not resolve
+SELECT path, line FROM kb.backlinks('/clients/acme/notes.md');               -- what points at it
 ```
 
 `kb.lines` and `kb.section` cost O(fragment); `content` costs the whole document.
@@ -106,6 +121,7 @@ DELETE FROM kb.file WHERE path = '/archive/acme/plan.md';
 | `TX002` | Too many concurrent commits on this file right now | Wait 50–200 ms, retry once or twice |
 | `TX003` | Path or version not found | List the folder; the file may have been moved |
 | `TX004` | Anchor text missing or ambiguous, or bad path | Read the current content, choose a unique anchor |
+| `TX005` | Forbidden: it is in your view and you may not do this — a read-only share, or one that was taken away | `SELECT * FROM kb.whoami()` lists your shares and their rights. Not the same as `TX003`, which means it is outside your shares and is indistinguishable from a path that never existed. Do not retry |
 
 Never loop on `UPDATE … SET content` without `base_version` to "win" a conflict: it silently
 overwrites other agents' lines. A successful write whose `version` did not move means an

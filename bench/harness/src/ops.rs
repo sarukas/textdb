@@ -20,6 +20,23 @@ pub const LIST: &str = "list";
 pub const SEARCH: &str = "search";
 pub const HISTORY: &str = "history";
 pub const MAINTENANCE: &str = "maintenance";
+// Structure sidecar: textdb-only, so these rows are present for the textdb bindings and
+// absent for the baselines rather than being compared across them.
+pub const LINKS: &str = "links";
+pub const BACKLINKS: &str = "backlinks";
+pub const FRONTMATTER: &str = "frontmatter";
+pub const SET_META: &str = "set_meta";
+pub const SECTIONS: &str = "sections";
+pub const SECTION: &str = "section";
+/// Headings across a folder or a whole vault, rather than one document's.
+pub const OUTLINE: &str = "outline";
+/// The distinct headings in use — the autosuggest call, run per keystroke.
+pub const HEADING_NAMES: &str = "heading_names";
+pub const CHANGES_SINCE: &str = "changes_since";
+pub const SYNC: &str = "sync";
+pub const PROP_KEYS: &str = "prop_keys";
+pub const PROP_VALUES: &str = "prop_values";
+pub const PROP_FIND: &str = "prop_find";
 
 /// Every operation name, in the order the report should present them.
 pub const ALL: &[&str] = &[
@@ -37,6 +54,19 @@ pub const ALL: &[&str] = &[
     SEARCH,
     HISTORY,
     MAINTENANCE,
+    LINKS,
+    BACKLINKS,
+    FRONTMATTER,
+    SET_META,
+    SECTIONS,
+    SECTION,
+    OUTLINE,
+    HEADING_NAMES,
+    CHANGES_SINCE,
+    SYNC,
+    PROP_KEYS,
+    PROP_VALUES,
+    PROP_FIND,
 ];
 
 /// True when `name` is part of the vocabulary. Used by the report to separate genuine

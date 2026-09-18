@@ -13,7 +13,15 @@ import {
   type Info,
   type ListOptions,
   type ListPage,
+  type PropertyHit,
+  type HeadingMatch,
+  type HeadingName,
+  type OutlineEntry,
+  type PropertyKey,
+  type PropertyValue,
   SORT_KEYS,
+  type Link,
+  type LinkOptions,
   type SearchHit,
   type SortKey,
   type WriteResult,
@@ -179,8 +187,10 @@ export function openCorpus(options: OpenOptions): Corpus {
   return new Corpus(sql, db, extension, options.author ?? null);
 }
 
+/** The canonical `Entry` columns, in order. One list, so `ls`, `list` and `entry` agree. */
 const ENTRY_COLS =
-  'id, name, path, kind, nbytes, nlines, nwords, versions, updated_at, updated_by, created_at, files, folders, nauthors, authors';
+  'path, name, kind, version, nbytes, nlines, updated_at, updated_by, id, dir, depth, ext, title, ' +
+  'nwords, nsections, nprops, nlinks, nlinks_broken, versions, created_at, files, folders, nauthors, authors';
 
 type EntryRow = Omit<Entry, 'authors'> & { authors: string };
 
@@ -283,7 +293,7 @@ export class Corpus {
       offset,
     );
     const total = rows[0]?.total ?? Number(this.sql.value(`SELECT count(*) FROM textdb_ls(?, ?) ${filter}`, ...params));
-    return { path: dir, total, offset, entries: rows.map(toEntry) };
+    return { path: dir, total, offset, limit, entries: rows.map(toEntry) };
   }
 
   read(filePath: string, version?: number): FileView {
@@ -326,7 +336,7 @@ export class Corpus {
   /** Oldest first. */
   history(filePath: string): HistoryEntry[] {
     return this.sql.all<HistoryEntry>(
-      'SELECT version, author, ts, message, nbytes, kind, base_version FROM textdb_history(?)',
+      'SELECT version, author, ts, message, kind, base_version, nbytes, nlines, nwords FROM textdb_history(?)',
       filePath,
     );
   }
@@ -372,13 +382,178 @@ export class Corpus {
     return asText(this.sql.value('SELECT textdb_diff(?, ?, ?)', filePath, from, to));
   }
 
-  search(query: string, options: { prefix?: string; limit?: number } = {}): SearchHit[] {
+  /**
+   * Matching lines. One row per line, `limit` counting rows and `perFile` capping how many
+   * come from any one document — the same meanings the CLI gives those words.
+   */
+  search(query: string, options: { prefix?: string; limit?: number; perFile?: number } = {}): SearchHit[] {
     return this.sql.all<SearchHit>(
-      'SELECT path, line, snippet, rank FROM textdb_search(?, ?, ?)',
+      'SELECT path, version, line, text, section, score, more FROM textdb_search(?, ?, ?, ?)',
       query,
       options.prefix ?? '/',
-      options.limit ?? 50,
+      // One default for the whole project: 200 rows. It used to be 100 in SQL, 50 here and
+      // in HTTP, and 200 in the UI, for the same function.
+      options.limit ?? 200,
+      options.perFile ?? 10,
     );
+  }
+
+  /** One path's listing row — the record `textdb stat` prints. */
+  entry(target: string): Entry {
+    const row = this.sql.get<EntryRow>(`SELECT ${ENTRY_COLS} FROM textdb_entry(?)`, target);
+    if (!row) throw new NotFound(`not found: ${target}`);
+    return toEntry(row);
+  }
+
+  /**
+   * Front-matter property names in use, most-used first.
+   *
+   * `prefix` is what the user has typed: this runs on every keystroke, so it is an index
+   * range rather than a scan.
+   */
+  propertyKeys(options: { prefix?: string; limit?: number } = {}): PropertyKey[] {
+    return this.sql
+      .all<{ key: string; docs: number; values_n: number; kind: PropertyKey['kind'] }>(
+        'SELECT key, docs, values_n, kind FROM textdb_prop_keys(?, ?)',
+        options.prefix ?? '',
+        options.limit ?? 200,
+      )
+      .map((r) => ({ key: r.key, docs: r.docs, values_n: r.values_n, kind: r.kind }));
+  }
+
+  /**
+   * Markdown headings under `path`: one document's outline, everything below a folder, or
+   * the whole store with `/`.
+   *
+   * Each row carries its document's size, line and word counts and last change, so a table
+   * needs no second query per row. `heading` narrows to one heading, matched folded, with
+   * `match` choosing `exact`, `prefix` or `contains`; `level` caps the depth.
+   */
+  outline(
+    path = '/',
+    options: { heading?: string; match?: HeadingMatch; level?: number; limit?: number } = {},
+  ): OutlineEntry[] {
+    return this.sql
+      .all<{
+        path: string;
+        heading: string;
+        heading_path: string;
+        level: number;
+        line_from: number;
+        line_to: number;
+        nwords: number | null;
+        nwords_total: number | null;
+        nbytes: number | null;
+        nlines: number | null;
+        file_nwords: number | null;
+        version: number;
+        updated_at: string;
+        updated_by: string | null;
+      }>(
+        'SELECT path, heading, heading_path, level, line_from, line_to, nwords, nwords_total, ' +
+          'nbytes, nlines, file_nwords, version, updated_at, updated_by FROM textdb_outline(?, ?, ?, ?, ?)',
+        path,
+        options.heading ?? null,
+        options.match ?? 'exact',
+        options.level ?? null,
+        options.limit ?? 1000,
+      )
+      .map((r) => ({
+        path: r.path,
+        heading: r.heading,
+        headingPath: r.heading_path,
+        level: r.level,
+        lineFrom: r.line_from,
+        lineTo: r.line_to,
+        nwords: r.nwords,
+        nwordsTotal: r.nwords_total,
+        nbytes: r.nbytes,
+        nlines: r.nlines,
+        fileNwords: r.file_nwords,
+        version: r.version,
+        updated_at: r.updated_at,
+        updatedBy: r.updated_by,
+      }));
+  }
+
+  /**
+   * Distinct headings in use, most-used first — the autosuggest call for outlines.
+   *
+   * `starts` is what the user has typed, matched as a folded prefix against an index range.
+   */
+  headingNames(path = '/', options: { starts?: string; limit?: number } = {}): HeadingName[] {
+    return this.sql.all<HeadingName>(
+      'SELECT heading, sections, docs FROM textdb_headings(?, ?, ?)',
+      path,
+      options.starts ?? '',
+      options.limit ?? 100,
+    );
+  }
+
+  /**
+   * Links written in a document, or in everything below a folder.
+   *
+   * `status` keeps only one kind — `broken` is the one worth asking for. Rows come back in
+   * document order within a document and in path order across them.
+   */
+  links(path = '/', options: LinkOptions = {}): Link[] {
+    return this.linkRows('textdb_links', path, options);
+  }
+
+  /**
+   * The links pointing at a document, as `links` gives the ones leaving it.
+   *
+   * An asset is found by its own path, not by the `.tdbasset` pointer beside it.
+   */
+  backlinks(path = '/', options: LinkOptions = {}): Link[] {
+    return this.linkRows('textdb_backlinks', path, options);
+  }
+
+  /** Both directions read the same ten columns, so neither can drift from the other. */
+  private linkRows(fn: 'textdb_links' | 'textdb_backlinks', path: string, options: LinkOptions): Link[] {
+    return this.sql
+      .all<Omit<Link, 'asset'> & { asset: number }>(
+        `SELECT path, version, line, kind, target, anchor, alias, status, resolved, asset FROM ${fn}(?, ?, ?)`,
+        path,
+        options.status ?? '',
+        options.limit ?? 10000,
+      )
+      .map((r) => ({ ...r, asset: r.asset !== 0 }));
+  }
+
+  /** The values one property takes, most-used first; `prefix` narrows them as above. */
+  propertyValues(key: string, options: { prefix?: string; limit?: number } = {}): PropertyValue[] {
+    return this.sql.all<PropertyValue>(
+      'SELECT value, docs FROM textdb_prop_values(?, ?, ?)',
+      key,
+      options.prefix ?? '',
+      options.limit ?? 200,
+    );
+  }
+
+  /**
+   * Documents matching a property query: `status:draft tags:telco -priority:>3`.
+   *
+   * See `textdb_md::query` for the grammar. A malformed query raises, with the offset it
+   * went wrong at in the message, so an editor can point at it.
+   */
+  propertyFind(query: string, options: { folder?: string; limit?: number } = {}): PropertyHit[] {
+    return this.sql
+      .all<{ path: string; nbytes: number; updated_at: string; frontmatter: string | null }>(
+        'SELECT path, nbytes, updated_at, frontmatter FROM textdb_prop_find(?, ?, ?)',
+        query,
+        options.folder ?? '/',
+        options.limit ?? 500,
+      )
+      .map((r) => ({
+        path: r.path,
+        nbytes: r.nbytes,
+        updated_at: r.updated_at,
+        // Parsed here so every caller does not: the column is the JSON the store keeps, and a
+        // document whose front matter failed to parse is reported as having none rather than
+        // failing the whole query.
+        frontmatter: r.frontmatter ? safeJson(r.frontmatter) : null,
+      }));
   }
 
   /** Writes the whole document, creating it if missing; rebased over commits newer than `baseVersion`. */
@@ -431,11 +606,6 @@ export class Corpus {
   /** Deletes a file, or a folder with everything below it. History stays in the store. */
   remove(target: string, options: AuthorOptions = {}): void {
     this.sql.value('SELECT textdb_delete(?, ?)', target, this.authorOf(options));
-  }
-
-  /** One file or folder as a listing shows it; the root too. */
-  entry(target: string): Entry {
-    return JSON.parse(String(this.sql.value('SELECT textdb_entry(?)', target))) as Entry;
   }
 
   /** Every live file below the folder `dir`, by path, with its size and last change: what an export writes. */
@@ -676,4 +846,14 @@ function countNewlines(text: string): number {
   let n = 0;
   for (let i = text.indexOf('\n'); i >= 0; i = text.indexOf('\n', i + 1)) n++;
   return n;
+}
+
+/** Parse JSON, or `null` rather than throwing: one unreadable row must not fail a search. */
+function safeJson(text: string): Record<string, unknown> | null {
+  try {
+    const v: unknown = JSON.parse(text);
+    return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
 }

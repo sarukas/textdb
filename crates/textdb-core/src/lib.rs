@@ -4,19 +4,25 @@
 //! algorithm (chunker, tree, hashing, materialize, locate, edit, rebase, diff) and has
 //! no database dependency; bindings implement [`Storage`] and own persistence.
 
+pub mod access;
+pub mod bm25;
 pub mod chunker;
 pub mod commit;
 pub mod diff;
 pub mod edit;
+pub mod fold;
 pub mod hash;
 pub mod myers;
 pub mod node;
 pub mod path;
+pub mod snippet;
 pub mod storage;
+pub mod terms;
 pub mod structure;
 pub mod tree;
 pub mod words;
 
+pub use access::{Denial, Grant, GrantError, Grants, Namespace, Resolved, Rights, View};
 pub use chunker::ChunkParams;
 pub use commit::{commit, commit_append, CommitKind, Committed, ConflictInfo, DEFAULT_RETRIES};
 pub use diff::{changed_runs, line_hunks, unified_diff, ChangedRun, LineHunk};
@@ -45,6 +51,11 @@ pub enum TextdbError {
     Conflict(Box<ConflictInfo>),
     #[error("contention: retry budget exhausted")]
     Contention,
+    /// It is in your view and you may not do this (#12). Kept apart from `NotFound` all the way
+    /// out to the exit code, because `sync` deletes what is absent and leaves alone what is
+    /// merely forbidden — conflating the two empties a checkout when a share is revoked.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("{0}")]
     Other(String),
 }
@@ -57,6 +68,7 @@ impl TextdbError {
             TextdbError::Contention => "TX002",
             TextdbError::NotFound(_) => "TX003",
             TextdbError::InvalidEdit(_) => "TX004",
+            TextdbError::Forbidden(_) => "TX005",
             _ => "TX000",
         }
     }

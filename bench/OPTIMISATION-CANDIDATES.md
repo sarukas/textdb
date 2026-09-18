@@ -23,6 +23,349 @@ structure sidecar and the index writes into a single number.
 Absolute numbers are host-specific. Ratios inside one run are the part to trust, and a
 before/after pair should come from one quiet machine, back to back.
 
+## Postgres: one SPI query per chunk is the whole story (2026-09-15)
+
+`textdb-pg` is 4-50x its SQLite sibling across the board, and loses to its own baseline
+`sql-text-pg` on the operations that matter most: `read` 6.45x, `create` 6.86x, `replace`
+2.96x, `search` 2.69x. It wins where chunk sharing pays — `append` 0.48x, `read_lines`
+0.36x, `read_version` 0.67x, `history` 0.68x — so the design is sound and the
+implementation is not.
+
+Nearly all of the read gap is one line. `SpiStorage::get_chunk` issues
+`Spi::get_one_with_args("SELECT bytes FROM kb.chunk WHERE hash = $1")` **once per chunk**,
+with no read cache (`pending_chunks` only serves writes) and no prepared plan, so every
+leaf costs a fresh parse, plan and execute.
+
+Measured on this host against a 982 KB document with 596 leaves at depth 2, with transport
+excluded (`SELECT length(content)` returns four bytes, so only server work is timed):
+
+| document | leaves | server-side read | per leaf |
+|---|---|---|---|
+| 62 KB | 41 | 1.73 ms | 42.2 us |
+| 244 KB | 154 | 3.66 ms | 23.8 us |
+| 983 KB | 596 | 13.8 ms | 23.1 us |
+| 1.98 MB | 1225 | 26.7 ms | 21.8 us |
+
+Linear in *leaves*, flat per leaf at ~22 us — per-chunk work, not per-byte. The SQLite
+binding materialises the same shape at roughly 0.6 us per leaf, in process and through a
+cached statement.
+
+The ceiling is easy to establish. Fetching all 596 chunks in **one** query, the tree walk
+to find them included, costs 2.3 ms warm against 17.5 ms for the per-chunk path:
+
+```sql
+SELECT sum(length(c.bytes)) FROM kb.chunk c
+ WHERE c.hash IN (SELECT hash FROM kb.leaf_hashes('/s14000.md'));   -- 2.3 ms
+SELECT length(content) FROM kb.file WHERE path = '/s14000.md';      -- 17.5 ms
+```
+
+So about 15 ms of a 17.5 ms read is per-query overhead rather than reaching the data.
+
+### Done: batched, ordered chunk fetch (2.6x on a 983 KB read)
+
+`materialize_all` now walks the tree a level at a time and fetches the leaves with
+`unnest($1::bytea[]) WITH ORDINALITY`, which returns the rows **in the order they were
+asked for**, so the bytes are appended as they arrive and each chunk is copied once. Server
+side, a 983 KB / 596-leaf read went 13.8 ms -> 5.27 ms. Across the matrix `read` is a median
+0.86x with a best of 0.35x and `replace` a median 0.73x with a best of 0.38x; the 10 MiB XL
+cells are all about 0.37x. `create`, `search` and `history` are unchanged, as they should
+be. 120 byte-exact oracle checks pass and the 8 Postgres CLI tests pass.
+
+Three things only showed up by measuring, and are why the final shape is not the obvious
+one:
+
+- **A cache plus a walk still handles every chunk twice.** Batching into a `HashMap` and
+  then walking the tree to copy back out gave only 2.0x and left ~10 us a leaf. Ordering the
+  fetch so the second pass is unnecessary is what took the rest.
+- **Batching makes small documents worse.** The first cut sped 10 MiB reads 2.6x while
+  making 512 B reads 1.76x *slower*: `unnest ... WITH ORDINALITY` joined against `kb.chunk`
+  costs more to plan than `WHERE hash = $1`, and on a one-leaf document that planning is the
+  whole read. Small documents are also what the RT, CR and SR families issue most. Hence
+  `BATCH_FLOOR`: under 8 leaves, stay on the single-row path.
+- **Dropping the node cache cost a query.** Nodes are asked for twice per read — once to
+  decide whether batching is worth it, once by the walk that assembles — so without a cache
+  a one-leaf document paid three queries where it had paid two. A node-only cache (never
+  chunks, which are asked for once each) restored it and helped large reads too, since the
+  assembling walk reuses what the level scan read. Small-document reads ended at 30 us
+  against 41 us without it.
+
+The fast path declines rather than guesses: unflushed pending writes, a tree it cannot walk,
+or a short result all fall back to the ordinary walk.
+
+**Now the limit:** at ~10 us a leaf what remains is pgrx turning each `bytea` datum into a
+`Vec<u8>`, not query overhead. That is inherent to reading bytes into Rust, so going further
+needs a different approach — assembling in Postgres, or avoiding the copy — not more
+batching.
+
+**Still to do — prepare once.** Where a per-row query has to stay, `Spi::prepare` a plan and
+reuse it rather than re-planning per call. Same fix that took `textdb-sqlite`'s scalar
+functions from 29.5 us to 9.9 us, one layer down.
+
+The client round trip is *not* the problem and should not be optimised first: this Postgres
+answers a trivial statement in 82-117 us, which bounds how much of a 648 us small-document
+read transport can explain.
+
+Not settled here: whether `textdb-pg` also carries the write regression the SQLite binding
+was shown to have. The old-versus-new A/B needs the previous commit's extension installed
+into a cluster, which this pass did not do; the cross-host figures suggest it does, and the
+rename path is shared logic, but that is inference and not a measurement.
+
+## The feature work since 2026-09-13 cost the write path (2026-09-15)
+
+Re-running the matrix on current `main` turned up a broad write regression. It is not the
+host, and it is not noise: the prior run's commit (`c93a7b7`) was built in a worktree and
+the two binaries were run **back to back on one machine, twice each**, over RT-01, NS-03 and
+NS-04.
+
+| cell | old | new | ratio |
+|---|---|---|---|
+| NS-03 folder rename, 1000 files | 3,185 us | 18,257 us | **5.73x** |
+| NS-04 folder delete | 1,338 us | 6,012 us | **4.49x** |
+| RT-01 create, 512 B | 163 us | 592 us | **3.63x** |
+| RT-01 create, 4 KiB | 400 us | 957 us | 2.39x |
+| RT-01 create, 1 MiB | 44,244 us | 74,932 us | 1.69x |
+| RT-01 read, 1 MiB | 275 us | 329 us | 1.20x |
+
+The control is `fs`, which is identical code in both trees. Its best-sampled cell, NS-04
+delete, moves 1.12x across the same pair of runs while textdb moves 4.49x on that same cell
+in that same run. (`fs`'s RT-01 create cells are too thinly sampled to use — one reads
+0.17x and another 1.60x. Quote the NS-04 control, not those.)
+
+**The shape says fixed cost per write, not cost per byte.** The regression is worst at the
+smallest documents (3.6x at 512 B) and fades as they grow (1.7x at 1 MiB), which is what
+per-commit bookkeeping looks like — sidecar rows, the change feed, path events and folder
+totals are all paid once per commit regardless of size. Reads are untouched.
+
+Two things are identified; the rest is not, and this entry does not pretend otherwise.
+
+**Rename re-resolves the link graph, and did so even with no links in the store.**
+`git bisect` over the 85 commits, running NS-03 on `textdb-sqlite` at each step, names
+`59f6ec3` "Links: resolved in the store" as the first commit to cross the threshold — though
+the readings climb (897, 1423, 2827, 3681 us), so it is cumulative rather than one cliff.
+That commit added two full subtree listings and a `relink` to every move and delete.
+
+An earlier draft of this entry said `relink` was where the 5.7x lived, on the strength of
+the `link_updates` settings recovering only ~20 %. That was wrong, and the measurement that
+corrected it is simple: a **1000-file folder rename in a store with no links at all took
+24 ms**, against 29 ms with one link per file. The links were never the bulk of it — the
+bookkeeping around them was, and it ran whether or not there was anything to book.
+
+Four things fixed, in order of what they were worth:
+
+1. **Skip the bookkeeping when the store records no links.** `has_links()` is one indexed
+   probe; without it a plain-text store listed the whole moved subtree and queried the empty
+   link table to discover there was nothing to do. 1000-file rename 24 ms -> 14 ms.
+2. **Derive the post-move listing instead of re-querying it.** `after` is `before` with the
+   path prefix substituted — exactly what the `UPDATE` did — so the second full subtree scan
+   was asking the database for what the caller already knew.
+3. **Split the `OR`.** `l.resolved_id IN (...) OR l.file_id IN (...)` let SQLite use neither
+   the `link_resolved` nor the `link_file` index, turning two seeks into a scan of the link
+   table on every move. Two statements, one per column.
+4. **Skip no-op link updates, and cache the statement.** Re-resolving usually confirms what
+   the row already said (a folder rename moves a file and the siblings its relative links
+   point at together), yet every row was rewritten regardless — an `UPDATE` and a WAL record
+   each. `relink_where` also used `prepare` rather than `prepare_cached`, recompiling a
+   500-placeholder statement per chunk.
+
+Measured on current `main` after all four: NS-03 folder rename 19,633 -> 14,770 us (0.75x),
+NS-04 delete 5,957 -> 4,756 us (0.80x), creates unchanged. 131 workspace tests and the 8
+Postgres CLI tests pass, and the links still resolve to their new paths after the move.
+
+Not recovered: the old code did NS-03 in 588 us at `xs` against about 3,200 us now. What is
+left is `resolve_link` running once per link row in the moved subtree, which for the NS-03
+corpus is every file. Removing that needs a sound argument about when a resolution *cannot*
+change — for a folder rename, a relative link between two files that both moved keeps its
+target — and that is a correctness question, not a tuning one. Left alone deliberately.
+
+**The sidecar is now measured rather than inferred.** MD-01 writes the same bytes as `.md`
+and `.txt` and reports the difference: 34 % on create for front matter and eight headings
+alone, 87 % at 8 links per document, 257 % at 64. That is a real cost but it is not 3x, so
+the sidecar is part of the small-document create regression and not all of it. The change
+feed, path events and folder totals are the untested remainder — the next step is a probe
+that switches each off in turn, which `textdb-probe writepath` is the right place for.
+
+## Front-matter search is a full scan on both engines (2026-09-15)
+
+What the store does well already: `textdb-md` parses YAML front matter into JSON with types
+and structure intact — nested objects, arrays, integers and booleans, keys sorted — and the
+rows are kept current at HEAD on every write. The *parsing* is not the problem.
+
+The problem is that **nothing indexes it**. The only index on `frontmatter` is the primary
+key `(file_id, version)`, so every query by property name or value is
+`SCAN f` plus a JSON parse per row. Measured on a generated 5,000-note vault with realistic
+front matter (title, status, author, a `tags` list, priority, a nested `project` object, and
+a long tail of rarer keys), then at 50,000:
+
+| query | 5k | 50k |
+|---|---|---|
+| `status = draft` | 3.7 ms | 37 ms |
+| `tags` contains `telco` | 6 ms | 60 ms |
+| distinct property names | 6 ms | 67 ms |
+
+Exactly linear, about 0.74 us per note per query. A dashboard with five property filters is
+five scans.
+
+Postgres is no better and in one case far worse. `data` is `jsonb` with no GIN index:
+containment runs 9-12 ms at 50k, and `jsonb_object_keys` over the table — the query behind
+"what properties does this vault use?" — takes **1,007 ms**.
+
+### What fixes it, measured
+
+**Postgres: one line.** `CREATE INDEX ... USING gin (data)`. On a selective query (50 rows
+of 50,000) the plan goes from `Seq Scan` at 8.84 ms to `Bitmap Index Scan` at 0.18 ms —
+**49x**. The index is 4.8 MB against an 11 MB table. It does *not* help unselective queries
+(returning 25 % of rows, a scan is the right plan) and does *not* help key enumeration.
+
+**SQLite: a property table**, because SQLite cannot index inside JSON at all. One row per
+(file, property path, value), arrays expanded to a row per element, nested objects flattened
+to dotted paths, and typed columns so numbers compare as numbers:
+
+```sql
+fm_prop(file_id, key, val_txt, val_num, ord)
+  INDEX (key, val_txt), (key, val_num), (file_id)
+```
+
+At 50,000 notes that is 548,760 rows, built from the existing JSON in 843 ms (17 us a note;
+incrementally it is ~11 rows per write):
+
+| query | JSON scan | property table |
+|---|---|---|
+| `status = draft` | 37 ms | 2 ms |
+| `tags` contains `telco` | 60 ms | 1 ms |
+| nested `project.name = atlas` | 37 ms | 0.7 ms |
+| `priority > 3` (numeric) | 37 ms | 0.9 ms |
+| distinct property names | 67 ms | **0.11 ms** |
+| distinct values of `status` | 37 ms | **0.05 ms** |
+| property-name prefix autocomplete | — | **0.04 ms** |
+| selective two-property AND, with paths | — | 6 ms |
+
+Arrays stop being a special case: `tags` contains `telco` is just a row, which is why it goes
+from the *slowest* query to the fastest.
+
+Two honest caveats. **Multi-property AND is the weak spot**: two non-selective properties
+intersect in 20 ms (`INTERSECT` beats a self-`JOIN`'s 33 ms), so it improves on the 60 ms
+scan but not by the order of magnitude the single-property cases do; selective ANDs are
+6 ms. And **it costs space**: +43 MB for 50,000 notes with all three indexes, about 860 B a
+note. In this corpus the bodies are tiny so that reads as 2.5x the store; against realistic
+4 KB notes it is nearer 20 %.
+
+### What is missing beyond the index
+
+Even with the storage fixed there is no way to *ask*. `textdb meta` is get/set/unset on one
+file. There is no vault-wide equivalent of what Obsidian's property view gives: no
+`meta keys` (what properties exist), no `meta values KEY` (what values does it take), no
+`meta find KEY=VALUE`. Today that is `textdb sql` with hand-written `json_extract`, which
+also means every caller writes the scan themselves.
+
+A complete answer is three pieces, in this order: the property table (SQLite) and a GIN
+index (Postgres); a `kb.property` view over both so one query text works on either; and the
+CLI verbs on top. None of it is on the write path's critical section — the rows derive from
+front matter already parsed at commit.
+
+## A round of per-row batching on both engines, stopped at diminishing returns (2026-09-15)
+
+Three changes, chosen from the `writepath` and `ops` probes rather than from guesses. All
+three are the same shape: a loop issuing one statement per chunk, node or row.
+
+**SQLite — `chunk_ref` in one statement per batch, not one per chunk.** A 1 MiB document
+made 652 of them. Batched into fixed-size multi-`VALUES` lists so `prepare_cached` can hold
+the statement. RT-01 1 MiB create 73.7 ms -> 68.5 ms (about 7 %); smaller documents have too
+few chunks to care, and do not move.
+
+**SQLite — stop recounting authors on every commit.** The node update carried
+`nauthors = (SELECT count(*) FROM file_author WHERE file_id = ?)`, a scan per write to
+re-derive a number that only moves the first time a given author writes to a file.
+`RETURNING commits` from the upsert says whether the row was new, and the recount now runs
+only then. **No measurable change** in the matrix — recorded as done and not as a win.
+
+**Postgres — `flush()` in one statement per batch.** The write-side twin of the per-chunk
+`SELECT` that `materialize_ordered` replaced: one `INSERT` per chunk and one per node.
+Unnested arrays instead. XL 10 MiB create 2.77 s -> 2.49 s (about 10 %), 10 MiB replace
+0.91x; median across the write cells 0.99x.
+
+Both batched paths needed the same floor the read path did, and for the same reason. Without
+it the first cut made a 513 B create **1.17x slower** while the 10 MiB one gained: building
+three arrays to insert a single chunk costs more than the statement it saves. Under
+`BATCH_FLOOR` entries, one statement each.
+
+One bug worth recording because the type system did not catch it: SQLite names a `VALUES`
+clause's columns `column1..N` and rejects the `AS v(h, f, v)` aliasing Postgres accepts. It
+compiled and failed at runtime, and the CLI suite plus the harness canary both caught it —
+the canary failed the cell and published no timings, which is what that check is for.
+
+**Stopping here.** Both engines now give roughly 10 % on large writes and nothing measurable
+on small ones, which is the diminishing-returns line. What is left is not per-row overhead:
+FTS tokenisation is 9-17 ms of a 1 MiB SQLite write and a standalone fts5 test puts batched
+inserts within 15 % of one-at-a-time, so that cost is the feature, not the loop. On Postgres
+the remainder is the round-trip floor (82-117 us a statement) and pgrx datum conversion.
+Neither yields to more batching.
+
+## Link rewriting on a move is within 1.45x of its floor (2026-09-15)
+
+`link_updates = rewrite` keeps the corpus correct when a file moves: every document that
+pointed at it is rewritten to point at the new path, one commit each, in the same
+transaction as the move. It handles all four link kinds and keeps each one's syntax and
+alias — `[x](./target.md)` -> `[x](./renamed.md)`, `[[target]]` -> `[[renamed]]`,
+`![[target]]`, `![alt](./target.md)`.
+
+It is the most expensive thing in the MD family, so it is worth saying what the cost *is*
+rather than only that it is large. Measured on this host, one file moved with N documents
+pointing at it:
+
+| fan-in | total | per rewritten document |
+|---|---|---|
+| 50 | 39 ms | 780 us |
+| 200 | 124 ms | 620 us |
+| 500 | 334 ms | 668 us |
+
+Linear in fan-in, flat per document — no quadratic blow-up from re-resolving the graph.
+
+The floor is "one ordinary edit per affected document", because a versioned store cannot
+change 500 documents without committing 500 versions. Measured on the same store, 500
+ordinary `textdb_edit` calls in one transaction cost **230 ms, 460 us each**. So the link
+rewrite runs at 668 us against a 460 us floor: **1.45x**, with about 208 us per document of
+genuinely link-specific work (finding what points here, rewriting the target text,
+re-resolving).
+
+The consequence for tuning is the useful part: two thirds of this is ordinary commit cost,
+so the lever is the per-commit fixed cost recorded above, not the link logic. Rewriting the
+link code could at best recover the 208 us.
+
+## Sync rewrote its whole base on every run, including a no-op (2026-09-15)
+
+SY-01 put a number on sync for the first time, and the no-op case — the one a save hook or
+a watcher runs constantly — cost 6.4 % of a full import.
+
+The change detection itself is already right: `t_changed` compares versions and `d_changed`
+compares size and mtime (with git's racy-clean window handled), so an unchanged file is
+never read. What cost the time was downstream. `save_sync_base` ended every run with
+`DELETE FROM sync_file WHERE sync_id = ?` followed by an `INSERT` per file, so a sync whose
+answer was "nothing to do" still wrote the entire base back — hundreds of statements and
+their WAL records.
+
+It now reads the stored rows and skips the rewrite when they already say the same thing: one
+indexed scan against two statements per file. Measured directly on 300 files:
+
+| corpus | before | after |
+|---|---|---|
+| 300 files, 1 MB total | 15 ms (52 us/file) | 13 ms (45 us/file) |
+| 300 files, 16 MB total | 25 ms (84 us/file) | 13 ms (46 us/file) |
+
+The interesting part is the second row. A no-op sync used to get slower as the *content*
+grew, which looked like it was re-reading documents; it was not — the bigger store simply
+made the pointless rewrite more expensive. The cost is now flat in content size, which is
+what a no-op should be. Both store backends got the fix; 131 workspace tests, 36 CLI tests
+and 8 Postgres CLI tests pass.
+
+**The SY family at `--size s` does not show this**, and that is worth knowing before reading
+its numbers: 120 files of about 1.2 KB is too small a corpus for the rewrite to dominate, so
+the cell moves 0.97x, inside the noise. The effect needs either more files or more bytes
+than the POC parameters use.
+
+Left alone: ~45 us per file per no-op sync, which is a `metadata` syscall, a store row
+lookup and the map work. For a 10,000-file vault that is about half a second to establish
+that nothing changed.
+
 ## Why the matrix alone was misleading
 
 Three things the published `2026-09-12` entry concluded do not survive decomposition.
@@ -236,6 +579,227 @@ pathological case — but cheap, and it is the worst ratio in the matrix, which 
 misreading.
 
 ---
+
+## Coverage gaps found by reading the surfaces, not the numbers (2026-09-16)
+
+**Closed on the same day — see "Closing the outline and snippet gaps" below for what they
+cost and what they turned up. Kept here for the reasoning that found them.**
+
+Neither of these is a regression. Both are places where the suite measures a narrower thing
+than the feature offers, so a cost we already pay has never been attributed.
+
+### Search snippets are timed but never isolated, and never checked
+
+`textdb_search(query, prefix, limit)` returns `path, line, snippet, rank`. The harness's SQL
+selects `path, line` only, and its `Hit` is `{ path: String, line: u64 }` — the `snippet`
+column is dropped on the floor. Two consequences:
+
+- Snippet extraction runs server-side inside every SR timing, so it is *inside* `op_search`
+  (699 us on `textdb-sqlite`, 8225 us on `textdb-pg`) without ever being separable from hit
+  lookup. We cannot say what share of the largest remaining gap is snippet rendering.
+- Snippet *content* has no oracle at all. Nothing asserts a snippet contains the matched
+  term, is centred on it, or is bounded in length. The web app highlights terms client-side
+  and would look wrong if the snippet were, but that is not a test.
+
+To close: carry `snippet` on the harness `Hit`, assert it contains the matched term, and time
+a snippet-less variant of the same query so the two costs separate. Cheap, and it feeds
+directly into gap 1 above.
+
+### Section listing exists only as a SQL view, and only per-file is measured
+
+Extraction and storage are complete — `textdb-md::extract` emits one row per H1-H6 with
+`heading_path` (the `Parent / Child` breadcrumb), `level`, `line_from`, `line_to`, and both
+engines keep them at HEAD. What is thin is everything above one document:
+
+- **No listing surface but raw SQL.** There is no `textdb outline` verb, no
+  `textdb_sections()` / `kb.sections()` table-valued function, no `Corpus.sections()` in
+  Python, and nothing whatever in the Node SDK — not even the single-section `section()` the
+  other surfaces have. Properties got three verbs, three functions, both SDKs and a UI;
+  sections got a view.
+- **The view carries no file metadata.** `sections` is `path, heading, level, line_from,
+  line_to`. A heading list is most useful next to `nbytes`, `updated_at`, `updated_by` and
+  the document's own front matter, and every caller has to join `files` itself to get them.
+- **A vault-wide heading query is a full scan.** The only index is
+  `section_file (file_id, version)`. `WHERE heading LIKE '%/ Next steps'` scans every section
+  row — roughly 32 per note in a heading-rich vault — and is case-sensitive unless wrapped in
+  `lower()`, which would defeat an index if one existed. The property work already settled
+  the shape for this: a stored folded column plus an index on it.
+- **No notion of a title.** An H1 is just `level = 1`; front-matter `title` is a property row.
+  Nothing reconciles them, so "list every document's title" means choosing a convention in
+  SQL each time.
+
+Benchmark coverage is MD-05 and it is strictly per-file: `sections_list` 16 us p50 on SQLite
+and 201 us on Postgres, `section_body` 25 us and 399 us, both oracles passing. Folder-scoped
+listing, vault-wide listing, any heading-text predicate, filtering by level, and the
+`sections` view itself (MD-05 queries the base table directly, so the join with `node` has
+never been timed) are all unmeasured. MD-01 does cover what maintaining the sidecar costs the
+write path, so the indexing side is fine; it is the reading side above one file that is not.
+
+### Counts: two holes, and one semantic worth writing down
+
+Line counts are carried at four levels — `node.nlines` per file, `node.t_lines` as the folder
+rollup, `commit.nlines` per version, `chunk.nlines` per chunk — and each tree node's children
+carry cumulative `nlines`, which is what makes descent by line O(log n) without visiting
+leaves. Word counts are `node.nwords` and `node.t_words` with `wc -w` semantics, kept current
+by `word_delta`, which counts only the changed line regions on the strength of a word never
+spanning a newline: maintenance costs the size of the edit, not the size of the document.
+
+What is missing:
+
+- **No `nwords` on `commit`.** Lines have per-version history and words do not, so word count
+  over time cannot be charted without materialising every version. The incremental machinery
+  to fill it already exists — the commit path computes the delta it would need — so this is a
+  column and a write, not an algorithm.
+- **No per-line or per-chunk word count.** `chunk` carries `nlines` but not `nwords`, and
+  nothing anywhere stores words per line. "The longest line in this document by words" is a
+  full read. Adding `nwords` to `chunk` would be nearly free — the bytes are in hand at
+  insert and `WordCounter` already composes across pieces — and would let word statistics
+  come off the index the way line counts do.
+- **`nlines` is a newline count, not a line count.** It is literally the number of `\n` bytes
+  (`chunker.rs:158`), so a file with no trailing newline undercounts by one: `"alpha\ngamma"`
+  reports `nlines = 1` for two lines of text. Defensible, matches `wc -l`, consistent across
+  every surface — but it is not what a UI showing "N lines" wants, and nothing documents it.
+
+### A chunk is not a line, and code that assumes otherwise will be wrong
+
+Worth stating because the assumption is natural and keeps coming up. `snap()`
+(`chunker.rs:131`) moves a CDC boundary forward to just past the next `\n` **only when one
+falls within `ChunkParams::snap` = 256 bytes**; past that it cuts mid-line, which is exactly
+what the LL family covers (minified JSON, single-line files). The invariant the code actually
+holds is the weaker one stated at line 130: a chunk ending in any other byte was cut knowing
+the next 256 bytes contain no `\n`. So a `\r\n` pair can straddle two chunks, and any
+optimisation phrased as "operate on whole lines by operating on chunks" is unsound.
+
+Content is stored byte-exact and never normalised (spec A3, property test P1). Line-ending
+normalisation on reconstruction was considered and rejected: it is not worth the round-trip
+fidelity, and the chunk-boundary assumption that would have made it cheap does not hold.
+
+## Closing the outline and snippet gaps, and what it cost (2026-09-16)
+
+The two coverage gaps recorded above are closed. Both turned up defects that the missing
+measurement had been hiding, and one of them was worth an order of magnitude.
+
+### Postgres: stale planner statistics, and an OR that estimated at one row
+
+A heading query over a 2,000-note vault took **74.4 ms**. The plan was a nested loop driven
+from `node`, rescanning `section_heading` once per document: 4,000,000 row visits and 12,078
+buffer hits to return 2,000 rows.
+
+Two causes, separable and both measured on one host:
+
+| | ms |
+|---|---|
+| as found | 74.4 |
+| after `ANALYZE` alone, same query, same bound parameters | 2.1 |
+
+The statistics were whatever autovacuum computed while the tables were still nearly empty.
+That is not an unlucky case, it is *the* case for a store built in one burst — an import, a
+sync, a restore — because autovacuum's threshold is a share of the rows it already knows
+about, so a store that arrives all at once is analysed once, early, and then never again.
+Every query joining `section`, `property` or `link` to `node` is exposed the same way.
+
+`kb.analyze_store()` refreshes them. `Backend::settle()` is a new harness hook — "the corpus
+is loaded, do whatever a store does before it is queried" — offered to every backend, taken
+by the one that needs it, and deliberately untimed: measuring an un-analysed store would be
+measuring a misconfiguration.
+
+The second cause was the scope predicate, `n.path = $1 OR (n.path >= $2 AND n.path < $3)`,
+which the planner estimates at one row. A prefix is now resolved *before* the query to either
+a file id or a subtree range, so the predicate is one indexed comparison; the level filter is
+emitted only when it applies rather than as `$4 IS NULL OR s.level <= $4`.
+
+Together, over 2,000 notes:
+
+| | before | after | |
+|---|---|---|---|
+| `outline_match_exact` | 74.40 ms | 7.70 ms | **9.66x** |
+| `heading_names_prefix` | 6.74 ms | 3.89 ms | 1.73x |
+| `outline_one_doc` | 764 us | 447 us | 1.71x |
+| `outline_level_1` | 11.42 ms | 8.03 ms | 1.42x |
+| `outline_match_prefix` | 18.89 ms | 15.72 ms | 1.20x |
+| `outline_vault` | 42.35 ms | 36.32 ms | 1.17x |
+
+**Where the rest of it goes, and why it stops here.** On both engines what is left is moving
+rows, not finding them, and the same measurement says so twice:
+
+- Postgres executes the prefix query server-side in 4.1 ms of the 15.7 ms measured — about
+  3 us per row of SPI materialisation, the overhead already recorded for chunk fetches.
+- SQLite runs the vault query, all fourteen columns, aggregated so no row crosses the
+  boundary, in 3.5 ms over 7,201 section rows. The same query through the virtual table
+  returns ~10,000 rows in 20.8 ms. Scaled, roughly 4.9 ms is the query and 16 ms is the
+  cursor materialising `Vec<Vec<Value>>`.
+
+Neither is a plan to fix or an index to add: both want a streaming cursor instead of a
+materialised result, which is a different piece of work from this pass. SQLite's plans were
+already right throughout and were not touched.
+
+### The section index: a composite that was never used as one
+
+Four columns and two indexes were added to `section`. Attributing the cost over 64,000 rows:
+
+| | ms | |
+|---|---|---|
+| 6 columns, 1 index (as it was) | 83.8 | 1.00x |
+| 10 columns, 1 index | 99.6 | 1.19x |
+| + `section_heading (heading_lc)` | 160.8 | 1.92x |
+| + `section_level (level, heading_lc)` | 188.4 | 2.25x |
+
+The level index took 17% of the insert cost, and no plan ever used it as a composite — only
+`level < ?`. Narrowing it to `section(level)` keeps the read exactly as fast and gives some of
+the write back:
+
+| | `(level, heading_lc)` | no index | `(level)` |
+|---|---|---|---|
+| MD-05 create (32 headings) | 1.745 ms | 1.569 ms | 1.637 ms |
+| `outline_level_1` | 4.163 ms | 5.016 ms | 4.162 ms |
+
+Dropping it outright is the better write and the worse read, and the read loss applies to
+every level-filtered query while the write win shows only on heading-dense documents. The
+narrow index is not a trade at all, so that is what is there.
+
+### What the write path actually cost, measured properly
+
+A first comparison against the 2026-09-15 run said writes were 1.3-1.6x slower. It was
+wrong, and instructively so: `create_txt` had "slowed" by the same factor, and `.txt`
+documents never run the extractor. It was host drift between two days. A worktree at the
+commit before this work, built and run back to back on one host, says:
+
+| | before | after | |
+|---|---|---|---|
+| `create_md` (8 headings, no links) | 0.913 ms | 0.928 ms | flat |
+| `create_md` (8 headings, 64 links) | 2.641 ms | 2.661 ms | flat |
+| `replace_md` (8 headings) | 0.735 ms | 0.701 ms | flat |
+| MD-05 `create` (32 headings) | 1.367 ms | 1.637 ms | 1.20x slower |
+
+So the cost is confined to heading-dense documents, and `replace` is flat — which is the
+evidence that the counts-only write path holds. Word counts move on nearly every body edit
+while the heading tree stays put, and `write_structure` now tells those apart: an unchanged
+tree refreshes the counts with one statement keyed on `line_from` instead of the delete,
+re-insert and relink a real structure change needs.
+
+### Snippets were never the cost
+
+The suspicion behind the original gap was that snippet rendering was expensive. It is not.
+Splitting `search` into finding candidates and resolving them (`textdb-probe search`):
+
+| document | query | hits | paths only | with line + snippet | resolution |
+|---|---|---|---|---|---|
+| 4 KiB | wide | 400 | 4.66 ms | 6.20 ms | 1.54 ms (24.8%, 3.8 us/hit) |
+| 4 KiB | narrow | 57 | 0.33 ms | 0.56 ms | 0.23 ms (40.6%, 4.0 us/hit) |
+| 64 KiB | wide | 400 | 51.42 ms | 54.40 ms | 2.98 ms (5.5%, 7.4 us/hit) |
+| 64 KiB | narrow | 57 | 0.63 ms | 0.96 ms | 0.33 ms (34.1%, 5.7 us/hit) |
+
+The line and the snippet come from one scan of the same chunk bytes, so they are not
+separable from each other; what *is* separable is the whole resolution phase from the index
+query underneath it, and for a wide query the index query is 94.5% of the total. That is gap
+1 above — the `limit * 50` hit window — not the snippet.
+
+What checking snippets did find was three ways of showing the wrong text for a right answer,
+all in `locate_terms`: raw comparison against a diacritic-folding index, a quoted phrase
+looked for with its spaces intact, and a 200-character *prefix* of the line rather than a
+window around the match. Over the SR corpus that was thousands of wrong snippets on
+single-term, 2-term and prefix queries, and 3,223 of 6,804 on phrases. The logic now lives
+once, in `textdb_core::snippet`; it existed twice and the two copies had drifted.
 
 ## Tried and rejected — do not pay for these twice
 

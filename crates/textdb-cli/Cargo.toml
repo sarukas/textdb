@@ -26,5 +26,18 @@ ignore = "0.4"
 sha2 = "0.11"
 uuid = { version = "1", features = ["v7"] }
 
+
+# The #12 acceptance catalogue is written before the feature and is red until it lands, so it
+# is not part of the default test run. Run it with `--features access-tests`.
+[features]
+access-tests = []
+
+[[test]]
+name = "access"
+required-features = ["access-tests"]
+
 [dev-dependencies]
 tempfile = "3"
+# The sync-base test stands in for another machine by writing to the store directly.
+rusqlite = { workspace = true }
+

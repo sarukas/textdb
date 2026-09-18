@@ -19,6 +19,15 @@ CREATE TABLE IF NOT EXISTS {p}node (
   deleted_at  TEXT    NULL,
   nwords      INTEGER,                        -- file: words, as wc -w counts them
   nauthors    INTEGER,                        -- file: distinct commit authors (file_author rows)
+  -- What the structure extractor found, counted once at commit and stored here so a listing
+  -- can say "12 headings, 4 properties, 2 links, 1 broken" without a query per row. Zero for
+  -- a file with no structure; the `title` is the front matter's, else the first level-1
+  -- heading, else NULL.
+  title           TEXT,
+  nsections       INTEGER NOT NULL DEFAULT 0,
+  nprops          INTEGER NOT NULL DEFAULT 0,
+  nlinks          INTEGER NOT NULL DEFAULT 0,
+  nlinks_broken   INTEGER NOT NULL DEFAULT 0,
   -- Folder: totals of every live node below it, kept current by each commit, mkdir, move and
   -- delete. Zero on files; a file's own figures are nbytes, nlines, nwords and version.
   t_files      INTEGER NOT NULL DEFAULT 0,
@@ -27,7 +36,12 @@ CREATE TABLE IF NOT EXISTS {p}node (
   t_lines      INTEGER NOT NULL DEFAULT 0,
   t_words      INTEGER NOT NULL DEFAULT 0,
   t_versions   INTEGER NOT NULL DEFAULT 0,
-  t_updated_at TEXT    NULL                   -- the last change anywhere below
+  t_sections     INTEGER NOT NULL DEFAULT 0,
+  t_props        INTEGER NOT NULL DEFAULT 0,
+  t_links        INTEGER NOT NULL DEFAULT 0,
+  t_links_broken INTEGER NOT NULL DEFAULT 0,
+  t_updated_at TEXT    NULL,                  -- the last change anywhere below
+  t_updated_by TEXT    NULL                   -- and who made it, so a folder row names an author
 );
 CREATE UNIQUE INDEX IF NOT EXISTS {p}node_path ON {p}node(path) WHERE deleted_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS {p}node_parent_name ON {p}node(parent_id, name) WHERE deleted_at IS NULL;
@@ -43,6 +57,7 @@ CREATE TABLE IF NOT EXISTS {p}commit (
   message      TEXT,
   nbytes       INTEGER,
   nlines       INTEGER,
+  nwords       INTEGER,                        -- as of this version, so word count has history
   kind         TEXT,                          -- direct, rebased, merged
   base_version INTEGER,                       -- the version the writer started from
   batch        TEXT    NULL,                  -- the run that made it (`textdb sql --write`), see bulk.rs
@@ -66,10 +81,18 @@ CREATE TABLE IF NOT EXISTS {p}chunk_ref (
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS {p}section (
   file_id INTEGER NOT NULL, version INTEGER NOT NULL,
-  heading_path TEXT NOT NULL, level INTEGER NOT NULL,
-  line_from INTEGER NOT NULL, line_to INTEGER NOT NULL
+  heading_path TEXT NOT NULL,                  -- the breadcrumb, `Parent / Child`
+  level INTEGER NOT NULL,
+  line_from INTEGER NOT NULL, line_to INTEGER NOT NULL,
+  heading TEXT NOT NULL DEFAULT '',            -- the last component, as written
+  heading_lc TEXT NOT NULL DEFAULT '',         -- folded, so a match is an index seek
+  -- Size of the section's own lines, and of it plus everything nested under it. Words never
+  -- span a line and sections partition by line, so both are exact.
+  nwords INTEGER, nwords_total INTEGER
 );
 CREATE INDEX IF NOT EXISTS {p}section_file ON {p}section(file_id, version);
+CREATE INDEX IF NOT EXISTS {p}section_heading ON {p}section(heading_lc);
+CREATE INDEX IF NOT EXISTS {p}section_level ON {p}section(level);
 CREATE TABLE IF NOT EXISTS {p}link (
   file_id INTEGER NOT NULL, version INTEGER NOT NULL,
   target_path TEXT NOT NULL, line INTEGER NOT NULL,
@@ -79,13 +102,42 @@ CREATE TABLE IF NOT EXISTS {p}link (
   external    INTEGER NOT NULL DEFAULT 0,     -- URL, email, query, numbered reference
   target_name TEXT,                           -- last segment, lower case, without .md (see links.rs)
   resolved_id INTEGER,                        -- the file it points to
-  status      TEXT                            -- ok, ambiguous, anchor-missing, broken, not-in-store, external
+  status      TEXT,
+  -- The bytes of the target as written, so a rewrite (a move, or #12's link projection) changes
+  -- a target without re-parsing free text: code spans, fenced blocks and escaped brackets are
+  -- left alone by construction rather than by a second parser agreeing with the first. NULL for
+  -- a reference link or an autolink, whose target is not written where the link is.
+  span_from   INTEGER,
+  span_to     INTEGER                            -- ok, ambiguous, anchor-missing, broken, not-in-store, external
 );
 CREATE INDEX IF NOT EXISTS {p}link_file ON {p}link(file_id, version);
 CREATE TABLE IF NOT EXISTS {p}frontmatter (
   file_id INTEGER NOT NULL, version INTEGER NOT NULL, data TEXT,
   PRIMARY KEY (file_id, version)
 );
+-- One row per (document, property path, value), derived from `frontmatter` at every
+-- commit. Front matter is JSON, and neither SQLite nor a scan of it can be indexed, so
+-- asking "which notes have status: draft" read every row and parsed it. These rows make
+-- that an index seek, and make a list membership (`tags` contains `telco`) an ordinary
+-- equality rather than a search inside an array. HEAD only, like the other structure
+-- tables (ADR 0007).
+CREATE TABLE IF NOT EXISTS {p}property (
+  file_id INTEGER NOT NULL,
+  version INTEGER NOT NULL,
+  key     TEXT NOT NULL,                      -- dotted path as written: `project.name`
+  key_lc  TEXT NOT NULL,                      -- and folded, which is what the indexes carry
+  val_txt TEXT NULL,                          -- every value as text; NULL for a null property
+  val_lc  TEXT NULL,
+  val_num REAL NULL,                          -- also as a number, when it is one
+  ord     INTEGER NOT NULL DEFAULT 0          -- position within a list; 0 for a scalar
+);
+-- Folded once on write rather than with `lower()` on read. A `lower(key) = ?` predicate is a
+-- function of the column, so SQLite cannot use an index for it and every lookup became a
+-- scan — measured at 13 ms where the seek is 0.2 ms. Folding in Rust also gets Unicode right,
+-- which SQLite's own `lower()` does not.
+CREATE INDEX IF NOT EXISTS {p}property_kv ON {p}property(key_lc, val_lc);
+CREATE INDEX IF NOT EXISTS {p}property_kn ON {p}property(key_lc, val_num);
+CREATE INDEX IF NOT EXISTS {p}property_file ON {p}property(file_id);
 CREATE TABLE IF NOT EXISTS {p}checkpoint (
   name TEXT NOT NULL, file_id INTEGER NOT NULL, path TEXT NOT NULL, root BLOB NOT NULL, version INTEGER NOT NULL,
   PRIMARY KEY (name, file_id)
@@ -97,11 +149,17 @@ CREATE TABLE IF NOT EXISTS {p}checkpoint (
 CREATE TABLE IF NOT EXISTS {p}change (
   seq          INTEGER PRIMARY KEY AUTOINCREMENT,
   ts           TEXT    NOT NULL,
-  op           TEXT    NOT NULL,              -- create, commit, mkdir, move, delete, purge
+  op           TEXT    NOT NULL,              -- create, commit, mkdir, move, delete, purge,
+                                             -- and for one account: share, unshare, move
   node_id      INTEGER NOT NULL,
   node_kind    INTEGER NOT NULL,              -- 0 folder, 1 file
   path         TEXT    NOT NULL,              -- the path after the change
   old_path     TEXT    NULL,                  -- move: the path before
+  -- Set when the change is about one account's *view* rather than about the store: a share
+  -- granted, renamed or taken away. Its `path` is already that account's, and nobody else's feed
+  -- carries it — which is how a revocation can be an event for the one account that needs to act
+  -- on it, at the moment it stops being able to see the folder (#12 F7-F9).
+  for_account  TEXT    NULL,
   version      INTEGER NULL,                  -- create, commit: the new version
   base_version INTEGER NULL,                  -- commit: the version the writer started from
   commit_kind  TEXT    NULL,                  -- create, commit: direct, rebased, merged
@@ -155,6 +213,8 @@ CREATE TABLE IF NOT EXISTS {p}sync (
   git_remote TEXT,
   git_clean  INTEGER,                       -- 1: no uncommitted changes; NULL: not a git checkout
   rules      TEXT,                          -- the include rules of that sync, as JSON (sync.rs Rules)
+  generation INTEGER NOT NULL DEFAULT 0,    -- bumped on every save; a sync saves against the one it read
+  dir_id     TEXT,                          -- the directory's own id (.textdb/config), so a move keeps its base
   UNIQUE (prefix, dir)
 );
 -- Each file both sides agreed on at that sync: its version in the store, the git blob id of its
@@ -178,6 +238,44 @@ CREATE TABLE IF NOT EXISTS {p}asset_store (
   options    TEXT,                          -- JSON, driver specific
   created_at TEXT NOT NULL
 );
+-- Accounts, bearer tokens and folder-scoped grants (#12). The same three tables in the
+-- Postgres extension, so one access model serves both engines. Empty in a store nobody has
+-- delegated: a store with no account rows has no token to present, so every connection is the
+-- owner and the whole model costs one "is this table empty" check at open.
+CREATE TABLE IF NOT EXISTS {p}account (
+  id           INTEGER PRIMARY KEY,
+  name         TEXT    NOT NULL,
+  kind         TEXT    NOT NULL,             -- 'agent' | 'person'
+  root_node_id INTEGER NULL REFERENCES {p}node(id),   -- single-root accounts only
+  created_at   TEXT    NOT NULL,
+  disabled_at  TEXT    NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS {p}account_name ON {p}account(name);
+CREATE TABLE IF NOT EXISTS {p}token (
+  id          INTEGER PRIMARY KEY,
+  account_id  INTEGER NOT NULL REFERENCES {p}account(id),
+  hash        TEXT    NOT NULL,              -- sha256 of the bearer; the bearer is shown once
+  label       TEXT,
+  created_at  TEXT    NOT NULL,
+  expires_at  TEXT    NULL,
+  revoked_at  TEXT    NULL,
+  last_used_at TEXT   NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS {p}token_hash ON {p}token(hash);
+CREATE INDEX IF NOT EXISTS {p}token_account ON {p}token(account_id);
+CREATE TABLE IF NOT EXISTS {p}grant (
+  account_id  INTEGER NOT NULL REFERENCES {p}account(id),
+  node_id     INTEGER NOT NULL REFERENCES {p}node(id),
+  alias       TEXT    NOT NULL,              -- '' for a single-root account
+  rights      TEXT    NOT NULL,              -- 'ro' | 'rw'
+  granted_by  TEXT,
+  granted_at  TEXT    NOT NULL,
+  -- A revoked grant keeps its row: an account whose checkout still holds the files must be told
+  -- `forbidden`, not `not found`, or its next sync deletes them.
+  revoked_at  TEXT    NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS {p}grant_alias ON {p}grant(account_id, alias);
+CREATE UNIQUE INDEX IF NOT EXISTS {p}grant_node ON {p}grant(account_id, node_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS {p}fts USING fts5(text, content='', tokenize='unicode61');
 "#,
         p = p
@@ -197,6 +295,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("node", "t_words", "INTEGER NOT NULL DEFAULT 0"),
     ("node", "t_versions", "INTEGER NOT NULL DEFAULT 0"),
     ("node", "t_updated_at", "TEXT NULL"),
+    ("node", "t_updated_by", "TEXT NULL"),
     // Links: how each is written and what it resolves to (links.rs).
     ("link", "kind", "TEXT"),
     ("link", "anchor", "TEXT"),
@@ -205,11 +304,39 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("link", "target_name", "TEXT"),
     ("link", "resolved_id", "INTEGER"),
     ("link", "status", "TEXT"),
+    ("link", "span_from", "INTEGER"),
+    ("link", "span_to", "INTEGER"),
+    // The sync base's compare-and-swap counter, for two machines sharing one folder: the
+    // directory lock is local, so only this catches a sync that landed from elsewhere.
+    ("sync", "generation", "INTEGER NOT NULL DEFAULT 0"),
+    // The directory's own name for itself, from its `.textdb/config`, so moving the directory
+    // does not lose the base and re-import everything under a path that has changed.
+    ("sync", "dir_id", "TEXT"),
     // Batches: the run (`textdb sql --write`) a commit or change belongs to.
     ("commit", "batch", "TEXT NULL"),
     ("change", "batch", "TEXT NULL"),
+    ("change", "for_account", "TEXT NULL"),
     // Sync: the include rules each base was made with.
     ("sync", "rules", "TEXT"),
+    // Structure counts on the node row, and their folder totals.
+    ("node", "title", "TEXT"),
+    ("node", "nsections", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "nprops", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "nlinks", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "nlinks_broken", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "t_sections", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "t_props", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "t_links", "INTEGER NOT NULL DEFAULT 0"),
+    ("node", "t_links_broken", "INTEGER NOT NULL DEFAULT 0"),
+    // Counts: words per version, and the size of each section (words.rs).
+    ("commit", "nwords", "INTEGER"),
+    ("section", "nwords", "INTEGER"),
+    ("section", "nwords_total", "INTEGER"),
+    ("section", "heading_lc", "TEXT NOT NULL DEFAULT ''"),
+    ("section", "heading", "TEXT NOT NULL DEFAULT ''"),
+    // Properties: the folded forms the indexes are built on.
+    ("property", "key_lc", "TEXT NOT NULL DEFAULT ''"),
+    ("property", "val_lc", "TEXT NULL"),
 ];
 
 /// Indexes on columns an older store gains in `migrate`, so they are created after them.
@@ -219,7 +346,12 @@ fn index_sql(p: &str) -> String {
          CREATE INDEX IF NOT EXISTS {p}link_resolved ON {p}link(resolved_id);
          CREATE INDEX IF NOT EXISTS {p}node_lower_name ON {p}node(lower(name)) WHERE deleted_at IS NULL;
          CREATE INDEX IF NOT EXISTS {p}node_lower_path ON {p}node(lower(path)) WHERE deleted_at IS NULL;
-         CREATE INDEX IF NOT EXISTS {p}change_batch ON {p}change(batch) WHERE batch IS NOT NULL;"
+         CREATE INDEX IF NOT EXISTS {p}change_batch ON {p}change(batch) WHERE batch IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS {p}property_kv ON {p}property(key_lc, val_lc);
+         CREATE INDEX IF NOT EXISTS {p}property_kn ON {p}property(key_lc, val_num);
+         CREATE INDEX IF NOT EXISTS {p}property_file ON {p}property(file_id);
+         CREATE INDEX IF NOT EXISTS {p}section_heading ON {p}section(heading_lc);
+         CREATE INDEX IF NOT EXISTS {p}section_level ON {p}section(level);"
     )
 }
 
@@ -246,6 +378,11 @@ pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> 
     }
     if missing.is_empty() {
         conn.execute_batch(&index_sql(p))?;
+        // `property` arrives as a whole new table rather than as a column, so a store that is
+        // otherwise current still reaches here with it empty. Backfilling is what makes the
+        // first `meta find` on an existing vault return anything.
+        crate::property::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+        crate::sections::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
         return Ok(0);
     }
     let backfill = missing.iter().any(|(table, _, _)| **table == "node");
@@ -262,6 +399,8 @@ pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> 
         if backfill_links {
             crate::links::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
         }
+        crate::property::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+        crate::sections::backfill(conn, p).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
         Ok(())
     };
     match run() {
@@ -274,9 +413,17 @@ pub fn migrate(conn: &rusqlite::Connection, p: &str) -> rusqlite::Result<usize> 
     Ok(missing.len())
 }
 
+/// Every shadow table, for `DROP TABLE kb`.
+///
+/// Children first: `grant` and `token` reference `account` and `node`, so the order matters
+/// wherever foreign keys are enforced. A table added to `create_sql` and forgotten here is left
+/// behind by a drop, and `sql_surface.rs::dropping_a_kb_table_removes_the_shadow_tables` is what
+/// notices — it counts what is left rather than naming what it expected, so it catches the next
+/// one too.
 pub fn drop_sql(p: &str) -> String {
     [
-        "node", "commit", "chunk", "tree_node", "chunk_ref", "section", "link", "frontmatter", "checkpoint", "change", "path_event",
+        "grant", "token", "account",
+        "node", "commit", "chunk", "tree_node", "chunk_ref", "section", "link", "frontmatter", "property", "checkpoint", "change", "path_event",
         "setting", "file_author", "sync", "sync_file", "asset_store", "fts",
     ]
     .iter()

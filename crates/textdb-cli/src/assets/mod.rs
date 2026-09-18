@@ -180,6 +180,17 @@ pub fn vault(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>) -> Resu
         return Ok(Vault { prefix: p, dir: dir.to_path_buf() });
     }
     let p = path.unwrap_or_else(|| "/".to_string());
+    // The directory the user is standing in comes first. Two directories per folder is the normal
+    // state — a person's vault and an agent's checkout — and "whichever was synced with this
+    // folder last" picked the wrong one silently: `assets push` run from the original pushed
+    // nothing and never said which directory it had looked at.
+    if let Ok(here) = std::env::current_dir() {
+        if let Some((root, config)) = crate::root::Config::find(&here) {
+            if (under(&config.prefix, &p) || under(&p, &config.prefix)) && root.is_dir() {
+                return Ok(Vault { prefix: config.prefix, dir: root });
+            }
+        }
+    }
     bases
         .iter()
         .find(|b| under(&b.prefix, &p) && Path::new(&b.dir).is_dir())
@@ -462,10 +473,11 @@ impl VaultCache {
 pub struct Item {
     /// The asset's path in the store.
     pub path: String,
-    /// `ok`, `new`, `modified`, `outdated`, `conflict`, `not-pulled`, `invalid-pointer` or
-    /// `invalid-path`; and from what the asset store itself holds, `moved-here` (the asset moved in
-    /// textdb, its file stayed), `moved-in-store`, `changed-in-store`, `trashed-in-store`,
-    /// `ambiguous` (two files of one name there) or `invalid-item` (no file of that item at all).
+    /// `ok`, `new`, `modified`, `outdated`, `conflict`, `not-pulled`, `conflict-copy`, `orphan`,
+    /// `invalid-pointer` or `invalid-path`; and from what the asset store itself holds,
+    /// `moved-here` (the asset moved in textdb while its file stayed where it was),
+    /// `moved-in-store`, `changed-in-store`, `trashed-in-store`, `ambiguous` (two files of one
+    /// name there) or `invalid-item` (no file of that item at all).
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
@@ -1132,7 +1144,7 @@ fn push_one(
     // Checked before the upload as well as before the commit, so a push that lost the race to
     // another leaves the asset store alone.
     let pointer_path = format!("{}{SUFFIX}", item.path);
-    if st.stat(&pointer_path).ok().map(|s| s.version) != item.version {
+    if st.stat(&pointer_path).ok().and_then(|s| s.version) != item.version {
         return Outcome::Conflict(format!("{}: its pointer changed in the store since this directory was scanned; run it again", item.path));
     }
     let d = match drivers.get(&store) {
@@ -1206,7 +1218,7 @@ fn push_one(
         extra: old.map(|p| p.extra.clone()).unwrap_or_default(),
     };
     // The bytes are in the asset store and checked; now the pointer, unless another push got there first.
-    if st.stat(&pointer_path).ok().map(|s| s.version) != item.version {
+    if st.stat(&pointer_path).ok().and_then(|s| s.version) != item.version {
         return Outcome::Conflict(format!(
             "{}: its pointer changed in the store during this push; run it again (the uploaded bytes stay in the asset store unused, and anything they replaced is in its trash)",
             item.path
@@ -1442,10 +1454,20 @@ pub fn push(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, o: PushOpt
         }
     }
     if json {
-        emit_json(&json!({ "dry_run": o.dry_run, "pushed": pushed, "bytes": bytes, "conflicts": conflicts, "failed": failed }))?;
+        emit_json(&json!({
+            "prefix": v.prefix,
+            "dir": v.dir.display().to_string(),
+            "dry_run": o.dry_run,
+            "pushed": pushed,
+            "bytes": bytes,
+            "conflicts": conflicts,
+            "failed": failed
+        }))?;
     } else {
         let verb = if o.dry_run { "would push" } else { "pushed" };
-        let mut s = format!("{verb} {} assets ({})\n", pushed.len(), size_text(bytes));
+        // Which directory, always: two per folder is the normal state, and "pushed 0 assets" from
+        // the wrong one looked exactly like "pushed 0 assets" from the right one.
+        let mut s = format!("{verb} {} assets ({}) from {} ({})\n", pushed.len(), size_text(bytes), v.dir.display(), v.prefix);
         for p in &pushed {
             s.push_str(&format!("  {:<10} {}\n", p["state"].as_str().unwrap_or(""), p["path"].as_str().unwrap_or("")));
         }
@@ -1686,7 +1708,7 @@ pub(crate) fn pull_run(
             // Read again right before writing, as a push does: a write against the version this scan
             // saw would otherwise be merged line by line with a pointer someone else committed
             // meanwhile, leaving one that names bytes no file holds.
-            let wrote = match st.stat(&pointer_path).ok().map(|s| s.version) == item.version {
+            let wrote = match st.stat(&pointer_path).ok().and_then(|s| s.version) == item.version {
                 false => Err(StoreError::conflict("its pointer changed in the store during this pull; run it again".to_string())),
                 true => st
                     .write(&pointer_path, told.to_text().as_bytes(), item.version, author, Some("assets pull: the asset store's bytes"))
@@ -1830,7 +1852,7 @@ pub(crate) fn relocate_run(st: &mut dyn Store, v: &Vault, scope: &[String], auth
                 // Read again right before writing, as a push does: a write against a version this
                 // scan saw would otherwise be merged line by line with a pointer someone else
                 // committed meanwhile, leaving one that names bytes no file holds.
-                if st.stat(&pointer_path).ok().map(|s| s.version) != item.version {
+                if st.stat(&pointer_path).ok().and_then(|s| s.version) != item.version {
                     r.failed.push(format!(
                         "{}: its file is at the asset's own path in the store now, but its pointer changed in the store meanwhile; run it again",
                         item.path
@@ -1871,7 +1893,7 @@ pub(crate) fn relocate_run(st: &mut dyn Store, v: &Vault, scope: &[String], auth
         let mut settled = p.clone();
         settled.item_path = Some(item.path.clone());
         let pointer_path = format!("{}{SUFFIX}", item.path);
-        if st.stat(&pointer_path).ok().map(|s| s.version) != item.version {
+        if st.stat(&pointer_path).ok().and_then(|s| s.version) != item.version {
             continue;
         }
         match st.write(&pointer_path, settled.to_text().as_bytes(), item.version, author, Some("assets relocate: where its store keeps it")) {
@@ -2169,6 +2191,11 @@ pub fn stores(st: &mut dyn Store, o: StoresOptions, json: bool) -> Result<()> {
             .ok_or_else(|| StoreError::invalid("--add needs --root: the folder (or rclone remote path) the asset store keeps its files in"))?;
         if let Some(problem) = (o.driver == "rclone").then(|| rclone::shared_root_problem(&root)).flatten() {
             return Err(StoreError::invalid(problem));
+        }
+        // A local root is created here rather than left for the first push to fail on: `--add`
+        // then `push` said "the folder is not there", with nothing in between to have made it.
+        if o.driver == "local" && !std::path::Path::new(&root).exists() {
+            std::fs::create_dir_all(&root).map_err(|e| StoreError::other(format!("{root}: {e}")))?;
         }
         st.put_asset_store(&AssetStore { name: name.clone(), driver: o.driver.clone(), root, options: None, created_at: None })?;
     }

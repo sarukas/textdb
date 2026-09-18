@@ -201,7 +201,7 @@ pub fn run(st: &mut dyn Store, query: &str, params: &[String], author: Option<&s
         if let Some(table) = internal_table(query, st.backend() == "sqlite") {
             return Err(StoreError::invalid(format!(
                 "--write statements cannot name the internal table {table}: change the store through kb and the textdb \
-                 functions, and read through the views files, folders, frontmatter, sections, links, commits and authors"
+                 functions, and read through the views files, folders, frontmatter, properties, sections, links, commits and authors"
             )));
         }
     }

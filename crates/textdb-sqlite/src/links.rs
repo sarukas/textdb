@@ -17,6 +17,21 @@ use textdb_md::resolve::{line_of_offset, resolve, rewritten_target, Lookup};
 use crate::db::{subtree_bounds, to_hash, TextDb};
 use crate::storage::sql_err;
 
+/// Does this status mean the link does not reach a document?
+///
+/// `external` is not broken — a URL is not this store's to resolve — and `not-in-store` means
+/// the target is deliberately outside it. What counts is a link that meant to reach something
+/// here and does not.
+pub(crate) fn is_broken(status: Option<&str>) -> bool {
+    matches!(status, Some("broken") | Some("anchor-missing") | Some("ambiguous"))
+}
+
+/// Ids or names per `IN (...)` statement.
+///
+/// Fixed so the statement text repeats and the cache can hold it: a chunk sized to whatever
+/// happened to be left over would compile a new statement every time.
+const CHUNK: usize = 500;
+
 /// A link that pointed at a file a move took elsewhere, and no longer reaches it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinkChange {
@@ -30,6 +45,12 @@ pub struct LinkChange {
     pub now_at: String,
     /// The version of `path` the link was rewritten in; `None` when it was only reported.
     pub version: Option<u64>,
+    /// The linking file is outside the caller's shares, so it was left alone and `path` is empty.
+    ///
+    /// A move rewrites links store-wide, and an account may not write every file that points into
+    /// what it moved. Those are counted and reported as a number — never as paths, which would
+    /// hand out the layout the alias exists to hide (#12 D14).
+    pub outside: bool,
 }
 
 /// A resolved link captured before a move.
@@ -98,7 +119,45 @@ impl<'c> TextDb<'c> {
         anchor: Option<&str>,
         external: bool,
     ) -> Result<(Option<i64>, &'static str)> {
+        if !external && self.names_no_share(kind, target) {
+            return Ok((None, "broken"));
+        }
         resolve(self, source_id, source, kind, target, anchor, external)
+    }
+
+    /// Is this a root path written in the account's own namespace that names no share it holds?
+    ///
+    /// Such a link is nonsense: the account meant a folder it does not have. Its bytes are kept
+    /// as written (#12 §3.4) — the text is the author's — but it must not then be resolved
+    /// against the store's root, which would let `[[hr/salaries]]` reach a document the account
+    /// cannot see and put a link into it in everyone else's backlinks. It is broken, for
+    /// everyone, which is what it means.
+    ///
+    /// A target that *did* un-project is a store path by the time it is indexed, so the account
+    /// can see it and this says no. The check is therefore on the text as stored, and needs no
+    /// record of what the writer meant.
+    ///
+    /// Re-resolution later, by someone whose view does contain the path, resolves it: `relink`
+    /// runs under whoever triggered it. That only happens when the target itself moves, and the
+    /// answer then is the one that account would get for text written now.
+    fn names_no_share(&self, kind: &str, target: &str) -> bool {
+        use textdb_core::access::Resolved;
+        if self.view.is_admin() || target.is_empty() {
+            return false;
+        }
+        let md = kind == "md" || kind == "image";
+        let looks_root = if md { target.starts_with('/') } else { target.contains('/') };
+        if !looks_root {
+            return false;
+        }
+        let local = format!("/{}", target.trim_start_matches('/'));
+        // Visible as written: it un-projected, and it is the store's path for a share.
+        if self.view.to_view(&local).is_some() {
+            return false;
+        }
+        // Addressable but not there: an ordinary broken link inside a share, which the resolver
+        // should answer for itself.
+        !matches!(self.view.to_store(&local), Resolved::In { .. } | Resolved::Root)
     }
 
     /// Replace the link rows of a file (resolution follows with [`TextDb::relink_where`]).
@@ -108,14 +167,15 @@ impl<'c> TextDb<'c> {
             .map_err(sql_err)?
             .execute(params![file_id])
             .map_err(sql_err)?;
-        // Nine parameters a row, under SQLite's default limit of 32766 per statement.
-        for batch in links.chunks(3000) {
-            let rows = vec!["(?,?,?,?,?,?,?,?,?)"; batch.len()].join(",");
+        // Eleven parameters a row, under SQLite's default limit of 32766 per statement.
+        for batch in links.chunks(2900) {
+            let rows = vec!["(?,?,?,?,?,?,?,?,?,?,?)"; batch.len()].join(",");
             let sql = format!(
-                "INSERT INTO {}link(file_id, version, target_path, line, kind, anchor, alias, external, target_name) VALUES {rows}",
+                "INSERT INTO {}link(file_id, version, target_path, line, kind, anchor, alias, external, target_name, span_from, span_to) \
+                 VALUES {rows}",
                 self.p
             );
-            let mut vals: Vec<Value> = Vec::with_capacity(batch.len() * 9);
+            let mut vals: Vec<Value> = Vec::with_capacity(batch.len() * 11);
             for l in batch {
                 let key = (!l.external && !l.target_path.is_empty()).then(|| name_key(&l.target_path));
                 vals.extend([
@@ -128,6 +188,8 @@ impl<'c> TextDb<'c> {
                     l.alias.clone().map_or(Value::Null, Value::Text),
                     (l.external as i64).into(),
                     key.map_or(Value::Null, Value::Text),
+                    l.span.map_or(Value::Null, |(a, _)| Value::Integer(a as i64)),
+                    l.span.map_or(Value::Null, |(_, b)| Value::Integer(b as i64)),
                 ]);
             }
             self.conn
@@ -141,47 +203,109 @@ impl<'c> TextDb<'c> {
 
     /// Resolve again the links of live files matching `cond` (over `l`, the link row).
     pub(crate) fn relink_where(&self, cond: &str, args: Vec<Value>) -> Result<()> {
-        type Row = (i64, i64, String, String, String, Option<String>, bool);
+        type Row = (i64, i64, String, String, String, Option<String>, bool, Option<i64>, Option<String>);
         let rows: Vec<Row> = {
             let mut st = self
                 .conn
-                .prepare(&format!(
-                    "SELECT l.rowid, l.file_id, n.path, coalesce(l.kind, ''), l.target_path, l.anchor, l.external \
+                .prepare_cached(&format!(
+                    "SELECT l.rowid, l.file_id, n.path, coalesce(l.kind, ''), l.target_path, l.anchor, l.external, \
+                            l.resolved_id, l.status \
                      FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL WHERE ({cond})",
                     p = self.p
                 ))
                 .map_err(sql_err)?;
             let it = st
                 .query_map(rusqlite::params_from_iter(args.iter()), |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get::<_, i64>(6)? != 0))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get::<_, i64>(6)? != 0, r.get(7)?, r.get(8)?))
                 })
                 .map_err(sql_err)?;
             it.collect::<rusqlite::Result<_>>().map_err(sql_err)?
         };
-        for (rowid, file_id, path, kind, target, anchor, external) in rows {
+        // A link breaking is the one structure count that moves without a commit, so the files
+        // whose broken total changed are collected here and rolled up once at the end rather
+        // than recomputed per row.
+        let mut touched: std::collections::BTreeMap<i64, String> = Default::default();
+        for (rowid, file_id, path, kind, target, anchor, external, had_id, had_status) in rows {
             let (id, status) = self.resolve_link(file_id, &path, &kind, &target, anchor.as_deref(), external)?;
+            // Most re-resolutions confirm what the row already said — a folder rename moves a
+            // file and the siblings its relative links point at together, so the answer does
+            // not change — and writing that back cost an UPDATE and a WAL record per link.
+            if had_id == id && had_status.as_deref() == Some(status) {
+                continue;
+            }
+            if is_broken(had_status.as_deref()) != is_broken(Some(status)) {
+                touched.insert(file_id, path.clone());
+            }
             self.conn
                 .prepare_cached(&format!("UPDATE {}link SET resolved_id = ?1, status = ?2 WHERE rowid = ?3", self.p))
                 .map_err(sql_err)?
                 .execute(params![id, status, rowid])
                 .map_err(sql_err)?;
         }
+        for (file_id, path) in touched {
+            self.refresh_broken_links(file_id, &path)?;
+        }
         Ok(())
+    }
+
+    /// Recount `file_id`'s broken links, store the number and move the folders above it.
+    fn refresh_broken_links(&self, file_id: i64, path: &str) -> Result<()> {
+        let now = self.broken_links_of(file_id)?;
+        let before: i64 = self
+            .conn
+            .prepare_cached(&format!("SELECT nlinks_broken FROM {}node WHERE id = ?1", self.p))
+            .map_err(sql_err)?
+            .query_row(params![file_id], |r| r.get(0))
+            .map_err(sql_err)?;
+        if now == before {
+            return Ok(());
+        }
+        self.conn
+            .prepare_cached(&format!("UPDATE {}node SET nlinks_broken = ?1 WHERE id = ?2", self.p))
+            .map_err(sql_err)?
+            .execute(params![now, file_id])
+            .map_err(sql_err)?;
+        let change = crate::stats::Totals {
+            links_broken: now - before,
+            ..Default::default()
+        };
+        self.add_to_ancestors(path, &change, &Self::now(), None)
     }
 
     /// Resolve again every link that could point to a file named one of `names`, or points to
     /// or is written in one of the files `ids`.
+    /// Does this store record any links at all?
+    ///
+    /// A move or a delete has link bookkeeping to do only if something could point at what it
+    /// touches. Without this, a store of plain text paid to list the whole moved subtree and
+    /// query the empty link table just to find out there was nothing to do.
+    pub(crate) fn has_links(&self) -> Result<bool> {
+        let any: Option<i64> = self
+            .conn
+            .prepare_cached(&format!("SELECT 1 FROM {}link LIMIT 1", self.p))
+            .map_err(sql_err)?
+            .query_row([], |r| r.get(0))
+            .optional()
+            .map_err(sql_err)?;
+        Ok(any.is_some())
+    }
+
     pub(crate) fn relink(&self, names: &[String], ids: &[i64]) -> Result<()> {
-        for chunk in names.chunks(500) {
+        if (names.is_empty() && ids.is_empty()) || !self.has_links()? {
+            return Ok(());
+        }
+        for chunk in names.chunks(CHUNK) {
             let marks = vec!["?"; chunk.len()].join(",");
             self.relink_where(&format!("l.target_name IN ({marks})"), chunk.iter().map(|n| Value::Text(n.clone())).collect())?;
         }
-        for chunk in ids.chunks(500) {
-            let marks = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
-            self.relink_where(
-                &format!("l.resolved_id IN ({marks}) OR l.file_id IN ({marks})"),
-                chunk.iter().map(|i| Value::Integer(*i)).collect(),
-            )?;
+        // Two statements rather than one with `OR`: `resolved_id` and `file_id` have an index
+        // each, and an `OR` across both columns lets SQLite use neither, so what should be two
+        // index seeks became a scan of the whole link table on every move.
+        for chunk in ids.chunks(CHUNK) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let args: Vec<Value> = chunk.iter().map(|i| Value::Integer(*i)).collect();
+            self.relink_where(&format!("l.resolved_id IN ({marks})"), args.clone())?;
+            self.relink_where(&format!("l.file_id IN ({marks})"), args)?;
         }
         Ok(())
     }
@@ -255,6 +379,21 @@ impl<'c> TextDb<'c> {
             let Some((source, root)) = self.live_path(file_id)? else {
                 continue;
             };
+            // A linking file the caller may not write is left exactly as it is. It is still a
+            // fact about the move — the link now points somewhere else — so it is reported, as a
+            // count with no path: naming it would disclose a layout the account cannot see.
+            if !self.view.is_admin() && !self.can_write_store_path(&source) {
+                changes.push(LinkChange {
+                    path: String::new(),
+                    line: 0,
+                    kind: String::new(),
+                    target: String::new(),
+                    now_at: String::new(),
+                    version: None,
+                    outside: true,
+                });
+                continue;
+            }
             let mut rewritten = HashSet::new();
             let mut version = None;
             if mode == LinkUpdates::Rewrite {
@@ -284,18 +423,29 @@ impl<'c> TextDb<'c> {
                     }
                 }
                 if !edits.is_empty() {
-                    version = Some(self.commit_edits(&source, &edits, None, author, Some(&message))?.version);
+                    version = Some(self.commit_edits_at(&source, &edits, None, author, Some(&message))?.version);
                 }
             }
             for p in &links {
                 let now_at = self.live_path(p.resolved_id)?.map(|(path, _)| path).unwrap_or_default();
+                // Both paths in the caller's namespace; the file is one it can write, so it has
+                // one, and the target may not be — then it is named as nothing rather than as a
+                // store path.
+                let (path, now_at) = match self.view.is_admin() {
+                    true => (source.clone(), now_at),
+                    false => (
+                        self.view_path(&source).unwrap_or_default(),
+                        self.view_path(&now_at).unwrap_or_default(),
+                    ),
+                };
                 changes.push(LinkChange {
-                    path: source.clone(),
+                    path,
                     line: p.line,
                     kind: p.kind.clone(),
                     target: p.target.clone(),
                     now_at,
                     version: if rewritten.contains(&p.rowid) { version } else { None },
+                    outside: false,
                 });
             }
         }
@@ -320,6 +470,7 @@ impl<'c> TextDb<'c> {
 /// Fill the link columns of a store that had none: extract every live markdown file's links
 /// again and resolve them all.
 pub fn backfill(conn: &Connection, p: &str) -> Result<()> {
+    // No view, deliberately: migration-time, over every file in the store. See stats::backfill.
     let db = TextDb::attach(conn, p, false);
     let files: Vec<(i64, i64, Vec<u8>, String)> = {
         let mut stmt = conn
@@ -339,4 +490,140 @@ pub fn backfill(conn: &Connection, p: &str) -> Result<()> {
         db.write_link_rows(id, version, &extractor.extract(&doc).links)?;
     }
     db.relink_where("1", Vec::new())
+}
+
+/// One link as every surface returns it — the canonical row of `docs/shapes.md`.
+///
+/// `version` is the file's, and it is here for the same reason it is on a search hit: a line
+/// number belongs to a version, and an agent that reads a link and then edits by line needs
+/// one to pass as `base_version`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkRow {
+    /// The file the link is written in.
+    pub path: String,
+    pub version: i64,
+    pub line: i64,
+    /// `wiki`, `embed`, `md` or `image`.
+    pub kind: String,
+    pub target: String,
+    pub anchor: Option<String>,
+    pub alias: Option<String>,
+    /// `ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store` or `external`.
+    pub status: Option<String>,
+    /// The file it points to; for an asset, the asset itself rather than its `.tdbasset` pointer.
+    pub resolved: Option<String>,
+    /// It resolves to an asset.
+    pub asset: bool,
+}
+
+/// Which way to follow a link: the ones written under `path`, or the ones pointing at it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Out,
+    In,
+}
+
+/// Links under `path` (a file or a whole folder), or the links pointing at it.
+///
+/// `statuses` filters on `status` and empty means all of them. A link to an asset's pointer is
+/// reported as the asset, which is what the user wrote and what `backlinks` on an asset finds.
+/// `view` is the caller's namespace. The rule is the CLI's, and the two must stay the same: the
+/// **linking** file has to be one the account can see, the **target** may not be and that is not
+/// a reason to drop the row — a hidden target keeps its row, is marked `hidden` and names no
+/// path, so a reader learns a document is there and nothing about where (#12 B13, E).
+pub fn rows(
+    conn: &Connection,
+    p: &str,
+    view: &textdb_core::access::View,
+    path: &str,
+    dir: Direction,
+    statuses: &[&str],
+    lim: usize,
+) -> Result<Vec<LinkRow>> {
+    let path = &crate::access::to_store(view, path)?;
+    let (lo, hi) = subtree_bounds(path).unwrap_or_else(|| ("/".into(), "0".into()));
+    // `status` is a closed set the caller does not choose freely, so the list is built into the
+    // statement text: it keeps the statement cacheable and the values can only be our own.
+    let only = if statuses.is_empty() {
+        String::new()
+    } else {
+        let known = ["ok", "ambiguous", "anchor-missing", "broken", "not-in-store", "external"];
+        let mut names: Vec<String> = Vec::new();
+        for s in statuses {
+            if !known.contains(s) {
+                return Err(TextdbError::InvalidEdit(format!("unknown link status: {s}")));
+            }
+            names.push(format!("'{s}'"));
+        }
+        format!(" AND l.status IN ({})", names.join(","))
+    };
+    let cond = match dir {
+        Direction::Out => format!("(n.path = ?1 OR (n.path >= ?2 AND n.path < ?3)){only}"),
+        // An asset is linked by its own name; the node that exists is the `.tdbasset` pointer.
+        Direction::In => format!(
+            "l.target_path <> '' AND l.resolved_id IN (SELECT id FROM {p}node WHERE kind = 1 AND deleted_at IS NULL \
+             AND (path = ?1 OR path = ?1 || '.tdbasset' OR (path >= ?2 AND path < ?3))){only}"
+        ),
+    };
+    let mut args: Vec<rusqlite::types::Value> = vec![path.clone().into(), lo.into(), hi.into(), (lim as i64).into()];
+    let vis = match crate::access::visible_sql(view, "n.path") {
+        None => "1".to_string(),
+        Some((pred, mut extra)) => {
+            let pred = crate::access::renumber(&pred, args.len());
+            args.append(&mut extra);
+            pred
+        }
+    };
+    let mut stmt = conn
+        .prepare_cached(&format!(
+            "SELECT n.path, n.version, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status, \
+             CASE WHEN r.path LIKE '%.tdbasset' THEN substr(r.path, 1, length(r.path) - 9) ELSE r.path END, \
+             coalesce(r.path LIKE '%.tdbasset', 0), l.resolved_id \
+             FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL \
+             LEFT JOIN {p}node r ON r.id = l.resolved_id AND r.deleted_at IS NULL \
+             WHERE ({cond}) AND ({vis}) ORDER BY n.path, l.line, l.rowid LIMIT ?4"
+        ))
+        .map_err(sql_err)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(args), |r| {
+            Ok((
+                LinkRow {
+                    path: r.get(0)?,
+                    version: r.get(1)?,
+                    line: r.get(2)?,
+                    kind: r.get(3)?,
+                    target: r.get(4)?,
+                    anchor: r.get(5)?,
+                    alias: r.get(6)?,
+                    status: r.get(7)?,
+                    resolved: r.get(8)?,
+                    asset: r.get::<_, i64>(9)? != 0,
+                },
+                r.get::<_, Option<i64>>(10)?,
+            ))
+        })
+        .map_err(sql_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_err)?;
+    // Both ends into the caller's namespace, where the row is built.
+    Ok(rows
+        .into_iter()
+        .filter_map(|(mut l, resolved_id)| {
+            l.path = view.to_view(&l.path)?;
+            if let Some(t) = l.resolved.take() {
+                match view.to_view(&t) {
+                    Some(v) => l.resolved = Some(v),
+                    None => {
+                        // The reader is told there is a document and nothing about where it is:
+                        // the target reads as the id form, exactly as the text does.
+                        l.status = Some("hidden".into());
+                        if let Some(id) = resolved_id {
+                            l.target = format!("textdb:{id}");
+                        }
+                    }
+                }
+            }
+            Some(l)
+        })
+        .collect())
 }

@@ -46,6 +46,18 @@ describe('corpus', () => {
         [2, 'human', null, 'direct', 1],
       ],
     );
+    // The nine keys of the history row, in the order the `commits` view uses on both engines.
+    assert.deepEqual(Object.keys(history[0]!), [
+      'version',
+      'author',
+      'ts',
+      'message',
+      'kind',
+      'base_version',
+      'nbytes',
+      'nlines',
+      'nwords',
+    ]);
     assert.deepEqual(kb.hunks('/docs/a.md'), [
       { old_from: 2, old_count: 1, new_from: 2, new_count: 1, old_text: 'two\n', new_text: 'TWO\n' },
     ]);
@@ -211,5 +223,52 @@ describe('corpus', () => {
 
     assert.deepEqual(kb.bulk('delete', ['/moved/a', '/moved/b.md']).done, ['/moved/a', '/moved/b.md']);
     assert.equal(kb.entry('/moved').files, 0);
+  });
+});
+
+describe('links', () => {
+  let tmp: TempDir;
+  let kb: Corpus;
+
+  before(() => {
+    tmp = tempStore();
+    kb = openCorpus({ db: tmp.db, author: 'tester' });
+  });
+
+  after(() => {
+    kb.close();
+    tmp.remove();
+  });
+
+  test('links and backlinks return the canonical row, with the version their line belongs to', () => {
+    kb.write('/lk/index.md', '# Guide\n\nSee [the limits page](limits.md) and [[Missing]].\n');
+    kb.write('/lk/limits.md', '# Limits\n');
+
+    const rows = kb.links('/lk');
+    assert.deepEqual(Object.keys(rows[0]!), [
+      'path',
+      'version',
+      'line',
+      'kind',
+      'target',
+      'anchor',
+      'alias',
+      'status',
+      'resolved',
+      'asset',
+    ]);
+    assert.deepEqual(
+      rows.map((l) => [l.line, l.kind, l.target, l.alias, l.status, l.asset]),
+      [
+        [3, 'md', 'limits.md', 'the limits page', 'ok', false],
+        [3, 'wiki', 'Missing', null, 'broken', false],
+      ],
+    );
+    assert.deepEqual([rows[0]!.path, rows[0]!.version, rows[0]!.resolved], ['/lk/index.md', 1, '/lk/limits.md']);
+
+    assert.deepEqual(kb.links('/lk', { status: 'broken' }).map((l) => l.target), ['Missing']);
+    assert.deepEqual(kb.backlinks('/lk/limits.md').map((l) => [l.path, l.line]), [['/lk/index.md', 3]]);
+    assert.deepEqual(kb.backlinks('/lk/index.md'), []);
+    assert.equal(kb.links('/lk', { limit: 1 }).length, 1);
   });
 });

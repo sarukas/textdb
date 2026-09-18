@@ -93,6 +93,23 @@ impl<'c> TextDb<'c> {
     /// The trash items, newest delete first; with `parent`, the entries deleted together
     /// inside that trashed folder, folders first.
     pub fn trash(&self, parent: Option<i64>) -> Result<Vec<TrashEntry>> {
+        // An account's trash is its own: a delete inside a share it holds. What was deleted
+        // elsewhere is not its business, and its `path` is the account's own.
+        let mine = |rows: Vec<TrashEntry>| -> Vec<TrashEntry> {
+            if self.view.is_admin() {
+                return rows;
+            }
+            rows.into_iter()
+                .filter_map(|mut e| {
+                    e.path = self.view_path(&e.path)?;
+                    Some(e)
+                })
+                .collect()
+        };
+        Ok(mine(self.trash_rows(parent)?))
+    }
+
+    fn trash_rows(&self, parent: Option<i64>) -> Result<Vec<TrashEntry>> {
         match parent {
             None => self
                 .trash_items()?
@@ -151,6 +168,57 @@ impl<'c> TextDb<'c> {
     }
 
     /// Remove a trash entry and everything deleted with it inside, for good.
+    /// Bring a trash item back where it was, with everything that went to the trash with it.
+    ///
+    /// The inverse of a delete, and it needs no record of its own: one delete writes one
+    /// `deleted_at` across the subtree it named, so what came with this node is exactly the
+    /// tombstones below it carrying that same timestamp. A later delete inside the same folder has
+    /// its own timestamp and its own trash entry, and stays in the trash.
+    ///
+    /// Refused rather than merged when something live is at the path already; the folders above it
+    /// are made again when they went too. A share root restored this way revives the grants that
+    /// name it, because a grant is dormant exactly while its node is deleted (#12 D12).
+    pub fn restore(&self, id: i64, author: Option<&str>) -> Result<TrashEntry> {
+        let n = self.trashed(id)?;
+        let was = self.trash_entry_from(n.clone(), self.deleted_by(self.trash_item_of(&n)?.id)?)?;
+        let deleted_at = n.deleted_at.clone().unwrap_or_default();
+        if !self.can_write_store_path(&n.path) {
+            return Err(TextdbError::Forbidden(format!(
+                "{}: restoring is for whoever may write where it was",
+                self.view_path(&n.path).unwrap_or_else(|| "that trash entry".to_string())
+            )));
+        }
+        self.tx(|db| {
+            if db.node_by_path(&n.path)?.is_some() {
+                return Err(TextdbError::InvalidEdit(format!("{} is taken, so {} was not restored", n.path, n.name)));
+            }
+            let parent = db.ensure_folder_at(crate::db::parent_of(&n.path))?;
+            let now = Self::now();
+            let (lo, hi) = crate::db::subtree_bounds(&n.path).ok_or_else(|| TextdbError::InvalidEdit("cannot restore the root".into()))?;
+            db.conn
+                .prepare_cached(&format!(
+                    "UPDATE {}node SET deleted_at = NULL, parent_id = CASE WHEN id = ?5 THEN ?6 ELSE parent_id END \
+                     WHERE deleted_at = ?1 AND (path = ?2 OR (path >= ?3 AND path < ?4))",
+                    db.p
+                ))
+                .map_err(sql_err)?
+                .execute(params![deleted_at, n.path, lo, hi, n.id, parent])
+                .map_err(sql_err)?;
+            // Counted after the rows are live again, so the totals are what the tree now holds.
+            let back = db.subtree_totals(n.id)?;
+            db.add_to_ancestors(&n.path, &back, &now, author)?;
+            let op = if n.kind == 1 { "create" } else { "mkdir" };
+            db.record_change(op, n.id, n.kind, &n.path, None, None, None, None, author, Some("restore from trash"))?;
+            if db.has_links()? {
+                let files = db.files_at(&n.path)?;
+                let names: Vec<String> = files.iter().map(|(_, p)| crate::links::name_key(p)).collect();
+                db.relink(&names, &files.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
+            }
+            // What came back, as the trash listed it, with the delete that is now undone cleared.
+            Ok(TrashEntry { deleted_at: String::new(), deleted_by: None, ..was })
+        })
+    }
+
     pub fn purge(&self, id: i64, author: Option<&str>) -> Result<PurgeStats> {
         self.tx(|db| {
             let n = db.trashed(id)?;

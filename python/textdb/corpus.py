@@ -1,6 +1,7 @@
 """`Corpus`: the user-facing API over a backend, plus file/folder loaders."""
 
 import fnmatch
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,35 +9,193 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 from .backends import open_backend
 from .backends.base import Bytes, to_text
-from .errors import Conflict, TextdbError
+from .errors import Conflict, InvalidEdit, NotFound, TextdbError
+
+#: The sort keys `ls` accepts, the same set and spelling as `textdb ls --sort` and the Node client.
+SORT_KEYS: Tuple[str, ...] = ("name", "type", "size", "lines", "words", "versions", "created", "updated", "authors")
 
 DEFAULT_INCLUDE: Tuple[str, ...] = ("*.md", "*.markdown", "*.txt", "*.rst", "*.adoc", "*.org", "*.csv", "*.json", "*.yaml", "*.yml", "*.toml")
 
 
 @dataclass
 class Entry:
+    """One listing row: the same twenty-four keys as every other surface, in this order.
+
+    Every field is always present; one that does not apply is ``None``. This used to be six
+    of them, so ``ls`` could not tell you the words, versions or authors the docs advertised.
+    """
+    # The minimal tier: what every surface carries.
     path: str
     name: str
+    #: ``file`` or ``folder``.
     kind: str
-    nbytes: Optional[int]
-    nlines: Optional[int]
-    updated_at: Any
+    #: A file's current version — what ``cat -n`` shows and ``base_version`` takes. ``None``
+    #: for a folder, which has no version of its own.
+    version: Optional[int]
+    #: A file's own size; a folder's total over the live files below it.
+    nbytes: int
+    nlines: int
+    #: ISO-8601 UTC with milliseconds and ``Z``, a ``str`` on both backends.
+    updated_at: str
+    updated_by: Optional[str]
+
+    # The rest of the full tier.
+    id: int
+    #: The parent folder; ``None`` for the root.
+    dir: Optional[str]
+    depth: int
+    #: Lower case, no dot; ``None`` for a folder or a name without one.
+    ext: Optional[str]
+    #: Front matter ``title``, else the first level-1 heading, else ``None``.
+    title: Optional[str]
+    nwords: int
+    #: Headings, top-level front matter keys, links, and links that reach nothing.
+    nsections: int
+    nprops: int
+    nlinks: int
+    nlinks_broken: int
+    versions: int
+    created_at: str
+    #: Folder only: live files and folders anywhere below it.
+    files: Optional[int]
+    folders: Optional[int]
+    nauthors: int
+    #: ``[{"author", "commits", "first_ts", "last_ts"}]``, most commits first.
+    authors: List[Dict[str, Any]]
 
 
 @dataclass
 class Hit:
+    """One matching line — the same seven keys as the CLI and the SQL functions.
+
+    One row per matching *line*. This used to be one row per document with the best chunk's
+    best line, so ``line`` was a hint here and a fact in the CLI under the same name.
+    """
     path: str
+    #: The version the line number belongs to; pass it as ``base_version`` when editing.
+    version: int
     line: int
-    snippet: str
-    rank: float
+    #: The matching line, windowed around the match when it is longer than the cut.
+    text: str
+    #: The heading path the line sits under, for ``section()``; ``None`` outside any heading.
+    section: Optional[str]
+    #: Relevance, higher is better, scaled to ``(0, 1]``; ``None`` when nothing ranked.
+    score: Optional[float]
+    #: Matching lines in this file not returned because of ``per_file``.
+    more: int
+
+
+@dataclass
+class PropertyKey:
+    """A front-matter property name in use across the store."""
+    key: str
+    #: Documents carrying it — a note with three tags counts once.
+    docs: int
+    #: Distinct values it takes.
+    #:
+    #: Spelled ``values_n`` and not ``values`` on every surface: ``values`` is a reserved word
+    #: in SQL, so a column named that would have to be quoted in every query that touched it.
+    values_n: int
+    #: ``number``, ``text`` or ``mixed``; a UI offers ``>`` only where it means something.
+    kind: str
+
+
+@dataclass
+class PropertyValue:
+    """One value a property takes, and how many documents use it."""
+    value: Optional[str]
+    docs: int
+
+
+@dataclass
+class OutlineEntry:
+    """One markdown heading, with its document's own figures alongside."""
+    path: str
+    #: The last component of the heading path, as written.
+    heading: str
+    #: The breadcrumb, ``Parent / Child``.
+    heading_path: str
+    #: 1 for ``#``, 2 for ``##``, and so on.
+    level: int
+    line_from: int
+    line_to: int
+    #: Words in the section's own lines, and in it plus everything nested under it. ``None``
+    #: on a store whose rows predate the counts and has not been rewritten since.
+    nwords: Optional[int]
+    nwords_total: Optional[int]
+    #: The document's own figures, repeated on each of its rows.
+    nbytes: Optional[int]
+    nlines: Optional[int]
+    file_nwords: Optional[int]
+    version: int
+    updated_at: str
+    updated_by: Optional[str]
+
+
+@dataclass
+class HeadingName:
+    """A distinct heading in use across the scope asked about."""
+    heading: str
+    #: Sections carrying it, and documents they are spread over.
+    sections: int
+    docs: int
+
+
+@dataclass
+class PropertyHit:
+    """A document matched by a property query."""
+    path: str
+    nbytes: int
+    updated_at: str
+    #: The whole front matter, so a table view needs no query per cell.
+    frontmatter: Optional[Dict[str, Any]]
+
+
+@dataclass
+class Link:
+    """One link, the same ten keys as `textdb links`, `textdb_links` and `kb.links`.
+
+    ``version`` is the file's, and it is here for the same reason it is on a :class:`Hit`: a
+    line number belongs to a version, and a caller that reads a link and then edits by line
+    needs one to pass as ``base_version``.
+    """
+    #: The file the link is written in.
+    path: str
+    version: int
+    line: int
+    #: ``wiki``, ``embed``, ``md`` or ``image``.
+    kind: str
+    target: str
+    anchor: Optional[str]
+    alias: Optional[str]
+    #: ``ok``, ``ambiguous``, ``anchor-missing``, ``broken``, ``not-in-store`` or ``external``.
+    status: Optional[str]
+    #: The file it points to; for an asset, the asset rather than its ``.tdbasset`` pointer.
+    resolved: Optional[str]
+    #: It resolves to an asset.
+    asset: bool
 
 
 @dataclass
 class Commit:
+    """One version of a file: the same nine fields, in the same order, as the ``commits`` view
+    and ``textdb_history`` on either engine.
+
+    This used to be four of them, so the SDK could not say how a commit landed or how big the
+    file was at it.
+    """
     version: int
     author: Optional[str]
-    ts: Any
+    #: ISO-8601 UTC with milliseconds and ``Z``, a ``str`` on both backends.
+    ts: str
     message: Optional[str]
+    #: How the commit landed: ``direct``, ``rebased`` or ``merged``.
+    kind: Optional[str]
+    #: The version the writer started from; ``None`` for a file's first version.
+    base_version: Optional[int]
+    nbytes: Optional[int]
+    nlines: Optional[int]
+    nwords: Optional[int]
 
 
 @dataclass
@@ -58,6 +217,40 @@ def normalize(path: str) -> str:
     if any(s == ".." for s in segs):
         raise TextdbError(f"invalid path: {path}", "TX004")
     return "/" + "/".join(segs)
+
+
+def _sorted(rows: List["Entry"], key: str, desc: bool, recursive: bool) -> List["Entry"]:
+    """`ls` ordering, matching `sort_entries` in the CLI so the three surfaces agree.
+
+    Folders come first unless the listing is recursive, in which case it is a path listing and
+    they interleave. Ties break on the name, or the path when recursive.
+    """
+    def ext(e: "Entry") -> str:
+        name = e.name
+        return name.rsplit(".", 1)[1].lower() if e.kind == "file" and "." in name else ""
+
+    def zero(v: Optional[int]) -> int:
+        return v or 0
+
+    of = {
+        "name": lambda e: "",
+        "type": ext,
+        "size": lambda e: zero(e.nbytes),
+        "lines": lambda e: zero(e.nlines),
+        "words": lambda e: zero(e.nwords),
+        "versions": lambda e: zero(e.versions),
+        "created": lambda e: e.created_at or "",
+        "updated": lambda e: e.updated_at or "",
+        "authors": lambda e: len(e.authors or []),
+    }[key]
+    tie = (lambda e: e.path) if recursive else (lambda e: e.name)
+    # Sorted twice rather than with one composite key: the tiebreak always reads ascending,
+    # and only the chosen key reverses, which is what `-r` means in the CLI.
+    rows = sorted(rows, key=tie)
+    rows = sorted(rows, key=of, reverse=desc)
+    if not recursive:
+        rows = sorted(rows, key=lambda e: e.kind != "folder")
+    return rows
 
 
 class Corpus:
@@ -85,8 +278,41 @@ class Corpus:
         self.close()
 
     # ------------------------------------------------------------------ namespace
-    def ls(self, path: str = "/") -> List[Entry]:
-        return [Entry(r["path"], r["name"], r["kind"], r["nbytes"], r["nlines"], r["updated_at"]) for r in self.backend.ls(normalize(path))]
+    def ls(
+        self,
+        path: str = "/",
+        *,
+        recursive: bool = False,
+        sort: Optional[str] = "name",
+        order: str = "asc",
+        limit: Optional[int] = None,
+    ) -> List[Entry]:
+        """Everything in a folder, or with ``recursive`` everything below it.
+
+        Each row is the full twenty-four-key :class:`Entry`, the same record every other
+        surface returns. ``sort`` is one of :data:`SORT_KEYS` and orders the rows the way
+        ``textdb ls --sort`` and the Node client do — folders first unless ``recursive``,
+        then the key, then the name (the path when recursive) — and defaults to ``name`` for
+        that reason; pass ``None`` to keep the store's own path order. ``order`` is ``asc``
+        or ``desc``; ``limit`` caps the rows returned, after sorting.
+        """
+        rows = [Entry(**r) for r in self.backend.ls(normalize(path), recursive)]
+        if sort is not None:
+            if sort not in SORT_KEYS:
+                raise InvalidEdit(f"sort must be one of {', '.join(SORT_KEYS)}")
+            if order not in ("asc", "desc"):
+                raise InvalidEdit("order must be asc or desc")
+            rows = _sorted(rows, sort, order == "desc", recursive)
+        if limit is not None:
+            rows = rows[: max(0, limit)]
+        return rows
+
+    def entry(self, path: str) -> Entry:
+        """One path's listing row — what ``textdb stat`` prints."""
+        rows = self.backend.entry(normalize(path))
+        if not rows:
+            raise NotFound(f"not found: {path}")
+        return Entry(**rows[0])
 
     def list(self, prefix: str = "/") -> List[str]:
         return [r["path"] for r in self.backend.list_files(normalize(prefix))]
@@ -132,6 +358,21 @@ class Corpus:
         v = self.backend.section(normalize(path), heading)
         return None if v is None else to_text(v)
 
+    def links(self, path: str = "/", *, status: Optional[str] = None, limit: int = 10000) -> List[Link]:
+        """Links written in a document, or in everything below a folder.
+
+        ``status`` keeps only one kind — ``broken`` is the one worth asking for. Rows come back
+        in document order within a document and in path order across them.
+        """
+        return [Link(**r) for r in self.backend.links(normalize(path), status or "", limit, False)]
+
+    def backlinks(self, path: str = "/", *, status: Optional[str] = None, limit: int = 10000) -> List[Link]:
+        """The links pointing at a document, as :meth:`links` gives the ones leaving it.
+
+        An asset is found by its own path, not by its ``.tdbasset`` pointer.
+        """
+        return [Link(**r) for r in self.backend.links(normalize(path), status or "", limit, True)]
+
     # ---------------------------------------------------------------------- write
     def write(self, path: str, content: Bytes, *, author: Optional[str] = None) -> int:
         """Create the file or replace its content (diffed against the current version).
@@ -175,14 +416,73 @@ class Corpus:
 
     # -------------------------------------------------------------- history/search
     def history(self, path: str) -> List[Commit]:
-        return [Commit(r["version"], r["author"], r["ts"], r["message"]) for r in self.backend.history(normalize(path))]
+        return [Commit(**r) for r in self.backend.history(normalize(path))]
 
     def diff(self, path: str, v1: int, v2: int) -> str:
         return self.backend.diff(normalize(path), v1, v2)
 
-    def search(self, query: str, prefix: str = "/", *, limit: int = 100) -> List[Hit]:
-        """Terms are ANDed per document; "quoted phrase"; prefix*. Hits carry the first matching line."""
-        return [Hit(r["path"], r["line"], r["snippet"], r["rank"]) for r in self.backend.search(query, normalize(prefix), limit)]
+    def search(self, query: str, prefix: str = "/", *, limit: int = 200, per_file: int = 10) -> List[Hit]:
+        """Matching lines. Terms are ANDed per document; ``"quoted phrase"``; ``prefix*``.
+
+        One row per matching line, not per document: ``limit`` counts rows and ``per_file``
+        caps how many come from any one document, with the rest reported as ``more``.
+        """
+        return [Hit(**r) for r in self.backend.search(query, normalize(prefix), limit, per_file)]
+
+    def property_keys(self, prefix: str = "", *, limit: int = 200) -> List[PropertyKey]:
+        """Property names in use, most-used first.
+
+        ``prefix`` is what the user has typed: this is the autosuggest call, so it reads an
+        index range rather than scanning.
+        """
+        return [PropertyKey(**r) for r in self.backend.property_keys(prefix, limit)]
+
+    def outline(
+        self,
+        path: str = "/",
+        *,
+        heading: Optional[str] = None,
+        match: str = "exact",
+        level: Optional[int] = None,
+        limit: int = 1000,
+    ) -> List[OutlineEntry]:
+        """Markdown headings under ``path``: one document's outline, a folder's, or the store's.
+
+        Each entry carries its document's size, counts and last change, so a table needs no
+        second query per row. ``heading`` narrows to one heading, matched ignoring case, with
+        ``match`` one of ``exact``, ``prefix`` or ``contains``; ``level`` caps the depth.
+        """
+        rows = self.backend.outline(normalize(path), heading, match, level, limit)
+        return [OutlineEntry(**r) for r in rows]
+
+    def heading_names(self, path: str = "/", starts: str = "", *, limit: int = 100) -> List[HeadingName]:
+        """Distinct headings in use, most-used first — the autosuggest call for outlines."""
+        return [HeadingName(**r) for r in self.backend.heading_names(normalize(path), starts, limit)]
+
+    def property_values(self, key: str, prefix: str = "", *, limit: int = 200) -> List[PropertyValue]:
+        """The values one property takes, most-used first; ``prefix`` narrows them as above."""
+        return [PropertyValue(r["value"], r["docs"]) for r in self.backend.property_values(key, prefix, limit)]
+
+    def property_find(self, query: str = "", folder: str = "/", *, limit: int = 500) -> List[PropertyHit]:
+        """Documents matching a property query: ``status:draft tags:telco -priority:>3``.
+
+        ``key:value`` equals, ``has:key`` exists, ``key:>3`` compares, ``key:val*`` starts
+        with, ``key:~val`` contains, ``key:!=val`` has it but not as that. A space means AND;
+        ``OR``, ``NOT`` (or a leading ``-``) and parentheses work as written. An empty query
+        lists every document that has front matter.
+        """
+        out = []
+        for r in self.backend.property_find(query, normalize(folder), limit):
+            data = r["frontmatter"]
+            if isinstance(data, str):
+                # A row whose JSON will not parse is reported as having no front matter
+                # rather than failing the whole search.
+                try:
+                    data = json.loads(data)
+                except ValueError:
+                    data = None
+            out.append(PropertyHit(r["path"], r["nbytes"], r["updated_at"], data if isinstance(data, dict) else None))
+        return out
 
     def checkpoint(self, name: str) -> int:
         return self.backend.checkpoint(name)

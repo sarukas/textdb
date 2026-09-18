@@ -60,6 +60,8 @@ fn textdb(db: &Db) -> Command {
         .env_remove("TEXTDB_AUTHOR")
         .env_remove("TEXTDB_PATH_HISTORY")
         .env("TEXTDB_CONFIG_DIR", std::env::temp_dir().join(format!("textdb-cli-pg-config-{}", db.name)))
+        // As in cli.rs: discovery must not wander above the test into a synced directory.
+        .env("TEXTDB_CEILING_DIRECTORIES", std::env::current_dir().unwrap_or_default())
         .arg("--store")
         .arg(&db.url);
     cmd
@@ -97,6 +99,13 @@ fn write_read_move_and_history() {
     let listed = ok(textdb(&db).args(["--json", "ls", "/archive"]), None).json();
     assert_eq!(listed[0]["name"], "a.md", "{listed}");
     let history = ok(textdb(&db).args(["--json", "history", "--versions-only", "/archive/a.md"]), None).json();
+    // The same nine keys in the same order as SQLite, behind the `type` tag the flag keeps.
+    let keys: Vec<String> = history[0].as_object().unwrap().keys().cloned().collect();
+    assert_eq!(
+        keys,
+        ["type", "version", "author", "ts", "message", "kind", "base_version", "nbytes", "nlines", "nwords"],
+        "{history}"
+    );
     let messages: Vec<&str> = history.as_array().unwrap().iter().map(|c| c["message"].as_str().unwrap_or("")).collect();
     assert_eq!(messages, ["first", "second"]);
     assert_eq!(history[1]["nbytes"], 9, "{history}");
@@ -466,4 +475,311 @@ fn sync_reconciles_both_sides_merges_and_marks_conflicts() {
     let quiet = sync(&[]).json();
     assert_eq!(quiet["unchanged"], 5, "{quiet}");
     assert_eq!(std::fs::read(dir.join("logo.png")).unwrap(), [0u8, 1, 2]);
+}
+
+/// The property index on Postgres: the same query language, the same answers.
+///
+/// Worth its own test rather than trusting the SQLite one: the two compile the query
+/// separately, and Postgres numbers its placeholders, which `!=` shifts along.
+#[test]
+fn properties_are_indexed_and_queryable_on_postgres() {
+    let Some(db) = database() else { return };
+    let note = |title: &str, status: &str, tags: &str, priority: u32, extra: &str| {
+        format!(
+            "---\ntitle: {title}\nstatus: {status}\ntags: [{tags}]\npriority: {priority}\nproject:\n  name: atlas\n---\n{extra}\n# {title}\n\nbody\n"
+        )
+    };
+    ok(textdb(&db).args(["write", "/a.md"]), Some(&note("A", "draft", "cvm, telco", 5, "")));
+    ok(textdb(&db).args(["write", "/b.md"]), Some(&note("B", "review", "telco", 2, "")));
+    ok(textdb(&db).args(["write", "/c.md"]), Some(&note("C", "draft", "cvm", 1, "")));
+    ok(textdb(&db).args(["write", "/plain.md"]), Some("# Plain\n\nno front matter\n"));
+
+    let keys = ok(textdb(&db).args(["--json", "meta", "keys"]), None).json();
+    let by_key: std::collections::HashMap<String, Value> = keys
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["key"].as_str().unwrap().to_string(), r.clone()))
+        .collect();
+    assert_eq!(by_key["tags"]["docs"], 3, "a document with several tags counts once");
+    assert_eq!(by_key["priority"]["kind"], "number");
+    assert!(by_key.contains_key("project.name"), "nested keys are dotted");
+
+    let values = ok(textdb(&db).args(["--json", "meta", "values", "status"]), None).json();
+    let vs: Vec<(&str, i64)> = values
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["value"].as_str().unwrap(), r["docs"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(vs, vec![("draft", 2), ("review", 1)]);
+
+    let find = |q: &str| -> Vec<String> {
+        ok(textdb(&db).args(["--json", "meta", "find", q]), None).json()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["path"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(find("status:draft"), vec!["/a.md", "/c.md"]);
+    assert_eq!(find("tags:telco"), vec!["/a.md", "/b.md"]);
+    assert_eq!(find("status:draft tags:telco"), vec!["/a.md"]);
+    assert_eq!(find("status:draft OR status:review").len(), 3);
+    assert_eq!(find("-status:draft"), vec!["/b.md"]);
+    assert_eq!(find("priority:>3"), vec!["/a.md"], "numbers compare numerically");
+    assert_eq!(find("tags:c*"), vec!["/a.md", "/c.md"]);
+    assert_eq!(find("title:~B"), vec!["/b.md"]);
+    // The placeholder shift `!=` needs is exactly what a second subquery could get wrong.
+    assert_eq!(find("status:!=draft"), vec!["/b.md"]);
+    assert_eq!(find("status:draft").len() + find("status:!=draft").len(), 3);
+    // A property search is over documents that have properties, so /plain.md is in none.
+    assert_eq!(find("").len(), 3);
+
+    ok(textdb(&db).args(["meta", "set", "/c.md", "status", "published"]), None);
+    assert_eq!(find("status:draft"), vec!["/a.md"]);
+    ok(textdb(&db).args(["rm", "/b.md"]), None);
+    assert_eq!(find("tags:telco"), vec!["/a.md"]);
+
+    // The `properties` view exposes the same rows to SQL, list order included.
+    let rows = ok(textdb(&db).args(["--json", "sql", "SELECT key, value, ord FROM properties WHERE key = 'tags' AND path = '/a.md' ORDER BY ord"]), None).json();
+    let vals: Vec<(&str, i64)> = rows["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["value"].as_str().unwrap(), r["ord"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(vals, vec![("cvm", 0), ("telco", 1)]);
+}
+
+#[test]
+fn outlines_list_headings_and_count_words_on_postgres() {
+    let Some(db) = database() else { return };
+    ok(
+        textdb(&db).args(["write", "/notes/a.md"]),
+        Some("---\ntitle: A\n---\n# Alpha\nintro words here\n\n## Goals\nwe want things\n\n### Detail\nfine print\n\n## Next Steps\nship it\n"),
+    );
+    ok(textdb(&db).args(["write", "/notes/b.md"]), Some("# Beta\nbody\n\n## next steps\nlater\n"));
+    ok(textdb(&db).args(["write", "/other/c.md"]), Some("# Gamma\nonly words\n"));
+
+    let rows = ok(textdb(&db).args(["--json", "outline", "/notes/a.md"]), None).json();
+    let rows = rows.as_array().unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r["heading"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["Alpha", "Goals", "Detail", "Next Steps"]);
+    assert_eq!(rows[2]["heading_path"], "Alpha / Goals / Detail");
+
+    // A parent's total is its own words plus every descendant's own.
+    let own = |i: usize| rows[i]["nwords"].as_i64().unwrap();
+    let nested: i64 = (1..rows.len()).map(own).sum();
+    assert_eq!(rows[0]["nwords_total"].as_i64().unwrap(), own(0) + nested);
+    // Each row carries its document's figures, so a table needs no query per row.
+    assert!(rows[0]["nbytes"].as_i64().unwrap() > 0);
+    assert_eq!(rows[0]["version"], 1);
+
+    // A folder takes what is below it and nothing beside it.
+    let other = ok(textdb(&db).args(["--json", "outline", "/other"]), None).json();
+    assert_eq!(other.as_array().unwrap().len(), 1);
+
+    // Folded matching finds both spellings of the shared heading, in all three shapes.
+    for (h, m) in [("NEXT STEPS", "exact"), ("next", "prefix"), ("tep", "contains")] {
+        let hits = ok(textdb(&db).args(["--json", "outline", "/", "--heading", h, "--match", m]), None).json();
+        let paths: Vec<&str> = hits.as_array().unwrap().iter().map(|r| r["path"].as_str().unwrap()).collect();
+        assert_eq!(paths, vec!["/notes/a.md", "/notes/b.md"], "{h} as {m}");
+    }
+
+    // `--level` caps the depth.
+    let tops = ok(textdb(&db).args(["--json", "outline", "/", "--level", "1"]), None).json();
+    let names: Vec<&str> = tops.as_array().unwrap().iter().map(|r| r["heading"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["Alpha", "Beta", "Gamma"]);
+
+    // `--names` folds the two spellings into one suggestion with its counts.
+    let sugg = ok(textdb(&db).args(["--json", "outline", "/", "--names", "--heading", "ne"]), None).json();
+    let sugg = sugg.as_array().unwrap();
+    assert_eq!(sugg.len(), 1);
+    assert_eq!((sugg[0]["sections"].as_i64(), sugg[0]["docs"].as_i64()), (Some(2), Some(2)));
+
+    // Word count has history the way bytes and lines do.
+    ok(textdb(&db).args(["edit", "/notes/a.md", "--old", "ship it", "--new", "ship it now"]), None);
+    let hist = ok(textdb(&db).args(["--json", "history", "/notes/a.md"]), None).json();
+    let words: Vec<i64> = hist.as_array().unwrap().iter().map(|r| r["nwords"].as_i64().unwrap()).collect();
+    assert_eq!(words.len(), 2);
+    assert_eq!(words[1], words[0] + 1);
+}
+
+/// The canonical listing record: the same twenty-four keys, in the same order, with the same
+/// values, from `ls`, `stat` and `tree` — and on this backend as on SQLite.
+#[test]
+fn every_listing_surface_returns_the_same_entry_on_postgres() {
+    let Some(db) = database() else { return };
+    ok(
+        textdb(&db).args(["write", "/g/api/index.md"]),
+        Some("---\ntitle: API Guide\nstatus: draft\n---\n# API Guide\n\nSee [limits](limits.md) and [gone](missing.md).\n\n## Errors\ntext\n"),
+    );
+    ok(textdb(&db).args(["write", "/g/api/limits.md"]), Some("# Limits\n\nrate limit is 100.\n"));
+
+    const KEYS: [&str; 24] = [
+        "path", "name", "kind", "version", "nbytes", "nlines", "updated_at", "updated_by", "id", "dir", "depth", "ext",
+        "title", "nwords", "nsections", "nprops", "nlinks", "nlinks_broken", "versions", "created_at", "files",
+        "folders", "nauthors", "authors",
+    ];
+    let keys_of = |v: &Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
+
+    let stat = ok(textdb(&db).args(["--json", "stat", "/g/api/index.md"]), None).json();
+    assert_eq!(keys_of(&stat), KEYS, "stat");
+    let ls = ok(textdb(&db).args(["--json", "ls", "/g/api"]), None).json();
+    assert_eq!(keys_of(&ls[0]), KEYS, "ls");
+    // `tree --json` used to return six keys with null folder totals — less than `tree` printed.
+    let tree = ok(textdb(&db).args(["--json", "tree", "/g"]), None).json();
+    assert_eq!(keys_of(&tree[0]), KEYS, "tree");
+
+    // The same file through three commands is the same record.
+    let from_ls = ls.as_array().unwrap().iter().find(|e| e["path"] == "/g/api/index.md").unwrap().clone();
+    assert_eq!(from_ls, stat);
+
+    // The structural counts the store has always indexed and never exposed.
+    assert_eq!(stat["title"], "API Guide");
+    assert_eq!(stat["nsections"], 2);
+    assert_eq!(stat["nprops"], 2);
+    assert_eq!((stat["nlinks"].as_i64(), stat["nlinks_broken"].as_i64()), (Some(2), Some(1)));
+    assert_eq!(stat["ext"], "md");
+    assert_eq!(stat["dir"], "/g/api");
+    assert_eq!(stat["depth"], 3);
+    assert_eq!(stat["version"], 1);
+
+    // A folder carries totals, never nulls, and no version of its own.
+    let folder = ok(textdb(&db).args(["--json", "stat", "/g/api"]), None).json();
+    assert_eq!(folder["kind"], "folder");
+    assert!(folder["version"].is_null(), "a folder has no version");
+    assert_eq!(folder["files"], 2);
+    assert_eq!(folder["nsections"], 3, "2 in index.md + 1 in limits.md");
+    assert_eq!(folder["nlinks_broken"], 1);
+    assert!(folder["nbytes"].as_i64().unwrap() > 0, "folder size is the total below it");
+
+    // Timestamps are ISO-8601 UTC with milliseconds and Z, not the session's time zone.
+    let ts = stat["updated_at"].as_str().unwrap();
+    assert!(ts.ends_with('Z') && ts.contains('T'), "{ts}");
+}
+
+/// Search and grep return the same seven keys, and `line` belongs to a version.
+#[test]
+fn search_and_grep_share_one_row_shape_on_postgres() {
+    let Some(db) = database() else { return };
+    ok(
+        textdb(&db).args(["write", "/s/doc.md"]),
+        Some("# Guide\n\nintro\n\n## Errors\n\nthe rate limit is 100 per minute.\n"),
+    );
+    const KEYS: [&str; 7] = ["path", "version", "line", "text", "section", "score", "more"];
+    let keys_of = |v: &Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
+
+    let hits = ok(textdb(&db).args(["--json", "search", "rate", "limit"]), None).json();
+    let hits = hits.as_array().unwrap();
+    assert!(!hits.is_empty());
+    assert_eq!(keys_of(&hits[0]), KEYS, "search");
+    assert_eq!(hits[0]["version"], 1, "the version the line number belongs to");
+    assert_eq!(hits[0]["section"], "Guide / Errors", "the heading the line sits under");
+    assert!(hits[0]["score"].as_f64().unwrap() > 0.0, "higher is better");
+
+    let greps = ok(textdb(&db).args(["--json", "grep", "rate"]), None).json();
+    let greps = greps.as_array().unwrap();
+    assert_eq!(keys_of(&greps[0]), KEYS, "grep");
+    assert!(greps[0]["score"].is_null(), "grep ranks nothing");
+    assert_eq!(greps[0]["line"], hits[0]["line"], "both name the same line");
+
+    // `-l` and `-c` filter rows; they do not change the row type.
+    for flag in ["-l", "-c"] {
+        for cmd in ["search", "grep"] {
+            let rows = ok(textdb(&db).args(["--json", cmd, flag, "rate"]), None).json();
+            let rows = rows.as_array().unwrap();
+            assert_eq!(keys_of(&rows[0]), ["path", "version", "matches"], "{cmd} {flag}");
+        }
+    }
+}
+
+
+/// As `a_folder_carries_the_authors_below_it` on SQLite: a folder names who changed something
+/// below it, and how many people have. Postgres keeps folder totals in a journal, so the author
+/// rides with the timestamp through the pending rows as well as the folded ones.
+#[test]
+fn a_folder_carries_the_authors_below_it_on_postgres() {
+    let Some(db) = database() else { return };
+    let write = |author: &str, path: &str, text: &str| {
+        ok(textdb(&db).args(["-a", author, "write", path]), Some(text));
+    };
+    write("alice", "/notes/a/x.md", "one\n");
+    write("bob", "/notes/a/y.md", "two\n");
+    write("alice", "/notes/b/z.md", "three\n");
+
+    let row = |path: &str| -> serde_json::Value { ok(textdb(&db).args(["--json", "stat", path]), None).json() };
+    assert_eq!((row("/notes/a")["nauthors"].as_i64(), row("/notes/a")["updated_by"].as_str()), (Some(2), Some("bob")));
+    assert_eq!((row("/notes/b")["nauthors"].as_i64(), row("/notes/b")["updated_by"].as_str()), (Some(1), Some("alice")));
+    assert_eq!(row("/")["nauthors"].as_i64(), Some(2));
+
+    write("carol", "/notes/a/x.md", "one again\n");
+    assert_eq!((row("/notes/a")["nauthors"].as_i64(), row("/notes/a")["updated_by"].as_str()), (Some(3), Some("carol")));
+
+    // The same answer once the journal is folded into the node rows.
+    ok(textdb(&db).args(["sql", "--write", "SELECT kb.compact_folder_totals()"]), None);
+    assert_eq!((row("/notes/a")["nauthors"].as_i64(), row("/notes/a")["updated_by"].as_str()), (Some(3), Some("carol")));
+    assert_eq!(row("/")["nauthors"].as_i64(), Some(3));
+}
+
+/// Both engines rank the same documents in the same order, because neither ranks them.
+///
+/// FTS5's `rank` is a chunk-level bm25 and Postgres's `ts_rank` is not bm25 at all — no term
+/// saturation, no length normalisation, no inverse document frequency — so the same query against
+/// the same documents came back in a different order depending on which engine answered. The
+/// scoring now happens in `textdb_core::bm25`, over the document rather than a chunk, and the two
+/// engines' own rankers only decide which documents are worth scoring.
+///
+/// The corpus is built so a wrong ranker gets it wrong: `hit.md` says the rare word once in a
+/// short document, `buried.md` says it once in a long one, and `noise.md` never says it but is
+/// full of the common word. BM25 puts the short one first.
+#[test]
+fn both_engines_rank_search_hits_the_same_way() {
+    let Some(db) = database() else { return };
+    let filler = "common filler about systems and data. ".repeat(60);
+    ok(textdb(&db).args(["write", "/r/hit.md"]), Some("# Hit\n\nzarquon and common\n"));
+    ok(textdb(&db).args(["write", "/r/buried.md"]), Some(&format!("# Buried\n\n{filler}\n\nzarquon once here\n")));
+    ok(textdb(&db).args(["write", "/r/noise.md"]), Some(&format!("# Noise\n\n{filler}\n")));
+
+    let order = |q: &str| -> Vec<String> {
+        ok(textdb(&db).args(["--json", "search", q, "-p", "/r"]), None)
+            .json()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["path"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // The rare word is in two documents; the shorter one wins on length normalisation.
+    let rare = order("zarquon");
+    assert_eq!(rare, vec!["/r/hit.md", "/r/buried.md"], "postgres");
+
+    // Same store, same query, through the SQLite binding.
+    let lite = tempfile::tempdir().unwrap();
+    let file = lite.path().join("kb.db").display().to_string();
+    let lite_cmd = |args: &[&str]| -> Command {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_textdb"));
+        c.env_remove("TEXTDB_STORE")
+            .env_remove("TEXTDB_AUTHOR")
+            .env("TEXTDB_CEILING_DIRECTORIES", std::env::current_dir().unwrap_or_default())
+            .args(["--store", &file])
+            .args(args);
+        c
+    };
+    let w = |p: &str, body: &str| {
+        ok(&mut lite_cmd(&["write", p]), Some(body));
+    };
+    w("/r/hit.md", "# Hit\n\nzarquon and common\n");
+    w("/r/buried.md", &format!("# Buried\n\n{filler}\n\nzarquon once here\n"));
+    w("/r/noise.md", &format!("# Noise\n\n{filler}\n"));
+    let lite_order: Vec<String> = ok(&mut lite_cmd(&["--json", "search", "zarquon", "-p", "/r"]), None)
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(lite_order, rare, "the two engines disagree about the order");
 }

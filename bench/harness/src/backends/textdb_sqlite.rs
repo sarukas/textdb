@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::backend::*;
-use crate::backends::col_bytes;
+use crate::backends::{col_bytes, delegate};
 use crate::reference::splice;
 
 static INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -24,21 +24,43 @@ pub struct TextdbSqlite {
     file: PathBuf,
     mode: Mode,
     base_wchar: AtomicU64,
+    /// The bearer every connection authenticates with, for the `@account` twin (#14 item 2).
+    /// `None` is the owner, and then nothing on any path below this costs anything.
+    bearer: Option<String>,
 }
 
 impl TextdbSqlite {
     pub fn new(dir: &Path, mode: Mode) -> anyhow::Result<Self> {
+        Self::open_store(dir, mode, false)
+    }
+
+    /// The same store, opened by an account that holds [`delegate::SHARE`] as its whole
+    /// namespace. See `delegate` for why that shape and what it does not measure.
+    pub fn as_account(dir: &Path, mode: Mode) -> anyhow::Result<Self> {
+        Self::open_store(dir, mode, true)
+    }
+
+    fn open_store(dir: &Path, mode: Mode, delegated: bool) -> anyhow::Result<Self> {
         let file = dir.join("textdb.db");
-        let b = TextdbSqlite {
+        let mut b = TextdbSqlite {
             id: INSTANCE.fetch_add(1, Ordering::Relaxed),
             file,
             mode,
             base_wchar: AtomicU64::new(io_counters::self_wchar()),
+            bearer: None,
         };
         b.with(|c| {
             c.execute_batch("CREATE VIRTUAL TABLE IF NOT EXISTS kb USING textdb(store='kb_');")?;
             Ok(())
         })?;
+        if delegated {
+            let bearer = b.with(grant_bench_account)?;
+            b.bearer = Some(bearer);
+            // The connection this thread cached during setup is the owner's, and `open` only
+            // authenticates when it builds one. Dropping it here is what makes the very next
+            // call — on this thread as much as any other — arrive as the account.
+            close_conn(b.id);
+        }
         Ok(b)
     }
 
@@ -50,7 +72,17 @@ impl TextdbSqlite {
             sync
         ))?;
         textdb_sqlite::register(&c, "kb_")?;
+        if let Some(bearer) = &self.bearer {
+            // One call, the way a SQL client does it: from here the virtual table and every
+            // `textdb_*` function answer in this account's paths and see only its share.
+            c.query_row("SELECT textdb_auth(?1)", params![bearer], |_| Ok(()))?;
+        }
         Ok(c)
+    }
+
+    /// The store path a suite path names, for the two hooks that read the node table directly.
+    fn store_path(&self, p: &str) -> String {
+        delegate::store_path(self.bearer.is_some(), p)
     }
 
     pub fn with<T>(&self, f: impl FnOnce(&Connection) -> R<T>) -> R<T> {
@@ -81,6 +113,34 @@ impl TextdbSqlite {
     }
 }
 
+/// Create the share folder, the account whose root it is, and a bearer for it. Returns the
+/// bearer.
+///
+/// Through the Rust access API rather than SQL because SQLite has no SQL surface for accounts —
+/// `textdb_auth` is the only one of these an embedded client can reach, and the rest is what the
+/// CLI calls. Postgres does have them, and its half of this uses them; each engine's setup is the
+/// path a deployment of that engine actually takes. Untimed either way: this runs once, before
+/// the suite, and nothing here is measured.
+fn grant_bench_account(c: &Connection) -> R<String> {
+    use textdb_core::access::{Grants, Namespace, Rights};
+    use textdb_sqlite::access as acl;
+
+    let now = textdb_sqlite::SqliteStorage::now();
+    let node_id = textdb_sqlite::TextDb::attach(c, "kb_", true)
+        .ensure_folder(delegate::SHARE)
+        .map_err(|e| delegate::setup_err("share folder", e))?;
+    let account = acl::create_account(c, "kb_", delegate::ACCOUNT, "agent", Some(node_id), &now)
+        .map_err(|e| delegate::setup_err("account", e))?;
+    // A single-root account's root is a share like any other, held under the empty alias, so
+    // everything downstream reads one table and not two.
+    let g = Grants::new()
+        .add(Namespace::SingleRoot, node_id, delegate::SHARE, None, Rights::Rw)
+        .map_err(|e| delegate::setup_err("grant", e))?;
+    acl::insert_grant(c, "kb_", account.id, &g, Some("owner"), &now).map_err(|e| delegate::setup_err("grant", e))?;
+    let (bearer, _) = acl::create_token(c, "kb_", account.id, Some("bench"), None, &now).map_err(|e| delegate::setup_err("token", e))?;
+    Ok(bearer)
+}
+
 fn content_param(b: &[u8]) -> rusqlite::types::Value {
     match std::str::from_utf8(b) {
         Ok(s) => rusqlite::types::Value::Text(s.to_string()),
@@ -109,7 +169,11 @@ impl Backend for TextdbSqlite {
     }
 
     fn id(&self) -> &'static str {
-        "textdb-sqlite"
+        if self.bearer.is_some() {
+            "textdb-sqlite@account"
+        } else {
+            "textdb-sqlite"
+        }
     }
     fn capabilities(&self) -> Caps {
         Caps {
@@ -276,7 +340,14 @@ impl Backend for TextdbSqlite {
                 }),
                 Err(e) => {
                     if e.to_string().contains("TX004") {
-                        let cur = self.read(path)?;
+                        // On the connection already borrowed here, not through `self.read`:
+                        // that re-enters `with`, and the thread-local `RefCell` is held for
+                        // the whole closure, so the recovery path panicked instead of
+                        // reporting the conflict it exists to report.
+                        let cur: Vec<u8> = c
+                            .query_row("SELECT content FROM kb WHERE path = ?1", params![path], |r| col_bytes(r, 0))
+                            .optional()?
+                            .unwrap_or_default();
                         return Ok(WriteOutcome::Conflict { current_region: cur });
                     }
                     Self::map_write_err(e)
@@ -293,12 +364,13 @@ impl Backend for TextdbSqlite {
     }
     fn search(&self, query: &str, prefix: &str) -> R<Vec<Hit>> {
         self.with(|c| {
-            let mut st = c.prepare_cached("SELECT path, line FROM textdb_search(?1, ?2, 100000)")?;
+            let mut st = c.prepare_cached("SELECT path, line, text FROM textdb_search(?1, ?2, 100000, 1000000)")?;
             let rows = st
                 .query_map(params![query, prefix], |r| {
                     Ok(Hit {
                         path: r.get(0)?,
                         line: r.get::<_, i64>(1)? as u64,
+                        snippet: r.get(2)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -310,6 +382,197 @@ impl Backend for TextdbSqlite {
             let mut st = c.prepare_cached("SELECT version FROM textdb_history(?1)")?;
             let v = st.query_map(params![path], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(v.into_iter().map(|x| x as u64).collect())
+        })
+    }
+    // structure sidecar -------------------------------------------------------------
+    //
+    // Read through the sidecar tables the write path maintains (`kb_link`, `kb_section`,
+    // `kb_frontmatter`), joined to `kb_node` for paths, which is what the CLI's `links`,
+    // `sections` and `frontmatter` views do. Rows are kept for HEAD only (ADR 0007), so
+    // every query is at the document's current version.
+
+    fn links(&self, prefix: &str) -> R<Vec<LinkRow>> {
+        // Read from the sidecar tables, which speak store paths and carry unprojected link
+        // targets: there is no account-side answer to give. See `delegate::NO_SIDECAR_VIEW`.
+        if self.bearer.is_some() {
+            return Err(BackendError::NotSupported(delegate::NO_SIDECAR_VIEW));
+        }
+        self.with(|c| {
+            let (lo, hi) = subtree_range(prefix);
+            let mut st = c.prepare_cached(
+                "SELECT n.path, l.target_path, l.line, l.status, r.path
+                   FROM kb_link l
+                   JOIN kb_node n ON n.id = l.file_id AND n.deleted_at IS NULL
+                   LEFT JOIN kb_node r ON r.id = l.resolved_id AND r.deleted_at IS NULL
+                  WHERE n.path = ?3 OR (n.path >= ?1 AND n.path < ?2)
+                  ORDER BY n.path, l.line",
+            )?;
+            let rows = st.query_map(params![lo, hi, prefix], link_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+    fn backlinks(&self, path: &str) -> R<Vec<LinkRow>> {
+        // Read from the sidecar tables, which speak store paths and carry unprojected link
+        // targets: there is no account-side answer to give. See `delegate::NO_SIDECAR_VIEW`.
+        if self.bearer.is_some() {
+            return Err(BackendError::NotSupported(delegate::NO_SIDECAR_VIEW));
+        }
+        self.with(|c| {
+            let mut st = c.prepare_cached(
+                "SELECT n.path, l.target_path, l.line, l.status, r.path
+                   FROM kb_link l
+                   JOIN kb_node r ON r.id = l.resolved_id AND r.deleted_at IS NULL AND r.path = ?1
+                   JOIN kb_node n ON n.id = l.file_id AND n.deleted_at IS NULL
+                  ORDER BY n.path, l.line",
+            )?;
+            let rows = st.query_map(params![path], link_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+    fn frontmatter(&self, path: &str) -> R<Option<String>> {
+        // Read from the sidecar tables, which speak store paths and carry unprojected link
+        // targets: there is no account-side answer to give. See `delegate::NO_SIDECAR_VIEW`.
+        if self.bearer.is_some() {
+            return Err(BackendError::NotSupported(delegate::NO_SIDECAR_VIEW));
+        }
+        self.with(|c| {
+            let v: Option<Option<String>> = c
+                .prepare_cached(
+                    "SELECT f.data FROM kb_frontmatter f
+                       JOIN kb_node n ON n.id = f.file_id AND n.deleted_at IS NULL AND n.path = ?1",
+                )?
+                .query_row(params![path], |r| r.get(0))
+                .optional()?;
+            Ok(v.flatten())
+        })
+    }
+    fn set_meta(&self, path: &str, key: &str, value: &str) -> R<Version> {
+        // The store has no "set one key" primitive: front matter is part of the document,
+        // so this reads, edits the YAML block and writes back. That is what the CLI's
+        // `meta set` does, and the cost the suite reports is that whole round trip.
+        let (body, _) = self.read_versioned(path)?;
+        let next = set_frontmatter_key(&body, key, value);
+        self.overwrite(path, &next)
+    }
+    fn outline(&self, prefix: &str, heading: Option<&str>, mode: &str, max_level: Option<u32>) -> R<Vec<OutlineRow>> {
+        self.with(|c| {
+            let mut st = c.prepare_cached(
+                "SELECT path, heading, level, line_from, nwords, nwords_total, nbytes
+                   FROM textdb_outline(?1, ?2, ?3, ?4, 1000000)",
+            )?;
+            let rows = st
+                .query_map(params![prefix, heading, mode, max_level.map(|l| l as i64)], |r| {
+                    Ok(OutlineRow {
+                        path: r.get(0)?,
+                        heading: r.get(1)?,
+                        level: r.get::<_, i64>(2)? as u32,
+                        line_from: r.get::<_, i64>(3)? as u64,
+                        nwords: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                        nwords_total: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                        file_nbytes: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+    fn heading_names(&self, prefix: &str, starts: &str) -> R<Vec<(String, u64, u64)>> {
+        self.with(|c| {
+            let mut st = c.prepare_cached("SELECT heading, sections, docs FROM textdb_headings(?1, ?2, 100000)")?;
+            let rows = st
+                .query_map(params![prefix, starts], |r| {
+                    Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+    fn sections(&self, path: &str) -> R<Vec<SectionRow>> {
+        // Read from the sidecar tables, which speak store paths and carry unprojected link
+        // targets: there is no account-side answer to give. See `delegate::NO_SIDECAR_VIEW`.
+        if self.bearer.is_some() {
+            return Err(BackendError::NotSupported(delegate::NO_SIDECAR_VIEW));
+        }
+        self.with(|c| {
+            let mut st = c.prepare_cached(
+                "SELECT s.heading_path, s.level, s.line_from, s.line_to
+                   FROM kb_section s
+                   JOIN kb_node n ON n.id = s.file_id AND n.deleted_at IS NULL AND n.path = ?1
+                  ORDER BY s.line_from",
+            )?;
+            let rows = st
+                .query_map(params![path], |r| {
+                    Ok(SectionRow {
+                        heading: r.get(0)?,
+                        level: r.get::<_, i64>(1)? as u64,
+                        line_from: r.get::<_, i64>(2)? as u64,
+                        line_to: r.get::<_, i64>(3)? as u64,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+    fn section(&self, path: &str, heading: &str) -> R<Option<Vec<u8>>> {
+        self.with(|c| {
+            let v: Option<Vec<u8>> = c
+                .prepare_cached("SELECT textdb_section(?1, ?2)")?
+                .query_row(params![path, heading], |r| col_bytes(r, 0))
+                .optional()?;
+            // `textdb_section` returns NULL for a heading the document does not have, which
+            // `col_bytes` flattens to empty: an empty answer is "no such section" here.
+            Ok(v.filter(|b| !b.is_empty()))
+        })
+    }
+    fn set_link_mode(&self, mode: &str) -> R<()> {
+        self.with(|c| {
+            c.prepare_cached("SELECT textdb_setting('link_updates', ?1)")?
+                .query_row(params![mode], |_| Ok(()))?;
+            Ok(())
+        })
+    }
+    fn property_keys(&self, prefix: &str) -> R<Vec<(String, u64)>> {
+        self.with(|c| {
+            let mut st = c.prepare_cached("SELECT key, docs FROM textdb_prop_keys(?1, 10000)")?;
+            let rows = st
+                .query_map(params![prefix], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+    fn property_values(&self, key: &str, prefix: &str) -> R<Vec<(String, u64)>> {
+        self.with(|c| {
+            let mut st = c.prepare_cached("SELECT value, docs FROM textdb_prop_values(?1, ?2, 10000)")?;
+            let rows = st
+                .query_map(params![key, prefix], |r| {
+                    Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, i64>(1)? as u64))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+    fn property_find(&self, query: &str) -> R<Vec<String>> {
+        self.with(|c| {
+            let mut st = c.prepare_cached("SELECT path FROM textdb_prop_find(?1, '/', 1000000)")?;
+            let rows = st.query_map(params![query], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+    fn sync_dir(&self, prefix: &str, dir: &std::path::Path) -> R<crate::backend::SyncStats> {
+        // `sync` is the one operation that lives in the CLI rather than the SQL surface, so the
+        // bearer reaches it the way a deployment sends one: in the environment.
+        super::run_sync(&self.file.display().to_string(), prefix, dir, self.bearer.as_deref())
+    }
+    fn changes_since(&self, seq: u64) -> R<(u64, u64)> {
+        self.with(|c| {
+            let mut st = c.prepare_cached("SELECT seq FROM textdb_feed(?1)")?;
+            let mut last = seq;
+            let mut n = 0u64;
+            for row in st.query_map(params![seq as i64], |r| r.get::<_, i64>(0))? {
+                last = last.max(row? as u64);
+                n += 1;
+            }
+            Ok((last, n))
         })
     }
     fn storage_bytes(&self) -> R<u64> {
@@ -344,8 +607,12 @@ impl Backend for TextdbSqlite {
                 ("tree_nodes", nodes as f64),
             ];
             if !path.is_empty() {
+                // `TextDb::attach` with no view is the owner's, so this speaks store paths while
+                // everything the suite calls speaks the account's. Untimed instrumentation, and
+                // the one place in this file that has to know the difference.
+                let path = self.store_path(path);
                 let db = textdb_sqlite::TextDb::attach(c, "kb_", true);
-                if let Ok(Some(n)) = db.node_by_path(path) {
+                if let Ok(Some(n)) = db.node_by_path(&path) {
                     if let Some(root) = n.root {
                         let st = textdb_sqlite::SqliteStorage::new(c, "kb_");
                         if let Ok(d) = textdb_core::tree::depth(&st, &root) {
@@ -364,6 +631,8 @@ impl Backend for TextdbSqlite {
 
 /// Leaf hash set of a file at HEAD (for LL-04 / ME-04 leaf-stability metrics).
 pub fn leaf_hashes(b: &TextdbSqlite, path: &str) -> R<Vec<textdb_core::Hash>> {
+    let path = b.store_path(path);
+    let path = path.as_str();
     b.with(|c| {
         let db = textdb_sqlite::TextDb::attach(c, "kb_", true);
         let n = db
@@ -378,4 +647,70 @@ pub fn leaf_hashes(b: &TextdbSqlite, path: &str) -> R<Vec<textdb_core::Hash>> {
             .map(|l| l.hash)
             .collect())
     })
+}
+
+/// `[lo, hi)` over `kb_node.path` covering a subtree, as an index range rather than a
+/// `substr` predicate (the same trick the vtab uses: "0" is the byte after "/").
+///
+/// The range covers what is *below* the path, so callers pair it with an equality on the
+/// path itself: `links("/a/b.md")` means that document, `links("/a")` means the folder.
+fn subtree_range(prefix: &str) -> (String, String) {
+    if prefix == "/" || prefix.is_empty() {
+        ("/".to_string(), "0".to_string())
+    } else {
+        let p = prefix.trim_end_matches('/');
+        (format!("{}/", p), format!("{}0", p))
+    }
+}
+
+fn link_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LinkRow> {
+    Ok(LinkRow {
+        path: r.get(0)?,
+        target: r.get(1)?,
+        line: r.get::<_, i64>(2)? as u64,
+        status: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        resolved: r.get(4)?,
+    })
+}
+
+/// Set one top-level key in a document's YAML front matter, leaving every other line
+/// exactly as it was, and creating the block when the document has none.
+///
+/// Deliberately the same shape as the CLI's `meta set`: a line-wise edit of the block, not
+/// a YAML round trip, because re-serialising would rewrite lines the user did not touch and
+/// the suite's oracle checks that the body comes back byte for byte.
+pub fn set_frontmatter_key(body: &[u8], key: &str, value: &str) -> Vec<u8> {
+    let line = format!("{}: {}\n", key, value);
+    let Some((fm, end)) = textdb_md::split_frontmatter(body) else {
+        let mut out = format!("---\n{}---\n", line).into_bytes();
+        out.extend_from_slice(body);
+        return out;
+    };
+    let mut out = Vec::with_capacity(body.len() + line.len());
+    out.extend_from_slice(b"---\n");
+    let mut replaced = false;
+    for l in fm.split(|&b| b == b'\n') {
+        if l.is_empty() {
+            continue;
+        }
+        let is_key = l
+            .iter()
+            .position(|&b| b == b':')
+            .is_some_and(|i| std::str::from_utf8(&l[..i]).is_ok_and(|k| k.trim() == key));
+        if is_key {
+            if !replaced {
+                out.extend_from_slice(line.as_bytes());
+                replaced = true;
+            }
+        } else {
+            out.extend_from_slice(l);
+            out.push(b'\n');
+        }
+    }
+    if !replaced {
+        out.extend_from_slice(line.as_bytes());
+    }
+    out.extend_from_slice(b"---\n");
+    out.extend_from_slice(&body[end..]);
+    out
 }

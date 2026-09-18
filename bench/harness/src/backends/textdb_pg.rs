@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use postgres::{Client, NoTls};
 
 use crate::backend::*;
+use crate::backends::delegate;
 use crate::backends::sql_text_pg::pg_written_bytes;
 use crate::reference::splice;
 
@@ -34,20 +35,44 @@ pub struct TextdbPg {
     url: String,
     mode: Mode,
     base_written: Mutex<u64>,
+    /// The bearer every connection authenticates with, for the `@account` twin (#14 item 2).
+    /// `None` is the owner, and then nothing on any path below this costs anything.
+    bearer: Option<String>,
 }
 
 impl TextdbPg {
     pub fn new(url: &str, mode: Mode) -> anyhow::Result<Self> {
-        let b = TextdbPg {
+        Self::open_store(url, mode, false)
+    }
+
+    /// The same store, opened by an account that holds [`delegate::SHARE`] as its whole
+    /// namespace. See `delegate` for why that shape and what it does not measure — in
+    /// particular that the RLS policy on `kb.node` does not apply to the role the harness
+    /// connects as, so this measures the `kb.*` surface and not the layer beneath it.
+    pub fn as_account(url: &str, mode: Mode) -> anyhow::Result<Self> {
+        Self::open_store(url, mode, true)
+    }
+
+    fn open_store(url: &str, mode: Mode, delegated: bool) -> anyhow::Result<Self> {
+        let mut b = TextdbPg {
             id: INSTANCE.fetch_add(1, Ordering::Relaxed),
             url: url.to_string(),
             mode,
             base_written: Mutex::new(0),
+            bearer: None,
         };
         b.with(|c| {
             c.batch_execute("DROP EXTENSION IF EXISTS textdb_pg CASCADE; DROP SCHEMA IF EXISTS kb CASCADE; CREATE EXTENSION textdb_pg;")?;
             Ok(())
         })?;
+        if delegated {
+            let bearer = b.with(grant_bench_account)?;
+            b.bearer = Some(bearer);
+            // The connection this thread cached during setup is the owner's, and `open` only
+            // authenticates when it builds one. Dropping it here is what makes the very next
+            // call — on this thread as much as any other — arrive as the account.
+            close_conn(b.id);
+        }
         Ok(b)
     }
 
@@ -55,6 +80,11 @@ impl TextdbPg {
         let mut c = Client::connect(&self.url, NoTls)?;
         let sc = if self.mode == Mode::Durable { "on" } else { "off" };
         c.batch_execute(&format!("SET synchronous_commit = {};", sc))?;
+        if let Some(bearer) = &self.bearer {
+            // One call, the way a SQL client does it: from here every `kb.*` view and function
+            // answers in this account's paths and sees only its share.
+            c.query_one("SELECT kb.auth($1)", &[&bearer.as_str()])?;
+        }
         Ok(c)
     }
 
@@ -102,7 +132,11 @@ impl Backend for TextdbPg {
         close_conn(self.id);
     }
     fn id(&self) -> &'static str {
-        "textdb-pg"
+        if self.bearer.is_some() {
+            "textdb-pg@account"
+        } else {
+            "textdb-pg"
+        }
     }
     fn capabilities(&self) -> Caps {
         Caps {
@@ -266,12 +300,13 @@ impl Backend for TextdbPg {
     }
     fn search(&self, query: &str, prefix: &str) -> R<Vec<Hit>> {
         self.with(|c| {
-            let rows = c.query("SELECT path, line FROM kb.search($1, $2, $3)", &[&query, &prefix, &100_000i64])?;
+            let rows = c.query("SELECT path, line, text FROM kb.search($1, $2, $3, 1000000)", &[&query, &prefix, &100_000i64])?;
             Ok(rows
                 .iter()
                 .map(|r| Hit {
                     path: r.get(0),
                     line: r.get::<_, i64>(1) as u64,
+                    snippet: r.get(2),
                 })
                 .collect())
         })
@@ -280,6 +315,180 @@ impl Backend for TextdbPg {
         self.with(|c| {
             let rows = c.query("SELECT version FROM kb.history($1)", &[&path])?;
             Ok(rows.iter().map(|r| r.get::<_, i64>(0) as u64).collect())
+        })
+    }
+    // structure sidecar -------------------------------------------------------------
+    // The same sidecar tables as the SQLite binding, in the `kb` schema. `kb._subtree_like`
+    // escapes `%` and `_` in the prefix, so a folder named `100%_done` selects itself and
+    // not `100XXXdone`.
+
+    fn links(&self, prefix: &str) -> R<Vec<LinkRow>> {
+        // Read from the sidecar tables, which speak store paths and carry unprojected link
+        // targets: there is no account-side answer to give. See `delegate::NO_SIDECAR_VIEW`.
+        if self.bearer.is_some() {
+            return Err(BackendError::NotSupported(delegate::NO_SIDECAR_VIEW));
+        }
+        self.with(|c| {
+            let rows = c.query(
+                "SELECT n.path, l.target_path, l.line, l.status, r.path
+                   FROM kb.link l
+                   JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL
+                   LEFT JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL
+                  WHERE n.path = $1 OR n.path LIKE kb._subtree_like($1) ESCAPE '\'
+                  ORDER BY n.path, l.line",
+                &[&prefix],
+            )?;
+            Ok(rows.iter().map(pg_link_row).collect())
+        })
+    }
+    fn backlinks(&self, path: &str) -> R<Vec<LinkRow>> {
+        // Read from the sidecar tables, which speak store paths and carry unprojected link
+        // targets: there is no account-side answer to give. See `delegate::NO_SIDECAR_VIEW`.
+        if self.bearer.is_some() {
+            return Err(BackendError::NotSupported(delegate::NO_SIDECAR_VIEW));
+        }
+        self.with(|c| {
+            let rows = c.query(
+                "SELECT n.path, l.target_path, l.line, l.status, r.path
+                   FROM kb.link l
+                   JOIN kb.node r ON r.id = l.resolved_id AND r.deleted_at IS NULL AND r.path = $1
+                   JOIN kb.node n ON n.id = l.file_id AND n.deleted_at IS NULL
+                  ORDER BY n.path, l.line",
+                &[&path],
+            )?;
+            Ok(rows.iter().map(pg_link_row).collect())
+        })
+    }
+    fn frontmatter(&self, path: &str) -> R<Option<String>> {
+        // Read from the sidecar tables, which speak store paths and carry unprojected link
+        // targets: there is no account-side answer to give. See `delegate::NO_SIDECAR_VIEW`.
+        if self.bearer.is_some() {
+            return Err(BackendError::NotSupported(delegate::NO_SIDECAR_VIEW));
+        }
+        self.with(|c| {
+            let rows = c.query(
+                // `data` is jsonb here and TEXT in the SQLite binding; ::text gives both
+                // bindings the same shape for the suite to check.
+                "SELECT f.data::text FROM kb.frontmatter f
+                   JOIN kb.node n ON n.id = f.file_id AND n.deleted_at IS NULL AND n.path = $1",
+                &[&path],
+            )?;
+            Ok(rows.first().and_then(|r| r.get::<_, Option<String>>(0)))
+        })
+    }
+    fn set_meta(&self, path: &str, key: &str, value: &str) -> R<Version> {
+        let (body, _) = self.read_versioned(path)?;
+        let next = super::textdb_sqlite::set_frontmatter_key(&body, key, value);
+        self.overwrite(path, &next)
+    }
+    fn settle(&self) -> R<()> {
+        self.with(|c| {
+            c.execute("SELECT kb.analyze_store()", &[])?;
+            Ok(())
+        })
+    }
+    fn outline(&self, prefix: &str, heading: Option<&str>, mode: &str, max_level: Option<u32>) -> R<Vec<OutlineRow>> {
+        self.with(|c| {
+            let lvl = max_level.map(|l| l as i64);
+            let rows = c.query(
+                "SELECT path, heading, level, line_from, nwords, nwords_total, nbytes
+                   FROM kb.outline($1, $2, $3, $4, 1000000)",
+                &[&prefix, &heading, &mode, &lvl],
+            )?;
+            Ok(rows
+                .iter()
+                .map(|r| OutlineRow {
+                    path: r.get(0),
+                    heading: r.get(1),
+                    level: r.get::<_, i64>(2) as u32,
+                    line_from: r.get::<_, i64>(3) as u64,
+                    nwords: r.get::<_, Option<i64>>(4).map(|v| v as u64),
+                    nwords_total: r.get::<_, Option<i64>>(5).map(|v| v as u64),
+                    file_nbytes: r.get::<_, Option<i64>>(6).map(|v| v as u64),
+                })
+                .collect())
+        })
+    }
+    fn heading_names(&self, prefix: &str, starts: &str) -> R<Vec<(String, u64, u64)>> {
+        self.with(|c| {
+            let rows = c.query("SELECT heading, sections, docs FROM kb.headings($1, $2, 100000)", &[&prefix, &starts])?;
+            Ok(rows
+                .iter()
+                .map(|r| (r.get(0), r.get::<_, i64>(1) as u64, r.get::<_, i64>(2) as u64))
+                .collect())
+        })
+    }
+    fn sections(&self, path: &str) -> R<Vec<SectionRow>> {
+        // Read from the sidecar tables, which speak store paths and carry unprojected link
+        // targets: there is no account-side answer to give. See `delegate::NO_SIDECAR_VIEW`.
+        if self.bearer.is_some() {
+            return Err(BackendError::NotSupported(delegate::NO_SIDECAR_VIEW));
+        }
+        self.with(|c| {
+            let rows = c.query(
+                "SELECT s.heading_path, s.level, s.line_from, s.line_to
+                   FROM kb.section s
+                   JOIN kb.node n ON n.id = s.file_id AND n.deleted_at IS NULL AND n.path = $1
+                  ORDER BY s.line_from",
+                &[&path],
+            )?;
+            Ok(rows
+                .iter()
+                .map(|r| SectionRow {
+                    heading: r.get(0),
+                    level: r.get::<_, i32>(1) as u64,
+                    line_from: r.get::<_, i64>(2) as u64,
+                    line_to: r.get::<_, i64>(3) as u64,
+                })
+                .collect())
+        })
+    }
+    fn section(&self, path: &str, heading: &str) -> R<Option<Vec<u8>>> {
+        self.with(|c| {
+            let rows = c.query("SELECT kb.section($1, $2)", &[&path, &heading])?;
+            Ok(rows.first().and_then(|r| r.get::<_, Option<String>>(0)).map(|s| s.into_bytes()))
+        })
+    }
+    fn set_link_mode(&self, mode: &str) -> R<()> {
+        self.with(|c| {
+            c.execute("SELECT kb.set_setting('link_updates', $1)", &[&mode])?;
+            Ok(())
+        })
+    }
+    fn property_keys(&self, prefix: &str) -> R<Vec<(String, u64)>> {
+        self.with(|c| {
+            let rows = c.query("SELECT key, docs FROM kb.prop_keys($1, 10000)", &[&prefix])?;
+            Ok(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1) as u64)).collect())
+        })
+    }
+    fn property_values(&self, key: &str, prefix: &str) -> R<Vec<(String, u64)>> {
+        self.with(|c| {
+            let rows = c.query("SELECT value, docs FROM kb.prop_values($1, $2, 10000)", &[&key, &prefix])?;
+            Ok(rows
+                .iter()
+                .map(|r| (r.get::<_, Option<String>>(0).unwrap_or_default(), r.get::<_, i64>(1) as u64))
+                .collect())
+        })
+    }
+    fn property_find(&self, query: &str) -> R<Vec<String>> {
+        self.with(|c| {
+            let rows = c.query("SELECT path FROM kb.prop_find($1, '/', 1000000)", &[&query])?;
+            Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+        })
+    }
+    fn sync_dir(&self, prefix: &str, dir: &std::path::Path) -> R<crate::backend::SyncStats> {
+        // `sync` is the one operation that lives in the CLI rather than the SQL surface, so the
+        // bearer reaches it the way a deployment sends one: in the environment.
+        super::run_sync(&self.url, prefix, dir, self.bearer.as_deref())
+    }
+    fn changes_since(&self, seq: u64) -> R<(u64, u64)> {
+        self.with(|c| {
+            let rows = c.query("SELECT seq FROM kb.feed($1)", &[&(seq as i64)])?;
+            let mut last = seq;
+            for r in &rows {
+                last = last.max(r.get::<_, i64>(0) as u64);
+            }
+            Ok((last, rows.len() as u64))
         })
     }
     fn storage_bytes(&self) -> R<u64> {
@@ -309,9 +518,25 @@ impl Backend for TextdbPg {
                     "VACUUM FULL kb.tree_node",
                     "VACUUM FULL kb.node",
                     "SELECT gin_clean_pending_list('kb.chunk_tsv')",
+                    // Without this the planner keeps whatever autovacuum worked out while the
+                    // store was still nearly empty, which is what a bulk-loaded store has.
+                    "SELECT kb.analyze_store()",
                 ],
             )?;
-            Ok("VACUUM FULL + gin_clean_pending_list (GC stub: none)")
+            Ok("VACUUM FULL + gin_clean_pending_list + ANALYZE (GC stub: none)")
+        })
+    }
+    fn leaf_hashes(&self, path: &str) -> R<Option<std::collections::HashSet<textdb_core::Hash>>> {
+        self.with(|c| {
+            let mut out = std::collections::HashSet::new();
+            for row in c.query("SELECT hash FROM kb.leaf_hashes($1)", &[&path])? {
+                let h: Vec<u8> = row.get(0);
+                let Ok(h) = <[u8; 32]>::try_from(h.as_slice()) else {
+                    return Err(BackendError::Other("kb.leaf_hashes returned a non-32-byte hash".into()));
+                };
+                out.insert(h);
+            }
+            Ok(Some(out))
         })
     }
     fn extra_stats(&self, path: &str) -> R<Vec<(&'static str, f64)>> {
@@ -334,5 +559,35 @@ impl Backend for TextdbPg {
             }
             Ok(v)
         })
+    }
+}
+
+/// Create the share folder, the account whose root it is, and a bearer for it. Returns the
+/// bearer.
+///
+/// Through `kb.*` rather than the Rust API, because Postgres has the admin surface in SQL and
+/// that is the path a deployment of this engine takes. (SQLite has no SQL surface for accounts,
+/// so its half calls the same functions the CLI does.) Untimed either way: this runs once,
+/// before the suite, and nothing here is measured.
+fn grant_bench_account(c: &mut Client) -> R<String> {
+    c.execute("INSERT INTO kb.folder (path) VALUES ($1)", &[&delegate::SHARE])
+        .map_err(|e| delegate::setup_err("share folder", e))?;
+    // `--root` makes it single-root and writes the grant in the same call, under the empty
+    // alias: the account's root *is* that folder, so its paths are the suite's paths.
+    c.query_one("SELECT kb.account_create($1, 'agent', $2)", &[&delegate::ACCOUNT, &delegate::SHARE])
+        .map_err(|e| delegate::setup_err("account", e))?;
+    let row = c
+        .query_one("SELECT bearer FROM kb.token_create($1, 'bench')", &[&delegate::ACCOUNT])
+        .map_err(|e| delegate::setup_err("token", e))?;
+    Ok(row.get::<_, String>(0))
+}
+
+fn pg_link_row(r: &postgres::Row) -> LinkRow {
+    LinkRow {
+        path: r.get(0),
+        target: r.get(1),
+        line: r.get::<_, i64>(2) as u64,
+        status: r.get::<_, Option<String>>(3).unwrap_or_default(),
+        resolved: r.get(4),
     }
 }

@@ -3,7 +3,7 @@
 //! made by another process.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -21,6 +21,36 @@ impl Output {
     }
 }
 
+/// Does making a file read-only actually stop this process writing to it?
+///
+/// On Unix root ignores the permission bits, so a test that makes a file read-only to provoke a
+/// write failure quietly tests nothing — and asserts the opposite of what happens. Containers
+/// usually run as root, which is where anyone would be debugging. Asking the filesystem beats
+/// asking who we are: it is the property the test actually depends on, and it needs no extra
+/// dependency and no per-platform guess (on Windows the bit binds administrators too).
+fn read_only_blocks_writes() -> bool {
+    let Ok(dir) = tempfile::tempdir() else { return true };
+    let probe = dir.path().join("probe");
+    if std::fs::write(&probe, b"before").is_err() {
+        return true;
+    }
+    let Ok(meta) = std::fs::metadata(&probe) else { return true };
+    let mut perms = meta.permissions();
+    perms.set_readonly(true);
+    if std::fs::set_permissions(&probe, perms).is_err() {
+        return true;
+    }
+    let blocked = std::fs::write(&probe, b"after").is_err();
+    // Put the bit back so the temporary directory can remove the file on Windows.
+    if let Ok(meta) = std::fs::metadata(&probe) {
+        let mut perms = meta.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(&probe, perms);
+    }
+    blocked
+}
+
 fn textdb(store: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_textdb"));
     // Asset bindings and caches in the test's own folder, never the user's.
@@ -29,6 +59,10 @@ fn textdb(store: &Path) -> Command {
         .env_remove("TEXTDB_AUTHOR")
         .env_remove("TEXTDB_PATH_HISTORY")
         .env("TEXTDB_CONFIG_DIR", config)
+        // Root discovery walks up from the working directory, so a synced directory anywhere
+        // above the test would pair it with a store it knows nothing about. The ceiling stops
+        // the walk where it starts, which is what a test wants: only what it set up itself.
+        .env("TEXTDB_CEILING_DIRECTORIES", std::env::current_dir().unwrap_or_default())
         .arg("--store")
         .arg(store);
     cmd
@@ -537,7 +571,8 @@ fn sql_bulk_edits_dry_runs_batches_revert_and_formats() {
     // Path helpers, TSV and one value per line.
     let files = sql(&["--format", "tsv", "SELECT path, dir, depth, ext FROM files ORDER BY path"]);
     assert_eq!(files.stdout, "path\tdir\tdepth\text\n/p/a.md\t/p\t2\tmd\n/p/b.md\t/p\t2\tmd\n/p/old/c.md\t/p/old\t3\tmd\n");
-    assert_eq!(sql(&["--format", "lines", "SELECT parent FROM folders WHERE path = '/p/old'"]).stdout, "/p\n");
+    // `folders.parent` is `dir` now: one name for the parent on every surface.
+    assert_eq!(sql(&["--format", "lines", "SELECT dir FROM folders WHERE path = '/p/old'"]).stdout, "/p\n");
     assert_eq!(sql(&["--format", "lines", "SELECT name FROM files ORDER BY name"]).stdout, "a.md\nb.md\nc.md\n");
     assert_eq!(sql(&["--format", "lines", "SELECT name, path FROM files"]).status, 6);
 
@@ -667,7 +702,7 @@ fn assets_push_pull_verify_links_and_gitignore() {
     std::fs::remove_file(vault.join("docs/deck.pdf")).unwrap();
     assert_eq!(status(&[])["counts"], serde_json::json!({ "not-pulled": 1, "ok": 2 }));
     let broken = ok(&mut t(&["links", "--broken", "--dir", dir]), None).stdout;
-    assert!(broken.contains("[](../docs/deck.pdf) -> /docs/deck.pdf (not-pulled)"), "{broken}");
+    assert!(broken.contains("[deck](../docs/deck.pdf) -> /docs/deck.pdf (not-pulled)"), "{broken}");
     let pulled = ok(&mut t(&["--json", "assets", "pull", "--linked-from", "/notes"]), None).json();
     assert_eq!(pulled["pulled"].as_array().unwrap().len(), 1, "{pulled}");
     assert_eq!(std::fs::read(vault.join("docs/deck.pdf")).unwrap(), b"%PDF-1.4 one");
@@ -1530,13 +1565,22 @@ fn assets_push_keeps_bytes_in_use_and_records_only_what_it_wrote() {
         p.set_readonly(yes);
         std::fs::set_permissions(&on_disk, p).unwrap();
     };
-    set_readonly(true);
-    let failed = run(&mut t(&["assets", "push", "--dir", d]), None);
-    set_readonly(false);
-    assert_eq!(failed.status, 1, "{}", failed.stdout);
-    ok(&mut t(&["sync", "/", d]), None);
-    assert_eq!(std::fs::read_to_string(&on_disk).unwrap(), ok(&mut t(&["cat", "/img/a.png.tdbasset"]), None).stdout);
-    assert_eq!(ok(&mut t(&["--json", "assets", "status", "--dir", d]), None).json()["counts"], serde_json::json!({ "ok": 2 }));
+    if read_only_blocks_writes() {
+        set_readonly(true);
+        let failed = run(&mut t(&["assets", "push", "--dir", d]), None);
+        set_readonly(false);
+        assert_eq!(failed.status, 1, "{}", failed.stdout);
+        ok(&mut t(&["sync", "/", d]), None);
+        assert_eq!(std::fs::read_to_string(&on_disk).unwrap(), ok(&mut t(&["cat", "/img/a.png.tdbasset"]), None).stdout);
+        assert_eq!(ok(&mut t(&["--json", "assets", "status", "--dir", d]), None).json()["counts"], serde_json::json!({ "ok": 2 }));
+    } else {
+        // Running as root (a container, usually), where the read-only bit does not bind: the
+        // push would succeed and this would assert the opposite of what happens. Push it the
+        // ordinary way instead, so the rest of the test carries on from the same state.
+        eprintln!("skipping the unwritable-pointer case: read-only files are writable by this user");
+        ok(&mut t(&["assets", "push", "--dir", d]), None);
+        assert_eq!(ok(&mut t(&["--json", "assets", "status", "--dir", d]), None).json()["counts"], serde_json::json!({ "ok": 2 }));
+    }
 
     // A pointer deleted in the store is not brought back by pushing a changed file.
     ok(&mut t(&["rm", "/img/a.png.tdbasset"]), None);
@@ -1550,12 +1594,13 @@ fn assets_push_keeps_bytes_in_use_and_records_only_what_it_wrote() {
     let dw = w.to_str().unwrap();
     std::fs::write(w.join("a.md"), "a\n").unwrap();
     ok(&mut t(&["sync", "/w1", dw]), None);
-    ok(&mut t(&["sync", "/w2", dw]), None);
+    // One directory paired with a second folder: the config names one, so this says so on purpose.
+    ok(&mut t(&["sync", "--force", "/w2", dw]), None);
     std::fs::write(w.join("z.png"), b"\x89PNG z").unwrap();
     ok(&mut t(&["assets", "push", "--dir", dw]), None);
     let s = ok(&mut t(&["--json", "assets", "status", "--dir", dw]), None).json();
     assert_eq!((s["prefix"].as_str(), &s["counts"]), (Some("/w2"), &serde_json::json!({ "ok": 1 })), "{s}");
-    let other = run(&mut t(&["--json", "sync", "--dry-run", "/w1", dw]), None).json();
+    let other = run(&mut t(&["--json", "sync", "--dry-run", "--force", "/w1", dw]), None).json();
     assert_eq!(other["to_textdb"]["new"], serde_json::json!(["z.png.tdbasset"]), "{other}");
 
     // One push that takes a moved pointer's bytes for a new asset does not then replace them for
@@ -1957,13 +2002,18 @@ fn sync_stops_when_its_include_rules_changed_and_honours_textdbignore() {
     assert_eq!(first.status, 0, "{}", first.stderr);
     assert_eq!(first.json()["to_textdb"]["new"], serde_json::json!([".claude/rules.md", "a.md"]));
 
-    // Wider extensions would take in notes.txt: the sync stops and lists it.
-    let wider = sync(&[]);
+    // A bare sync keeps the rules the pairing recorded, so it is not a widening.
+    let same = sync(&[]);
+    assert_eq!(same.status, 0, "{}", same.stderr);
+    assert!(same.json().get("rules").is_none(), "{}", same.stdout);
+
+    // Wider extensions, asked for: the sync stops and lists what they would take in.
+    let wider = sync(&["--ext", "md,txt"]);
     assert_eq!(wider.status, 6, "{}", wider.stdout);
     let w = wider.json();
     assert_eq!((w["stopped_by_rules"].as_bool(), &w["rules"]["newly_included"]), (Some(true), &serde_json::json!(["notes.txt"])));
     assert_eq!(run(textdb(&store).args(["stat", "/notes.txt"]), None).status, 5);
-    let accepted = sync(&["--accept-rules"]);
+    let accepted = sync(&["--ext", "md,txt", "--accept-rules"]);
     assert_eq!(accepted.status, 0, "{}", accepted.stderr);
     assert_eq!(accepted.json()["to_textdb"]["new"], serde_json::json!(["notes.txt"]));
     let quiet = sync(&[]).json();
@@ -2189,7 +2239,8 @@ fn sync_in_a_git_checkout_credits_git_authors_and_commits_with_trailers() {
     std::fs::write(docs.join("a.md"), "a3\n").unwrap();
     git(&repo, &["-c", "user.name=carol", "-c", "user.email=carol@example.com", "commit", "-q", "-am", "a3"]);
     ok(textdb(&older).args(["write", "/docs/b.md"]), Some("b3\n"));
-    let boot = ok(textdb(&older).args(["--json", "sync", "--base", "HEAD~1", "/docs"]).arg(&docs), None).json();
+    // A second store for the same directory: the pairing names one, so this says so on purpose.
+    let boot = ok(textdb(&older).args(["--json", "sync", "--force", "--base", "HEAD~1", "/docs"]).arg(&docs), None).json();
     assert_eq!(boot["to_textdb"]["changed"], serde_json::json!(["a.md"]), "{boot}");
     assert_eq!(boot["to_disk"]["changed"], serde_json::json!(["b.md"]));
     assert_eq!(boot["conflicts"], serde_json::json!([]));
@@ -2234,9 +2285,11 @@ fn renames_moves_and_deletes_show_in_history_unless_turned_off() {
     let text = ok(textdb(&store).args(["history", "b/y.md"]), None).stdout;
     assert!(text.contains("renamed") && text.contains("/a/x.md -> /a/y.md"), "{text}");
     assert!(text.contains("/a/y.md -> /b/y.md  (with /a)"), "{text}");
+    // `--versions-only` filters the rows and keeps the row type: it used to drop the `type`
+    // tag that tells a version from a path event, so one command emitted two JSON shapes.
     let versions = ok(textdb(&store).args(["--json", "history", "/b/y.md", "--versions-only"]), None).json();
     assert_eq!(versions.as_array().unwrap().len(), 1);
-    assert!(versions[0].get("type").is_none(), "{versions}");
+    assert_eq!(versions[0]["type"], "version", "{versions}");
 
     // Off in the store: nothing recorded, unless one command asks for it.
     ok(textdb(&store).args(["setting", "path_history", "off"]), None);
@@ -2296,4 +2349,1085 @@ fn watch_follows_commits_made_by_another_process() {
     let ops: Vec<(&str, &str)> = seen.iter().map(|c| (c["op"].as_str().unwrap(), c["path"].as_str().unwrap())).collect();
     assert_eq!(ops, [("mkdir", "/live"), ("create", "/live/a.md"), ("commit", "/live/a.md")]);
     assert_eq!(seen[2]["author"], "agent-9");
+}
+
+// ---------------------------------------------------------------------------
+// The rclone driver against a provider that misbehaves
+//
+// `assets_through_an_rclone_store` above runs against real rclone on its local backend, which
+// proves the command line and the JSON are right. It cannot prove anything about the paths that
+// only run against a real provider, because the local backend never misbehaves: it always keeps
+// a SHA-256, never rewrites what it stores, and renames atomically. Those paths carry the most
+// risk in the driver and had no test at all. `textdb-fake-rclone` stands in for rclone and can
+// be told to behave as the providers documentably do.
+// ---------------------------------------------------------------------------
+
+/// A store, a vault synced with it, and an rclone store served by the stand-in.
+///
+/// Returns a command builder whose environment points `TEXTDB_RCLONE` at the stand-in, plus the
+/// vault and the directory the "remote" keeps its bytes in.
+fn fake_rclone_vault(tmp: &Path, name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let (store, vault, remote, config) =
+        (tmp.join("kb.db"), tmp.join("vault"), tmp.join("remote"), tmp.join("config"));
+    std::fs::create_dir_all(vault.join("img")).unwrap();
+    // The root the stand-in serves; the driver addresses it as `fake:NAME`.
+    std::fs::create_dir_all(remote.join(name)).unwrap();
+    (store, vault, remote, config)
+}
+
+/// `textdb` with the stand-in wired in as rclone.
+fn with_fake_rclone(store: &Path, remote: &Path, config: &Path, args: &[&str]) -> Command {
+    let mut c = textdb(store);
+    c.env("TEXTDB_CONFIG_DIR", config)
+        .env("TEXTDB_RCLONE", env!("CARGO_BIN_EXE_textdb-fake-rclone"))
+        .env("TEXTDB_FAKE_RCLONE_ROOT", remote)
+        .args(args);
+    c
+}
+
+/// The stand-in is faithful enough to push, pull and verify through: if this fails, nothing the
+/// other tests in this group claim about the driver means anything.
+#[test]
+fn fake_rclone_round_trips_a_push_and_a_pull() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, vault, remote, config) = fake_rclone_vault(tmp.path(), "textdb");
+    let other = tmp.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(vault.join("notes.md"), "![[arch.png]]\n").unwrap();
+    std::fs::write(vault.join("img/arch.png"), b"\x89PNG first").unwrap();
+    let t = |args: &[&str]| with_fake_rclone(&store, &remote, &config, args);
+    let (dir, other_dir) = (vault.to_str().unwrap(), other.to_str().unwrap());
+
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "stores", "--add", "drive", "--driver", "rclone", "--root", "fake:textdb"]), None);
+    let stores = ok(&mut t(&["--json", "assets", "stores"]), None).json();
+    assert_eq!(stores[0]["reachable"], true, "{stores}");
+
+    let pushed = ok(&mut t(&["--json", "assets", "push", "--dir", dir]), None).json();
+    assert_eq!(pushed["pushed"].as_array().unwrap().len(), 1, "{pushed}");
+    assert_eq!(std::fs::read(remote.join("textdb/img/arch.png")).unwrap(), b"\x89PNG first");
+    assert_eq!(ok(&mut t(&["--json", "assets", "status", "--dir", dir]), None).json()["counts"], serde_json::json!({ "ok": 1 }));
+    assert_eq!(ok(&mut t(&["--json", "assets", "verify", "--dir", dir]), None).json()["problems"], 0);
+
+    // And out again into a second directory.
+    ok(&mut t(&["sync", "/", other_dir]), None);
+    ok(&mut t(&["assets", "pull", "--dir", other_dir]), None);
+    assert_eq!(std::fs::read(other.join("img/arch.png")).unwrap(), b"\x89PNG first");
+}
+
+/// OneDrive and SharePoint hash with QuickXorHash, so `--hash-type SHA256` gives nothing back and
+/// the driver has to read the bytes to hash them. Real rclone's local backend always answers with
+/// a SHA-256, so this fallback has never run under test — and it is what every push verification
+/// and every `verify` against those providers would go through.
+#[test]
+fn an_asset_store_that_keeps_no_sha256_is_hashed_by_reading_it_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, vault, remote, config) = fake_rclone_vault(tmp.path(), "textdb");
+    std::fs::write(vault.join("notes.md"), "![[a.png]]\n").unwrap();
+    std::fs::write(vault.join("img/a.png"), b"\x89PNG no provider hash").unwrap();
+    let t = |args: &[&str]| {
+        let mut c = with_fake_rclone(&store, &remote, &config, args);
+        c.env("TEXTDB_FAKE_RCLONE_NO_SHA256", "1");
+        c
+    };
+    let dir = vault.to_str().unwrap();
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "stores", "--add", "sharepoint", "--driver", "rclone", "--root", "fake:textdb"]), None);
+
+    ok(&mut t(&["assets", "push", "--dir", dir]), None);
+    assert_eq!(std::fs::read(remote.join("textdb/img/a.png")).unwrap(), b"\x89PNG no provider hash");
+    assert_eq!(ok(&mut t(&["--json", "assets", "status", "--dir", dir]), None).json()["counts"], serde_json::json!({ "ok": 1 }));
+    // `verify` hashes both sides, so it exercises the read-back path on purpose.
+    assert_eq!(ok(&mut t(&["--json", "assets", "verify", "--dir", dir]), None).json()["problems"], 0);
+
+    // And it still catches bytes changed in the store directly, which is the point of hashing.
+    std::fs::write(remote.join("textdb/img/a.png"), b"tampered").unwrap();
+    assert_eq!(run(&mut t(&["assets", "verify", "--dir", dir]), None).status, 1);
+}
+
+/// SharePoint "silently modifies uploaded files, mainly Office files (.docx, .xlsx, etc.), causing
+/// file size and hash checks to fail" (rclone's own OneDrive documentation). The bytes that land
+/// are then not the bytes the pointer names, so the push must fail and commit no pointer — never
+/// publish a pointer whose sha256 nothing in the store matches.
+///
+/// This is the failure every Office-file push against real SharePoint would hit today, and the
+/// reason stage 3's second part wants a provider version tag rather than a hash comparison.
+#[test]
+fn an_asset_store_that_rewrites_uploads_fails_the_push_and_publishes_no_pointer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, vault, remote, config) = fake_rclone_vault(tmp.path(), "textdb");
+    std::fs::write(vault.join("notes.md"), "![[report.docx]]\n").unwrap();
+    std::fs::write(vault.join("img/report.docx"), b"PK\x03\x04 office bytes").unwrap();
+    let t = |args: &[&str]| {
+        let mut c = with_fake_rclone(&store, &remote, &config, args);
+        c.env("TEXTDB_FAKE_RCLONE_REWRITE", "1");
+        c
+    };
+    let dir = vault.to_str().unwrap();
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "stores", "--add", "sharepoint", "--driver", "rclone", "--root", "fake:textdb"]), None);
+
+    let failed = run(&mut t(&["assets", "push", "--dir", dir]), None);
+    assert_eq!(failed.status, 1, "{}{}", failed.stdout, failed.stderr);
+    assert!(failed.stdout.contains("report.docx"), "{}", failed.stdout);
+
+    // No pointer was committed, so the asset is still waiting to be published rather than
+    // recorded as stored under a hash the store cannot produce.
+    assert_eq!(run(&mut t(&["stat", "/img/report.docx.tdbasset"]), None).status, 5);
+    let counts = ok(&mut t(&["--json", "assets", "status", "--dir", dir]), None).json()["counts"].clone();
+    assert_eq!(counts, serde_json::json!({ "new": 1 }), "{counts}");
+
+    // "One asset failing does not stop the others": a file the provider leaves alone goes up in
+    // the same run, and the run still exits 1 for the one that did not.
+    std::fs::write(vault.join("img/plain.png"), b"\x89PNG untouched").unwrap();
+    ok(&mut t(&["sync", "/", dir]), None);
+    let both = run(&mut t(&["--json", "assets", "push", "--dir", dir]), None);
+    assert_eq!(both.status, 1, "{}{}", both.stdout, both.stderr);
+    let report: Value = serde_json::from_str(both.stdout.lines().next().unwrap()).unwrap();
+    let pushed: Vec<&str> = report["pushed"].as_array().unwrap().iter().map(|p| p["path"].as_str().unwrap()).collect();
+    assert_eq!(pushed, ["/img/plain.png"], "{}", both.stdout);
+    assert_eq!(report["failed"].as_array().unwrap().len(), 1, "{}", both.stdout);
+    assert!(report["failed"][0].as_str().unwrap().contains("report.docx"), "{}", both.stdout);
+    assert_eq!(std::fs::read(remote.join("textdb/img/plain.png")).unwrap(), b"\x89PNG untouched");
+
+    // The rewritten bytes never become the asset: no pointer names them, under its own path or
+    // the `beside` name a push falls back to when other bytes hold the path.
+    assert_eq!(run(&mut t(&["stat", "/img/report.docx.tdbasset"]), None).status, 5);
+}
+
+/// rclone clears the destination before a server-side move, so an asset is briefly missing from
+/// its own path while it is replaced. When the move then fails, what was there has to come back:
+/// the one path in the driver where a provider hiccup could lose an asset outright. Real rclone on
+/// a local backend renames atomically and never leaves that gap.
+#[test]
+fn a_move_that_clears_the_destination_and_fails_puts_the_old_bytes_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, vault, remote, config) = fake_rclone_vault(tmp.path(), "textdb");
+    std::fs::write(vault.join("notes.md"), "![[a.png]]\n").unwrap();
+    std::fs::write(vault.join("img/a.png"), b"\x89PNG published").unwrap();
+    let plain = |args: &[&str]| with_fake_rclone(&store, &remote, &config, args);
+    let dir = vault.to_str().unwrap();
+    ok(&mut plain(&["sync", "/", dir]), None);
+    ok(&mut plain(&["assets", "stores", "--add", "drive", "--driver", "rclone", "--root", "fake:textdb"]), None);
+    ok(&mut plain(&["assets", "push", "--dir", dir]), None);
+    let stored = remote.join("textdb/img/a.png");
+    assert_eq!(std::fs::read(&stored).unwrap(), b"\x89PNG published");
+
+    // A new version of the asset, pushed while every server-side move fails after clearing the
+    // destination.
+    std::fs::write(vault.join("img/a.png"), b"\x89PNG the next version").unwrap();
+    let mut gap = with_fake_rclone(&store, &remote, &config, &["assets", "push", "--dir", dir]);
+    let failed = run(gap.env("TEXTDB_FAKE_RCLONE_MOVE_GAP", "1"), None);
+    assert_eq!(failed.status, 1, "{}{}", failed.stdout, failed.stderr);
+
+    // The published bytes are back where the asset belongs: not missing, and not the half-written
+    // new version.
+    assert_eq!(std::fs::read(&stored).unwrap(), b"\x89PNG published", "the asset must not be left missing or replaced");
+    // And the store still describes what is actually there.
+    assert_eq!(ok(&mut plain(&["--json", "assets", "verify", "--dir", dir]), None).json()["problems"], 0);
+
+    // Once the provider behaves, the same push goes through.
+    ok(&mut plain(&["assets", "push", "--dir", dir]), None);
+    assert_eq!(std::fs::read(&stored).unwrap(), b"\x89PNG the next version");
+}
+
+/// The lock protocol rests on the provider listing what was just written ("of two pushes that
+/// wrote at once, the one that lists later sees the other's file"). Google Drive promises no such
+/// thing. A push must still finish when its own lock file takes several listings to appear, rather
+/// than wedging or giving up.
+#[test]
+fn a_push_finishes_when_the_provider_lists_its_lock_file_late() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, vault, remote, config) = fake_rclone_vault(tmp.path(), "textdb");
+    std::fs::write(vault.join("notes.md"), "![[a.png]]\n").unwrap();
+    std::fs::write(vault.join("img/a.png"), b"\x89PNG late listing").unwrap();
+    let t = |args: &[&str]| {
+        let mut c = with_fake_rclone(&store, &remote, &config, args);
+        // Every lock file stays unlisted for its first few listings.
+        c.env("TEXTDB_FAKE_RCLONE_LIST_LAG", "6");
+        c
+    };
+    let dir = vault.to_str().unwrap();
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "stores", "--add", "drive", "--driver", "rclone", "--root", "fake:textdb"]), None);
+
+    let started = std::time::Instant::now();
+    ok(&mut t(&["assets", "push", "--dir", dir]), None);
+    // It has to converge, not wait out the ten-minute lock budget.
+    assert!(started.elapsed() < std::time::Duration::from_secs(60), "the push took {:?}", started.elapsed());
+    assert_eq!(std::fs::read(remote.join("textdb/img/a.png")).unwrap(), b"\x89PNG late listing");
+    assert_eq!(ok(&mut t(&["--json", "assets", "status", "--dir", dir]), None).json()["counts"], serde_json::json!({ "ok": 1 }));
+
+    // No lock file is left behind for the next push to wait on.
+    let locks = remote.join("textdb/.textdb-trash/locks");
+    let left: Vec<_> = std::fs::read_dir(&locks).into_iter().flatten().flatten().map(|e| e.file_name()).collect();
+    assert!(left.is_empty(), "locks left behind: {left:?}");
+}
+
+/// The front-matter property index: what a vault uses, what each property holds, and the
+/// query language over both.
+///
+/// The counts matter as much as the paths: a list has one row per element, so a note tagged
+/// three ways must still count once, and `meta keys` reporting three would quietly mislead
+/// every UI that shows it.
+#[test]
+fn properties_are_indexed_and_queryable_by_name_and_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let note = |title: &str, status: &str, tags: &str, priority: u32, extra: &str| {
+        format!(
+            "---\ntitle: {title}\nstatus: {status}\ntags: [{tags}]\npriority: {priority}\nproject:\n  name: atlas\n  phase: pilot\n{extra}---\n\n# {title}\n\nbody\n"
+        )
+    };
+    ok(textdb(&store).args(["write", "/a.md"]), Some(&note("A", "draft", "cvm, telco", 5, "budget: 120\n")));
+    ok(textdb(&store).args(["write", "/b.md"]), Some(&note("B", "review", "telco", 2, "")));
+    ok(textdb(&store).args(["write", "/c.md"]), Some(&note("C", "draft", "cvm", 1, "")));
+    // No front matter at all: it must not appear in any property answer.
+    ok(textdb(&store).args(["write", "/plain.md"]), Some("# Plain\n\nno front matter\n"));
+
+    let keys = ok(textdb(&store).args(["--json", "meta", "keys"]), None).json();
+    let by_key: std::collections::HashMap<String, serde_json::Value> = keys
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["key"].as_str().unwrap().to_string(), r.clone()))
+        .collect();
+    // Three documents carry `tags`, not five rows' worth.
+    assert_eq!(by_key["tags"]["docs"], 3, "a document with several tags counts once");
+    assert_eq!(by_key["status"]["values"], 2, "draft and review");
+    assert_eq!(by_key["priority"]["kind"], "number", "so a UI knows > means something here");
+    assert_eq!(by_key["status"]["kind"], "text");
+    assert_eq!(by_key["budget"]["docs"], 1, "a property only one note has is still listed");
+    assert!(by_key.contains_key("project.name"), "nested keys are dotted: {:?}", by_key.keys());
+
+    // The prefix is the autosuggest call.
+    let pro = ok(textdb(&store).args(["--json", "meta", "keys", "pro"]), None).json();
+    let names: Vec<&str> = pro.as_array().unwrap().iter().map(|r| r["key"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["project.name", "project.phase"]);
+
+    let values = ok(textdb(&store).args(["--json", "meta", "values", "status"]), None).json();
+    let vs: Vec<(&str, i64)> = values
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["value"].as_str().unwrap(), r["docs"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(vs, vec![("draft", 2), ("review", 1)], "most-used first");
+
+    let find = |q: &str| -> Vec<String> {
+        let rows = ok(textdb(&store).args(["--json", "meta", "find", q]), None).json();
+        rows.as_array().unwrap().iter().map(|r| r["path"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(find("status:draft"), vec!["/a.md", "/c.md"]);
+    // A list contains a value: indexed one row per element, so this is an ordinary equality.
+    assert_eq!(find("tags:telco"), vec!["/a.md", "/b.md"]);
+    assert_eq!(find("status:draft tags:telco"), vec!["/a.md"], "a space means AND");
+    assert_eq!(find("status:draft OR status:review").len(), 3);
+    assert_eq!(find("-status:draft"), vec!["/b.md"]);
+    assert_eq!(find("NOT status:draft"), vec!["/b.md"], "either spelling of NOT");
+    assert_eq!(find("(status:draft OR status:review) has:budget"), vec!["/a.md"]);
+    assert_eq!(find("project.name:atlas").len(), 3, "nested keys resolve");
+    // Numbers compare numerically: lexically "5" would sort below "2" here.
+    assert_eq!(find("priority:>3"), vec!["/a.md"]);
+    assert_eq!(find("priority:<=2").len(), 2);
+    assert_eq!(find("tags:c*"), vec!["/a.md", "/c.md"], "starts with");
+    assert_eq!(find("title:~B"), vec!["/b.md"], "contains, ignoring case");
+    // `!=` means "has it, but not as that" — /plain.md has no status and is not an answer.
+    assert_eq!(find("status:!=draft"), vec!["/b.md"]);
+    // The two partition the documents that have the property, exactly.
+    assert_eq!(find("status:draft").len() + find("status:!=draft").len(), 3);
+    // An empty query is every document that has front matter, so not /plain.md.
+    assert_eq!(find("").len(), 3, "a document with no front matter is in no property answer");
+
+    // Editing front matter moves the document between answers.
+    ok(textdb(&store).args(["meta", "set", "/c.md", "status", "published"]), None);
+    assert_eq!(find("status:draft"), vec!["/a.md"]);
+    assert_eq!(find("status:published"), vec!["/c.md"]);
+    // Removing the property removes the rows with it.
+    ok(textdb(&store).args(["meta", "unset", "/c.md", "status"]), None);
+    assert_eq!(find("has:status").len(), 2);
+    // And deleting the document takes it out of every answer.
+    ok(textdb(&store).args(["rm", "/b.md"]), None);
+    assert_eq!(find("tags:telco"), vec!["/a.md"]);
+
+    // A malformed query is an invalid edit (exit 6), named with the offset it went wrong at.
+    let bad = run(textdb(&store).args(["meta", "find", "status:draft AND"]), None);
+    assert_eq!(bad.status, 6, "{}", bad.stderr);
+    assert!(bad.stderr.contains("ends early"), "{}", bad.stderr);
+}
+
+/// `meta find --show` prints property columns beside the path, and the `properties` view
+/// exposes the same rows to SQL.
+#[test]
+fn property_columns_and_the_sql_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    ok(
+        textdb(&store).args(["write", "/a.md"]),
+        Some("---\nstatus: draft\ntags: [cvm, telco]\npriority: 4\n---\n\n# A\n"),
+    );
+    let shown = ok(textdb(&store).args(["meta", "find", "status:draft", "--show", "status,tags,missing"]), None).stdout;
+    assert!(shown.contains("status=draft"), "{shown}");
+    // A list joins with commas rather than printing as JSON, and a property the document does
+    // not have is a dash rather than a blank that reads as an empty value.
+    assert!(shown.contains("tags=cvm,telco"), "{shown}");
+    assert!(shown.contains("missing=-"), "{shown}");
+
+    let rows = ok(
+        textdb(&store).args(["--json", "sql", "SELECT key, value, ord FROM properties WHERE key = 'tags' ORDER BY ord"]),
+        None,
+    )
+    .json();
+    let vals: Vec<(&str, i64)> = rows["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["value"].as_str().unwrap(), r["ord"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(vals, vec![("cvm", 0), ("telco", 1)], "a list keeps its order in `ord`");
+}
+
+/// The canonical listing record on SQLite: the same twenty-four keys, in the same order,
+/// from `ls`, `stat` and `tree`, and identical to what Postgres returns (`cli_pg.rs`).
+#[test]
+fn every_listing_surface_returns_the_same_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kb.db");
+    ok(
+        textdb(&db).args(["write", "/g/api/index.md"]),
+        Some("---\ntitle: API Guide\nstatus: draft\n---\n# API Guide\n\nSee [limits](limits.md) and [gone](missing.md).\n\n## Errors\ntext\n"),
+    );
+    ok(textdb(&db).args(["write", "/g/api/limits.md"]), Some("# Limits\n\nrate limit is 100.\n"));
+
+    const KEYS: [&str; 24] = [
+        "path", "name", "kind", "version", "nbytes", "nlines", "updated_at", "updated_by", "id", "dir", "depth", "ext",
+        "title", "nwords", "nsections", "nprops", "nlinks", "nlinks_broken", "versions", "created_at", "files",
+        "folders", "nauthors", "authors",
+    ];
+    let keys_of = |v: &Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
+
+    let stat = ok(textdb(&db).args(["--json", "stat", "/g/api/index.md"]), None).json();
+    assert_eq!(keys_of(&stat), KEYS, "stat");
+    let ls = ok(textdb(&db).args(["--json", "ls", "/g/api"]), None).json();
+    assert_eq!(keys_of(&ls[0]), KEYS, "ls");
+    let tree = ok(textdb(&db).args(["--json", "tree", "/g"]), None).json();
+    assert_eq!(keys_of(&tree[0]), KEYS, "tree");
+    // The same file through three commands is the same record, byte for byte.
+    let from_ls = ls.as_array().unwrap().iter().find(|e| e["path"] == "/g/api/index.md").unwrap().clone();
+    assert_eq!(from_ls, stat);
+
+    assert_eq!(stat["title"], "API Guide");
+    assert_eq!((stat["nsections"].as_i64(), stat["nprops"].as_i64()), (Some(2), Some(2)));
+    assert_eq!((stat["nlinks"].as_i64(), stat["nlinks_broken"].as_i64()), (Some(2), Some(1)));
+    assert_eq!((stat["ext"].as_str(), stat["dir"].as_str()), (Some("md"), Some("/g/api")));
+
+    // A folder has totals and no version; both used to be null or meaningless (`v0`).
+    let folder = ok(textdb(&db).args(["--json", "stat", "/g/api"]), None).json();
+    assert!(folder["version"].is_null());
+    assert_eq!(folder["nsections"], 3);
+    assert_eq!(folder["nlinks_broken"], 1);
+    assert!(folder["nbytes"].as_i64().unwrap() > 0);
+
+    // `ls FILE` lists that one file rather than nothing, and `-1` marks folders.
+    let one = ok(textdb(&db).args(["--json", "ls", "/g/api/index.md"]), None).json();
+    assert_eq!(one.as_array().unwrap().len(), 1);
+    let paths = ok(textdb(&db).args(["ls", "-1", "/g"]), None).stdout;
+    assert!(paths.contains("/g/api/\n"), "a folder keeps its marker in -1: {paths:?}");
+}
+
+/// Creating a link's target fixes the count without a commit to the file holding the link.
+#[test]
+fn broken_link_counts_follow_the_target_not_the_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kb.db");
+    ok(textdb(&db).args(["write", "/a.md"]), Some("# A\n\n[later](later.md)\n"));
+    let before = ok(textdb(&db).args(["--json", "stat", "/a.md"]), None).json();
+    assert_eq!(before["nlinks_broken"], 1);
+
+    // Nothing writes to /a.md here; the link starts resolving because its target appears.
+    ok(textdb(&db).args(["write", "/later.md"]), Some("# Later\n"));
+    let after = ok(textdb(&db).args(["--json", "stat", "/a.md"]), None).json();
+    assert_eq!(after["nlinks_broken"], 0, "the link resolves now");
+    assert_eq!(after["version"], before["version"], "and /a.md was not rewritten");
+    // The folder total followed it down.
+    let root = ok(textdb(&db).args(["--json", "stat", "/"]), None).json();
+    assert_eq!(root["nlinks_broken"], 0);
+}
+
+/// `search` and `grep` return one row shape, and a `line` always has a `version`.
+#[test]
+fn search_and_grep_share_one_row_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kb.db");
+    ok(
+        textdb(&db).args(["write", "/s/doc.md"]),
+        Some("# Guide\n\nintro\n\n## Errors\n\nthe rate limit is 100 per minute.\n"),
+    );
+    const KEYS: [&str; 7] = ["path", "version", "line", "text", "section", "score", "more"];
+    let keys_of = |v: &Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
+
+    let hits = ok(textdb(&db).args(["--json", "search", "rate", "limit"]), None).json();
+    let hits = hits.as_array().unwrap();
+    assert_eq!(keys_of(&hits[0]), KEYS, "search");
+    assert_eq!(hits[0]["version"], 1);
+    assert_eq!(hits[0]["section"], "Guide / Errors");
+    assert!(hits[0]["score"].as_f64().unwrap() > 0.0, "higher is better");
+
+    let greps = ok(textdb(&db).args(["--json", "grep", "rate"]), None).json();
+    assert_eq!(keys_of(&greps.as_array().unwrap()[0]), KEYS, "grep");
+    assert!(greps[0]["score"].is_null(), "grep ranks nothing");
+
+    // `-l` and `-c` filter rows on both commands without changing the row type.
+    for flag in ["-l", "-c"] {
+        for cmd in ["search", "grep"] {
+            let rows = ok(textdb(&db).args(["--json", cmd, flag, "rate"]), None).json();
+            assert_eq!(keys_of(&rows.as_array().unwrap()[0]), ["path", "version", "matches"], "{cmd} {flag}");
+        }
+    }
+
+    // `--per-file` truncation is visible in JSON, which it never was.
+    ok(textdb(&db).args(["write", "/s/many.md"]), Some("rate\nrate\nrate\nrate\n"));
+    let capped = ok(textdb(&db).args(["--json", "search", "--per-file", "2", "rate"]), None).json();
+    let many = capped.as_array().unwrap().iter().find(|h| h["path"] == "/s/many.md").unwrap();
+    assert_eq!(many["more"], 2, "two lines were held back and the row says so");
+}
+
+/// A path echoed back is the path the store knows, whatever the caller typed.
+#[test]
+fn paths_come_back_normalized() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kb.db");
+    ok(textdb(&db).args(["write", "/n/a.md"]), Some("one\n"));
+    ok(textdb(&db).args(["write", "/n/a.md"]), Some("two\n"));
+    for args in [vec!["--json", "cat", "n/a.md"], vec!["--json", "diff", "n/a.md", "1", "2"]] {
+        let v = ok(textdb(&db).args(&args), None).json();
+        assert_eq!(v["path"], "/n/a.md", "{args:?}");
+    }
+}
+
+/// The history row's nine keys, in the order the `commits` view and `textdb_history` use.
+/// They used to come back in a third order here, so `SELECT *` consumed positionally swapped
+/// `nbytes` and `kind` between the CLI and either engine.
+#[test]
+fn history_rows_are_in_the_commits_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kb.db");
+    ok(textdb(&db).args(["write", "/h/a.md"]), Some("one\n"));
+    ok(textdb(&db).args(["write", "/h/a.md"]), Some("one\ntwo\n"));
+
+    const ORDER: [&str; 9] =
+        ["version", "author", "ts", "message", "kind", "base_version", "nbytes", "nlines", "nwords"];
+    let keys_of = |v: &Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
+
+    let plain = ok(textdb(&db).args(["--json", "history", "/h/a.md"]), None).json();
+    // `--json history` tags each row; a flag filters rows, it never changes the row type.
+    let tagged: Vec<String> = std::iter::once("type".to_string()).chain(ORDER.map(str::to_string)).collect();
+    assert_eq!(keys_of(&plain[0]), tagged, "history");
+
+    let only = ok(textdb(&db).args(["--json", "history", "/h/a.md", "--versions-only"]), None).json();
+    assert_eq!(keys_of(&only[0]), tagged, "history --versions-only");
+
+    let sql = ok(
+        textdb(&db).args(["--json", "sql", "SELECT * FROM textdb_history('/h/a.md') LIMIT 1"]),
+        None,
+    )
+    .json();
+    let cols: Vec<&str> = sql["columns"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+    assert_eq!(cols, ORDER, "textdb_history");
+
+    // The `commits` view carries the same nine after `path`, then the batch that wrote it.
+    let view = ok(textdb(&db).args(["--json", "sql", "SELECT * FROM commits LIMIT 1"]), None).json();
+    let cols: Vec<&str> = view["columns"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+    let want: Vec<&str> = ["path"].into_iter().chain(ORDER).chain(["batch"]).collect();
+    assert_eq!(cols, want, "commits view");
+}
+
+/// `tree` says what each folder holds all the way down, and `tree FILE` shows the one entry
+/// rather than a header claiming the file's folder holds nothing.
+#[test]
+fn tree_counts_folders_and_prints_a_file_plainly() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("kb.db");
+    ok(textdb(&db).args(["write", "/t/api/one.md"]), Some("a\n"));
+    ok(textdb(&db).args(["write", "/t/api/deep/two.md"]), Some("bb\n"));
+
+    let all = ok(textdb(&db).args(["tree", "/t"]), None).stdout;
+    assert!(all.starts_with("/t  (2 files, 2 folders, "), "{all}");
+    assert!(all.contains("api/  (2 files, 1 folder, "), "{all}");
+    assert!(all.contains("deep/  (1 file, 0 folders, "), "{all}");
+
+    let one = ok(textdb(&db).args(["tree", "/t/api/one.md"]), None).stdout;
+    assert!(!one.contains("0 files"), "{one}");
+    assert!(one.contains("one.md"), "{one}");
+}
+
+/// Two syncs of one directory at once: exactly one runs, and the other fails saying so.
+///
+/// Without the directory lock both went ahead, each computing both sides from the same base, and
+/// one line appended on disk landed twice on disk and three times in the store — with both runs
+/// reporting success. Failing the second is the point: a collision a caller can see beats two
+/// exit-zero runs where the second quietly found the work already done.
+///
+/// Ignored by default because it races two real processes: the first has to still be working when
+/// the second reaches the lock, which 800 new files buy here but a faster machine might not.
+/// `two_syncs_at_once_serialise` holds the lock itself and asserts the same rule without a race;
+/// this one stays for `--ignored` runs, where it also checks the data after a real collision.
+#[test]
+#[ignore = "races two processes; run with --ignored"]
+fn two_syncs_at_once_are_one_success_and_one_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Enough files that the first run is still going when the second starts.
+    for i in 0..600 {
+        std::fs::write(dir.join(format!("n{i}.md")), format!("# N {i}\n\nbody line\n")).unwrap();
+    }
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+
+    let note = dir.join("n5.md");
+    std::fs::write(&note, "# N 5\n\nbody line\n- appended\n").unwrap();
+    for i in 600..1400 {
+        std::fs::write(dir.join(format!("n{i}.md")), format!("# N {i}\n\nbody line\n")).unwrap();
+    }
+
+    let both: Vec<_> = (0..2)
+        .map(|_| {
+            textdb(&db)
+                .args(["sync", "/"])
+                .arg(&dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn sync")
+        })
+        .collect();
+    let outs: Vec<Output> = both
+        .into_iter()
+        .map(|c| {
+            let o = c.wait_with_output().unwrap();
+            Output {
+                status: o.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+            }
+        })
+        .collect();
+
+    let codes: Vec<i32> = outs.iter().map(|o| o.status).collect();
+    assert_eq!(codes.iter().filter(|c| **c == 0).count(), 1, "exactly one should run: {codes:?}");
+    assert_eq!(codes.iter().filter(|c| **c == 4).count(), 1, "exactly one should fail: {codes:?}");
+    let refused = outs.iter().find(|o| o.status == 4).unwrap();
+    assert!(refused.stderr.contains("already being synced by another process"), "{}", refused.stderr);
+    assert!(refused.stderr.contains("--lock-timeout"), "the message should say how to queue: {}", refused.stderr);
+
+    // The one that ran did the whole job, and nothing was doubled.
+    let on_disk = std::fs::read_to_string(&note).unwrap();
+    let in_store = ok(textdb(&db).args(["cat", "/n5.md"]), None).stdout;
+    assert_eq!(on_disk, "# N 5\n\nbody line\n- appended\n", "disk");
+    assert_eq!(in_store, on_disk, "the store and disk agree");
+    assert!(!on_disk.contains("<<<<<<<") && !on_disk.contains(">>>>>>>"), "no markers: {on_disk}");
+    let history = ok(textdb(&db).args(["--json", "history", "/n5.md", "--versions-only"]), None).json();
+    assert_eq!(history.as_array().unwrap().len(), 2, "one disk edit is one new version: {history}");
+    let files = ok(textdb(&db).args(["--json", "sql", "SELECT count(*) AS n FROM files"]), None).json();
+    assert_eq!(files["rows"][0]["n"], 1400, "{files}");
+
+    // The failure is not a dead end: run it again and the rest goes through.
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+}
+
+/// The same rule as the race above, with the race taken out: while the lock is held, a sync of
+/// that directory fails, and once it is released the next one runs. No timing, no two processes.
+#[test]
+fn two_syncs_at_once_serialise() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.md"), "# A\n\nbody\n").unwrap();
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+
+    // Stand in for the sync that got there first.
+    let held = std::fs::OpenOptions::new().read(true).write(true).open(dir.join(".textdb").join("lock")).unwrap();
+    held.try_lock().expect("hold the lock");
+
+    std::fs::write(dir.join("a.md"), "# A\n\nbody\n- appended\n").unwrap();
+    let refused = run(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+    assert_eq!(refused.status, 4, "stdout: {}\nstderr: {}", refused.stdout, refused.stderr);
+    assert!(refused.stderr.contains("already being synced by another process"), "{}", refused.stderr);
+    assert!(refused.stderr.contains("--lock-timeout"), "the message should say how to queue: {}", refused.stderr);
+    // It failed before doing anything: the store still has the text from before the edit.
+    assert_eq!(ok(textdb(&db).args(["cat", "/a.md"]), None).stdout, "# A\n\nbody\n");
+
+    held.unlock().unwrap();
+    drop(held);
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+    assert_eq!(ok(textdb(&db).args(["cat", "/a.md"]), None).stdout, "# A\n\nbody\n- appended\n");
+    let history = ok(textdb(&db).args(["--json", "history", "/a.md", "--versions-only"]), None).json();
+    assert_eq!(history.as_array().unwrap().len(), 2, "one edit, one version: {history}");
+}
+
+/// `--lock-timeout` is the other half: a caller that would rather queue than retry.
+#[test]
+#[ignore = "races two processes; run with --ignored"]
+fn lock_timeout_queues_behind_a_running_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..600 {
+        std::fs::write(dir.join(format!("n{i}.md")), format!("# N {i}\n\nbody\n")).unwrap();
+    }
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+    for i in 600..1400 {
+        std::fs::write(dir.join(format!("n{i}.md")), format!("# N {i}\n\nbody\n")).unwrap();
+    }
+
+    // Both queue, so it does not matter which reaches the lock first: neither fails, where the
+    // default would have failed whichever came second.
+    let both: Vec<_> = (0..2)
+        .map(|_| {
+            textdb(&db)
+                .args(["sync", "/"])
+                .arg(&dir)
+                .args(["--lock-timeout", "60"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn sync")
+        })
+        .collect();
+    let outs: Vec<_> = both.into_iter().map(|c| c.wait_with_output().unwrap()).collect();
+    for o in &outs {
+        assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    // One did the work and the other found it done, in whichever order they got the lock.
+    let said: Vec<String> = outs.iter().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).collect();
+    assert_eq!(said.iter().filter(|s| s.contains("1400 unchanged")).count(), 1, "{said:?}");
+    let files = ok(textdb(&db).args(["--json", "sql", "SELECT count(*) AS n FROM files"]), None).json();
+    assert_eq!(files["rows"][0]["n"], 1400, "{files}");
+}
+
+/// A sync will not start while another holds the directory, and says so rather than proceeding.
+#[test]
+fn a_second_sync_waits_or_reports_the_holder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.md"), "one\n").unwrap();
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+
+    // Hold the lock the way a running sync does, from this process.
+    let lock = dir.join(".textdb").join("lock");
+    let held = std::fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
+    held.try_lock().expect("hold the lock the way a running sync does");
+
+    let refused = run(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+    assert_eq!(refused.status, 4, "stdout: {}\nstderr: {}", refused.stdout, refused.stderr);
+    assert!(refused.stderr.contains("being synced by another process"), "{}", refused.stderr);
+
+    // Released, and the next sync goes through.
+    held.unlock().unwrap();
+    drop(held);
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+}
+
+/// A dry run reads only, so it neither takes the lock nor queues behind a sync that holds it.
+#[test]
+fn a_dry_run_does_not_queue_behind_a_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.md"), "one\n").unwrap();
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+
+    let lock = dir.join(".textdb").join("lock");
+    let held = std::fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
+    held.try_lock().expect("hold the lock the way a running sync does");
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir).arg("--dry-run"), None);
+}
+
+/// `.textdb` keeps a checkout clean on its own, so nothing textdb writes beside a directory shows
+/// up as untracked and the user's `.gitignore` needs no entry for it.
+#[test]
+fn the_textdb_directory_ignores_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.md"), "one\n").unwrap();
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+
+    let ignore = std::fs::read_to_string(dir.join(".textdb").join(".gitignore")).unwrap();
+    assert!(ignore.contains('*'), "{ignore}");
+}
+
+/// A synced directory remembers what it is paired with, so `textdb sync` needs no arguments from
+/// anywhere inside it — and refuses a folder or store that contradicts the pairing, which used to
+/// import the whole tree again under a second prefix without a word.
+#[test]
+fn a_synced_directory_remembers_its_store_and_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(dir.join("notes/deep")).unwrap();
+    std::fs::write(dir.join("a.md"), "one\n").unwrap();
+    std::fs::write(dir.join("notes/deep/c.md"), "three\n").unwrap();
+    ok(textdb(&db).args(["sync", "/docs"]).arg(&dir), None);
+
+    let config = std::fs::read_to_string(dir.join(".textdb").join("config")).unwrap();
+    assert!(config.contains("prefix = \"/docs\""), "{config}");
+    assert!(config.contains("id = \""), "{config}");
+
+    // No arguments at all, three levels down: the pairing supplies the folder, the directory and
+    // the store, so `-s` is not needed either.
+    let mut bare = Command::new(env!("CARGO_BIN_EXE_textdb"));
+    bare.current_dir(dir.join("notes/deep"))
+        .env_remove("TEXTDB_STORE")
+        .env("TEXTDB_CONFIG_DIR", tmp.path().join("config"))
+        .arg("sync");
+    let out = ok(&mut bare, None);
+    assert!(out.stdout.contains("/docs with"), "{}", out.stdout);
+    assert!(out.stdout.contains("2 unchanged"), "{}", out.stdout);
+
+    // A different folder, and a different store, are refused by name.
+    let other = run(textdb(&db).args(["sync", "/elsewhere"]).arg(&dir), None);
+    assert_eq!(other.status, 6, "{}", other.stdout);
+    assert!(other.stderr.contains("is paired with /docs"), "{}", other.stderr);
+    let second = tmp.path().join("second.db");
+    let mut from_inside = Command::new(env!("CARGO_BIN_EXE_textdb"));
+    from_inside
+        .current_dir(&dir)
+        .env_remove("TEXTDB_STORE")
+        .env("TEXTDB_CONFIG_DIR", tmp.path().join("config"))
+        .arg("--store")
+        .arg(&second)
+        .arg("sync");
+    let moved = run(&mut from_inside, None);
+    assert_eq!(moved.status, 6, "{}", moved.stdout);
+    assert!(moved.stderr.contains("paired with the store"), "{}", moved.stderr);
+
+    // One argument is the folder in the store, so a lone directory is a mistake worth naming.
+    let mistake = run(textdb(&db).arg("sync").arg(&dir), None);
+    assert_eq!(mistake.status, 6, "{}", mistake.stdout);
+    assert!(mistake.stderr.contains("is a directory on this computer"), "{}", mistake.stderr);
+
+    // --force says so on purpose, and the pairing follows.
+    ok(textdb(&db).args(["sync", "--force", "/elsewhere"]).arg(&dir), None);
+    let config = std::fs::read_to_string(dir.join(".textdb").join("config")).unwrap();
+    assert!(config.contains("prefix = \"/elsewhere\""), "{config}");
+}
+
+/// The store's own files are never documents, whichever way they would travel.
+#[test]
+fn the_store_is_left_out_of_the_directory_it_syncs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("kb.db");
+    std::fs::write(dir.join("a.md"), "one\n").unwrap();
+
+    // `--ext '*'` takes in everything text-shaped, which is how `kb.db-wal` was offered.
+    ok(textdb(&db).args(["sync", "/"]).arg(&dir).args(["--ext", "*"]), None);
+    let out = ok(textdb(&db).args(["sync", "/"]).arg(&dir).args(["--ext", "*"]), None);
+    assert!(out.stdout.contains("the store itself"), "{}", out.stdout);
+
+    let paths = ok(textdb(&db).args(["ls", "-1", "-R", "/"]), None).stdout;
+    assert!(paths.contains("/a.md"), "{paths}");
+    for name in ["kb.db", "kb.db-wal", "kb.db-shm"] {
+        assert!(!paths.contains(name), "{name} was taken in: {paths}");
+    }
+}
+
+/// What a sync walked past, and the one line a hook wants instead of the whole list.
+#[test]
+fn sync_says_what_it_left_out_and_can_keep_quiet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.md"), "one\n").unwrap();
+    std::fs::write(dir.join("data.csv"), "x,y\n").unwrap();
+    std::fs::write(dir.join("app.json"), "{}\n").unwrap();
+
+    let first = ok(textdb(&db).args(["sync", "/"]).arg(&dir), None);
+    assert!(first.stdout.contains("left out        2 files by extension"), "{}", first.stdout);
+    assert!(first.stdout.contains("--ext to include them"), "{}", first.stdout);
+    // A plain directory is not an Obsidian vault, so no .textdbignore is written into it and
+    // nothing of sync's own counts as a change on disk.
+    assert!(!dir.join(".textdbignore").exists());
+    assert!(first.stdout.contains("disk 0 new"), "{}", first.stdout);
+
+    std::fs::write(dir.join("b.md"), "two\n").unwrap();
+    let quiet = ok(textdb(&db).args(["sync", "/"]).arg(&dir).arg("--quiet"), None);
+    assert!(!quiet.stdout.contains("textdb new"), "{}", quiet.stdout);
+    assert_eq!(quiet.stdout.lines().filter(|l| l.starts_with("synced:")).count(), 1, "{}", quiet.stdout);
+    // The same two files are still left out, so it does not say so again: on a code directory
+    // that line was the whole output of every hook run.
+    assert!(!quiet.stdout.contains("left out"), "{}", quiet.stdout);
+
+    // A third one appears, and it says so once.
+    std::fs::write(dir.join("more.csv"), "a,b\n").unwrap();
+    let changed = ok(textdb(&db).args(["sync", "/"]).arg(&dir).arg("--quiet"), None);
+    assert!(changed.stdout.contains("left out        3 files by extension"), "{}", changed.stdout);
+    let settled = ok(textdb(&db).args(["sync", "/"]).arg(&dir).arg("--quiet"), None);
+    assert!(!settled.stdout.contains("left out"), "{}", settled.stdout);
+}
+
+/// Two directories per folder is the normal state — a person's vault and an agent's checkout —
+/// and `assets` used to take whichever was synced with the folder last, silently. It now takes
+/// the one the command is run from, and says which it used.
+#[test]
+fn assets_use_the_directory_you_are_standing_in() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let bucket = tmp.path().join("bucket");
+    let one = tmp.path().join("one");
+    let two = tmp.path().join("two");
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::create_dir_all(&two).unwrap();
+    std::fs::write(one.join("a.md"), "see ![[logo.png]]\n").unwrap();
+
+    ok(textdb(&db).args(["assets", "stores", "--add", "team", "--root", bucket.to_str().unwrap()]), None);
+    // --add creates a local root rather than leaving the first push to fail on a missing folder.
+    assert!(bucket.is_dir());
+
+    ok(textdb(&db).args(["sync", "/v"]).arg(&one), None);
+    ok(textdb(&db).args(["sync", "/v"]).arg(&two), None);
+    // `two` was synced last, so that is what the old rule would have picked.
+    std::fs::write(one.join("logo.png"), b"\x89PNG one").unwrap();
+
+    let mut from_one = Command::new(env!("CARGO_BIN_EXE_textdb"));
+    from_one
+        .current_dir(&one)
+        .env_remove("TEXTDB_STORE")
+        .env("TEXTDB_CONFIG_DIR", tmp.path().join("config"))
+        .arg("--store")
+        .arg(&db)
+        .args(["assets", "push"]);
+    let out = ok(&mut from_one, None);
+    assert!(out.stdout.contains("pushed 1 assets"), "{}", out.stdout);
+    // And it names the directory it used, which push never did.
+    assert!(out.stdout.contains(one.to_str().unwrap()), "{}", out.stdout);
+}
+
+/// The sync base follows the directory's own id, so moving or renaming the directory is not a
+/// re-import of everything in it under a path that has changed.
+#[test]
+fn a_directory_that_moves_keeps_its_sync_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let one = tmp.path().join("one");
+    let two = tmp.path().join("two");
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::write(one.join("a.md"), "one\n").unwrap();
+    std::fs::write(one.join("b.md"), "two\n").unwrap();
+    let first = ok(textdb(&db).args(["sync", "/v"]).arg(&one), None);
+    assert!(first.stdout.contains("textdb 2 new"), "{}", first.stdout);
+
+    std::fs::rename(&one, &two).unwrap();
+    let after = ok(textdb(&db).args(["sync", "/v"]).arg(&two), None);
+    assert!(after.stdout.contains("2 unchanged"), "{}", after.stdout);
+    assert!(after.stdout.contains("textdb 0 new"), "{}", after.stdout);
+    // Said once, so a reader knows why the directory in the summary changed.
+    assert!(after.stdout.contains("was ") && after.stdout.contains("at the last sync"), "{}", after.stdout);
+
+    // And the base moved rather than being duplicated.
+    let bases = ok(textdb(&db).args(["--json", "sql", "SELECT dir FROM kb_sync"]), None).json();
+    assert_eq!(bases["rows"].as_array().unwrap().len(), 1, "{bases}");
+}
+
+/// The sync base is a compare-and-swap, so a run that another machine sharing the folder
+/// overtook does not record its own base over theirs.
+///
+/// The directory lock covers one computer; this is the case it cannot see. The base is written
+/// last, after the store and disk writes, so what the overtaken run wrote stays — it is versioned
+/// in the store and present on disk. What the check buys is the *next* sync's starting point: it
+/// reconciles against the base the other machine left rather than taking the overtaken run's view
+/// as the agreed state.
+#[test]
+fn a_sync_another_machine_overtook_does_not_record_its_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..200 {
+        std::fs::write(dir.join(format!("n{i}.md")), format!("# N {i}\n\nbody\n")).unwrap();
+    }
+    ok(textdb(&db).args(["sync", "/v"]).arg(&dir), None);
+
+    let generation = |label: &str| -> i64 {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.query_row("SELECT generation FROM kb_sync", [], |r| r.get(0)).unwrap_or_else(|e| panic!("{label}: {e}"))
+    };
+    // One sync, one generation: the mechanism is live rather than stuck at zero.
+    assert_eq!(generation("after the first sync"), 1);
+
+    // Enough new work that the run takes long enough for the other machine to land inside it.
+    for i in 200..1400 {
+        std::fs::write(dir.join(format!("n{i}.md")), format!("# N {i}\n\nbody\n")).unwrap();
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bumping = {
+        let (db, stop) = (db.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(30)).unwrap();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = conn.execute("UPDATE kb_sync SET generation = generation + 1", []);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })
+    };
+    let overtaken = run(textdb(&db).args(["sync", "/v"]).arg(&dir), None);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    bumping.join().unwrap();
+
+    assert_eq!(overtaken.status, 4, "stdout: {}\nstderr: {}", overtaken.stdout, overtaken.stderr);
+    assert!(overtaken.stderr.contains("were synced by another process"), "{}", overtaken.stderr);
+    // The message says what is true: the writes landed, only the base did not.
+    assert!(overtaken.stderr.contains("is in the store and on disk"), "{}", overtaken.stderr);
+    let files = ok(textdb(&db).args(["--json", "sql", "SELECT count(*) AS n FROM files"]), None).json();
+    assert_eq!(files["rows"][0]["n"], 1400, "the run's work is in the store: {files}");
+
+    // And a following sync succeeds, leaving both sides agreeing.
+    let again = ok(textdb(&db).args(["sync", "/v"]).arg(&dir), None);
+    assert!(again.stdout.contains("1400 unchanged"), "{}", again.stdout);
+}
+
+/// A sync killed while it is writing leaves every file whole: the old bytes or the new ones,
+/// never a truncated one.
+///
+/// `write_disk` used to open the target with `truncate(true)` and write into it, so a sync a hook
+/// timed out on — or any kill — left an empty note where a document had been. The bytes now go to
+/// `.textdb/tmp` and are renamed over the target, which no reader can see half of.
+#[test]
+fn a_killed_sync_leaves_no_half_written_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Big enough that writing them all takes long enough to be interrupted part-way.
+    let old: String = (0..600).map(|i| format!("old line {i}\n")).collect();
+    let new: String = (0..600).map(|i| format!("new line {i}\n")).collect();
+    for i in 0..60 {
+        std::fs::write(dir.join(format!("n{i}.md")), &old).unwrap();
+    }
+    ok(textdb(&db).args(["sync", "/v"]).arg(&dir), None);
+
+    // Change every document in the store, so the next sync has to rewrite every file on disk.
+    ok(
+        textdb(&db).args(["sql", "--write", "UPDATE kb SET content = replace(content, 'old line', 'new line')"]),
+        None,
+    );
+
+    let mut child = textdb(&db)
+        .args(["sync", "/v"])
+        .arg(&dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sync");
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Whatever it managed, every file is one of the two whole texts.
+    let mut newly = 0;
+    for i in 0..60 {
+        let text = std::fs::read_to_string(dir.join(format!("n{i}.md"))).unwrap();
+        if text == new {
+            newly += 1;
+        } else {
+            assert_eq!(text, old, "n{i}.md is neither the old text nor the new one ({} bytes)", text.len());
+        }
+    }
+
+    // The staging files of a run that was killed do not pile up: the next sync holds the lock, so
+    // anything left in .textdb/tmp is from a run that is gone, and it clears them.
+    ok(textdb(&db).args(["sync", "/v"]).arg(&dir), None);
+    let staging = dir.join(".textdb").join("tmp");
+    let left: Vec<_> = std::fs::read_dir(&staging).map(|d| d.flatten().collect()).unwrap_or_default();
+    assert!(left.is_empty(), "staging files left behind: {left:?}");
+}
+
+/// Discovery walks up, and the two ways of stopping it work.
+///
+/// A synced directory above the one you are in would otherwise pair your command with a store it
+/// knows nothing about — which is how a misfired test came to sync this repository once, and why
+/// the harness pins `TEXTDB_CEILING_DIRECTORIES`.
+#[test]
+fn discovery_stops_where_it_is_told_to() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let outer = tmp.path().join("outer");
+    let inner = outer.join("a").join("b");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::write(outer.join("top.md"), "top\n").unwrap();
+    ok(textdb(&db).args(["sync", "/outer"]).arg(&outer), None);
+
+    // From inside, with nothing said: the pairing above is found.
+    let sync_from = |at: &std::path::Path, env: &[(&str, &std::ffi::OsStr)]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_textdb"));
+        cmd.current_dir(at)
+            .env_remove("TEXTDB_STORE")
+            .env_remove("TEXTDB_DIR")
+            .env("TEXTDB_CONFIG_DIR", tmp.path().join("config"));
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        cmd.arg("sync");
+        run(&mut cmd, None)
+    };
+    let found = sync_from(&inner, &[("TEXTDB_CEILING_DIRECTORIES", std::ffi::OsStr::new(""))]);
+    assert_eq!(found.status, 0, "{}", found.stderr);
+    assert!(found.stdout.contains("/outer with"), "{}", found.stdout);
+
+    // A ceiling at the directory you are in stops the walk before it starts, so nothing is found
+    // and the current directory is what gets synced — with its own folder, not the one above.
+    let stopped = sync_from(&inner, &[("TEXTDB_CEILING_DIRECTORIES", inner.as_os_str())]);
+    assert_eq!(stopped.status, 0, "{}", stopped.stderr);
+    assert!(stopped.stdout.contains(inner.to_str().unwrap()), "{}", stopped.stdout);
+    assert!(!stopped.stdout.contains("/outer with"), "{}", stopped.stdout);
+
+    // TEXTDB_DIR names one outright, from anywhere.
+    let named = sync_from(tmp.path(), &[("TEXTDB_DIR", outer.as_os_str())]);
+    assert_eq!(named.status, 0, "{}", named.stderr);
+    assert!(named.stdout.contains("/outer with"), "{}", named.stdout);
+}
+
+/// A folder names who changed something below it, and how many people have.
+///
+/// Both were the contract in `docs/shapes.md` and neither was true: `nauthors` came back 0 for
+/// every folder, because the column only ever holds a file's own count, and `updated_by` was the
+/// folder row's own author, which nothing sets.
+#[test]
+fn a_folder_carries_the_authors_below_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("kb.db");
+    let write = |author: &str, path: &str, text: &str| {
+        ok(textdb(&db).args(["-a", author, "write", path]), Some(text));
+    };
+    write("alice", "/notes/a/x.md", "one\n");
+    write("bob", "/notes/a/y.md", "two\n");
+    write("alice", "/notes/b/z.md", "three\n");
+
+    let row = |path: &str| -> serde_json::Value {
+        ok(textdb(&db).args(["--json", "stat", path]), None).json()
+    };
+    assert_eq!((row("/notes/a")["nauthors"].as_i64(), row("/notes/a")["updated_by"].as_str()), (Some(2), Some("bob")));
+    assert_eq!((row("/notes/b")["nauthors"].as_i64(), row("/notes/b")["updated_by"].as_str()), (Some(1), Some("alice")));
+    // The root counts each author once, not once per file.
+    assert_eq!(row("/")["nauthors"].as_i64(), Some(2));
+
+    // A later commit by a third author moves both.
+    write("carol", "/notes/a/x.md", "one again\n");
+    assert_eq!((row("/notes/a")["nauthors"].as_i64(), row("/notes/a")["updated_by"].as_str()), (Some(3), Some("carol")));
+    assert_eq!(row("/")["nauthors"].as_i64(), Some(3));
+    // `ls` says the same as `stat`, on the same row.
+    let ls = ok(textdb(&db).args(["--json", "ls", "/notes"]), None).json();
+    let a = ls.as_array().unwrap().iter().find(|e| e["path"] == "/notes/a").unwrap();
+    assert_eq!((a["nauthors"].as_i64(), a["updated_by"].as_str()), (Some(3), Some("carol")));
 }

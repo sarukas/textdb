@@ -36,6 +36,7 @@ import { useNow } from "../state/useNow";
 import { actionFor, count, type BulkAction, type PathAction } from "../tree/actions";
 import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
 import { PathBar } from "./PathBar";
+import { MetaExplorer } from "./MetaExplorer";
 import { SearchResults } from "./SearchResults";
 import { ensureRowVisible, VirtualList } from "./VirtualList";
 
@@ -120,6 +121,8 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
   const [filterText, setFilterText] = useState("");
   const [filter, setFilter] = useState(() => parseFilter(""));
   const [contents, setContents] = useState(false);
+  // Search by front-matter property, scoped to this folder.
+  const [props, setProps] = useState(false);
   const [recursive, setRecursive] = useState(false);
   const [nonce, setNonce] = useState(0);
   const [summary, setSummary] = useState<LsEntry | null>(null);
@@ -738,20 +741,50 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
                 listRef.current?.focus();
               }
             }}
-            placeholder={contents ? `Search the text of ${label}` : `Filter ${label}: name, author:…, type:…`}
+            disabled={props}
+            placeholder={
+              props ? "Use the query box below" : contents ? `Search the text of ${label}` : `Filter ${label}: name, author:…, type:…`
+            }
             aria-label={contents ? `Search the text of files in ${label}` : `Filter ${label}`}
             spellCheck={false}
           />
           <div className="segmented" role="group" aria-label="Search in">
-            <button type="button" aria-pressed={!contents} onClick={() => setContents(false)} title="Filter by name, author and type">
+            <button
+              type="button"
+              aria-pressed={!contents && !props}
+              onClick={() => {
+                setContents(false);
+                setProps(false);
+              }}
+              title="Filter by name, author and type"
+            >
               Names
             </button>
-            <button type="button" aria-pressed={contents} onClick={() => setContents(true)} title="Full-text search inside this folder">
+            <button
+              type="button"
+              aria-pressed={contents}
+              onClick={() => {
+                setContents(true);
+                setProps(false);
+              }}
+              title="Full-text search inside this folder"
+            >
               Contents
+            </button>
+            <button
+              type="button"
+              aria-pressed={props}
+              onClick={() => {
+                setProps(true);
+                setContents(false);
+              }}
+              title="Search by front-matter property, and browse what properties this vault uses"
+            >
+              Properties
             </button>
           </div>
           <label className="toggle" title="List everything below this folder, not only what is directly in it">
-            <input type="checkbox" checked={recursive} disabled={contents} onChange={(e) => setRecursive(e.target.checked)} />
+            <input type="checkbox" checked={recursive} disabled={contents || props} onChange={(e) => setRecursive(e.target.checked)} />
             Subfolders
           </label>
           <ColumnChooser columns={columns} onChange={changeColumns} />
@@ -854,7 +887,9 @@ export function FolderView({ path, hub, onOpenFolder, onOpenFile, onAction, onBu
         </div>
       )}
 
-      {contents ? (
+      {props ? (
+        <MetaExplorer onOpen={onOpenFile} folder={path} />
+      ) : contents ? (
         search ? (
           <div className="folder-hits">
             <SearchResults

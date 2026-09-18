@@ -280,7 +280,24 @@ impl<'c> TextDb<'c> {
     /// since the batch is left alone and reported; unless `skip_changed`, that fails the whole
     /// revert, so nothing changes. The revert is itself recorded like any other write.
     pub fn revert_batch(&self, batch: &str, author: Option<&str>, skip_changed: bool) -> Result<RevertReport> {
-        self.tx(|db| {
+        // Reverting is a write to every path the batch touched, so the whole set is settled
+        // before anything is undone: a batch that reached outside this account's writable shares
+        // is refused whole rather than half-reverted (#12 C20). With that answered the undo runs
+        // as the owner, because from here on every path is the store's own and a public method
+        // would translate it a second time.
+        {
+            let recs = self.change_recs("batch = ?1", batch.to_string().into())?;
+            for path in recs.iter().flat_map(|r| [Some(&r.path), r.old_path.as_ref()]).flatten() {
+                if !self.can_write_store_path(path) {
+                    return Err(TextdbError::Forbidden(format!(
+                        "batch {batch} changed files you may not write, so none of it was reverted"
+                    )));
+                }
+            }
+        }
+        // Paths in the report are the caller's, even though the undo below works in the store's.
+        let show = |p: &str| self.view_path(p).unwrap_or_else(|| p.to_string());
+        self.as_owner().tx(|db| {
             let recs = db.change_recs("batch = ?1", batch.to_string().into())?;
             if recs.is_empty() {
                 return Err(TextdbError::NotFound(format!("no changes recorded under batch {batch}")));
@@ -305,19 +322,19 @@ impl<'c> TextDb<'c> {
                         match db.node_by_id(r.node_id)? {
                             Some(n) if n.deleted_at.is_none() && n.path == r.path => {
                                 if db.node_by_path(old)?.is_some() {
-                                    report.skipped.push(format!("{} not moved back: {old} exists", r.path));
+                                    report.skipped.push(format!("{} not moved back: {} exists", show(&r.path), show(old)));
                                     continue;
                                 }
                                 db.rename_by(&r.path, old, author)?;
-                                report.moved_back.push((r.path.clone(), old.clone()));
+                                report.moved_back.push((show(&r.path), show(old)));
                             }
-                            _ => report.skipped.push(format!("{} not moved back to {old}: moved or deleted since", r.path)),
+                            _ => report.skipped.push(format!("{} not moved back to {}: moved or deleted since", show(&r.path), show(old))),
                         }
                     }
                     "delete" => {
                         let Some(d) = db.node_by_id(r.node_id)? else { continue };
                         let Some(deleted_at) = d.deleted_at.clone() else {
-                            report.skipped.push(format!("{} not restored: no longer deleted", r.path));
+                            report.skipped.push(format!("{} not restored: no longer deleted", show(&r.path)));
                             continue;
                         };
                         let files: Vec<(i64, String, Option<Vec<u8>>)> = {
@@ -338,13 +355,13 @@ impl<'c> TextDb<'c> {
                         if d.kind == 0 && files.is_empty() {
                             if db.node_by_path(&r.path)?.is_none() {
                                 db.ensure_folder(&r.path)?;
-                                report.recreated.push(r.path.clone());
+                                report.recreated.push(show(&r.path));
                             }
                             continue;
                         }
                         for (id, path, root) in files {
                             if db.node_by_path(&path)?.is_some() {
-                                report.skipped.push(format!("{path} not restored: the path is taken"));
+                                report.skipped.push(format!("{} not restored: the path is taken", show(&path)));
                                 continue;
                             }
                             let content_root = match (span.get(&id), root) {
@@ -356,7 +373,7 @@ impl<'c> TextDb<'c> {
                             };
                             let content = (*db.storage().document(&content_root)?.0).clone();
                             db.create(&path, &content, author, Some(&message))?;
-                            report.recreated.push(path);
+                            report.recreated.push(show(&path));
                         }
                     }
                     "create" | "commit" => {
@@ -367,23 +384,23 @@ impl<'c> TextDb<'c> {
                         let Some(n) = db.node_by_id(r.node_id)? else { continue };
                         if n.deleted_at.is_some() {
                             if !deleted_by_batch(&n.path) {
-                                report.skipped.push(format!("{} not restored: deleted since the batch", n.path));
+                                report.skipped.push(format!("{} not restored: deleted since the batch", show(&n.path)));
                             }
                             continue;
                         }
                         if n.version != last {
-                            report.skipped.push(format!("{} not restored: changed since the batch (v{last}, now v{})", n.path, n.version));
+                            report.skipped.push(format!("{} not restored: changed since the batch (v{last}, now v{})", show(&n.path), n.version));
                             continue;
                         }
                         if first <= 1 {
                             db.delete_by(&n.path, author)?;
-                            report.removed.push(n.path.clone());
+                            report.removed.push(show(&n.path));
                             continue;
                         }
                         let root = db.root_of_version(n.id, (first - 1) as u64)?;
                         let content = (*db.storage().document(&root)?.0).clone();
                         let w = db.update_content(&n.path, &content, Some(n.version as u64), author, Some(&message))?;
-                        report.restored.push((n.path.clone(), w.version as i64));
+                        report.restored.push((show(&n.path), w.version as i64));
                     }
                     _ => {}
                 }

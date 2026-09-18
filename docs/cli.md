@@ -108,34 +108,83 @@ environment and its own author name, and the instructions in
 | `config` | Show settings and their sources |
 | `import DIR [--prefix /p] [--ext md,markdown,mdx,txt] [--batch 500]` | Load matching files; unchanged files make no new version, and binary files (a NUL byte in their first 8000 bytes) are skipped with a note. `.git`, `.textdb`, `.trash` and `node_modules` directories are skipped; other hidden directories (`.claude`, `.github`) are read, as by `sync` |
 | `export PREFIX DIR [--dry-run]` | Write the files under a folder to disk, byte for byte (line endings, BOM). Only new and changed files are written and nothing on disk is deleted, so exporting over a git checkout shows only real changes; an existing file is overwritten in place and keeps its permissions, a symbolic link is left alone. Names that cannot coexist on this computer (differing only in letter case on Windows and macOS, or in Unicode normalization on macOS; Windows reserved names, forbidden characters, trailing dot or space; clashes with what is on disk) stop the export before anything is written, with exit code 6 and the list; problems only on other systems are warnings. `--dry-run` lists what would be written. `--json` gives `{ new, changed, unchanged, skipped, problems, stopped, written, bytes }` |
-| `sync PREFIX DIR [--dry-run] [--commit] [--base REV] [--ext md,markdown,mdx,txt]` | Reconcile a folder with a directory both ways against what both held at the last sync (recorded in the store): changes, new files, deletes and moves on either side are carried across; edits on both sides are merged line by line, and where they overlap the file on disk gets `<<<<<<< textdb` / `>>>>>>> disk` markers (exit code 3) and the store keeps its version until they are resolved. Files never synced are left alone. In a git checkout, changes that came from git are committed to the store under their git author and subject; `--commit` commits what sync wrote to disk with `Textdb-*` trailers. See [Syncing with a git checkout](#syncing-with-a-git-checkout). Each sync records its include rules (extensions, skipped folders, `.textdbignore`); when they changed and would take in files the last sync left out, sync lists them and stops (exit 6) unless `--accept-rules`. `.textdbignore` in the directory (`.gitignore` syntax, in any letter case on Windows and macOS) leaves files out both ways: they are not taken in, and a store file it matches is never written, moved or deleted on disk (listed as skipped); as in git, a file inside a folder it leaves out stays out whatever a `!` line says. It is the directory's own: sync never writes anything under that name from the store, and stops if the file is there but cannot be read. The first sync of a folder with a directory that goes ahead puts the lines `**/.obsidian/plugins`, `**/.obsidian/snippets` and `**/.obsidian/themes` in its `.textdbignore` (creating the file, or adding those for folders it has no `**/` or `!` line for yet; with `--commit` the file is committed too), so the code and styles Obsidian loads are never written from the store; delete those lines to sync them, and later syncs of that folder do not add them again. `.textdbignore` must be UTF-8. A `.textdbignore` loosened so that files it left out would be taken in, written, merged or deleted stops the sync like other rule changes, until `--accept-rules`. Binary files (a NUL byte in their first 8000 bytes) are never taken in or merged, new or changed: sync lists each as skipped, suggesting `.textdbignore` or an asset rule (or saving UTF-16 text as UTF-8), and both sides keep what they have. When the store moved a whole folder, files textdb does not track (images, JSON, `.base`) move on disk with it (`disk carried`); folders whose text files left but that still hold such files are listed as `left behind`. Directories holding no files are listed, and removed with `--prune-empty-dirs`. Asset pointers are paired with their files: a pointer moved in the store moves its file, one deleted there sends it to `.textdb/trash/`, a file renamed on disk takes its pointer along, and a file changed both here and in the store is kept as `NAME (conflict HOST DATE).ext` while the store's bytes are pulled. `--push` and `--pull` push and pull assets after the documents (else the `asset_sync` setting decides); assets that fail exit 1, assets left for a conflict exit 3; a changed `.gitattributes` stops automatic pushes until `--accept-rules`; see [Assets](#assets-binaries-next-to-the-text) |
-| `sql [STATEMENT \| -f FILE] [-p VALUE]… [--write [--dry-run]] [--format table\|tsv\|lines\|json] [--full]` | One SQL statement (argument, `-f FILE` or stdin) against the store, printed as a table, TSV, one value per line or, with `--json`, `{ columns, rows, row_count, store_changes, batch }`. `--write --dry-run` runs it, prints each file's diff and the moves and deletes, and undoes it all; a real write prints the batch id that `revert-batch` undoes. Views `files`, `folders`, `frontmatter`, `sections`, `links`, `commits`, `authors` besides `kb` and the `textdb_*` functions. Read-only unless `--write`; see [Querying with SQL](#querying-with-sql) |
-| `revert-batch BATCH [--skip-changed] [--dry-run]` | Undo what one `sql --write` run changed: files get their content from before the batch back (as a new version), files it created are deleted, moves are undone, and files it deleted are created again (new files; the deleted ones keep their history in the trash). When anything in the batch changed since, nothing is reverted (exit 6) unless `--skip-changed`, which reverts the rest and lists what it left. The revert is a batch itself. SQLite stores |
+| `sync [PREFIX] [DIR] [--force] [-q] [--dry-run] [--commit] [--base REV] [--ext md,markdown,mdx,txt] [--lock-timeout SECONDS]` | Reconcile a folder with a directory both ways against what both held at the last sync (recorded in the store): changes, new files, deletes and moves on either side are carried across; edits on both sides are merged line by line, and where they overlap the file on disk gets `<<<<<<< textdb` / `>>>>>>> disk` markers (exit code 3) and the store keeps its version until they are resolved. Files never synced are left alone. In a git checkout, changes that came from git are committed to the store under their git author and subject; `--commit` commits what sync wrote to disk with `Textdb-*` trailers. See [Syncing with a git checkout](#syncing-with-a-git-checkout). Each sync records its include rules (extensions, skipped folders, `.textdbignore`); when they changed and would take in files the last sync left out, sync lists them and stops (exit 6) unless `--accept-rules`. `.textdbignore` in the directory (`.gitignore` syntax, in any letter case on Windows and macOS) leaves files out both ways: they are not taken in, and a store file it matches is never written, moved or deleted on disk (listed as skipped); as in git, a file inside a folder it leaves out stays out whatever a `!` line says. It is the directory's own: sync never writes anything under that name from the store, and stops if the file is there but cannot be read. The first sync of a folder with a directory that goes ahead puts the lines `**/.obsidian/plugins`, `**/.obsidian/snippets` and `**/.obsidian/themes` in its `.textdbignore` (creating the file, or adding those for folders it has no `**/` or `!` line for yet; with `--commit` the file is committed too), so the code and styles Obsidian loads are never written from the store; delete those lines to sync them, and later syncs of that folder do not add them again. `.textdbignore` must be UTF-8. A `.textdbignore` loosened so that files it left out would be taken in, written, merged or deleted stops the sync like other rule changes, until `--accept-rules`. Binary files (a NUL byte in their first 8000 bytes) are never taken in or merged, new or changed: sync lists each as skipped, suggesting `.textdbignore` or an asset rule (or saving UTF-16 text as UTF-8), and both sides keep what they have. When the store moved a whole folder, files textdb does not track (images, JSON, `.base`) move on disk with it (`disk carried`); folders whose text files left but that still hold such files are listed as `left behind`. Directories holding no files are listed, and removed with `--prune-empty-dirs`. Asset pointers are paired with their files: a pointer moved in the store moves its file, one deleted there sends it to `.textdb/trash/`, a file renamed on disk takes its pointer along, and a file changed both here and in the store is kept as `NAME (conflict HOST DATE).ext` while the store's bytes are pulled. `--push` and `--pull` push and pull assets after the documents (else the `asset_sync` setting decides); assets that fail exit 1, assets left for a conflict exit 3; a changed `.gitattributes` stops automatic pushes until `--accept-rules`; see [Assets](#assets-binaries-next-to-the-text). **One sync of a directory at a time:** a sync takes an exclusive lock on `DIR/.textdb/lock` for its whole run, because two at once would each compute both sides from the same base and land one edit twice — which is what a turn-end hook in one agent and a turn-start hook in another produce. A second sync exits 4 at once, naming the holder: a collision is worth seeing rather than absorbing, and exit 4 already means retry shortly. `--lock-timeout SECONDS` queues behind the first instead, which is what a hook wants: a turn-start sync colliding with another agent's turn-end sync should wait for it rather than start the turn on stale files, so the hook line is `textdb sync -q --lock-timeout 30`. The lock is advisory (`flock` on Unix, `LockFileEx` on Windows, through one `File::try_lock`), so a killed sync releases it without leaving anything to clean up, and its staging files are cleared by the next sync that takes the lock; `--dry-run` neither takes the lock nor waits for it. The sync base is saved with a compare-and-swap as well: a sync that another machine sharing the folder overtook exits 4 without recording its base, so the next sync reconciles against the base that machine left rather than taking the overtaken run's view as the agreed state. The base is written last, so this does not undo what the run already wrote — it is in the store, versioned, and on disk; run sync again. Files are written to `DIR/.textdb/tmp` and renamed into place, so a reader never sees half a note and a sync killed mid-write leaves the old content. `DIR/.textdb` carries a `.gitignore` of `*`, so nothing textdb keeps beside a directory shows up as untracked. **The directory remembers what it is paired with:** a sync that goes ahead writes `DIR/.textdb/config` naming the store, the folder and an id of its own, and every later `textdb sync` finds it by walking up from the current directory — so `textdb sync` with no arguments at all syncs the whole tree from anywhere inside it, with the store it was paired with. `TEXTDB_DIR` names a directory outright and `TEXTDB_CEILING_DIRECTORIES` (`:`-separated) stops the walk, as their git counterparts do; the walk also stops at a filesystem boundary. The include rules go in it too, so `textdb sync` with no arguments keeps the extensions the directory was taken in with rather than falling back to the default four; `--ext` on the command line still overrides them, and still triggers the rules-changed stop. A folder or store that contradicts the pairing is refused naming what the directory is already paired with, rather than importing the whole tree again under a second name — `--force` pairs it anew. With one argument that argument is the folder in the store, so a lone directory is refused rather than taken as a folder. The store's own file is never synced when it lies inside the directory, `-wal` and `-shm` included, and is reported once. `-q` prints the summary line and what went wrong, not the file-by-file list; a line names what was left out and why (`left out 2 files by extension (app.json, data.csv); --ext to include them`), said when that set changes rather than on every run — on a code directory the same hundreds of files are walked past every time. The Obsidian `.textdbignore` lines are written only where Obsidian is — in the directory or in the folder being synced into it — and directories under an ignored or skipped path are neither counted as empty nor offered to `--prune-empty-dirs`. The sync base follows the directory's id rather than its path, so moving or renaming a directory keeps it — the sync continues where it left off instead of treating every file as new — and the move is reported once |
+| `sql [STATEMENT \| -f FILE] [-p VALUE]… [--write [--dry-run]] [--format table\|tsv\|lines\|json] [--full]` | One SQL statement (argument, `-f FILE`, `-f -` or stdin) against the store, printed as a table, TSV, one value per line or, with `--json`, `{ columns, rows, row_count, store_changes, batch }`. `--write --dry-run` runs it, prints each file's diff and the moves and deletes, and undoes it all; a real write prints the batch id that `revert-batch` undoes. Views `files`, `folders`, `frontmatter`, `properties`, `sections`, `links`, `commits`, `authors` besides `kb` and the `textdb_*` functions. Read-only unless `--write`; see [Querying with SQL](#querying-with-sql) |
+| `trash ls [ID]` | What was deleted and not yet purged, newest delete first: id, kind, path, when, and who deleted it. With a trashed folder's `ID`, the entries that went to the trash inside it rather than the top-level items. An account sees the trash of its own shares, in its own paths. SQLite stores |
+| `trash restore ID` | Put one trash entry back where it was, with everything that went to the trash with it — one delete is one item, so a later delete inside the same folder stays in the trash. Refused, changing nothing, when something is at that path already; the folders above it are made again when they went too, and links that pointed at the restored files resolve again. Restoring a share root revives the grants that name it. SQLite stores |
+| `revert-batch BATCH [--skip-changed] [--dry-run]` | Undo what one `sql --write` run changed: files get their content from before the batch back (as a new version), files it created are deleted, moves are undone, and files it deleted are created again (new files; the deleted ones keep their history in the trash). When anything in the batch changed since, nothing is reverted (exit 6) unless `--skip-changed`, which reverts the rest and lists what it left. The revert is a batch itself. Both backends |
 | `git-status PREFIX DIR [--rev REV]` | When the folder was synced and with which commit, what changed in the store since, and how it compares with a commit (`HEAD` by default) by git blob id: same (CRLF-only differences noted), differ, only in textdb, only in git |
-| `ls [PATH] [-l \| -1] [-S KEY] [-r] [-R]` | One folder: folders first, then files with size and line count. `-1` (`--paths`) prints only the paths, one per line, for scripts. `-l` adds words, versions, last update, and a file's authors (commits each) or a folder's contents; a folder's size, lines, words and versions are totals of everything below it. `--sort` by `name`, `type`, `size`, `lines`, `words`, `versions`, `created`, `updated` or `authors`; `-r` reverses; `-R` lists everything below the folder by path |
-| `tree [PATH] [-L DEPTH] [-d]` | The folder tree with file counts and sizes; `--json` gives a flat, path-sorted list |
-| `stat PATH` | Kind, version, size, lines, last update and author |
+| `ls [PATH] [-l \| -1] [-S KEY] [-r] [-R]` | One folder: folders first, then files with size and line count. `-1` (`--paths`) prints only the paths, one per line, for scripts; a folder keeps its trailing `/` so a script can tell it from a file with no extension. `ls FILE` lists that one file. `-l` adds words, headings (`SECT`), front-matter keys (`PROPS`), links (`LINKS`, as `total/broken`, where broken counts the links with status `broken`, `anchor-missing` or `ambiguous` — the ones needing attention), versions, last update, and a file's authors (commits each) or a folder's contents; a folder's size, lines, words and versions are totals of everything below it. `--sort` by `name`, `type`, `size`, `lines`, `words`, `versions`, `created`, `updated` or `authors`; `-r` reverses; `-R` lists everything below the folder by path |
+| `tree [PATH] [-L DEPTH] [-d]` | The folder tree. Every folder row says what it holds all the way down (`guide/  (2 files, 1 folder, 394 B)`), whatever `-L` lets through; `tree FILE` prints the one entry, as `ls FILE` does. `--json` gives a flat, path-sorted list of the same full records `ls --json` returns |
+| `stat PATH` | Everything the store knows about one path, one key per line: the full listing record, the same twenty-four keys `ls --json` returns |
 | `cat PATH [-n] [--lines A:B] [--version V] [--section HEADING]` | Content; `-n` numbers lines under a header `PATH vN · lines A-B of T` |
-| `search WORD… [-p PREFIX] [--limit N] [--per-file N]` | Full text: every word must occur in the document, `"phrases"`, `prefix*`, case and accents ignored. Prints `path:line: text` for each line holding a word (up to `--per-file`, default 10), checked against the text; a document is listed only when its lines hold every word. No match: nothing on stdout, `no matches` on stderr, exit 0 |
-| `grep PATTERN [-p PREFIX] [-i] [-F] [-l] [--limit N]` | Regular expression per line over every file under a folder (case-sensitive unless `-i`; `-F` plain text; `-l` paths only). Reads each file, so slower than `search` on large folders; stops after `--limit` lines (500) |
-| `write PATH [-b V] [-f FILE] [-m MSG] [--allow-empty] [--create]` | Create or replace from `--file` or stdin; with `-b`, concurrent commits are rebased. `--create` refuses (exit 6) when the file exists |
-| `edit PATH --old TEXT --new TEXT [-m MSG]` | Replace the one occurrence of `old`. Also `--old-file`/`--new-file`, or `--stdin-json` reading `{"old": …, "new": …}` |
-| `replace-lines PATH FROM TO [-b V] [--text T \| -f FILE \| stdin] [-m MSG]` | Replace lines `FROM..TO` (1-based, inclusive) as numbered in version `V`; `TO = FROM-1` inserts before `FROM` |
-| `replace-lines PATH --stdin-json [-b V] [-m MSG]` | Several ranges in one commit, from stdin: `[{"from": N, "to": N, "text": "…"}, …]`, all numbered as in version `V`, in any order. Overlapping ranges, or ranges outside the file, change nothing (exit 6) |
-| `meta get PATH [KEY]` | A front matter value: a string as it is, list items one per line; `--json` gives the JSON value. Without `KEY`, the front matter as written (`--json`: the object). A missing key exits 5 |
-| `meta set PATH KEY VALUE… [--list] [--raw] [-m MSG]` | Set a top-level key, replacing only its lines, or add it before the closing `---` (front matter is created when the file has none). One value is a string, quoted only when YAML needs it; several values or `--list` a block list indented like the file's other lists; `--raw` writes YAML as given. Line endings, comments and other keys are untouched. Committed against the version read, so other edits to the file rebase. Values starting with `-` go after `--` |
-| `meta unset PATH KEY [-m MSG]` | Remove a top-level key and its lines; nothing to remove makes no version |
-| `append PATH [TEXT] [-m MSG]` | Append the argument (as a line) or stdin; never conflicts |
-| `history PATH [--versions-only]` | Versions — time, author, how each landed (`direct`, `rebased`, `merged`) and its base — and, between them, the renames, moves and deletes that touched the file, including those of a folder it was in. A deleted file is found at the path it was deleted from |
-| `diff PATH V1 [V2]` | Unified diff; `V2` defaults to the current version |
-| `hunks PATH [V1 [V2]]` | Line hunks; defaults to the latest commit |
-| `chunks PATH [--version V]` | The content-defined chunks the file is stored as |
-| `mv FROM TO [-m MSG]`, `rm PATH [-m MSG]` | Move/rename and delete files or folders. History stays readable, and each file or folder touched gets a `rename`, `move` or `delete` entry in its history while path history is on. Folders left empty are removed (listed as `removed empty folder …`) unless `--keep-empty-folders`; `-m` is recorded in the change log. Links that pointed at what moved and no longer reach it are listed, or rewritten with `--update-links` (see `link_updates`); `rm` lists the links it leaves broken |
-| `links [PATH] [--broken [--dir DIR]]` | The links written in a file or every file below a folder: `path:line: [[target]] -> /resolved/path` with a status — `ok`, `ambiguous` (several files match; the nearest is taken), `anchor-missing`, `broken`, `not-in-store` (PDFs, images and other files a text store does not hold) or `external` (URLs, emails, `?tab=` queries, numbered references). Resolved by Obsidian's rules: markdown links relative to the note, `[[a/b]]` from the vault root, `[[name]]` by file name anywhere, `.md` optional, `#heading` checked (block `^ids` are not). `--broken` lists only what does not resolve; with `--dir`, links to files the store does not hold are looked for on disk. SQLite stores |
+| `search WORD… [-p PREFIX] [-l] [-c] [--limit N] [--per-file N]` | Full text: every word must occur in the document, `"phrases"`, `prefix*`, case and accents ignored. Prints `path:line: text` for each line holding a word, checked against the text; a document is listed only when its lines hold every word. `--limit` counts rows (200) and `--per-file` lines from one document (10), with the rest reported as `more`. `-l` lists the matching documents, `-c` each with its count. No match: nothing on stdout, a note on stderr, exit 0 |
+| `grep PATTERN [-p PREFIX] [-i] [-F] [-l] [-c] [--limit N] [--per-file N]` | Regular expression per line over every file under a folder (case-sensitive unless `-i`; `-F` plain text). Reads each file, so slower than `search` on large folders. Same rows, same flags and the same meanings of `--limit` and `--per-file` as `search`; `score` is null |
+| `links [PATH] [--broken [--dir DIR]]` | The links written in a file or every file below a folder: `path:line: [[target]] -> /resolved/path` with a status — `ok`, `ambiguous` (several files match; the nearest is taken), `anchor-missing`, `broken`, `not-in-store` (PDFs, images and other files a text store does not hold) or `external` (URLs, emails, `?tab=` queries, numbered references). Resolved by Obsidian's rules: markdown links relative to the note, `[[a/b]]` from the vault root, `[[name]]` by file name anywhere, `.md` optional, `#heading` checked (block `^ids` are not). `--broken` lists only what does not resolve; with `--dir`, links to files the store does not hold are looked for on disk. Both backends |
 | `backlinks PATH` | The links in any file that resolve to a file, or to a file below a folder |
 | `setting [KEY [VALUE]]` | Show or change a store setting. `path_history` is `on` (default) or `off`; `default` clears it. `--path-history` overrides it for one command. `link_updates` is what a move does to links that pointed at what moved: `report` (default: list them), `rewrite` (rewrite them, one commit per linking file) or `off`; moves made by `sync` never rewrite links. `asset_sync` is what `sync` does with assets without `--push`/`--pull`: `off` (default: list them), `push`, `pull` or `both`; `asset_pull` is which it pulls: `linked` (default: what the folder's notes link to) or `all` |
+| `whoami` | Who this connection is, and what it can see: the owner, or an account with each share, its alias and its rights |
+| `account create NAME [--kind agent\|person] [--root PATH]` | An account that can hold shares. `--root` makes it **single-root**: its root *is* that folder, it holds that one share and sees it at `/`, which is the shape for an agent that owns exactly one vault. Owner only |
+| `account ls` \| `account convert NAME [--as ALIAS]` | Every account; or turn a single-root account into one that holds shares under aliases, which gives every path it sees a `/<alias>` prefix — an announced change, not a silent one. Owner only |
+| `token create ACCOUNT [--label L] [--expires 30d]` | Mint a bearer. **Printed once**: the store keeps only its SHA-256, so it cannot be shown again. `--expires` takes `30d`, `12h`, `90m` or an ISO-8601 instant. Owner only |
+| `token ls [ACCOUNT]` \| `token revoke ID` | Every token, without any bearer; or stop one. Revoking a token leaves the account's shares alone. Owner only |
+| `access grant ACCOUNT PATH ro\|rw [--as ALIAS]` | Share a folder and everything below it. The alias is the account's own name for the share and the first segment of every path it sees through it; it defaults to the folder's name and a collision is **refused** rather than suffixed, because auto-suffixing would make an account's paths depend on the order its shares were added. Regranting the same folder changes its rights. Owner only |
+| `access rename ACCOUNT FROM TO` | Rename a share in one account's namespace. Recorded as a **move** for that account, so its next sync moves the directory on disk instead of deleting it and pulling every file down again. Owner only |
+| `access revoke ACCOUNT ALIAS` | Take a share away. The account's checkout keeps its files: the store then answers `forbidden` (TX005, exit 7) for them rather than `not found`, and `sync` leaves them alone. Owner only |
+| `access ls [ACCOUNT\|PATH]` | Who sees what. An account name lists that account's shares; a store path lists the accounts that can see it. Owner only |
 | `log [--since SEQ] [--limit N]` | The change log: every create, commit, mkdir, move and delete, in order |
 | `watch [--since SEQ] [-p PREFIX]` | Follow the change log live — one line per change, JSON lines with `--json` |
+
+## Delegating folders to accounts
+
+One store holds every vault; an **account** is given whole folders of it and sees nothing else.
+
+```sh
+textdb account create accounts-agent --kind agent
+textdb access grant accounts-agent /legal/contracts rw --as contracts
+textdb access grant accounts-agent /products ro
+textdb token create accounts-agent --label "claude session"   # prints the bearer, once
+```
+
+The account then works with `TEXTDB_TOKEN` set (or `--token`), and every path it says or hears is
+its own:
+
+```
+store (the owner's view)            accounts-agent's view
+/legal/contracts/acme.md            /contracts/acme.md        rw
+/legal/contracts/2026/q3.md         /contracts/2026/q3.md     rw
+/products/catalog/x.md              /products/catalog/x.md    ro
+/hr/salaries.md                     —
+```
+
+What the shape buys, and what it costs:
+
+- **A share is a folder and everything below it.** There are no partial folders and no deny
+  rules, so every total, count and `tree` an account sees is exact rather than recomputed, and no
+  ancestor of a share is ever shown.
+- **The alias belongs to the grant**, not to the current set of shares, so an account's paths
+  never move when another share is added or taken away. There is always exactly one alias level,
+  even for an account with a single share — otherwise adding a second one later would shift every
+  existing path down by one.
+- **No overlapping shares in one account.** `/legal` and `/legal/contracts` together would give
+  one file two paths with two rights. Grant the subfolder alone, or raise the parent to `rw`.
+- **Paths are per view; ids are not.** The same document is `/contracts/acme.md` to one account
+  and `/legal/contracts/acme.md` to the owner, so a path quoted from one namespace means nothing
+  in another. Every listing row carries the store's `id`, and every path-taking command accepts
+  `id:1234` — that is what to put in a message between agents, in a link to the web app, or in a
+  log.
+- **`forbidden` is not `not found`.** A path under an alias the account has, or had, is TX005
+  (exit 7); a path under no alias of theirs is TX003 (exit 5) and is indistinguishable from a
+  path that never existed. The difference is what stops `sync` deleting a checkout when a share
+  is revoked.
+- **The owner is whoever opens the store without a token.** On SQLite that is anyone who can open
+  the file, and on Postgres a superuser; both already mean "you own the store". The model is real
+  where the store is held by a server and clients hold tokens.
+
+Rights are `ro` (`cat`, `ls`, `tree`, `stat`, `search`, `grep`, `history`, `links`, `meta get`,
+`meta find`, `export`, and `sync` to disk) and `rw` (all of that, plus every write, inside the
+share). `mv` needs `rw` at both ends. `--author` is refused on a token session: an account writes
+as itself.
 
 ## Querying with SQL
 
@@ -159,9 +208,10 @@ by path, deleted files left out:
 | `files` | `id, path, name, dir` (`/accounts/acme`), `depth` (`/a.md` is 1), `ext` (lower case, `''` without one), `version, nbytes, nlines, nwords, nauthors, created_at, updated_at, updated_by` |
 | `folders` | `id, path, name, parent, depth, files, folders, nbytes, nlines, nwords, versions, updated_at` — totals of everything below |
 | `frontmatter` | `path, data` — a document's YAML front matter as JSON (text in SQLite: `json_extract`, `json_each`; `jsonb` in Postgres) |
-| `sections` | `path, heading` (`Title / Section / Subsection`), `level, line_from, line_to` |
-| `links` | `path, target` (without `#anchor` or `\|alias`; markdown links decoded), `line, kind` (`wiki`, `embed`, `md`, `image`), `anchor, alias, status` (`ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store`, `external`), `resolved` (the path it points to). SQLite stores; Postgres has `path, target, line` |
-| `commits` | `path, version, author, ts, message, kind, base_version, nbytes, nlines, batch` (`batch` in SQLite: the `sql --write` run that made it) |
+| `properties` | `path, key` (dotted: `project.name`), `value, number` (the value as a number when it is one), `ord` (position in a list). One row per value, so a list is one row per element |
+| `sections` | `path, heading` (`Title / Section / Subsection`), `level, line_from, line_to, title` (the last component alone), `nwords` (the section's own lines), `nwords_total` (plus everything nested under it), and the document's `nbytes, nlines, file_nwords, version, updated_at, updated_by` |
+| `links` | `path, version, line, kind` (`wiki`, `embed`, `md`, `image`), `target` (without `#anchor` or `\|alias`; markdown links decoded), `anchor, alias, status` (`ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store`, `external`), `resolved` (the path it points to), `asset` (it resolves to an asset). The same ten columns as `textdb_links` / `kb.links`. Both backends |
+| `commits` | `path, version, author, ts, message, kind, base_version, nbytes, nlines, nwords, batch` (`batch` in SQLite: the `sql --write` run that made it) |
 | `authors` | `path, author, commits, first_ts, last_ts` |
 
 ```sh
@@ -175,8 +225,10 @@ SQL
 textdb sql -p guides/intro.md <<'SQL'
 SELECT path, line FROM links WHERE target = ?1 OR target LIKE '%/' || ?1
 SQL
-textdb sql -p '%/ Next steps' 'SELECT path, line_from FROM sections WHERE heading LIKE ?'
 textdb sql 'SELECT path, nwords FROM files ORDER BY nwords DESC LIMIT 10'
+-- Headings are indexed folded, so prefer textdb_outline over LIKE over the view:
+textdb sql "SELECT path, line_from FROM textdb_outline('/', 'Next steps')"
+textdb sql "SELECT heading, nwords_total FROM textdb_outline('/plan.md') ORDER BY nwords_total DESC"
 ```
 
 Avoid `SELECT content FROM kb` over many files: it reads every document in full. Use the views, or
@@ -192,13 +244,14 @@ textdb sql --format lines "SELECT path FROM files WHERE dir = '/accounts/acme' A
 textdb sql "SELECT substr(dir, 11) AS account, count(*) FROM files WHERE depth = 3 AND path GLOB '/accounts/*' GROUP BY account"
 ```
 
-**Full-text search in SQL.** `textdb_search(query, prefix)` returns one row per document that holds
-every term (terms are ANDed per document; `"a phrase"`, `prefix*`; a term with punctuation such as
-`teo-group` or `2026-02` is matched as the phrase of its words, no quoting needed). `line` and
-`snippet` come from one chunk of the document, the best-ranked one for the first term: the line in
-that chunk holding the most terms. The document holds all the terms, but that line may hold only some
-of them, so confirm with `textdb_lines(path, line, line)` before relying on it. The `search` command
-instead checks every line and lists each one that holds a term.
+**Full-text search in SQL.** `textdb_search(query, prefix, limit, per_file)` returns one row per
+matching *line* — `path, version, line, text, section, score, more` — the same rows the `search`
+command prints (terms are ANDed; `"a phrase"`, `prefix*`; a term with punctuation such as
+`teo-group` or `2026-02` is matched as the phrase of its words, no quoting needed). The index works
+on chunks, so the function reads the matching documents and lists the lines that really hold the
+terms: `line` is a fact rather than a guess, and a document whose words only ever appear apart is
+dropped. `SELECT DISTINCT path` gives the documents, and `more` says how many lines `per_file` held
+back.
 
 **Changing documents.** Statements are read-only unless `--write`. With it, change the store
 through `kb` (`INSERT`, `UPDATE`, `DELETE`) and the functions `textdb_write`, `textdb_edit`,
@@ -246,6 +299,40 @@ and `kb.content` (see [USAGE.md](USAGE.md)); positional parameters are `$1`, `$2
 client records its own batch with `SELECT set_config('textdb.batch', 'id', true)` in its
 transaction.
 
+## Property queries
+
+`meta find` takes the same query language everywhere — CLI, SQL, both SDKs and the web app —
+so a query written once means the same thing wherever it is run. Full detail, including what
+the index costs, is in [`docs/properties.md`](properties.md).
+
+| Written | Means |
+|---|---|
+| `status:draft` | equals, ignoring case |
+| `tags:telco` | a list contains it; lists are indexed one row per element, so this is the same comparison |
+| `project.name:atlas` | nested properties are dotted |
+| `title:"quarterly review"` | quote a value with spaces; a quoted value is never read as an operator |
+| `priority:>3`, `due:<=2026-10-01` | compare — numerically when both sides are numbers, as text otherwise, so ISO dates sort correctly |
+| `has:budget`, `budget:*` | the property is present, whatever it holds |
+| `name:atl*`, `note:~telco` | starts with, contains |
+| `status:!=draft` | **has** the property, but not with that value |
+| `status:draft tags:telco` | a space means AND |
+| `a:1 OR b:2` | OR, which binds looser than AND |
+| `-status:archived`, `NOT status:archived` | either spelling of NOT |
+| `(a OR b) AND c` | parentheses regroup |
+
+`!=` is worth stating plainly: a note with no `status` at all is not a note whose status is
+not draft, so `status:draft` and `status:!=draft` partition the corpus exactly rather than
+overlapping or leaving a gap.
+
+```sh
+textdb meta keys                      # what this vault uses
+textdb meta values status             # what that property holds
+textdb meta find "status:draft tags:telco" --show status,tags
+textdb meta find "priority:>3 -status:archived" --folder /notes
+```
+
+An invalid query exits 6 and names the offset it went wrong at, so an editor can point at it.
+
 ## Syncing with a git checkout
 
 `sync` keeps a folder in the store and a directory reconciled, typically a git checkout that
@@ -274,8 +361,18 @@ git -C ~/src/handbook push
   store as their git author, with a message like `git 1a2b3c4: Fix the intro`.
 - **`--commit`** stages and commits only the files sync wrote or deleted on disk, leaving your
   other uncommitted work alone. The message says who changed them in textdb and ends with
-  trailers: `Textdb-Store`, `Textdb-Prefix`, `Textdb-Seq` (the store's change number) and one
-  `Textdb-Author` per author.
+  trailers: `Textdb-Store`, `Textdb-Prefix`, `Textdb-Seq` (the store's change number), one
+  `Textdb-Author` per author, and `Textdb-Account` when the checkout belongs to one — the same
+  directory synced by two accounts holds two different sets of paths, and the commit is the only
+  record of which.
+- **Moved in the store.** A file moved centrally moves on disk, with its base and with whatever
+  was edited here and not yet synced, so the edit lands on the document it belongs to rather than
+  being added back at the old path as a second one.
+- **A renamed share.** When the owner renames an account's alias, the next sync moves the
+  directory rather than deleting it and writing it again under the new name, so whatever else was
+  in it comes along. `.textdb/config` records each alias with the store's node id for its share
+  root, which is what makes a rename legible; node ids name nodes, not paths, so it still says
+  nothing about the store's layout.
 - **The first sync** of a store that was imported earlier has no base, so a file that differs on
   the two sides is a conflict. Pass `--base REV`, the commit the import was made from, and git
   supplies the base instead: `textdb sync /handbook ~/src/handbook --base 3f9c2e1`.
@@ -302,7 +399,7 @@ textdb assets stores --add team --root 'G:\Shared drives\Team\textdb'   # declar
 textdb assets stores --bind team='/Volumes/GoogleDrive/Shared drives/Team/textdb'   # where this computer reaches it
 textdb assets stores --add drive --driver rclone --root teamdrive:textdb   # or through an rclone remote
 textdb sync /handbook ~/src/handbook               # the vault: a directory synced with a folder
-textdb assets status /handbook                     # ok, new, modified, outdated, conflict, not-pulled, conflict-copy
+textdb assets status /handbook                     # ok, new, modified, outdated, conflict, not-pulled, conflict-copy, orphan, invalid-path, invalid-pointer
 textdb assets push /handbook -m "diagrams"         # upload and check the bytes, then commit the pointers
 textdb assets pull --linked-from /handbook/guides  # only what those notes link to
 textdb assets verify /handbook                     # every hash, here and in the asset store (exit 1 on problems)
@@ -345,9 +442,10 @@ textdb setting asset_sync both                     # make that what every sync o
 | 1 | Other error (store unreachable, I/O) | Read the message |
 | 2 | Usage error | Check the arguments |
 | 3 | `TX001` conflict: the same lines changed since your base version | Rebuild on `theirs`, retry with `-b current_version` |
-| 4 | `TX002` contention: retry budget exhausted on a very hot file | Retry shortly |
+| 4 | `TX002` contention: retry budget exhausted on a very hot file, or another sync holds the directory | Retry shortly |
 | 5 | `TX003` not found | Check the path (`ls`, `tree`) |
 | 6 | `TX004` invalid edit: `old` missing or ambiguous, line range outside the file, empty content | Re-read and adjust |
+| 7 | `TX005` forbidden: it is in your view and you may not do this — a read-only share, a share whose folder is in the trash, or one that was taken away | `whoami` lists your shares and their rights. **Not** the same as 5: a path you can see but may not touch is 7, a path outside every share of yours is 5 and looks exactly like one that never existed |
 
 With `--json` an error is printed on stdout as
 `{"error": {"code": "TX001", "message": "…", "conflict": {"path", "region_line_from", "region_line_to", "base", "theirs", "ours", "current_version"}}}`.
@@ -377,15 +475,13 @@ EOF
 |---|---|
 | writes | `{"path", "version", "kind"}` |
 | `cat` | `{"path", "version", "nlines", "from", "to", "content"}` |
-| `ls` | `[{"path", "name", "kind", "nbytes", "nlines", "updated_at", "nwords", "versions", "created_at", "updated_by", "files", "folders", "authors": [{"author", "commits", "last_ts"}]}]`; `files`/`folders` only for folders, `authors` only for files |
-| `tree` | `[{"path", "name", "kind", "nbytes", "nlines", "updated_at"}]` |
-| `stat` | `{"path", "kind", "version", "nbytes", "nlines", "updated_at", "updated_by"}` |
-| `history` | time-ordered `[{"type": "version", "version", "author", "ts", "message", "nbytes", "kind", "base_version"} \| {"type": "path", "id", "ts", "op", "old_path", "new_path", "via", "version", "author"}]`; `op` is `rename`, `move` or `delete`, `via` the folder the operation named when the file went along with it, `version` the file's version at the time. With `--versions-only`, the version objects without `type` |
+| `ls`, `tree` | `[{"path", "name", "kind", "version", "nbytes", "nlines", "updated_at", "updated_by", "id", "dir", "depth", "ext", "title", "nwords", "nsections", "nprops", "nlinks", "nlinks_broken", "versions", "created_at", "files", "folders", "nauthors", "authors": [{"author", "commits", "last_ts"}]}]` — the full listing record, the same twenty-four keys in this order from every listing surface and both backends. Every key is always present; one that does not apply is `null`. `version`, `ext` and `authors` are null or empty for a folder; `files`/`folders` for a file. A folder's figures are totals over everything below it |
+| `stat` | one object of the same twenty-four keys |
+| `history` | time-ordered `[{"type": "version", "version", "author", "ts", "message", "kind", "base_version", "nbytes", "nlines", "nwords"} \| {"type": "path", "id", "ts", "op", "old_path", "new_path", "via", "version", "author"}]`; `op` is `rename`, `move` or `delete`, `via` the folder the operation named when the file went along with it, `version` the file's version at the time. With `--versions-only`, the version objects without `type` |
 | `setting` | `{"path_history": {"value": "on" \| "off" \| null, "effective": true \| false}}` |
-| `hunks` | `{"path", "from", "to", "hunks": [{"old_from", "old_count", "new_from", "new_count", "old_text", "new_text"}]}` |
+| `hunks` | `{"path", "from", "to", "hunks": [{"old_from", "old_count", "new_from", "new_count", "old_text", "new_text"}]}`. The text form uses `@@` headers but is **not** a unified diff — no context lines, no `---`/`+++` — so it cannot be fed to `patch`; `diff` can |
 | `log`, `watch` | `{"seq", "ts", "op", "path", "old_path", "node_kind", "version", "base_version", "commit_kind", "author", "message"}` |
-| `search` | `[{"path", "line", "snippet", "rank"}]`, one per matching line |
-| `grep` | `[{"path", "line", "text"}]`; with `-l`, `["path", …]` |
+| `search`, `grep` | `[{"path", "version", "line", "text", "section", "score", "more"}]`, one row per matching line. `version` is the version the line number belongs to — pass it to `--base-version`. `section` is the heading path the line sits under, for `cat --section`. `score` is relevance, higher is better, scaled to (0, 1]; `null` from `grep`, which ranks nothing. It is BM25 over the *document*, computed in `textdb-core` rather than by the engine underneath, so the same query over the same documents comes back in the same order on SQLite and on Postgres. The index chooses which documents are worth scoring and no longer decides the order. `more` counts matching lines in that file held back by `--per-file`, so truncation is visible. With `-l` or `-c`, `[{"path", "version", "matches"}]` — a flag filters rows, it does not change the row type |
 | `import` | `{"dir", "prefix", "stats": {"files", "created", "updated", "unchanged", "failed", "bytes"}, "seconds"}` |
 
 ## How `watch` learns about changes

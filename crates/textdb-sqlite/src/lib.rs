@@ -9,12 +9,15 @@
 //! ```
 //! The Rust API ([`TextDb`]) offers the same operations without SQL.
 
+pub mod access;
 pub mod bulk;
 pub mod db;
 pub mod functions;
 pub mod links;
 pub mod path_history;
+pub mod property;
 pub mod schema;
+pub mod sections;
 pub mod stats;
 pub mod storage;
 pub mod trash;
@@ -41,6 +44,14 @@ pub fn register(conn: &Connection, prefix: &str) -> Result<()> {
         ("textdb_hunks", FnKind::Hunks),
         ("textdb_chunks", FnKind::Chunks),
         ("textdb_path_history", FnKind::PathHistory),
+        ("textdb_prop_keys", FnKind::PropKeys),
+        ("textdb_prop_values", FnKind::PropValues),
+        ("textdb_prop_find", FnKind::PropFind),
+        ("textdb_outline", FnKind::Outline),
+        ("textdb_headings", FnKind::Headings),
+        ("textdb_entry", FnKind::Entry),
+        ("textdb_links", FnKind::Links),
+        ("textdb_backlinks", FnKind::Backlinks),
     ] {
         conn.create_module(
             name,

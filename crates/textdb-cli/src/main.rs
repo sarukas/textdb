@@ -28,11 +28,26 @@ type Result<T> = std::result::Result<T, StoreError>;
 mod assets;
 mod git;
 mod links;
+mod lock;
+mod root;
 mod meta;
+mod outline;
 mod portable;
 mod search;
 mod sql_query;
 mod sync;
+
+#[derive(clap::Subcommand)]
+enum TrashCmd {
+    /// The trash, newest delete first; with an ID, what went to the trash inside that folder.
+    Ls {
+        /// A trashed folder's id: its own entries rather than the top-level items.
+        parent: Option<i64>,
+    },
+    /// Put a trash entry back where it was, with everything that went with it. Refused, changing
+    /// nothing, when something is at that path already.
+    Restore { id: i64 },
+}
 
 #[derive(Parser)]
 #[command(
@@ -52,6 +67,10 @@ struct Cli {
     /// Answer in JSON (errors too, on stdout).
     #[arg(long, global = true)]
     json: bool,
+    /// A bearer token. Everything is then answered in that account's view: its own paths, its own
+    /// shares, and nothing else. Without one the store is opened as its owner.
+    #[arg(long, short = 't', global = true, env = "TEXTDB_TOKEN", value_name = "BEARER")]
+    token: Option<String>,
     /// Record renames, moves and deletes in the history of what they touch: `on` or `off` for
     /// this command. Without it the store's `path_history` setting decides, which is on unless
     /// changed with `textdb setting path_history off`.
@@ -60,6 +79,100 @@ struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
 }
+
+
+#[derive(Subcommand)]
+enum AccountCmd {
+    /// Create an account. With `--root` its root *is* that folder: it holds that one share and
+    /// sees it at `/`, which is the shape for an agent that owns exactly one vault.
+    Create {
+        name: String,
+        #[arg(long, default_value = "agent", value_name = "agent|person|admin")]
+        kind: String,
+        #[arg(long, value_parser = store_path)]
+        root: Option<String>,
+    },
+    /// Every account, with how many shares it holds.
+    Ls,
+    /// Stop an account: its tokens stop working. Its shares stay, so `account enable` is one
+    /// command rather than granting everything again.
+    Disable {
+        name: String,
+    },
+    /// Let a disabled account work again.
+    Enable {
+        name: String,
+    },
+    /// Turn a single-root account into one that holds shares under aliases. Every path it sees
+    /// gains a `/<alias>` prefix, so this is announced rather than silent.
+    Convert {
+        name: String,
+        /// Hold shares under aliases from now on. Spelled out because it changes every path the
+        /// account sees, and a command that does that should say which way it is going.
+        #[arg(long)]
+        multi: bool,
+        /// The alias its existing share takes; the folder's own name by default.
+        #[arg(long = "root-alias", visible_alias = "as", value_name = "ALIAS")]
+        alias: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenCmd {
+    /// Mint a bearer for an account. Printed once and stored hashed: it cannot be shown again.
+    Create {
+        account: String,
+        #[arg(long)]
+        label: Option<String>,
+        /// When it stops working: `30d`, `12h`, or an ISO-8601 instant.
+        #[arg(long, value_name = "WHEN")]
+        expires: Option<String>,
+    },
+    /// Every token, without any bearer.
+    Ls {
+        account: Option<String>,
+    },
+    /// Stop a token. The account keeps its shares; this bearer stops working.
+    Revoke {
+        id: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum AccessCmd {
+    /// Share a folder and everything below it with an account.
+    Grant {
+        account: String,
+        #[arg(value_parser = store_path)]
+        path: String,
+        #[arg(value_name = "ro|rw")]
+        rights: String,
+        /// The account's name for this share, and the first segment of every path it sees through
+        /// it. The folder's own name by default; a collision is refused rather than suffixed.
+        #[arg(long = "as", value_name = "ALIAS")]
+        alias: Option<String>,
+    },
+    /// Rename a share in one account's namespace. A move for that account, so its next sync moves
+    /// the directory on disk instead of deleting it and pulling every file down again.
+    Rename {
+        account: String,
+        from: String,
+        to: String,
+    },
+    /// Take a share away. The account's checkout keeps its files: the store answers `forbidden`
+    /// for them, not `not found`, so nothing on disk is deleted.
+    Revoke {
+        account: String,
+        alias: String,
+    },
+    /// Who sees what. With an account name, that account's shares; with a store path, the
+    /// accounts that can see it.
+    Ls {
+        #[arg(value_name = "ACCOUNT|PATH")]
+        who: Option<String>,
+    },
+}
+
 
 /// A path inside the store, as given on the command line.
 ///
@@ -118,9 +231,16 @@ enum Cmd {
     /// they overlap the file on disk gets conflict markers. In a git checkout, changes that came
     /// from git are attributed to their git authors, and --commit commits what sync wrote.
     Sync {
+        /// The store folder. Left out, it is the one this directory was paired with by its first
+        /// sync (`.textdb/config`), so `textdb sync` on its own works from anywhere in the tree.
         #[arg(value_parser = store_path)]
-        prefix: String,
-        dir: PathBuf,
+        prefix: Option<String>,
+        /// The directory. Left out, it is the synced directory found by walking up from here.
+        dir: Option<PathBuf>,
+        /// Pair this directory with a folder or store it was not paired with before, replacing
+        /// what `.textdb/config` records.
+        #[arg(long)]
+        force: bool,
         /// Files found only on disk to take in, by extension (`*` for all). Files already synced
         /// are followed whatever their type.
         #[arg(long, default_value = "md,markdown,mdx,txt")]
@@ -151,6 +271,14 @@ enum Cmd {
         /// asset_pull setting is `all`.
         #[arg(long)]
         pull: bool,
+        /// Seconds to wait for another sync of the same directory instead of failing. One sync
+        /// of a directory runs at a time; by default a second exits 4 at once, so a collision is
+        /// visible rather than absorbed. Pass this to queue behind the first instead.
+        #[arg(long, value_name = "SECONDS", default_value_t = 0)]
+        lock_timeout: u64,
+        /// Print the summary line and what went wrong, not the file-by-file list. For hooks.
+        #[arg(long, short = 'q')]
+        quiet: bool,
     },
     /// When a store folder was last synced, what changed in it since, and how it compares with a
     /// git commit (by git blob id).
@@ -172,7 +300,7 @@ enum Cmd {
         op: AssetsOp,
     },
     /// Run one SQL statement against the store and print its rows. Besides `kb` and the textdb
-    /// functions, the views files, folders, frontmatter, sections, links, commits and authors
+    /// functions, the views files, folders, frontmatter, properties, sections, links, commits and authors
     /// describe the live store by path. Read-only unless --write.
     Sql {
         /// The statement; read from stdin when omitted or `-`.
@@ -211,6 +339,12 @@ enum Cmd {
         /// Say what reverting would do, without changing anything.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// What was deleted and not yet purged: `trash ls`, and `trash restore ID` to put one back
+    /// where it was with everything that went with it. SQLite stores.
+    Trash {
+        #[command(subcommand)]
+        cmd: TrashCmd,
     },
     /// List one folder.
     Ls {
@@ -276,12 +410,18 @@ enum Cmd {
         query: Vec<String>,
         #[arg(long, short = 'p', default_value = "/", value_parser = store_path)]
         prefix: String,
-        /// Documents to list at most.
-        #[arg(long, default_value_t = 50)]
-        limit: i64,
-        /// Matching lines to list per document.
+        /// Rows to return at most — matching lines, as on `grep`.
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Matching lines to list per document; the rest are reported as `more`.
         #[arg(long, default_value_t = 10)]
         per_file: usize,
+        /// List only the paths of documents that matched.
+        #[arg(long, short = 'l', conflicts_with = "count")]
+        files_with_matches: bool,
+        /// List each matching document and how many of its lines matched.
+        #[arg(long, short = 'c')]
+        count: bool,
     },
     /// Lines matching a regular expression in every file under a folder; case-sensitive
     /// unless -i. Reads the files, so it is slower than `search` on a large folder.
@@ -295,11 +435,17 @@ enum Cmd {
         #[arg(long, short = 'F')]
         fixed_strings: bool,
         /// List only the paths of files with a match.
-        #[arg(long, short = 'l')]
+        #[arg(long, short = 'l', conflicts_with = "count")]
         files_with_matches: bool,
-        /// Matching lines to list at most.
-        #[arg(long, default_value_t = 500)]
+        /// List each matching file and how many of its lines matched.
+        #[arg(long, short = 'c')]
+        count: bool,
+        /// Rows to return at most — matching lines, as on `search`.
+        #[arg(long, default_value_t = 200)]
         limit: usize,
+        /// Matching lines to list per file; the rest are reported as `more`.
+        #[arg(long, default_value_t = 10)]
+        per_file: usize,
     },
     /// Create a file or replace its content, from --file or stdin.
     Write {
@@ -383,6 +529,27 @@ enum Cmd {
         #[arg(value_parser = store_path)]
         path: String,
     },
+    /// List markdown headings: one file's outline, or every heading under a folder or the
+    /// whole store, with each document's own size and last change alongside.
+    Outline {
+        /// A file, a folder, or `/` for everything. Default `/`.
+        #[arg(value_parser = store_path, default_value = "/")]
+        path: String,
+        /// Only headings matching this, ignoring case.
+        #[arg(long)]
+        heading: Option<String>,
+        /// How `--heading` matches: the whole heading, its start, or anywhere in it.
+        #[arg(long, value_parser = ["exact", "prefix", "contains"], default_value = "exact")]
+        match_: String,
+        /// Only headings this deep or shallower (`1` is `#`, `2` is `##`).
+        #[arg(long)]
+        level: Option<i64>,
+        /// Distinct headings in use with their counts, rather than the headings themselves.
+        #[arg(long)]
+        names: bool,
+        #[arg(long, default_value_t = 1000)]
+        limit: i64,
+    },
     /// Read or change front matter, one top-level key at a time; the other lines of the file are
     /// left exactly as they are.
     Meta {
@@ -460,6 +627,22 @@ enum Cmd {
         #[arg(long)]
         keep_empty_folders: bool,
     },
+    /// Create a folder, and any parents it needs. Already there is not an error.
+    Mkdir {
+        #[arg(value_parser = store_path)]
+        path: String,
+    },
+    /// Who this connection is, and what it can see.
+    Whoami,
+    /// Accounts that hold shares of this store (owner only).
+    #[command(subcommand)]
+    Account(AccountCmd),
+    /// Bearer tokens (owner only).
+    #[command(subcommand)]
+    Token(TokenCmd),
+    /// Folder-scoped shares (owner only).
+    #[command(subcommand)]
+    Access(AccessCmd),
     /// Show or change a store setting: `setting`, `setting path_history`,
     /// `setting path_history off` (`on`, or `default` to clear it).
     Setting {
@@ -468,6 +651,9 @@ enum Cmd {
     },
     /// Changes after a sequence number, oldest first.
     Log {
+        /// Only changes under this folder.
+        #[arg(long, short = 'p', default_value = "/", value_parser = store_path)]
+        prefix: String,
         #[arg(long, default_value_t = 0)]
         since: i64,
         #[arg(long, default_value_t = 100)]
@@ -512,15 +698,49 @@ fn cli_main() -> i32 {
     status
 }
 
-fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
+fn run(mut cli: Cli, matches: &ArgMatches) -> Result<()> {
     let json = cli.json;
     if let Cmd::Config = cli.cmd {
         return show_config(&cli, matches);
     }
+    // A synced directory records the store and folder it is paired with, so `textdb sync` on its
+    // own works from anywhere inside the tree. Resolved before the store is opened, since which
+    // store to open is part of what the directory remembers.
+    if let Cmd::Sync { prefix, dir, force, ext, .. } = &mut cli.cmd {
+        let from_args = |id: &str| {
+            matches!(matches.subcommand().and_then(|(_, m)| m.value_source(id)), Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable))
+        };
+        let store_given = matches!(matches.value_source("store"), Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable));
+        let (mut p, mut d, f, mut e) = (prefix.take(), dir.take(), *force, std::mem::take(ext));
+        root::resolve(&mut p, &mut d, f, &mut cli.store, store_given, &mut e, from_args("ext"))?;
+        if let Cmd::Sync { prefix, dir, ext, .. } = &mut cli.cmd {
+            (*prefix, *dir, *ext) = (p, d, e);
+        }
+    }
     let mut store = store::open(&cli.store)?;
     let st = store.as_mut();
+    // Before anything else: from here on every path this process says or hears is the account's,
+    // and the store answers nothing about what lies outside its shares.
+    if let Some(bearer) = cli.token.as_deref() {
+        st.authenticate(bearer)?;
+    }
     if cli.path_history.is_some() {
         st.set_session_path_history(cli.path_history)?;
+    }
+    // A token session writes as its account, and cannot claim to be someone else (#12 §3). The
+    // default `cli` is not a claim, so only an author actually given is refused.
+    if cli.token.is_some() {
+        let given = matches!(matches.value_source("author"), Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable));
+        let me = st.whoami()?;
+        if let Some(account) = me.account {
+            if given && cli.author != account {
+                return Err(StoreError::forbidden(format!(
+                    "--author says '{}', but a token session writes as its own account, '{account}'",
+                    cli.author
+                )));
+            }
+            cli.author = account;
+        }
     }
     let author = Some(cli.author.as_str());
     match cli.cmd {
@@ -535,11 +755,25 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
                 line(format!("{} store ready: {shown} (last change #{seq})", st.backend()))
             }
         }
+        Cmd::Mkdir { path } => {
+            st.mkdir(&path)?;
+            let shown = shown_path(st, &path)?;
+            if json {
+                emit_json(&json!({ "path": shown, "kind": "folder" }))
+            } else {
+                line(shown)
+            }
+        }
+        Cmd::Whoami => whoami(st, json),
+        Cmd::Account(c) => account_cmd(st, c, json),
+        Cmd::Token(c) => token_cmd(st, c, json),
+        Cmd::Access(c) => access_cmd(st, c, json),
         Cmd::Import { dir, prefix, ext, batch } => import(st, &dir, &prefix, &ext, batch, author, json),
         Cmd::Export { prefix, dir, dry_run } => export(st, &prefix, &dir, dry_run, json),
         Cmd::Sync {
             prefix,
             dir,
+            force: _,
             ext,
             base,
             dry_run,
@@ -548,19 +782,25 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             prune_empty_dirs,
             push,
             pull,
+            lock_timeout,
+            quiet,
         } => sync::sync(
             st,
             sync::Options {
-                prefix,
-                dir,
+                // `root::resolve` filled both in above, from the directory's pairing.
+                prefix: prefix.expect("prefix resolved"),
+                dir: dir.expect("directory resolved"),
                 exts: sync::parse_exts(&ext),
                 base_rev: base,
                 dry_run,
                 commit,
                 author: cli.author.clone(),
                 store: config::redact(&cli.store),
+                store_file: cli.store.clone(),
                 accept_rules,
                 prune_empty_dirs,
+                lock_wait: Duration::from_secs(lock_timeout),
+                quiet,
                 assets: match (push, pull) {
                     (true, true) => Some("both".to_string()),
                     (true, false) => Some("push".to_string()),
@@ -579,20 +819,47 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             file,
             format,
         } => {
-            let statement = match (file, query.as_deref()) {
+            // `-f -` is stdin, as `sql -` already is: the same convention, so a statement piped
+            // in does not have to be a file first.
+            let stdin_file = file.as_deref().is_some_and(|f| f.as_os_str() == "-");
+            let statement = match (file.filter(|_| !stdin_file), query.as_deref()) {
                 (Some(file), _) => String::from_utf8(read_file(&file)?)
                     .map_err(|_| StoreError::invalid(format!("{} is not UTF-8 text", file.display())))?,
-                (None, None | Some("-")) => {
+                (None, Some(text)) if !stdin_file && text != "-" => text.to_string(),
+                (None, _) => {
                     let mut text = String::new();
                     std::io::stdin().read_to_string(&mut text)?;
                     text
                 }
-                (None, Some(text)) => text.to_string(),
             };
             let format = if json { sql_query::SqlFormat::Json } else { format };
             let options = sql_query::SqlOptions { write, dry_run, full, format };
             sql_query::run(st, &statement, &params, author, options)
         }
+        Cmd::Trash { cmd } => match cmd {
+            TrashCmd::Ls { parent } => {
+                let rows = st.trash(parent)?;
+                if json {
+                    return emit_json(&rows);
+                }
+                let mut s = String::new();
+                for r in &rows {
+                    let by = r.deleted_by.as_deref().unwrap_or("-");
+                    s.push_str(&format!("{:>8}  {:<6} {:<40} {} by {by}\n", r.id, r.kind, r.path, r.deleted_at));
+                }
+                if rows.is_empty() {
+                    s.push_str("the trash is empty\n");
+                }
+                out(s.as_bytes())
+            }
+            TrashCmd::Restore { id } => {
+                let r = st.trash_restore(id, author)?;
+                if json {
+                    return emit_json(&r);
+                }
+                out(format!("restored {} {}\n", r.kind, r.path).as_bytes())
+            }
+        },
         Cmd::RevertBatch {
             batch,
             skip_changed,
@@ -613,37 +880,32 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             reverse,
             recursive,
         } => {
-            let mut entries = st.ls(&path, recursive)?;
+            // `ls FILE` lists that one file, as Unix does; it used to print nothing at all.
+            let mut entries = match st.stat(&path) {
+                Ok(e) if e.kind == "file" => vec![e],
+                _ => st.ls(&path, recursive)?,
+            };
             sort_entries(&mut entries, sort, reverse, recursive);
             if json {
                 return emit_json(&entries);
             }
             if paths {
-                return out(entries.iter().map(|e| format!("{}\n", e.path)).collect::<String>().as_bytes());
+                // The trailing `/` marks a folder here too: without it a script could not tell
+                // `/guides` the folder from `/guides` a file with no extension.
+                let mark = |e: &Entry| if e.kind == "folder" { format!("{}/\n", e.path) } else { format!("{}\n", e.path) };
+                return out(entries.iter().map(mark).collect::<String>().as_bytes());
             }
             out(ls_text(&entries, long, recursive).as_bytes())
         }
         Cmd::Tree { path, depth, dirs } => tree(st, &path, depth, dirs, json),
         Cmd::Stat { path } => {
-            let s = st.stat(&path)?;
+            let e = st.stat(&path)?;
             if json {
-                return emit_json(&s);
+                return emit_json(&e);
             }
-            let mut text = format!("{} {} v{}", s.path, s.kind, s.version);
-            if s.kind == "file" {
-                text.push_str(&format!(
-                    " · {} · {} lines",
-                    human_bytes(s.nbytes.unwrap_or(0)),
-                    s.nlines.unwrap_or(0)
-                ));
-            }
-            if let Some(at) = &s.updated_at {
-                text.push_str(&format!(" · updated {at}"));
-            }
-            if let Some(by) = &s.updated_by {
-                text.push_str(&format!(" by {by}"));
-            }
-            line(text)
+            // One key per line: `stat` is the "what is this" command, and an agent reaching
+            // for it first should see everything the store knows rather than seven fields.
+            line(stat_text(&e))
         }
         Cmd::Cat { path, number, lines, at, section } => cat(st, &path, number, lines.as_deref(), at, section.as_deref(), json),
         Cmd::Search {
@@ -651,23 +913,40 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             prefix,
             limit,
             per_file,
-        } => search::search(st, &query.join(" "), &prefix, limit, per_file, json),
+            files_with_matches,
+            count,
+        } => search::search(
+            st,
+            &query.join(" "),
+            &prefix,
+            search::Options {
+                mode: mode_of(files_with_matches, count),
+                limit,
+                per_file,
+                ignore_case: false,
+                fixed: false,
+            },
+            json,
+        ),
         Cmd::Grep {
             pattern,
             prefix,
             ignore_case,
             fixed_strings,
             files_with_matches,
+            count,
             limit,
+            per_file,
         } => search::grep(
             st,
             &pattern,
             &prefix,
-            search::GrepOptions {
+            search::Options {
+                mode: mode_of(files_with_matches, count),
+                limit,
+                per_file,
                 ignore_case,
                 fixed: fixed_strings,
-                files_only: files_with_matches,
-                limit,
             },
             json,
         ),
@@ -690,7 +969,7 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
                     Ok(s) => {
                         return Err(StoreError::invalid(format!(
                             "{} exists already (v{}); --create only makes new files",
-                            s.path, s.version
+                            s.path, s.version.unwrap_or(0)
                         )))
                     }
                     Err(e) if e.code == "TX003" => {}
@@ -751,8 +1030,24 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
                 json,
             ),
         },
+        Cmd::Outline {
+            path,
+            heading,
+            match_,
+            level,
+            names,
+            limit,
+        } => outline::run(st, &path, heading.as_deref(), &match_, level, names, limit, json),
         Cmd::Meta { op } => match op {
             MetaOp::Get { path, key } => meta::get(st, &path, key.as_deref(), json),
+            MetaOp::Keys { prefix, limit } => meta::keys(st, prefix.as_deref().unwrap_or(""), limit, json),
+            MetaOp::Values { key, prefix, limit } => meta::values(st, &key, prefix.as_deref().unwrap_or(""), limit, json),
+            MetaOp::Find {
+                query,
+                folder,
+                limit,
+                show,
+            } => meta::find(st, query.as_deref().unwrap_or(""), &folder, limit, show.as_deref(), json),
             MetaOp::Set {
                 path,
                 key,
@@ -829,9 +1124,8 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
         }
         Cmd::History { path, versions_only } => {
             let commits = st.history(&path)?;
-            if versions_only && json {
-                return emit_json(&commits);
-            }
+            // `--versions-only` filters the rows; it does not drop the `type` tag that tells
+            // a version from a path event, which used to make one command emit two shapes.
             let events = if versions_only { Vec::new() } else { st.path_history(&path)? };
             let mut items: Vec<HistoryItem> =
                 commits.iter().map(HistoryItem::Version).chain(events.iter().map(HistoryItem::Path)).collect();
@@ -845,11 +1139,12 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
         Cmd::Diff { path, v1, v2 } => {
             let v2 = match v2 {
                 Some(v) => v,
-                None => st.stat(&path)?.version,
+                // A folder has no version, and neither command accepts one, so this is a file.
+                None => st.stat(&path)?.version.unwrap_or(0),
             };
             let diff = st.diff(&path, v1, v2)?;
             if json {
-                emit_json(&json!({ "path": path, "from": v1, "to": v2, "diff": diff }))
+                emit_json(&json!({ "path": normalize_path(&path)?, "from": v1, "to": v2, "diff": diff }))
             } else {
                 out(diff.as_bytes())
             }
@@ -857,12 +1152,13 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
         Cmd::Hunks { path, v1, v2 } => {
             let v2 = match v2 {
                 Some(v) => v,
-                None => st.stat(&path)?.version,
+                // A folder has no version, and neither command accepts one, so this is a file.
+                None => st.stat(&path)?.version.unwrap_or(0),
             };
             let v1 = v1.unwrap_or(v2 - 1).max(0);
             let hunks = st.hunks(&path, v1, v2)?;
             if json {
-                return emit_json(&json!({ "path": path, "from": v1, "to": v2, "hunks": hunks }));
+                return emit_json(&json!({ "path": normalize_path(&path)?, "from": v1, "to": v2, "hunks": hunks }));
             }
             let mut s = String::new();
             for h in &hunks {
@@ -1006,8 +1302,16 @@ fn run(cli: Cli, matches: &ArgMatches) -> Result<()> {
             };
             line(format!("{key}  {shown}{session}"))
         }
-        Cmd::Log { since, limit } => {
-            let changes = st.feed(since, limit)?;
+        Cmd::Log { prefix, since, limit } => {
+            // Scoped after the fact rather than in the query: the feed is ordered by `seq` and
+            // its rows carry the path a change was made at, so filtering here keeps one feed
+            // implementation for both engines and cannot drop a change into a `seq` gap that
+            // `--since` would then skip past.
+            let changes: Vec<_> = st
+                .feed(since, limit)?
+                .into_iter()
+                .filter(|c| prefix == "/" || c.path == prefix || c.path.starts_with(&format!("{prefix}/")))
+                .collect();
             if json {
                 return emit_json(&changes);
             }
@@ -1080,6 +1384,250 @@ fn history_text(items: &[HistoryItem]) -> String {
 
 /// Write to stdout. A reader that went away (`textdb cat big.md | head`) ends the program
 /// quietly instead of as an error.
+
+// ---------------------------------------------------------------- accounts, tokens and shares
+
+fn whoami(st: &mut dyn Store, json: bool) -> Result<()> {
+    let me = st.whoami()?;
+    if json {
+        return emit_json(&me);
+    }
+    if me.admin {
+        return line("owner of the store: every folder, every account, store paths");
+    }
+    let name = me.account.clone().unwrap_or_default();
+    line(format!("{name} ({}, {} namespace)", me.kind, me.namespace))?;
+    if me.shares.is_empty() {
+        return line("  no shares");
+    }
+    for sh in &me.shares {
+        let at = if sh.alias.is_empty() { "/".to_string() } else { format!("/{}/", sh.alias) };
+        let note = if sh.dormant { "  (its folder is in the trash)" } else { "" };
+        line(format!("  {:<4} {at}{note}", sh.rights))?;
+    }
+    Ok(())
+}
+
+fn account_cmd(st: &mut dyn Store, c: AccountCmd, json: bool) -> Result<()> {
+    match c {
+        AccountCmd::Create { name, kind, root } => {
+            st.account_create(&name, &kind, root.as_deref())?;
+            if json {
+                emit_json(&json!({ "account": name, "kind": kind, "root": root }))
+            } else if let Some(r) = root {
+                line(format!("account {name} ({kind}), whose root is {r}"))
+            } else {
+                line(format!("account {name} ({kind}); grant it a folder with `textdb access grant`"))
+            }
+        }
+        AccountCmd::Ls => {
+            let rows = st.account_ls()?;
+            if json {
+                return emit_json(&rows);
+            }
+            if rows.is_empty() {
+                return line("no accounts; the store is opened by its owner and by nobody else");
+            }
+            for a in rows {
+                let what = match &a.root {
+                    Some(r) => format!("root {r}"),
+                    None => format!("{} share{}", a.shares, if a.shares == 1 { "" } else { "s" }),
+                };
+                let off = if a.disabled { "  (disabled)" } else { "" };
+                line(format!("{:<24} {:<8} {what}{off}", a.name, a.kind))?;
+            }
+            Ok(())
+        }
+        AccountCmd::Disable { name } => account_switch(st, &name, true, json),
+        AccountCmd::Enable { name } => account_switch(st, &name, false, json),
+        AccountCmd::Convert { name, multi, alias } => {
+            if !multi {
+                return Err(StoreError::invalid(
+                    "say which way: `account convert NAME --multi` moves it to aliased shares, and every path it sees gains a prefix",
+                ));
+            }
+            let alias = st.account_convert(&name, alias.as_deref())?;
+            if json {
+                emit_json(&json!({ "account": name, "alias": alias }))
+            } else {
+                line(format!(
+                    "{name} now holds its shares under aliases: every path it sees gains a /{alias} prefix"
+                ))
+            }
+        }
+    }
+}
+
+fn account_switch(st: &mut dyn Store, name: &str, off: bool, json: bool) -> Result<()> {
+    st.account_disable(name, off)?;
+    if json {
+        emit_json(&json!({ "account": name, "disabled": off }))
+    } else if off {
+        line(format!("{name} is disabled; its tokens stop working and its shares are kept"))
+    } else {
+        line(format!("{name} works again"))
+    }
+}
+
+fn token_cmd(st: &mut dyn Store, c: TokenCmd, json: bool) -> Result<()> {
+    match c {
+        TokenCmd::Create { account, label, expires } => {
+            let expires_at = expires.as_deref().map(parse_expiry).transpose()?;
+            let (bearer, id) = st.token_create(&account, label.as_deref(), expires_at.as_deref())?;
+            // Printed here and nowhere again: the store keeps only its hash.
+            if json {
+                emit_json(&json!({ "bearer": bearer, "id": id, "account": account, "expires_at": expires_at }))
+            } else {
+                line(format!("{bearer}\ntoken {id} for {account}; this is the only time it is shown"))
+            }
+        }
+        TokenCmd::Ls { account } => {
+            let rows = st.token_ls(account.as_deref())?;
+            if json {
+                return emit_json(&rows);
+            }
+            if rows.is_empty() {
+                return line("no tokens");
+            }
+            for t in rows {
+                let state = if t.revoked_at.is_some() {
+                    "revoked".to_string()
+                } else if !t.live {
+                    "expired".to_string()
+                } else {
+                    match &t.expires_at {
+                        Some(e) => format!("until {e}"),
+                        None => "live".to_string(),
+                    }
+                };
+                line(format!(
+                    "{:<5} {:<24} {:<20} {}",
+                    t.id,
+                    t.account,
+                    state,
+                    t.label.unwrap_or_default()
+                ))?;
+            }
+            Ok(())
+        }
+        TokenCmd::Revoke { id } => {
+            st.token_revoke(id)?;
+            if json {
+                emit_json(&json!({ "revoked": id }))
+            } else {
+                line(format!("token {id} revoked; the account keeps its shares"))
+            }
+        }
+    }
+}
+
+fn access_cmd(st: &mut dyn Store, c: AccessCmd, json: bool) -> Result<()> {
+    match c {
+        AccessCmd::Grant { account, path, rights, alias } => {
+            let sh = st.access_grant(&account, &path, &rights, alias.as_deref())?;
+            if json {
+                emit_json(&sh)
+            } else {
+                let at = if sh.alias.is_empty() { "/".to_string() } else { format!("/{}/", sh.alias) };
+                line(format!("{account} sees {path} as {at} ({})", sh.rights))
+            }
+        }
+        AccessCmd::Rename { account, from, to } => {
+            st.access_rename(&account, &from, &to)?;
+            if json {
+                emit_json(&json!({ "account": account, "from": from, "to": to }))
+            } else {
+                line(format!("{account}: /{from}/ is now /{to}/; its next sync moves the directory"))
+            }
+        }
+        AccessCmd::Revoke { account, alias } => {
+            st.access_revoke(&account, &alias)?;
+            if json {
+                emit_json(&json!({ "account": account, "revoked": alias }))
+            } else {
+                line(format!(
+                    "{account} no longer sees /{alias}/; files already on its disk are left alone"
+                ))
+            }
+        }
+        AccessCmd::Ls { who } => {
+            let rows = st.access_ls(who.as_deref())?;
+            if json {
+                return emit_json(&rows);
+            }
+            if rows.is_empty() {
+                return line("nothing is shared");
+            }
+            for sh in rows {
+                let at = if sh.alias.is_empty() { "/".to_string() } else { format!("/{}/", sh.alias) };
+                let note = if sh.dormant { "  (in the trash)" } else { "" };
+                line(format!(
+                    "{:<24} {:<4} {:<24} {}{note}",
+                    sh.account,
+                    sh.rights,
+                    at,
+                    sh.store_path.unwrap_or_default()
+                ))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `30d`, `12h`, `90m`, or an ISO-8601 instant passed through as written.
+fn parse_expiry(s: &str) -> Result<String> {
+    let (n, unit) = s.split_at(s.len().saturating_sub(1));
+    let secs = match (n.parse::<i64>(), unit) {
+        (Ok(n), "d") => n * 86_400,
+        (Ok(n), "h") => n * 3_600,
+        (Ok(n), "m") => n * 60,
+        // Not a duration: take it as an instant the store can compare as text, which is what
+        // every timestamp in the store is.
+        _ => {
+            return if s.len() >= 10 && s.starts_with(|c: char| c.is_ascii_digit()) {
+                Ok(s.to_string())
+            } else {
+                Err(StoreError::invalid(format!(
+                    "'{s}' is not a duration (30d, 12h, 90m) or an ISO-8601 instant"
+                )))
+            }
+        }
+    };
+    let at = std::time::SystemTime::now() + std::time::Duration::from_secs(secs.max(0) as u64);
+    let d = at.duration_since(std::time::UNIX_EPOCH).map_err(StoreError::other)?;
+    Ok(iso8601_utc(d.as_secs()))
+}
+
+/// The store's timestamp format, without pulling in a date library for one call.
+fn iso8601_utc(secs: u64) -> String {
+    let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
+    let (mut y, mut d) = (1970i64, days);
+    loop {
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let len = if leap { 366 } else { 365 };
+        if d < len {
+            break;
+        }
+        d -= len;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let months = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0;
+    while d >= months[m] {
+        d -= months[m];
+        m += 1;
+    }
+    format!(
+        "{y:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z",
+        m + 1,
+        d + 1,
+        rest / 3600,
+        (rest % 3600) / 60,
+        rest % 60
+    )
+}
+
 fn out(bytes: &[u8]) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     match stdout.write_all(bytes).and_then(|_| stdout.flush()) {
@@ -1100,7 +1648,7 @@ fn emit_json<T: Serialize + ?Sized>(v: &T) -> Result<()> {
 
 fn emit_written(path: &str, w: &Written, json: bool) -> Result<()> {
     if json {
-        emit_json(&json!({ "path": path, "version": w.version, "kind": w.kind }))
+        emit_json(&json!({ "path": normalize_path(path)?, "version": w.version, "kind": w.kind }))
     } else if w.kind == "noop" {
         line(format!("{path}: unchanged, still v{}", w.version))
     } else {
@@ -1216,7 +1764,7 @@ fn export(st: &mut dyn Store, prefix: &str, dir: &Path, dry_run: bool, json: boo
             Ok(meta) => {
                 let disk_len = std::fs::metadata(&target).map(|m| m.len()).ok();
                 let same = disk_len.is_some()
-                    && disk_len == f.nbytes.map(|n| n as u64)
+                    && disk_len == Some(f.nbytes as u64)
                     && std::fs::read(&target).ok() == Some(st.read(&f.path, None)?.0);
                 if same {
                     report.unchanged += 1;
@@ -1350,6 +1898,66 @@ fn sort_entries(entries: &mut [Entry], key: SortKey, reverse: bool, recursive: b
     });
 }
 
+/// `stat` as one key per line: the full `Entry`, with the values that do not apply omitted
+/// from the *text* (the JSON still carries every key as `null`).
+fn stat_text(e: &Entry) -> String {
+    let mut out = Vec::new();
+    let mut add = |k: &str, v: String| out.push(format!("{k:<14} {v}"));
+    add("path", e.path.clone());
+    add("name", e.name.clone());
+    add("kind", e.kind.clone());
+    if let Some(v) = e.version {
+        add("version", format!("v{v}"));
+    }
+    add("nbytes", format!("{} ({})", e.nbytes, human_bytes(e.nbytes)));
+    add("nlines", e.nlines.to_string());
+    add("nwords", e.nwords.to_string());
+    add("updated_at", e.updated_at.clone());
+    if let Some(by) = &e.updated_by {
+        add("updated_by", by.clone());
+    }
+    add("created_at", e.created_at.clone());
+    if let Some(d) = &e.dir {
+        add("dir", d.clone());
+    }
+    add("depth", e.depth.to_string());
+    if let Some(x) = &e.ext {
+        add("ext", x.clone());
+    }
+    if let Some(t) = &e.title {
+        add("title", t.clone());
+    }
+    add("nsections", e.nsections.to_string());
+    add("nprops", e.nprops.to_string());
+    add("nlinks", format!("{} ({} broken)", e.nlinks, e.nlinks_broken));
+    add("versions", e.versions.to_string());
+    if e.kind == "folder" {
+        add("files", e.files.unwrap_or(0).to_string());
+        add("folders", e.folders.unwrap_or(0).to_string());
+    }
+    add("nauthors", e.nauthors.to_string());
+    if !e.authors.is_empty() {
+        let who: Vec<String> =
+            e.authors.iter().map(|a| format!("{} ({})", a.author.as_deref().unwrap_or("-"), a.commits)).collect();
+        add("authors", who.join(", "));
+    }
+    add("id", e.id.to_string());
+    out.join("\n")
+}
+
+/// `-l` and `-c` pick the same two modes on both commands.
+fn mode_of(files_only: bool, count: bool) -> search::Mode {
+    match (files_only, count) {
+        (true, _) => search::Mode::Files,
+        (_, true) => search::Mode::Count,
+        _ => search::Mode::Lines,
+    }
+}
+
+/// The short listing is the minimal tier: size, lines, the version, and the name.
+///
+/// The version is there because every line-numbered edit needs one, and without it a short
+/// listing was not enough to start one.
 fn ls_text(entries: &[Entry], long: bool, recursive: bool) -> String {
     let name = |e: &Entry| {
         let n = if recursive { &e.path } else { &e.name };
@@ -1362,22 +1970,31 @@ fn ls_text(entries: &[Entry], long: bool, recursive: bool) -> String {
     let mut s = String::new();
     if !long {
         for e in entries {
-            let (size, lines) = if e.kind == "folder" {
-                (String::new(), String::new())
-            } else {
-                (human_bytes(e.nbytes.unwrap_or(0)), format!("{}L", e.nlines.unwrap_or(0)))
-            };
-            s.push_str(&format!("{size:>9}  {lines:>7}  {}\n", name(e)));
+            let version = e.version.map_or(String::new(), |v| format!("v{v}"));
+            s.push_str(&format!(
+                "{:>9}  {:>7}  {:>4}  {}\n",
+                human_bytes(e.nbytes),
+                format!("{}L", e.nlines),
+                version,
+                name(e)
+            ));
         }
         return s;
     }
+    // The full tier. `LINKS` is total/broken; `UPDATED` keeps the seconds and the `Z` rather
+    // than a 16-character cut that read as local time to anyone not in UTC.
+    //
+    // `RIGHTS` appears only when the rows carry it — an account's, never the owner's, who holds
+    // no shares. A column of blanks on every ordinary listing would be worse than no column.
+    let rights = entries.iter().any(|e| e.rights.is_some());
+    let rights_head = if rights { "RIGHTS  " } else { "" };
     s.push_str(&format!(
-        "{:>9} {:>8} {:>9} {:>5}  {:<16}  {:<28}  {}\n",
-        "SIZE", "LINES", "WORDS", "VERS", "UPDATED", "AUTHORS / CONTAINS", "NAME"
+        "{:>9} {:>7} {:>8} {:>5} {:>6} {:>7} {:>5}  {:<24}  {:<28}  {rights_head}{}\n",
+        "SIZE", "LINES", "WORDS", "SECT", "PROPS", "LINKS", "VERS", "UPDATED", "BY / CONTAINS", "NAME"
     ));
     for e in entries {
         let who = if e.kind == "folder" {
-            format!("{} files, {} folders", e.files.unwrap_or(0), e.folders.unwrap_or(0))
+            format!("{}, {}", plural(e.files.unwrap_or(0) as usize, "file"), plural(e.folders.unwrap_or(0) as usize, "folder"))
         } else {
             let mut names: Vec<String> =
                 e.authors.iter().take(2).map(|a| format!("{} ({})", a.author.as_deref().unwrap_or("-"), a.commits)).collect();
@@ -1386,14 +2003,22 @@ fn ls_text(entries: &[Entry], long: bool, recursive: bool) -> String {
             }
             names.join(", ")
         };
-        let updated: String = e.updated_at.as_deref().unwrap_or("").replace('T', " ").chars().take(16).collect();
+        let links = if e.nlinks_broken > 0 {
+            format!("{}/{}", e.nlinks, e.nlinks_broken)
+        } else {
+            e.nlinks.to_string()
+        };
+        let mine = if rights { format!("{:<8}", e.rights.as_deref().unwrap_or("")) } else { String::new() };
         s.push_str(&format!(
-            "{:>9} {:>8} {:>9} {:>5}  {:<16}  {:<28}  {}\n",
-            human_bytes(e.nbytes.unwrap_or(0)),
-            e.nlines.unwrap_or(0),
-            e.nwords.unwrap_or(0),
-            e.versions.unwrap_or(0),
-            updated,
+            "{:>9} {:>7} {:>8} {:>5} {:>6} {:>7} {:>5}  {:<24}  {:<28}  {mine}{}\n",
+            human_bytes(e.nbytes),
+            e.nlines,
+            e.nwords,
+            e.nsections,
+            e.nprops,
+            links,
+            e.versions,
+            e.updated_at,
             who,
             name(e)
         ));
@@ -1401,19 +2026,13 @@ fn ls_text(entries: &[Entry], long: bool, recursive: bool) -> String {
     s
 }
 
+/// A byte count for a human to read.
+///
+/// One formatter for the whole CLI. There were two, and they disagreed above a gigabyte: this
+/// one stopped at `GB` and the assets one went to `TB`, so the same number printed differently
+/// depending on which command showed it.
 fn human_bytes(n: i64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut v = n as f64;
-    let mut unit = 0;
-    while v >= 1024.0 && unit < UNITS.len() - 1 {
-        v /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{n} B")
-    } else {
-        format!("{v:.1} {}", UNITS[unit])
-    }
+    assets::size_text(n.max(0) as u64)
 }
 
 fn change_line(c: &Change) -> String {
@@ -1526,6 +2145,10 @@ fn cat(
     let from = from.max(1);
     let to = to.min(total);
     let selected: &[&[u8]] = if from <= to { &all[(from - 1) as usize..to as usize] } else { &[] };
+    // Echo the path the store knows, not the one the user typed: `cat guides/x.md` used to
+    // answer `"path":"guides/x.md"` while every listing said `/guides/x.md`, so a caller
+    // keying on `path` saw two spellings of one file.
+    let path = &shown_path(st, path)?;
     if json {
         return emit_json(&json!({
             "path": path,
@@ -1550,6 +2173,28 @@ fn cat(
     out(s.as_bytes())
 }
 
+/// The path to echo back for what the caller named.
+///
+/// Normally the normalised argument. An `id:1234` reference names a document without naming a
+/// path, and every view has its own, so that one is asked of the store: echoing `/id:1234` back
+/// would give a caller keying on `path` a spelling that matches no listing.
+fn shown_path(st: &mut dyn Store, path: &str) -> Result<String> {
+    if path.trim_start_matches('/').starts_with("id:") {
+        return Ok(st.stat(path)?.path);
+    }
+    Ok(normalize_path(path)?)
+}
+
+/// Let the store get ready after a bulk load, and say so if it could not.
+///
+/// A store that will not settle is slower to query, not broken, so this never fails the
+/// command that just succeeded in writing everything.
+pub fn settle(st: &mut dyn Store) {
+    if let Err(e) = st.settle() {
+        eprintln!("note: the store could not refresh its query statistics ({}); queries may plan badly until it does", e.message);
+    }
+}
+
 fn import(
     st: &mut dyn Store,
     dir: &Path,
@@ -1567,6 +2212,11 @@ fn import(
     let files = collect_files(dir, &exts)?;
     let total = files.len();
     let prefix = normalize_path(prefix)?;
+    // Asked of the store before a single file is read: importing into somewhere the caller may
+    // not write is one refusal about the destination, not a failure per file. The account root
+    // is the case that reads worst otherwise — "0 created, 47 failed" for something that was
+    // never going to work.
+    st.mkdir(&prefix)?;
     let base = if prefix == "/" { "" } else { prefix.as_str() };
     let interactive = std::io::stderr().is_terminal() && !json;
     let started = Instant::now();
@@ -1599,6 +2249,7 @@ fn import(
     if interactive {
         eprintln!();
     }
+    settle(st);
     if json {
         return emit_json(&json!({ "dir": dir.display().to_string(), "prefix": prefix, "stats": stats, "seconds": seconds }));
     }
@@ -1798,6 +2449,43 @@ enum MetaOp {
         #[arg(long, short = 'm')]
         message: Option<String>,
     },
+    /// Property names used anywhere in the store, most-used first.
+    Keys {
+        /// Only names starting with this.
+        prefix: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        limit: i64,
+    },
+    /// The values one property takes, most-used first.
+    Values {
+        key: String,
+        /// Only values starting with this.
+        prefix: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        limit: i64,
+    },
+    /// Documents matching a property query: `status:draft tags:telco -priority:>3`.
+    ///
+    /// `key:value` equals, `has:key` exists, `key:>3` compares, `key:val*` starts with,
+    /// `key:~val` contains, `key:!=val` has it but not as that. A space means AND; `OR`,
+    /// `NOT` (or a leading `-`) and parentheses work as written. Quote a value with spaces.
+    Find {
+        /// The query. An empty one lists every document that has front matter.
+        ///
+        /// `allow_hyphen_values`: `-status:archived` is the documented way to negate a term,
+        /// and without this clap reads it as `-s tatus:archived` — the store flag — and
+        /// searches an empty store instead of complaining.
+        #[arg(allow_hyphen_values = true)]
+        query: Option<String>,
+        /// Only below this folder.
+        #[arg(long, default_value = "/")]
+        folder: String,
+        #[arg(long, default_value_t = 500)]
+        limit: i64,
+        /// Show these property columns, comma separated (`status,tags`).
+        #[arg(long)]
+        show: Option<String>,
+    },
     /// Remove a top-level key and its lines.
     Unset {
         #[arg(value_parser = store_path)]
@@ -1954,6 +2642,7 @@ struct TreeNode {
     entry: Option<Entry>,
     children: BTreeMap<String, TreeNode>,
     files: usize,
+    folders: usize,
     bytes: i64,
 }
 
@@ -1966,7 +2655,14 @@ impl TreeNode {
 fn tree(st: &mut dyn Store, path: &str, depth: Option<usize>, dirs_only: bool, json: bool) -> Result<()> {
     let root = normalize_path(path)?;
     let base_len = if root == "/" { 0 } else { root.len() };
-    let mut entries = st.nodes(&root)?;
+    // `tree FILE` shows the one entry, as `ls FILE` does. `nodes()` answers about a subtree and
+    // gives nothing for a file, which used to leave a header reading `(0 files, 0 B)` and no rows.
+    let one = st.stat(&root).ok().filter(|e| e.kind == "file");
+    let file = one.is_some();
+    let mut entries = match one {
+        Some(e) => vec![e],
+        None => st.nodes(&root)?,
+    };
     if json {
         entries.retain(|e| {
             let rel = e.path[base_len.min(e.path.len())..].trim_start_matches('/');
@@ -1986,25 +2682,34 @@ fn tree(st: &mut dyn Store, path: &str, depth: Option<usize>, dirs_only: bool, j
             top.children.insert(e.name.clone(), TreeNode { entry: Some(e), ..Default::default() });
             continue;
         }
-        let size = if e.kind == "file" { e.nbytes.unwrap_or(0) } else { 0 };
         let is_file = e.kind == "file";
+        let size = if is_file { e.nbytes } else { 0 };
         let mut node = &mut top;
+        // Each step counts the entry against the folder it is *in*, so every ancestor of a
+        // node holds the totals for its whole subtree and the node itself does not count itself.
         for seg in rel.split('/') {
             if is_file {
                 node.files += 1;
                 node.bytes += size;
+            } else {
+                node.folders += 1;
             }
             node = node.children.entry(seg.to_string()).or_default();
         }
         node.entry = Some(e);
     }
-    let mut s = format!("{root}  ({}, {})\n", count_files(top.files), human_bytes(top.bytes));
+    let mut s = if file { String::new() } else { format!("{root}  ({})\n", contains(top.files, top.folders, top.bytes)) };
     render_tree(&top, "", depth, dirs_only, &mut s);
     out(s.as_bytes())
 }
 
-fn count_files(n: usize) -> String {
-    if n == 1 { "1 file".to_string() } else { format!("{n} files") }
+/// What a folder holds, all the way down: `2 files, 1 folder, 394 B`.
+fn contains(files: usize, folders: usize, bytes: i64) -> String {
+    format!("{}, {}, {}", plural(files, "file"), plural(folders, "folder"), human_bytes(bytes))
+}
+
+fn plural(n: usize, what: &str) -> String {
+    if n == 1 { format!("1 {what}") } else { format!("{n} {what}s") }
 }
 
 /// Draw `node`'s children, and their children down to `depth` more levels (all when `None`).
@@ -2018,11 +2723,11 @@ fn render_tree(node: &TreeNode, indent: &str, depth: Option<usize>, dirs_only: b
         let last = i + 1 == kids.len();
         let branch = if last { "└── " } else { "├── " };
         if kid.is_folder() {
-            s.push_str(&format!("{indent}{branch}{name}/  ({}, {})\n", count_files(kid.files), human_bytes(kid.bytes)));
+            s.push_str(&format!("{indent}{branch}{name}/  ({})\n", contains(kid.files, kid.folders, kid.bytes)));
             let indent = format!("{indent}{}", if last { "    " } else { "│   " });
             render_tree(kid, &indent, depth.map(|d| d - 1), dirs_only, s);
         } else {
-            let size = kid.entry.as_ref().and_then(|e| e.nbytes).unwrap_or(0);
+            let size = kid.entry.as_ref().map_or(0, |e| e.nbytes);
             s.push_str(&format!("{indent}{branch}{name}  {}\n", human_bytes(size)));
         }
     }

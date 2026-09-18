@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -48,6 +48,9 @@ pub struct Options {
     pub author: String,
     /// The store as trailers name it, without a password.
     pub store: String,
+    /// The store as given, so a SQLite file inside the directory can be left out of the sync.
+    /// Unredacted, since it is compared as a path and never printed.
+    pub store_file: String,
     /// Take in files that a change of include rules adds since the last sync.
     pub accept_rules: bool,
     /// Remove directories on disk that hold no files.
@@ -55,6 +58,12 @@ pub struct Options {
     /// What to do with assets besides listing them: `push`, `pull` or `both`; `None` for what the
     /// store's `asset_sync` setting says.
     pub assets: Option<String>,
+    /// How long to wait for another sync of the same directory. Zero — the default — fails at
+    /// once, so two syncs at once are one success and one visible failure rather than two
+    /// successes where the second silently found nothing left to do.
+    pub lock_wait: Duration,
+    /// Print the summary line and what went wrong, nothing else. What a hook wants.
+    pub quiet: bool,
 }
 
 /// What a sync takes in from disk, recorded with its base so the next sync can tell when it
@@ -75,6 +84,11 @@ pub struct Rules {
     /// are none); `None` for a base an older build saved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gitattributes: Option<String>,
+    /// A digest of the files this sync walked past, so the next one can say so only when the set
+    /// changed. `Rules::same` does not look at it: a new `.csv` on disk is not a rules change, it
+    /// is something to mention once. `None` for a base an older build saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_out: Option<String>,
 }
 
 impl Rules {
@@ -134,6 +148,16 @@ pub fn parse_exts(ext: &str) -> Vec<String> {
         .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
         .filter(|e| !e.is_empty())
         .collect()
+}
+
+/// One id for the set of files a sync walked past, so the next one can tell whether it changed.
+///
+/// The paths themselves, not a count: the same number of different files is a different set, and
+/// that is what a reader wants told.
+fn left_out_digest(left_out: &BTreeMap<String, Vec<String>>) -> String {
+    let mut flat: Vec<&str> = left_out.values().flatten().map(String::as_str).collect();
+    flat.sort_unstable();
+    blob_id(flat.join("\n").as_bytes())
 }
 
 /// Git's blob id of `bytes`: the SHA-1 of `blob <size>\0` and the bytes.
@@ -381,6 +405,26 @@ fn refuse_link(root: &Path, rel: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The store's own files, relative to the synced directory, when the store lives inside it.
+///
+/// A SQLite store is a file plus its `-wal`, `-shm` and `-journal` siblings, and `-wal` is
+/// text-shaped enough that `--ext '*'` offered it for import. None of the four is a document,
+/// and writing one from the store would corrupt the store this sync is reading.
+pub fn store_rels(store: &str, dir: &Path) -> Vec<String> {
+    let crate::config::StoreUrl::Sqlite(path) = crate::config::parse_store(store) else {
+        return Vec::new();
+    };
+    // Compared as canonical paths: `-s ./kb.db` and `-s /abs/kb.db` name the same file, and the
+    // directory may be reached through a link.
+    let file = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
+    let root = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let Ok(rel) = file.strip_prefix(&root) else {
+        return Vec::new();
+    };
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    ["", "-wal", "-shm", "-journal"].iter().map(|suffix| format!("{rel}{suffix}")).collect()
+}
+
 /// Whether a file found only on disk is taken in: one of `exts`, and not inside one of
 /// [`SKIP_DIRS`] (the same files `import` reads).
 fn eligible(rel: &str, exts: &[String]) -> bool {
@@ -463,6 +507,28 @@ fn walk(root: &Path, tracked_dirs: &HashSet<String>) -> Result<Walk> {
     Ok(w)
 }
 
+/// `DIR/.textdb`, created if it is not there, ignoring itself.
+///
+/// Everything textdb keeps beside a synced directory lives here: the lock, the staging files and
+/// the trash. It carries a `.gitignore` of `*` so a checkout stays clean without the user adding
+/// anything to theirs — the same trick git's own tooling uses for generated directories.
+pub fn textdb_dir(root: &Path) -> std::io::Result<PathBuf> {
+    let dir = root.join(".textdb");
+    std::fs::create_dir_all(&dir)?;
+    let ignore = dir.join(".gitignore");
+    if !ignore.exists() {
+        // Best effort: a read-only directory is not a reason to fail the sync.
+        let _ = std::fs::write(&ignore, "# textdb's own files; not yours to track.\n*\n");
+    }
+    Ok(dir)
+}
+
+/// Write `rel` whole, or not at all.
+///
+/// The bytes go to a staging file and are renamed over the target, as git does with its `.lock`
+/// files: a reader never sees half a note, and a sync killed mid-write — a hook that timed out,
+/// say — leaves the old content rather than an empty file. Truncating in place was worth one
+/// thing, that the file kept its permissions; those are copied onto the staging file instead.
 fn write_disk(root: &Path, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
     refuse_protected(rel)?;
     refuse_link(root, rel)?;
@@ -471,9 +537,26 @@ fn write_disk(root: &Path, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Truncated in place rather than replaced, so the file keeps its permissions.
-    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&target)?;
-    file.write_all(bytes)
+    let staging = textdb_dir(root)?.join("tmp");
+    std::fs::create_dir_all(&staging)?;
+    // Unique per process and call: two syncs of different directories may share a root, and one
+    // sync writes many files.
+    let tmp = staging.join(format!("{}-{}.tdbtmp", std::process::id(), now_ns()));
+    let done = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        // Durable before the rename, so a crash cannot leave the name pointing at empty bytes.
+        file.sync_all()?;
+        drop(file);
+        if let Ok(meta) = std::fs::metadata(&target) {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, &target)
+    })();
+    if done.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    done
 }
 
 /// Delete a file, then the directories it leaves empty (never `root`).
@@ -1052,6 +1135,14 @@ pub struct Report {
     pub to_textdb: Changes,
     /// Moved in the store because the file moved on disk.
     pub moved: Vec<Move>,
+    /// Share directories renamed on disk because the account's alias for them was renamed
+    /// centrally (#12 §4). Whatever else was in them came along.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub renamed_shares: Vec<Move>,
+    /// Files moved on disk to follow a move made in the store, with their base and with whatever
+    /// was edited here and not yet synced.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub followed_moves: Vec<Move>,
     pub merged: Vec<String>,
     /// Conflict markers written to these files on disk.
     pub conflicts: Vec<String>,
@@ -1079,6 +1170,14 @@ pub struct Report {
     pub left_behind: Vec<Note>,
     /// Directories on disk that hold no files.
     pub empty_dirs: Vec<String>,
+    /// Where this directory was when it was last synced, when it has moved since. The base
+    /// follows the directory's id rather than its path, so a move is not a re-import.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved_dir: Option<String>,
+    /// Files on disk this sync did not take in, by reason: `extension`, `binary`, `ignored`.
+    /// A `.csv` created after the first sync used to produce no line at all, so "why is my file
+    /// not there" had no answer anywhere in the output.
+    pub left_out: BTreeMap<String, Vec<String>>,
     /// Of those, removed by `--prune-empty-dirs`.
     pub removed_empty_dirs: usize,
     /// Assets, when the directory or the store has any, or an asset store is declared.
@@ -1094,36 +1193,146 @@ fn failure(e: &StoreError) -> String {
     }
 }
 
+/// The alias of the denied share a relative path falls under, if any.
+///
+/// `rel` is relative to the synced prefix, so for an account syncing its root the first segment
+/// is the alias; syncing one share, the alias is the prefix itself and every file is under it.
+fn denied_share_of(denied: &[String], rel: &str) -> Option<String> {
+    denied
+        .iter()
+        .find(|a| rel == a.as_str() || rel.starts_with(&format!("{a}/")) || a.is_empty())
+        .cloned()
+}
+
 pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     let prefix = normalize_path(&o.prefix)?;
     if !o.dir.exists() && !o.dry_run {
         std::fs::create_dir_all(&o.dir).map_err(|e| StoreError::other(format!("{}: {e}", o.dir.display())))?;
     }
+    // Held for the whole run, before anything is read: two syncs of one directory each compute
+    // both sides from the same base and commit, so one disk edit lands twice — which is what a
+    // turn-end hook in one agent and a turn-start hook in another produce. A dry run reads only,
+    // so it does not queue behind a real one.
+    let _lock = if o.dry_run { None } else { Some(crate::lock::acquire(&o.dir, o.lock_wait)?) };
     let key = dir_key(&o.dir);
     let repo = git::repo(&o.dir);
     if o.commit && repo.is_none() {
         return Err(StoreError::invalid(format!("--commit needs {} to be in a git checkout", o.dir.display())));
     }
+    // The name this directory calls itself. Settled before the base is looked up, because a
+    // directory that moved is found by it rather than by a path that has changed.
+    let dir_id = crate::root::Config::read(&o.dir)?
+        .map(|c| c.id)
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+    // Shares this connection holds but may not use. Read before anything is planned: what the
+    // store no longer lists is otherwise indistinguishable from what it no longer has, and the
+    // plan below turns the second into a delete on disk.
+    // Who this checkout belongs to. Noted in its config so whoever opens the directory later can
+    // see whose layout it is; the bearer never goes to disk.
+    let me = st.whoami()?;
+    let account = me.account.clone();
+    // An alias renamed centrally is the same share under a new name (#12 §4). Matched by the
+    // store's node id — which the last sync recorded in `.textdb/config` — it reads as a rename
+    // here too, so the directory moves with everything in it. Read as one share gone and another
+    // arrived it would be a delete and a fresh write, and whatever else was in the directory
+    // (a local note, an untracked file) would go with the delete.
+    let renamed_aliases: Vec<(String, String)> = match crate::root::Config::read(&o.dir)? {
+        Some(cfg) => {
+            let now: HashMap<i64, &str> = me.shares.iter().map(|sh| (sh.node_id, sh.alias.as_str())).collect();
+            cfg.shares
+                .iter()
+                .filter_map(|(was, id)| now.get(id).map(|alias| (was.clone(), (*alias).to_string())))
+                .filter(|(was, alias)| was != alias && !was.is_empty() && !alias.is_empty())
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    // The share this directory is a checkout of was itself renamed: the folder it is paired with
+    // is the same node, under the name the account now has for it.
+    let prefix = renamed_aliases.iter().fold(prefix, |prefix, (was, alias)| match prefix.strip_prefix(&format!("/{was}")) {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("/{alias}{rest}"),
+        _ => prefix,
+    });
+    // Alias -> the node it names, for the config this sync leaves behind.
+    let share_ids: Vec<(String, i64)> = me.shares.iter().map(|sh| (sh.alias.clone(), sh.node_id)).collect();
+    let shares = st.share_state()?;
+    let denied: Vec<String> = shares.iter().filter(|(_, s)| s == "denied").map(|(a, _)| a.clone()).collect();
+    let read_only: Vec<String> = shares.iter().filter(|(_, s)| s == "ro").map(|(a, _)| a.clone()).collect();
     let mut stored = find_sync_base(st, &prefix, &key)?;
+    let mut moved_from: Option<String> = None;
+    // A directory that was moved or renamed: the base is its own, found by the id it carries, so
+    // the sync continues from where it left off instead of treating every file as new.
+    if stored.is_none() {
+        let moved = st
+            .all_sync_bases()?
+            .into_iter()
+            .find(|b| b.prefix == prefix && b.dir_id.as_deref() == Some(dir_id.as_str()) && b.dir != key);
+        if let Some(b) = moved {
+            if !o.dry_run {
+                st.rename_sync_dir(&prefix, &b.dir, &key)?;
+            }
+            moved_from = Some(b.dir.clone());
+            stored = find_sync_base(st, &prefix, &key)?.or_else(|| Some(SyncBase { dir: key.clone(), ..b }));
+        }
+    }
     // A base an older build recorded under another form of the directory's name takes this one,
     // so the sync saves over it rather than next to it.
     if let Some(b) = stored.as_mut().filter(|b| b.dir != key && !o.dry_run) {
         st.rename_sync_dir(&prefix, &b.dir, &key)?;
         b.dir = key.clone();
     }
+    // Carry an alias rename through to disk and to the base, before either side is read: from
+    // here on the directory looks as though it had always been called this, so the rest of the
+    // sync has nothing to do about it. Aliases sit at the top of a view, so only a checkout of
+    // the whole view holds them as directories; a checkout of one share had its prefix renamed
+    // above instead.
+    let mut renamed_shares: Vec<Move> = Vec::new();
+    let mut rename_notes: Vec<Note> = Vec::new();
+    if prefix == "/" {
+        for (was, alias) in &renamed_aliases {
+            let (from, to) = (o.dir.join(was), o.dir.join(alias));
+            if !from.is_dir() {
+                continue;
+            }
+            if to.exists() {
+                // Something is there already. Left for the ordinary path, which writes the files
+                // under the new name and says what it deleted, rather than merging two trees here.
+                rename_notes.push(note(alias, &format!("{was}/ is now {alias}/, but {alias}/ is here already: left as it is")));
+                continue;
+            }
+            renamed_shares.push(Move { from: format!("{was}/"), to: format!("{alias}/") });
+            if o.dry_run {
+                continue;
+            }
+            std::fs::rename(&from, &to).map_err(|e| StoreError::other(format!("{was}/ -> {alias}/: {e}")))?;
+            if let Some(b) = stored.as_mut() {
+                let (old, new) = (format!("{was}/"), format!("{alias}/"));
+                for f in &mut b.files {
+                    if let Some(rest) = f.rel.strip_prefix(old.as_str()) {
+                        f.rel = format!("{new}{rest}");
+                    }
+                }
+            }
+        }
+    }
     if stored.is_some() && o.base_rev.is_some() {
         return Err(StoreError::invalid(format!(
             "{prefix} has been synced with {key} before and has a base already; --base is for the first sync only"
         )));
     }
+    let generation = stored.as_ref().map_or(0, |b| b.generation);
     let heads = heads_by_rel(st, &prefix)?;
     let mut report = Report {
         prefix: prefix.clone(),
         dir: key.clone(),
         dry_run: o.dry_run,
         first_sync: stored.is_none(),
+        moved_dir: moved_from,
+        renamed_shares,
         ..Default::default()
     };
+    report.kept.append(&mut rename_notes);
 
     let stored_rows: HashMap<String, BaseFile> = stored
         .as_ref()
@@ -1160,6 +1369,63 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         report.base_commit = Some(commit);
     }
 
+    // Paths deleted or moved away in the store since the last sync: a file there now may be another
+    // with the same version number, so its content tells. Read before the directory is walked,
+    // because a move is followed on disk first and the walk must see the result.
+    let mut gone_since: HashSet<String> = HashSet::new();
+    let mut moved_since: Vec<(String, String)> = Vec::new();
+    if let Some(b) = &stored {
+        const PAGE: i64 = 10_000;
+        let mut since = b.seq;
+        loop {
+            let page = st.feed(since, PAGE)?;
+            for c in &page {
+                match c.op.as_str() {
+                    "delete" => drop(gone_since.insert(c.path.clone())),
+                    "move" => {
+                        if let Some(from) = c.old_path.clone() {
+                            moved_since.push((from.clone(), c.path.clone()));
+                            gone_since.insert(from);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match page.last() {
+                Some(last) if page.len() as i64 == PAGE => since = last.seq,
+                _ => break,
+            }
+        }
+    }
+    // A file moved centrally is the same document under a new path, so the copy on disk follows
+    // it — with whatever was edited here and not yet synced. Left to the ordinary plan it would
+    // be a delete at the old path and a new file at the new one, and an unsynced edit would be
+    // added back at the old path as a second document (#12 M10).
+    if !moved_since.is_empty() {
+        let rel_of = |path: &str| -> Option<String> {
+            let under = if prefix == "/" { path.strip_prefix('/') } else { path.strip_prefix(&prefix).and_then(|r| r.strip_prefix('/')) };
+            under.filter(|r| !r.is_empty()).map(str::to_string)
+        };
+        for (from, to) in &moved_since {
+            let (Some(from_rel), Some(to_rel)) = (rel_of(from), rel_of(to)) else { continue };
+            // Only a file this directory actually holds at the old path, and only when nothing is
+            // at the new one: anything else is for the ordinary plan to reconcile.
+            if !base.contains_key(&from_rel) || base.contains_key(&to_rel) {
+                continue;
+            }
+            if !o.dir.join(&from_rel).is_file() || o.dir.join(&to_rel).exists() {
+                continue;
+            }
+            if !o.dry_run {
+                move_disk(&o.dir, &from_rel, &to_rel).map_err(|e| StoreError::other(format!("{from_rel} -> {to_rel}: {e}")))?;
+                if let Some(row) = base.remove(&from_rel) {
+                    base.insert(to_rel.clone(), row);
+                }
+            }
+            report.followed_moves.push(Move { from: from_rel, to: to_rel });
+        }
+    }
+
     let mut tracked_dirs = HashSet::new();
     for rel in base.keys().chain(heads.keys()) {
         let mut at = 0;
@@ -1187,27 +1453,6 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         textdb: HashMap::new(),
         disk: HashMap::new(),
     };
-    // Paths deleted or moved away in the store since the last sync: a file there now may be another
-    // with the same version number, so its content tells.
-    let mut gone_since: HashSet<String> = HashSet::new();
-    if let Some(b) = &stored {
-        const PAGE: i64 = 10_000;
-        let mut since = b.seq;
-        loop {
-            let page = sides.st.feed(since, PAGE)?;
-            for c in &page {
-                match c.op.as_str() {
-                    "delete" => drop(gone_since.insert(c.path.clone())),
-                    "move" => gone_since.extend(c.old_path.clone()),
-                    _ => {}
-                }
-            }
-            match page.last() {
-                Some(last) if page.len() as i64 == PAGE => since = last.seq,
-                _ => break,
-            }
-        }
-    }
     // The path, or a folder it is in, went away.
     let recreated = |rel: &str| {
         if gone_since.is_empty() {
@@ -1247,7 +1492,18 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     let mut ignore_write: Option<(String, Option<String>)> = None;
     if !ignore_seeded {
         ignore_seeded = true;
-        if let Some(add) = default_ignore_additions(ignore_text.as_deref().unwrap_or("").trim_start_matches('\u{feff}')) {
+        // Only where Obsidian is: a Rust repository does not need three lines about plugins, and
+        // the file they were written into stayed untracked for no reason. The store counts as
+        // well as the disk — a sync into an empty directory would otherwise write out the very
+        // plugin code these lines exist to keep from being written.
+        let vault_rel = |rel: &&String| rel.starts_with(".obsidian/") || rel.contains("/.obsidian/");
+        let obsidian = o.dir.join(".obsidian").is_dir()
+            || heads.keys().any(|r| vault_rel(&r))
+            || walked.files.keys().any(|r| vault_rel(&r));
+        if let Some(add) = obsidian
+            .then(|| default_ignore_additions(ignore_text.as_deref().unwrap_or("").trim_start_matches('\u{feff}')))
+            .flatten()
+        {
             let mut text = ignore_text.clone().unwrap_or_default();
             if !text.is_empty() && !text.ends_with('\n') {
                 text.push('\n');
@@ -1266,6 +1522,12 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     }
     report.skipped.extend(ignore_notes.into_iter().map(|e| note(IGNORE_FILE, format!("not read: {e}"))));
     let ignored = |rel: &str| ignore.as_ref().is_some_and(|gi| ignored_by(gi, rel));
+    let store_rels = store_rels(&o.store_file, &o.dir);
+    if !store_rels.is_empty() {
+        // Allowed, since a store beside its notes is a reasonable thing to want, but said once:
+        // a reader wondering why `kb.db` is not in the listing has an answer.
+        report.skipped.push(note(&store_rels[0], "the store itself, inside the directory it syncs: left out of the sync"));
+    }
 
     let mut plan = Plan::default();
     let all: BTreeSet<String> = base.keys().chain(heads.keys()).chain(walked.files.keys()).cloned().collect();
@@ -1278,14 +1540,20 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         // `.textdbignore`: nothing there is synced either way, whether textdb, the last sync or only
         // the disk has it (a submodule's `.git` file under its short name, a plugin deleted in
         // textdb, a plugin taken in from disk).
-        let protected = protected_rel(&rel);
+        // The store's own file is never a document, whichever way it would travel: taking it in
+        // would version the database this sync is reading, and writing it from the store would
+        // corrupt it. `--ext '*'` used to offer `kb.db-wal`, which is text-shaped enough to pass.
+        let is_store = store_rels.iter().any(|s| s == &rel);
+        let protected = protected_rel(&rel) || is_store;
         if protected || ignored(&rel) {
             // Gone from both sides: the last sync's record of it goes too.
             if !heads.contains_key(&rel) && !walked.files.contains_key(&rel) {
                 continue;
             }
             if heads.contains_key(&rel) || base.contains_key(&rel) {
-                let why = if rel.split('/').next().is_some_and(|s| crate::assets::classify::names_dir(s, &[IGNORE_FILE])) {
+                let why = if is_store {
+                    "the store's own file: not synced"
+                } else if rel.split('/').next().is_some_and(|s| crate::assets::classify::names_dir(s, &[IGNORE_FILE])) {
                     "the directory's own .textdbignore, which sync never writes from textdb: not synced"
                 } else if protected {
                     "inside a folder sync never writes into (.git, .textdb, node_modules, …): not synced"
@@ -1305,6 +1573,13 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
                 (None, Some(_)) => {
                     if eligible(&rel, &o.exts) {
                         plan.candidates.push(rel);
+                    } else {
+                        // Only files in folders sync reads at all: a `node_modules` tree is not
+                        // something a user is waiting to see synced.
+                        let segs: Vec<&str> = rel.split('/').collect();
+                        if !segs.iter().any(|s| SKIP_DIRS.contains(s)) {
+                            report.left_out.entry("extension".to_string()).or_default().push(rel);
+                        }
                     }
                 }
                 (Some(_), Some(_)) => {
@@ -1364,7 +1639,29 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             (None, None) => {}
             (Some(false), Some(false)) => plan.keep.push(rel),
             (Some(true), Some(false)) => plan.to_disk.push(rel),
+            (Some(false), Some(true)) if denied_share_of(&read_only, &rel).is_some() => {
+                let alias = denied_share_of(&read_only, &rel).unwrap_or_default();
+                report.kept.push(note(&rel, &format!("{alias}/ is read-only for you; your change stays here")));
+                // Keep the base row exactly as it was. Without this the file has no base at the
+                // next sync, which reads as "in the store and on disk, unrelated" — a conflict,
+                // on a file the reader was told would simply be left alone.
+                plan.hold.push(rel);
+            }
             (Some(false), Some(true)) => plan.to_textdb.push((rel, t.map(|t| t.version))),
+            // Both sides changed, under a share this account can only read. A conflict is the
+            // right answer for an `rw` share — resolve it and push — but here the reader can
+            // never push, so markers would sit in the file for ever and every later sync would
+            // conflict again. The local text is kept as it is and the store's newer version is
+            // simply not pulled while it stands, which is the same rule as G3 applied to a file
+            // that also moved centrally.
+            (Some(true), Some(true)) if denied_share_of(&read_only, &rel).is_some() => {
+                let alias = denied_share_of(&read_only, &rel).unwrap_or_default();
+                report.kept.push(note(
+                    &rel,
+                    &format!("changed here and in textdb, and {alias}/ is read-only for you; your version is kept"),
+                ));
+                plan.hold.push(rel);
+            }
             (Some(true), Some(true)) => {
                 // A file that is binary on disk now is not merged: conflict markers would destroy it,
                 // and merged bytes would pass it into the store. Both sides keep what they have.
@@ -1397,6 +1694,15 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
                 } else {
                     plan.conflicts.push((rel, tv, blob_id(&tb), merged));
                 }
+            }
+            // Gone from the store and unchanged here — unless it is under a share this account
+            // holds but may not use. A revoked share's files disappear from every listing, which
+            // looks exactly like a delete; deleting them would empty a vault because someone
+            // changed a permission. Forbidden is left alone, and said out loud.
+            (None, Some(false)) if denied_share_of(&denied, &rel).is_some() => {
+                let alias = denied_share_of(&denied, &rel).unwrap_or_default();
+                report.kept.push(note(&rel, &format!("{alias}/ is no longer shared with you; left alone")));
+                plan.hold.push(rel);
             }
             (None, Some(false)) => plan.disk_delete.push(rel),
             (Some(false), None) => plan.textdb_delete.push(rel),
@@ -1456,8 +1762,16 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             ignore_text: ignore_text.clone(),
             ignore_seeded,
             gitattributes: Some(gitattributes_id(&o.dir, &walked)),
+            left_out: Some(left_out_digest(&report.left_out)),
         }
     };
+    // Say what was walked past when the set has changed — a `.csv` added after the first sync
+    // must not go unmentioned — and not on every run of a hook over a code directory, where the
+    // same 1200 files are left out every time and the line is pure noise.
+    let said_before = stored.as_ref().and_then(|b| b.rules.as_deref()).and_then(|r| serde_json::from_str::<Rules>(r).ok());
+    if said_before.as_ref().and_then(|r| r.left_out.clone()).as_deref() == rules.left_out.as_deref() {
+        report.left_out.clear();
+    }
     // A file gone from disk and an identical new one elsewhere is a move: the store moves the
     // file, keeping its history.
     let mut by_blob: HashMap<String, Vec<String>> = HashMap::new();
@@ -1478,9 +1792,17 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     });
     plan.moves = moves;
     for rel in std::mem::take(&mut plan.candidates) {
-        if !moved_to.contains(&rel) {
-            plan.to_textdb.push((rel, None));
+        if moved_to.contains(&rel) {
+            continue;
         }
+        // A file made on disk under a read-only share belongs to whoever made it, and stays
+        // there. Offering it to the store would get it refused file by file, which reads as a
+        // failure rather than as the rule it is.
+        if let Some(alias) = denied_share_of(&read_only, &rel) {
+            report.kept.push(note(&rel, &format!("{alias}/ is read-only for you; this file stays here")));
+            continue;
+        }
+        plan.to_textdb.push((rel, None));
     }
     // A binary file (a NUL byte in its first 8000 bytes, as git tells) is not text for the store:
     // it stays on disk, and the store keeps what it had, with a word on what to do about it.
@@ -1620,7 +1942,15 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     for rel in &gone {
         ancestors(&mut emptied_by_sync, rel);
     }
-    report.empty_dirs = walked.dirs.iter().filter(|d| !holds.contains(*d) && !emptied_by_sync.contains(*d)).cloned().collect();
+    // A build tree or an ignored folder holds no documents by design, so counting its empty
+    // directories — and recommending --prune-empty-dirs, which would delete Cargo's output —
+    // was advice to act on the one thing sync must not touch.
+    report.empty_dirs = walked
+        .dirs
+        .iter()
+        .filter(|d| !holds.contains(*d) && !emptied_by_sync.contains(*d) && !protected_rel(d) && !ignored(d))
+        .cloned()
+        .collect();
     report.empty_dirs.sort();
     plan.carry = carry.into_iter().filter(|(from, to)| !ignored(from) && !ignored(to)).collect();
     plan.keep.retain(|rel| !pairs.renames.iter().any(|(from, _)| from == rel));
@@ -1789,7 +2119,25 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     }
     if !report.stopped && !report.stopped_by_rules && !o.dry_run {
         let (stores, why) = (store_files.as_mut(), no_store_files.as_deref());
-        apply(&mut sides, &o, &plan, &base, &stored_rows, &heads, &changes, &key, from_commit.as_deref(), stores, why, &mut report, &rules)?;
+        apply(
+            &mut sides,
+            &o,
+            &plan,
+            &base,
+            &stored_rows,
+            &heads,
+            &changes,
+            &key,
+            from_commit.as_deref(),
+            stores,
+            why,
+            &mut report,
+            &rules,
+            generation,
+            &dir_id,
+            account.as_deref(),
+            &share_ids,
+        )?;
     }
     if !report.stopped && !report.stopped_by_rules {
         let (stores, why) = (store_files.as_mut(), no_store_files.as_deref());
@@ -1830,7 +2178,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         }
         return Ok(());
     }
-    print_report(&report)?;
+    print_report(&report, o.quiet)?;
     let blocking = report.problems.iter().filter(|p| p.blocking).count();
     if report.stopped {
         return Err(StoreError::invalid(format!(
@@ -1838,6 +2186,11 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             if blocking == 1 { "name" } else { "names" },
             if blocking == 1 { "it" } else { "them" }
         )));
+    }
+    // A sync that wrote anything is a bulk load; let the store get ready before the error
+    // checks below can return early, since those still leave the writes in place.
+    if !o.dry_run {
+        crate::settle(sides.st);
     }
     if rules_stop {
         let n = report.rules.as_ref().map_or(0, |r| r.newly_included.len());
@@ -1881,6 +2234,15 @@ fn apply(
     no_store_files: Option<&str>,
     report: &mut Report,
     rules: &Rules,
+    // What the base was at when this sync read it; saving checks it has not moved since.
+    generation: i64,
+    // The id this directory calls itself, recorded with the base so a move does not lose it.
+    dir_id: &str,
+    // The account this checkout belongs to, noted in its config. Never the bearer.
+    account: Option<&str>,
+    // Its aliases and the node each one names, noted in the config so the next sync can tell a
+    // rename from a share gone and another arrived.
+    shares: &[(String, i64)],
 ) -> Result<()> {
     let prefix = sides.prefix.clone();
     let dir = o.dir.as_path();
@@ -2113,7 +2475,7 @@ fn apply(
             .cloned()
             .collect();
         if !paths.is_empty() {
-            let message = commit_message(o, &prefix, plan, report, heads, from_commit, seq, &not_done);
+            let message = commit_message(o, &prefix, plan, report, heads, from_commit, seq, &not_done, account);
             let result = git::commit(dir, &paths, &message);
             if let Some(g) = report.git.as_mut() {
                 match result {
@@ -2142,8 +2504,35 @@ fn apply(
             clean: r.clean,
         }),
         rules: serde_json::to_string(rules).ok(),
+        generation,
+        dir_id: Some(dir_id.to_string()),
         files: rows.into_values().collect(),
-    })
+    })?;
+    // Written last, and only by a sync that got this far: the pairing this directory will be
+    // found by from now on. Kept as it was when it is already right, so an id stays stable.
+    let paired = crate::root::Config {
+        store: crate::root::Config::record_store(&o.store_file, dir),
+        prefix: prefix.clone(),
+        id: dir_id.to_string(),
+        created: crate::assets::driver::stamp(SystemTime::now()),
+        // Normalised, so it round-trips through `parse_exts` unchanged.
+        ext: Some(o.exts.join(",")),
+        account: account.map(str::to_string),
+        shares: shares.to_vec(),
+    };
+    match crate::root::Config::read(dir)? {
+        Some(before)
+            if before.store == paired.store
+                && before.prefix == paired.prefix
+                && before.ext == paired.ext
+                && before.account == paired.account
+                && before.shares == paired.shares =>
+        {
+            Ok(())
+        }
+        Some(before) => crate::root::Config { id: before.id, created: before.created, ..paired }.write(dir),
+        None => paired.write(dir),
+    }
 }
 
 /// `textdb sync /docs: 2 changed, 1 added` with who made the changes in the store and
@@ -2157,6 +2546,9 @@ fn commit_message(
     from_commit: Option<&str>,
     seq: i64,
     not_done: &HashSet<&str>,
+    // Whose view this checkout is. The commit says so, because the same directory synced by two
+    // accounts holds two different sets of paths and the message is the only record of which.
+    account: Option<&str>,
 ) -> String {
     let done = |rel: &&String| !not_done.contains(rel.as_str());
     // What was written, as the report has it (a file new on disk is added, `.textdbignore` too).
@@ -2192,6 +2584,11 @@ fn commit_message(
         m.push_str(&format!("Changed in textdb{since} by {}.\n\n", by.join(", ")));
     }
     m.push_str(&format!("Textdb-Store: {}\nTextdb-Prefix: {prefix}\nTextdb-Seq: {seq}\n", o.store));
+    // The account's own name, never its share roots: `prefix` above is already the view's path,
+    // and the store's path for it is not this checkout's business (#12 §3).
+    if let Some(name) = account {
+        m.push_str(&format!("Textdb-Account: {name}\n"));
+    }
     for a in authors.keys() {
         m.push_str(&format!("Textdb-Author: {a}\n"));
     }
@@ -2207,8 +2604,21 @@ fn list(s: &mut String, label: &str, items: &[String]) {
     }
 }
 
-fn print_report(r: &Report) -> Result<()> {
+fn print_report(r: &Report, quiet: bool) -> Result<()> {
     let mut s = String::new();
+    if quiet {
+        // The summary line, and anything that went wrong. A hook wants one line on success and
+        // the reason on failure; the file-by-file list is for a person reading along.
+        for (label, notes) in [("failed", &r.failed), ("conflict", &r.conflicts.iter().map(|c| note(c, "")).collect::<Vec<_>>())] {
+            for n in notes {
+                s.push_str(&format!("{label:<15} {}{}{}\n", n.path, if n.reason.is_empty() { "" } else { ": " }, n.reason));
+            }
+        }
+        for p in r.problems.iter().filter(|p| p.blocking) {
+            s.push_str(&format!("{:<15} {}: {}\n", "problem", p.path, p.detail));
+        }
+        return summary(r, s);
+    }
     if let Some(rc) = &r.rules {
         let before = match &rc.before {
             Some(b) => b.describe(),
@@ -2223,6 +2633,12 @@ fn print_report(r: &Report) -> Result<()> {
     list(&mut s, "textdb new", &r.to_textdb.new);
     list(&mut s, "textdb changed", &r.to_textdb.changed);
     list(&mut s, "textdb deleted", &r.to_textdb.deleted);
+    for m in &r.followed_moves {
+        s.push_str(&format!("{:<15} {} -> {} (moved in textdb)\n", "disk moved", m.from, m.to));
+    }
+    for m in &r.renamed_shares {
+        s.push_str(&format!("{:<15} {} -> {} (renamed for you in textdb)\n", "share moved", m.from, m.to));
+    }
     for m in &r.moved {
         s.push_str(&format!("{:<15} {} -> {}\n", "textdb moved", m.from, m.to));
     }
@@ -2280,6 +2696,33 @@ fn print_report(r: &Report) -> Result<()> {
             let counts: Vec<String> = a.counts.iter().map(|(state, n)| format!("{n} {}", state.replace('-', " "))).collect();
             s.push_str(&format!("{:<15} {} (push and pull: {})\n", "assets", counts.join(", "), a.mode));
         }
+    }
+    summary(r, s)
+}
+
+/// The line every sync ends with, plus what it left out and the git line. Shared with `--quiet`,
+/// which prints this and nothing else.
+fn summary(r: &Report, mut s: String) -> Result<()> {
+    // One line naming the files sync walked past and why. Without it a `.csv` added after the
+    // first sync produced no output at all, and the only way to find out was to go looking.
+    if let Some(from) = &r.moved_dir {
+        s.push_str(&format!("{:<15} this directory was {from} at the last sync; its base came with it\n", "moved"));
+    }
+    for (why, rels) in &r.left_out {
+        let shown: Vec<&str> = rels.iter().take(3).map(String::as_str).collect();
+        let more = if rels.len() > 3 { ", …" } else { "" };
+        let fix = match why.as_str() {
+            "extension" => "; --ext to include them",
+            "binary" => "; .textdbignore, or an asset rule in .gitattributes",
+            _ => "",
+        };
+        s.push_str(&format!(
+            "{:<15} {} {} by {why} ({}{more}){fix}\n",
+            "left out",
+            rels.len(),
+            if rels.len() == 1 { "file" } else { "files" },
+            shown.join(", ")
+        ));
     }
     let verb = if r.stopped || (r.stopped_by_rules && !r.dry_run) {
         "nothing synced"

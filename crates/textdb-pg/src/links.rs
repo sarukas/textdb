@@ -30,6 +30,32 @@ fn id_paths(sql: &str, arg: &str) -> Result<Vec<(i64, String)>> {
     })
 }
 
+/// Is this a root path written in the account's own namespace that names no share it holds?
+///
+/// Such a link is nonsense: the account meant a folder it does not have. Its bytes are kept as
+/// written (#12 §3.4) — the text is the author's — but it must not then be resolved against the
+/// store's root, which would let `[[hr/salaries]]` reach a document the account cannot see and
+/// put a link into it in everyone else's backlinks. It is broken, for everyone, which is what it
+/// means. A target that *did* un-project is a store path by the time it is indexed, so the
+/// account can see it and this says no.
+fn names_no_share(kind: &str, target: &str) -> bool {
+    use textdb_core::access::Resolved;
+    let Some(view) = crate::kb::current_view() else { return false };
+    if target.is_empty() {
+        return false;
+    }
+    let md = kind == "md" || kind == "image";
+    let looks_root = if md { target.starts_with('/') } else { target.contains('/') };
+    if !looks_root {
+        return false;
+    }
+    let local = format!("/{}", target.trim_start_matches('/'));
+    if view.to_view(&local).is_some() {
+        return false;
+    }
+    !matches!(view.to_store(&local), Resolved::In { .. } | Resolved::Root)
+}
+
 /// The store's answers for [`resolve`].
 pub struct PgLookup;
 
@@ -122,16 +148,31 @@ fn relink_where(cond: &str, arg: Option<&str>) -> Result<()> {
         }
         Ok::<_, TextdbError>(out)
     })?;
+    // A link breaking is the one structure count that moves without a commit, so the files it
+    // touched are collected and their totals refreshed once at the end.
+    let mut touched: std::collections::BTreeMap<i64, String> = Default::default();
     for (id, file_id, path, kind, target, anchor, external) in rows {
-        let (to, status) = resolve(&PgLookup, file_id, &path, &kind, &target, anchor.as_deref(), external)?;
+        let (to, status) = match !external && names_no_share(&kind, &target) {
+            true => (None, "broken"),
+            false => resolve(&PgLookup, file_id, &path, &kind, &target, anchor.as_deref(), external)?,
+        };
         // Only rows whose outcome changed are written: a commit then locks no other file's rows
         // it leaves as they were, so writers to files that link to each other do not deadlock.
-        Spi::run_with_args(
-            "UPDATE kb.link SET resolved_id = $1, status = $2 \
-             WHERE id = $3 AND (resolved_id IS DISTINCT FROM $1 OR status IS DISTINCT FROM $2)",
+        let changed = Spi::get_one_with_args::<i64>(
+            "WITH u AS (UPDATE kb.link SET resolved_id = $1, status = $2 \
+                         WHERE id = $3 AND (resolved_id IS DISTINCT FROM $1 OR status IS DISTINCT FROM $2) \
+                         RETURNING 1) \
+             SELECT count(*) FROM u",
             &[to.into(), status.into(), id.into()],
         )
-        .map_err(err)?;
+        .map_err(err)?
+        .unwrap_or(0);
+        if changed > 0 {
+            touched.insert(file_id, path);
+        }
+    }
+    for (file_id, path) in touched {
+        crate::kb::refresh_broken_links(file_id, &path)?;
     }
     Ok(())
 }
@@ -270,6 +311,16 @@ pub fn follow_move(
         let Some((source, root)) = live_path(file_id)? else {
             continue;
         };
+        // A linking file the caller may not write is left exactly as it is. It is still a fact
+        // about the move — the link now points somewhere else — so it is reported, as a count with
+        // no path: naming it would disclose a layout the account cannot see (#12 D14).
+        if !crate::kb::writable(&source) {
+            changes.push(serde_json::json!({
+                "path": "", "line": 0, "kind": "", "target": "", "now_at": "",
+                "version": Option::<i64>::None, "outside": true,
+            }));
+            continue;
+        }
         let mut rewritten = HashSet::new();
         let mut version = None;
         if let (LinkUpdates::Rewrite, Some(root)) = (mode, root) {
@@ -300,13 +351,18 @@ pub fn follow_move(
         }
         for p in &links {
             let now_at = live_path(p.resolved_id)?.map(|(path, _)| path).unwrap_or_default();
+            // Both paths in the caller's namespace. The file is one it can write, so it has a
+            // path; the target may not be, and is then named as nothing rather than as a store
+            // path.
+            let seen = |p: &str| crate::kb::to_view(p).unwrap_or_default();
             changes.push(serde_json::json!({
-                "path": source,
+                "path": seen(&source),
                 "line": p.line,
                 "kind": p.kind,
                 "target": p.target,
-                "now_at": now_at,
+                "now_at": seen(&now_at),
                 "version": if rewritten.contains(&p.id) { version } else { None },
+                "outside": false,
             }));
         }
     }

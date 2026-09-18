@@ -15,8 +15,16 @@ edit the `.db` file with other tools.
 ```sh
 export TEXTDB_STORE=path/to/kb.db       # or postgres://user@host/db
 export TEXTDB_AUTHOR=agent-<name>        # your writes are attributed to this name
+export TEXTDB_TOKEN=tdb_…               # only if you were given one; see below
 export MSYS_NO_PATHCONV=1               # Git Bash on Windows only: stops "/a.md" being rewritten
 ```
+
+**If you were given a token**, you are an *account* and see only the folders shared with you,
+each at your own root under a name of its own: what the owner calls `/legal/contracts` may be
+`/contracts/` to you. Run `textdb whoami` first — it lists your shares and whether each is `ro`
+or `rw`. Use the paths it shows and nothing else; a path outside your shares is "not found", and
+that is all you can learn about it. Your writes are attributed to your account, so
+`TEXTDB_AUTHOR` is ignored and naming someone else is refused.
 
 With `MSYS_NO_PATHCONV=1`, give local files and directories (the store, `sync`/`export` targets)
 as Windows (`C:/Users/me/kb.db`) or relative paths: `/c/Users/...` is no longer translated and the
@@ -32,7 +40,7 @@ output.
 ## Find your way around
 
 ```sh
-textdb tree -L 2                         # top of the tree with file counts
+textdb tree -L 2                         # top of the tree; folders say what they hold
 textdb tree guides -d                    # folders only under /guides
 textdb ls guides/api
 textdb ls -l guides                      # + words, versions, last update, authors; folders show totals below them
@@ -47,7 +55,7 @@ textdb export guides ./checkout --dry-run # what writing /guides to disk would c
 ```
 
 `search` uses the full-text index (case and accents ignored) and prints nothing on stdout when
-nothing matches (`no matches` on stderr, exit 0). Treat its lines as candidates: read the lines
+nothing matches (`no matches for X under /` on stderr, exit 0). Treat its lines as candidates: read the lines
 with `cat -n --lines` before editing. Use `grep` for exact case, punctuation or regular
 expressions; it reads every file under the folder, so narrow it with `-p`.
 
@@ -60,6 +68,12 @@ To keep a folder reconciled with a git checkout both ways, use `sync` rather tha
 ```sh
 textdb sync guides ~/src/repo/guides --dry-run   # changes each way, merges, conflicts
 textdb sync guides ~/src/repo/guides --commit    # apply; commit what changed on disk (Textdb-* trailers)
+textdb sync                                      # a synced directory remembers its store and folder:
+                                                 # no arguments needed from anywhere inside it
+textdb sync -q --lock-timeout 30                 # the hook line: summary only, and queue rather than fail
+# One sync of a directory at a time. A second exits 4 at once, so a collision you typed is
+# visible; a hook should pass --lock-timeout instead, because a turn-start sync colliding with
+# another agent's turn-end sync wants to wait for it, not to start the turn on stale files.
 textdb git-status guides ~/src/repo/guides       # last synced commit; store vs HEAD by blob id
 ```
 
@@ -88,15 +102,18 @@ textdb --json sql 'SELECT path, nwords FROM files ORDER BY nwords DESC LIMIT 10'
 
 | View | Columns |
 |---|---|
-| `files` | `path, name, dir, depth, ext, version, nbytes, nlines, nwords, created_at, updated_at, updated_by` |
-| `folders` | `path, name, parent, depth, files, folders, nbytes, nwords, versions, updated_at` (totals below) |
+| `files`, `folders` | the canonical listing record, filtered by kind: `path, name, kind, version, nbytes, nlines, updated_at, updated_by, id, dir, depth, ext, title, nwords, nsections, nprops, nlinks, nlinks_broken, versions, created_at, files, folders, nauthors`. A folder's figures are totals over everything below it; `version`, `ext` and the author list are null for one. See `docs/shapes.md` |
 | `frontmatter` | `path, data` — YAML front matter as JSON: `json_extract(data, '$.key')`, `json_each(data, '$.list')` |
-| `sections` | `path, heading` (`Title / Section`), `level, line_from, line_to` — feed `line_from` to `cat --lines` |
+| `sections` | `path, heading` (`Title / Section`), `level, line_from, line_to, title` (the last component), `nwords` (the section's own lines), `nwords_total` (plus everything nested), and the document's `nbytes, nlines, file_nwords, version, updated_at, updated_by` — feed `line_from` to `cat --lines` |
 | `links` | `path, target` (without `#anchor`/`|alias`), `line, kind` (`wiki`, `embed`, `md`, `image`), `anchor, alias, status` (`ok`, `ambiguous`, `anchor-missing`, `broken`, `not-in-store`, `external`), `resolved` (the file it points to; for an asset, the asset's path), `asset` (it resolves to an asset's pointer) |
-| `commits` | `path, version, author, ts, message, kind, batch` |
+| `commits` | `path, version, author, ts, message, kind, base_version, nbytes, nlines, nwords, batch` |
 | `authors` | `path, author, commits, first_ts, last_ts` |
 
-Also `textdb_search(query, prefix)`, `textdb_ls(dir, recursive)`, `textdb_content(path)`. Do not
+Also `textdb_search(query, prefix, limit, per_file)` → `path, version, line, text, section, score, more`
+(one row per matching line), `textdb_ls(dir, recursive)` and `textdb_entry(path)` → the full record above,
+`textdb_outline(path, heading, match, level, limit)`, `textdb_headings(path, starts, limit)`,
+`textdb_links(path, status, limit)` and `textdb_backlinks(path, status, limit)` → `path, version,
+line, kind, target, anchor, alias, status, resolved, asset`, `textdb_content(path)`. Do not
 select `content` from `kb` across many files: it reads every document in full.
 
 - **Output for scripts:** `--format lines` prints one value per line (one column), `--format tsv`
@@ -107,10 +124,11 @@ select `content` from `kb` across many files: it reads every document in full.
 - **Patterns:** in `LIKE`, `_` and `%` are wildcards (`'/work_files/%'` matches `/workXfiles/`; add
   `ESCAPE '\'` and write `\_`); `[0-9]`-style classes work only with `GLOB`, which is case-sensitive.
   A wrong "0 rows" is often this.
-- **`textdb_search`** gives one row per document holding every term (hyphenated terms such as
-  `teo-group` need no quotes). Its `line`/`snippet` come from one chunk and may hold only some of the
-  terms: check with `textdb_lines(path, line, line)`, or use the `search` command, which lists each
-  matching line.
+- **`textdb_search`** gives one row per matching *line* — `path, version, line, text, section,
+  score, more` — the same rows the `search` command prints (hyphenated terms such as `teo-group`
+  need no quotes). The index works on chunks, so the function reads the matching documents and
+  lists the lines that really hold the terms: `line` is a fact, and a document whose words only
+  ever appear apart is not returned. `SELECT DISTINCT path` for the documents.
 
 Statements are read-only unless you pass `--write`. Then change documents only through the textdb
 functions, passing `:author` (bound to your author name) so the edits are attributed:
@@ -213,9 +231,10 @@ three-way merge was clean), `unchanged` (nothing to do).
 | Exit status | Meaning | Do this |
 |---|---|---|
 | 3 | Conflict: someone changed the same lines since your version | Read the payload (stderr, or `--json` stdout): `theirs` is the current text of those lines and `current_version` the version it belongs to. Rebuild your change on `theirs` and retry with `-b <current_version>`. Do not retry the same command blindly |
-| 4 | Contention on a very hot file | Wait a moment and retry |
+| 4 | Contention on a very hot file, or another sync holds the directory | Wait a moment and retry |
 | 5 | Not found | Check the path with `ls` / `tree`; it may have moved (`textdb log`) |
 | 6 | Invalid edit: `--old` text missing or not unique, line range outside the file, empty content | Re-read (`cat -n`) and choose a unique anchor or a valid range |
+| 7 | Forbidden: you can see it and may not do this — a read-only share, or one that was taken away | `whoami` shows your shares and their rights. **Not** the same as 5: 7 means it is there and yours to read; 5 means it is outside your shares and you cannot tell it from a path that never existed. Do not retry; ask whoever owns the store |
 | 2 | Usage error, including a path mangled into `C:/…` by the shell | Drop the leading slash or set `MSYS_NO_PATHCONV=1` |
 
 ## History and other people's changes
@@ -303,7 +322,11 @@ pass `--keep-empty-folders` to keep them.
 3. On exit status 3, rebuild on `theirs`; never overwrite with a stale whole-document `write`
    that lacks `-b`.
 4. Use `append` for journals and logs.
-5. Use your own `TEXTDB_AUTHOR`, so the changes you make are attributed to you.
-6. Do not `rm` or `mv` folders you were not asked to reorganise; people are browsing them.
-7. To find things across many files, write one `textdb sql` query rather than a shell loop over
+5. Use your own `TEXTDB_AUTHOR`, so the changes you make are attributed to you. With a token
+   your account name is used instead, and you cannot write as anyone else.
+6. Quote an `id:` when you tell someone else about a document. Paths are per view — yours are
+   not the owner's — but `textdb stat PATH` gives an `id`, and `id:1234` names the same document
+   in every view, including a link to the web app.
+7. Do not `rm` or `mv` folders you were not asked to reorganise; people are browsing them.
+8. To find things across many files, write one `textdb sql` query rather than a shell loop over
    `cat`/`ls`; check a `--write` statement's `SELECT` first.

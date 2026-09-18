@@ -4,16 +4,22 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension};
 use textdb_core::CommitKind;
+use textdb_core::access::{self as model, Namespace, Rights, View};
+use textdb_sqlite::access as acl;
 use textdb_sqlite::db::subtree_bounds;
-use textdb_sqlite::{normalize_path, NodeRow, TextDb, DEFAULT_PREFIX};
+use textdb_sqlite::{normalize_path, TextDb, DEFAULT_PREFIX};
 
 use super::{
-    Author, BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, MovedBack, PathEvent,
-    RestoredFile, Result, RevertOutcome, SqlResult, Stat, Store, StoreError, SyncBase, Written,
+    AccountRow, Author, BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, MovedBack,
+    PathEvent, RestoredFile, Result, RevertOutcome, Share, ShareRow, SqlResult, Store, StoreError, SyncBase, TokenRow, TrashRow, Whoami,
+    Written,
 };
 
 pub struct SqliteStore {
     conn: Connection,
+    /// This connection's account. `View::admin()` until a bearer is presented, which is what a
+    /// store opened directly is — see #12 §3 on why "no token" means owner.
+    view: View,
     /// `--path-history`: this process's choice, or `None` to follow the store's setting.
     path_history: Option<bool>,
     /// `PRAGMA data_version` as of the last `wait`. It moves only when another connection
@@ -24,19 +30,26 @@ pub struct SqliteStore {
 impl SqliteStore {
     fn link_rows(&self, cond: &str, args: [String; 3]) -> Result<Vec<super::LinkRow>> {
         let p = DEFAULT_PREFIX;
+        // The linking file must be one the account can see; the *target* may not be, and that is
+        // not a reason to drop the row — it is the id-reference case, handled where the row is
+        // built, so that a hidden target is reported as hidden rather than as absent.
+        let (vis, vis_args) = self.visible("n.path", args.len());
+        let mut all: Vec<rusqlite::types::Value> = args.iter().map(|a| rusqlite::types::Value::Text(a.clone())).collect();
+        all.extend(vis_args);
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "SELECT n.path, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status, r.path \
+                "SELECT n.path, l.line, coalesce(l.kind, ''), l.target_path, l.anchor, l.alias, l.status, r.path, n.version, r.id \
                  FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL \
                  LEFT JOIN {p}node r ON r.id = l.resolved_id AND r.deleted_at IS NULL \
-                 WHERE {cond} ORDER BY n.path, l.line, l.rowid"
+                 WHERE ({cond}) AND ({vis}) ORDER BY n.path, l.line, l.rowid"
             ))
             .map_err(sql)?;
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+            .query_map(rusqlite::params_from_iter(all.iter()), |r| {
                 Ok(super::LinkRow {
                     path: r.get(0)?,
+                    version: r.get(8)?,
                     line: r.get(1)?,
                     kind: r.get(2)?,
                     target: r.get(3)?,
@@ -45,10 +58,35 @@ impl SqliteStore {
                     status: r.get(6)?,
                     resolved: r.get(7)?,
                     asset: false,
+                    resolved_id: r.get(9)?,
                 })
             })
             .map_err(sql)?;
-        rows.map(|r| r.map(super::asset_link)).collect::<rusqlite::Result<_>>().map_err(sql)
+        let rows: Vec<super::LinkRow> = rows.map(|r| r.map(super::asset_link)).collect::<rusqlite::Result<_>>().map_err(sql)?;
+        // Both paths into the caller's namespace. A target outside its shares keeps its row but
+        // names no path: `links` reports it `hidden`, which is what stops the layout leaking.
+        Ok(rows
+            .into_iter()
+            .filter_map(|mut l| {
+                l.path = self.seen(&l.path)?;
+                l.resolved = match l.resolved {
+                    Some(t) => match self.seen(&t) {
+                        Some(v) => Some(v),
+                        None => {
+                            // The reader is told there is a document and nothing about where it
+                            // is: the target reads as the id form, exactly as the text does.
+                            l.status = Some("hidden".into());
+                            if let Some(id) = l.resolved_id {
+                                l.target = format!("textdb:{id}");
+                            }
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                Some(l)
+            })
+            .collect())
     }
 }
 
@@ -57,7 +95,12 @@ fn sql(e: rusqlite::Error) -> StoreError {
 }
 
 fn kind_name(kind: i64) -> String {
-    if kind == 1 { "file" } else { "folder" }.to_string()
+    match kind {
+        1 => "file",
+        textdb_sqlite::db::Entry::ROOT => "root",
+        _ => "folder",
+    }
+    .to_string()
 }
 
 fn lossy(bytes: Vec<u8>) -> String {
@@ -71,15 +114,48 @@ fn written(r: textdb_sqlite::WriteResult) -> Written {
     }
 }
 
-fn entry(n: NodeRow) -> Entry {
+/// The binding's listing row as the CLI's, field for field.
+///
+/// One conversion for every listing path — `ls`, `tree`, `stat`, `export` — so the twenty-four
+/// keys cannot drift between commands the way they used to.
+fn entry(e: textdb_sqlite::db::Entry) -> Entry {
     Entry {
-        path: n.path,
-        name: n.name,
-        kind: kind_name(n.kind),
-        nbytes: n.nbytes,
-        nlines: n.nlines,
-        updated_at: Some(n.updated_at),
-        ..Entry::default()
+        path: e.path,
+        name: e.name,
+        kind: kind_name(e.kind),
+        version: e.version,
+        nbytes: e.nbytes,
+        nlines: e.nlines,
+        updated_at: e.updated_at,
+        updated_by: e.updated_by,
+        id: e.id,
+        dir: e.dir,
+        depth: e.depth,
+        ext: e.ext,
+        title: e.title,
+        nwords: e.nwords,
+        nsections: e.nsections,
+        nprops: e.nprops,
+        nlinks: e.nlinks,
+        nlinks_broken: e.nlinks_broken,
+        versions: e.versions,
+        created_at: e.created_at,
+        files: e.files,
+        folders: e.folders,
+        nauthors: e.nauthors,
+        share: e.share,
+        rights: e.rights,
+        shares: (e.kind == textdb_sqlite::db::Entry::ROOT)
+            .then(|| e.shares.iter().map(|(alias, rights)| Share { alias: alias.clone(), rights: rights.clone() }).collect()),
+        authors: e
+            .authors
+            .into_iter()
+            .map(|a| Author {
+                author: a.author,
+                commits: a.commits,
+                last_ts: Some(a.last_ts),
+            })
+            .collect(),
     }
 }
 
@@ -105,13 +181,87 @@ impl SqliteStore {
         textdb_sqlite::schema::migrate(&conn, DEFAULT_PREFIX).map_err(sql)?;
         Ok(SqliteStore {
             conn,
+            view: View::admin(),
             path_history: None,
             data_version: None,
         })
     }
 
     fn db(&self) -> TextDb<'_> {
-        TextDb::attach(&self.conn, DEFAULT_PREFIX, true).with_path_history(self.path_history)
+        TextDb::attach(&self.conn, DEFAULT_PREFIX, true)
+            .with_path_history(self.path_history)
+            .with_view(self.view.clone())
+    }
+
+    /// `(predicate, params)` restricting `col` to what this connection may see, for the queries
+    /// this module writes itself rather than going through `TextDb`. `("1", [])` for the admin,
+    /// so the SQL is unchanged for a store that delegates nothing.
+    fn visible(&self, col: &str, offset: usize) -> (String, Vec<rusqlite::types::Value>) {
+        match textdb_sqlite::access::visible_sql(&self.view, col) {
+            None => ("1".to_string(), Vec::new()),
+            Some((pred, args)) => (textdb_sqlite::access::renumber(&pred, offset), args),
+        }
+    }
+
+    /// A store path as this connection sees it, or `None` when it sees nothing there.
+    fn seen(&self, store_path: &str) -> Option<String> {
+        self.view.to_view(store_path)
+    }
+
+    /// A result on its way out of the binding, with the caller's own paths back in any error.
+    ///
+    /// Rows are translated where they are built; errors carry paths too — a conflict payload
+    /// names its file, a not-found names what was not found — and an untranslated one leaks the
+    /// store's layout exactly when someone is most likely to paste the message somewhere.
+    fn out<T>(&self, r: textdb_core::storage::Result<T>) -> Result<T> {
+        r.map_err(|e| StoreError::from(self.db().to_view_err(e)))
+    }
+
+
+    /// Only the owner runs the delegation commands. A token session is refused here rather than
+    /// in the CLI, because the CLI is not the only caller.
+    fn admin_only(&self, what: &str) -> Result<()> {
+        if self.view.is_admin() {
+            return Ok(());
+        }
+        Err(StoreError::forbidden(format!(
+            "only the owner of the store can {what}"
+        )))
+    }
+
+    fn account_id(&self, name: &str) -> Result<i64> {
+        match acl::account_by_name(&self.conn, DEFAULT_PREFIX, name).map_err(StoreError::from)? {
+            Some(a) => Ok(a.id),
+            None => Err(StoreError::not_found(format!("there is no account called '{name}'"))),
+        }
+    }
+
+    /// The node a share is to bind to, as the admin names it. A grant is a folder: sharing a file
+    /// would be a different model, and refusing it here is clearer than discovering it later.
+    fn share_node(&self, path: &str) -> Result<(i64, String)> {
+        let path = normalize_path(path).map_err(StoreError::invalid)?;
+        let db = self.db();
+        match db.node_by_path(&path).map_err(StoreError::from)? {
+            Some(n) if n.kind == 0 => Ok((n.id, path)),
+            Some(_) => Err(StoreError::invalid(format!("{path} is a file; a share is a folder and everything below it"))),
+            None => Err(StoreError::not_found(format!("{path} does not exist"))),
+        }
+    }
+
+    /// `whoami` lists the shares an account can actually use; `access ls`, which is the owner's
+    /// view of the same table, lists every grant including the ones that are denied.
+    fn share_rows(&self, account: &str, grants: &model::Grants, as_admin: bool) -> Vec<ShareRow> {
+        grants
+            .live()
+            .map(|g| ShareRow {
+                account: account.to_string(),
+                alias: g.alias.clone(),
+                rights: g.rights.as_str().to_string(),
+                store_path: as_admin.then(|| g.store_path.clone()),
+                node_id: g.node_id,
+                dormant: !g.live(),
+            })
+            .collect()
     }
 
     /// Run reads that must agree with each other — content and the version it is — in one
@@ -127,6 +277,287 @@ impl SqliteStore {
 }
 
 impl Store for SqliteStore {
+    // ------------------------------------------------------------ accounts, tokens and shares
+
+    fn authenticate(&mut self, bearer: &str) -> Result<()> {
+        let now = textdb_sqlite::SqliteStorage::now();
+        match acl::authenticate(&self.conn, DEFAULT_PREFIX, bearer, &now).map_err(StoreError::from)? {
+            Ok(view) => {
+                // Bound to the connection as well as kept here: the virtual table and the
+                // `textdb_*` table functions run inside SQLite with only the handle to go on,
+                // and a session they cannot find is the owner's (#12 K3, K9).
+                textdb_sqlite::access::set_session(unsafe { self.conn.handle() } as usize, view.clone());
+                install_raw_table_guard(&self.conn, DEFAULT_PREFIX)?;
+                self.view = view;
+                Ok(())
+            }
+            Err(e) => Err(StoreError::forbidden(e)),
+        }
+    }
+
+    fn whoami(&mut self) -> Result<Whoami> {
+        if self.view.is_admin() {
+            // The owner's "shares" are every account's, because that is what the question means
+            // when the answer is "everything".
+            return Ok(Whoami {
+                account: None,
+                admin: true,
+                kind: "owner".into(),
+                namespace: "store".into(),
+                shares: Vec::new(),
+            });
+        }
+        let name = self.view.name().unwrap_or_default().to_string();
+        let ns = match self.view.namespace() {
+            Namespace::SingleRoot => "single-root",
+            Namespace::Aliased => "aliased",
+        };
+        let kind = acl::account_by_name(&self.conn, DEFAULT_PREFIX, &name)
+            .map_err(StoreError::from)?
+            .map(|a| a.kind)
+            .unwrap_or_default();
+        // An account is never told where its shares live in the store: the alias exists to hide
+        // exactly that, and `whoami` is the one place it would be easy to leak it back.
+        Ok(Whoami {
+            account: Some(name.clone()),
+            admin: false,
+            kind,
+            namespace: ns.into(),
+            shares: self.share_rows(&name, self.view.grants(), false),
+        })
+    }
+
+    fn account_create(&mut self, name: &str, kind: &str, root: Option<&str>) -> Result<()> {
+        self.admin_only("create accounts")?;
+        let root_node = match root {
+            Some(p) => Some(self.share_node(p)?),
+            None => None,
+        };
+        let now = textdb_sqlite::SqliteStorage::now();
+        let account = acl::create_account(&self.conn, DEFAULT_PREFIX, name, kind, root_node.as_ref().map(|(id, _)| *id), &now)
+            .map_err(StoreError::from)?;
+        // A single-root account's root is a share like any other, held under the empty alias, so
+        // that everything downstream reads one table and not two.
+        if let Some((node_id, store_path)) = root_node {
+            let mut grants = model::Grants::new();
+            let g = grants
+                .add(Namespace::SingleRoot, node_id, &store_path, None, Rights::Rw)
+                .map_err(StoreError::invalid)?;
+            acl::insert_grant(&self.conn, DEFAULT_PREFIX, account.id, &g, Some("owner"), &now).map_err(StoreError::from)?;
+        }
+        Ok(())
+    }
+
+    fn account_disable(&mut self, name: &str, disabled: bool) -> Result<()> {
+        self.admin_only("disable accounts")?;
+        let id = self.account_id(name)?;
+        let now = textdb_sqlite::SqliteStorage::now();
+        let at = disabled.then_some(now);
+        self.conn
+            .execute(
+                &format!("UPDATE {DEFAULT_PREFIX}account SET disabled_at = ?2 WHERE id = ?1"),
+                rusqlite::params![id, at],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    fn account_ls(&mut self) -> Result<Vec<AccountRow>> {
+        self.admin_only("list accounts")?;
+        let mut out = Vec::new();
+        for a in acl::accounts(&self.conn, DEFAULT_PREFIX).map_err(StoreError::from)? {
+            let grants = acl::grants_of(&self.conn, DEFAULT_PREFIX, a.id).map_err(StoreError::from)?;
+            let root = match a.root_node_id {
+                Some(_) => grants.iter().next().map(|g| g.store_path.clone()),
+                None => None,
+            };
+            out.push(AccountRow {
+                name: a.name,
+                kind: a.kind,
+                root,
+                created_at: a.created_at,
+                disabled: a.disabled_at.is_some(),
+                shares: grants.len(),
+            });
+        }
+        Ok(out)
+    }
+
+    fn account_convert(&mut self, name: &str, alias: Option<&str>) -> Result<String> {
+        self.admin_only("convert accounts")?;
+        let a = match acl::account_by_name(&self.conn, DEFAULT_PREFIX, name).map_err(StoreError::from)? {
+            Some(a) => a,
+            None => return Err(StoreError::not_found(format!("there is no account called '{name}'"))),
+        };
+        if a.root_node_id.is_none() {
+            return Err(StoreError::invalid(format!("'{name}' already holds its shares under aliases")));
+        }
+        let grants = acl::grants_of(&self.conn, DEFAULT_PREFIX, a.id).map_err(StoreError::from)?;
+        let g = grants
+            .iter()
+            .next()
+            .ok_or_else(|| StoreError::invalid(format!("'{name}' has no share to convert")))?;
+        let alias = alias
+            .map(str::to_string)
+            .unwrap_or_else(|| g.store_path.rsplit('/').next().unwrap_or("share").to_string());
+        self.conn
+            .execute(
+                &format!("UPDATE {DEFAULT_PREFIX}grant SET alias = ?2 WHERE account_id = ?1"),
+                rusqlite::params![a.id, &alias],
+            )
+            .map_err(sql)?;
+        self.conn
+            .execute(
+                &format!("UPDATE {DEFAULT_PREFIX}account SET root_node_id = NULL WHERE id = ?1"),
+                [a.id],
+            )
+            .map_err(sql)?;
+        Ok(alias)
+    }
+
+    fn token_create(&mut self, account: &str, label: Option<&str>, expires_at: Option<&str>) -> Result<(String, i64)> {
+        self.admin_only("create tokens")?;
+        let id = self.account_id(account)?;
+        let now = textdb_sqlite::SqliteStorage::now();
+        acl::create_token(&self.conn, DEFAULT_PREFIX, id, label, expires_at, &now).map_err(StoreError::from)
+    }
+
+    fn token_ls(&mut self, account: Option<&str>) -> Result<Vec<TokenRow>> {
+        self.admin_only("list tokens")?;
+        let now = textdb_sqlite::SqliteStorage::now();
+        Ok(acl::tokens(&self.conn, DEFAULT_PREFIX, account)
+            .map_err(StoreError::from)?
+            .into_iter()
+            .map(|t| TokenRow {
+                live: t.live(&now),
+                id: t.id,
+                account: t.account,
+                label: t.label,
+                created_at: t.created_at,
+                expires_at: t.expires_at,
+                revoked_at: t.revoked_at,
+                last_used_at: t.last_used_at,
+            })
+            .collect())
+    }
+
+    fn token_revoke(&mut self, id: i64) -> Result<()> {
+        self.admin_only("revoke tokens")?;
+        let now = textdb_sqlite::SqliteStorage::now();
+        if acl::revoke_token(&self.conn, DEFAULT_PREFIX, id, &now).map_err(StoreError::from)? {
+            Ok(())
+        } else {
+            Err(StoreError::not_found(format!("there is no live token {id}")))
+        }
+    }
+
+    fn access_grant(&mut self, account: &str, path: &str, rights: &str, alias: Option<&str>) -> Result<ShareRow> {
+        self.admin_only("grant access")?;
+        let rights = Rights::parse(rights).ok_or_else(|| StoreError::invalid(format!("rights are 'ro' or 'rw', not '{rights}'")))?;
+        let a = match acl::account_by_name(&self.conn, DEFAULT_PREFIX, account).map_err(StoreError::from)? {
+            Some(a) => a,
+            None => return Err(StoreError::not_found(format!("there is no account called '{account}'"))),
+        };
+        let (node_id, store_path) = self.share_node(path)?;
+        let mut grants = acl::grants_of(&self.conn, DEFAULT_PREFIX, a.id).map_err(StoreError::from)?;
+        // Regranting the same node replaces its rights rather than being refused as a duplicate,
+        // which is what "raise this share to rw" has to mean.
+        let existing = grants.by_node(node_id).cloned();
+        let g = match existing {
+            Some(mut g) if alias.is_none() || alias == Some(g.alias.as_str()) => {
+                g.rights = rights;
+                g
+            }
+            _ => {
+                let ns = a.namespace();
+                // Every refusal here is "you asked for something the model does not allow",
+                // not "you may not": invalid, not forbidden.
+                grants.add(ns, node_id, &store_path, alias, rights).map_err(StoreError::invalid)?
+            }
+        };
+        let now = textdb_sqlite::SqliteStorage::now();
+        acl::insert_grant(&self.conn, DEFAULT_PREFIX, a.id, &g, Some("owner"), &now).map_err(StoreError::from)?;
+        // The account's feed carries this, so a `watch` or a `sync` can act on a share arriving
+        // rather than discovering it by accident on some later listing.
+        let at = if g.alias.is_empty() { "/".to_string() } else { format!("/{}", g.alias) };
+        acl::record_share_event(&self.conn, DEFAULT_PREFIX, account, "share", &at, None, Some("owner"), &now)
+            .map_err(StoreError::from)?;
+        Ok(ShareRow {
+            account: account.to_string(),
+            alias: g.alias.clone(),
+            rights: g.rights.as_str().to_string(),
+            store_path: Some(g.store_path.clone()),
+            node_id: g.node_id,
+            dormant: !g.live(),
+        })
+    }
+
+    fn access_rename(&mut self, account: &str, from: &str, to: &str) -> Result<()> {
+        self.admin_only("rename shares")?;
+        let id = self.account_id(account)?;
+        let mut grants = acl::grants_of(&self.conn, DEFAULT_PREFIX, id).map_err(StoreError::from)?;
+        grants.rename(from, to).map_err(StoreError::invalid)?;
+        if acl::rename_grant(&self.conn, DEFAULT_PREFIX, id, from, to).map_err(StoreError::from)? {
+            // A move, not a delete and a create: the account's next sync renames the directory on
+            // disk rather than pulling every file down again.
+            let now = textdb_sqlite::SqliteStorage::now();
+            let (before, after) = (format!("/{from}"), format!("/{to}"));
+            acl::record_share_event(&self.conn, DEFAULT_PREFIX, account, "move", &after, Some(&before), Some("owner"), &now)
+                .map_err(StoreError::from)?;
+            Ok(())
+        } else {
+            Err(StoreError::not_found(format!("'{account}' has no share called '{from}'")))
+        }
+    }
+
+    fn access_revoke(&mut self, account: &str, alias: &str) -> Result<()> {
+        self.admin_only("revoke shares")?;
+        let id = self.account_id(account)?;
+        let now = textdb_sqlite::SqliteStorage::now();
+        if acl::revoke_grant(&self.conn, DEFAULT_PREFIX, id, alias, &now).map_err(StoreError::from)? {
+            let at = if alias.is_empty() { "/".to_string() } else { format!("/{alias}") };
+            acl::record_share_event(&self.conn, DEFAULT_PREFIX, account, "unshare", &at, None, Some("owner"), &now)
+                .map_err(StoreError::from)?;
+            Ok(())
+        } else {
+            Err(StoreError::not_found(format!("'{account}' has no share called '{alias}'")))
+        }
+    }
+
+    fn share_state(&mut self) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .view
+            .grants()
+            .iter()
+            .map(|g| {
+                let state = if g.live() { g.rights.as_str() } else { "denied" };
+                (g.alias.clone(), state.to_string())
+            })
+            .collect())
+    }
+
+    fn access_ls(&mut self, who: Option<&str>) -> Result<Vec<ShareRow>> {
+        self.admin_only("list shares")?;
+        let all = acl::all_grants(&self.conn, DEFAULT_PREFIX).map_err(StoreError::from)?;
+        let rows = all.into_iter().filter(|(account, g)| match who {
+            None => true,
+            // A path answers "who can see this?", an account name "what does this account see?".
+            // Which one was meant is decided by the shape of the argument, as `ls` does it.
+            Some(w) if w.starts_with('/') => model::contains(&g.store_path, w) || model::contains(w, &g.store_path),
+            Some(w) => account == w,
+        });
+        Ok(rows
+            .map(|(account, g)| ShareRow {
+                account,
+                alias: g.alias.clone(),
+                rights: g.rights.as_str().to_string(),
+                node_id: g.node_id,
+                dormant: !g.live(),
+                store_path: Some(g.store_path),
+            })
+            .collect())
+    }
+
     fn backend(&self) -> &'static str {
         "sqlite"
     }
@@ -137,91 +568,22 @@ impl Store for SqliteStore {
     }
 
     fn nodes(&mut self, prefix: &str) -> Result<Vec<Entry>> {
-        let prefix = normalize_path(prefix)?;
-        if prefix != "/" {
-            let n = self.db().node_by_path(&prefix)?.ok_or_else(|| not_found(&prefix))?;
-            if n.kind == 1 {
-                return Ok(vec![entry(n)]);
-            }
-        }
-        let cols = "path, name, kind, nbytes, nlines, updated_at";
-        let map = |r: &rusqlite::Row| -> rusqlite::Result<Entry> {
-            Ok(Entry {
-                path: r.get(0)?,
-                name: r.get(1)?,
-                kind: kind_name(r.get(2)?),
-                nbytes: r.get(3)?,
-                nlines: r.get(4)?,
-                updated_at: r.get(5)?,
-                ..Entry::default()
-            })
-        };
-        let rows = match subtree_bounds(&prefix) {
-            None => self
-                .conn
-                .prepare_cached(&format!(
-                    "SELECT {cols} FROM {DEFAULT_PREFIX}node WHERE deleted_at IS NULL AND path <> '/'"
-                ))
-                .map_err(sql)?
-                .query_map([], map)
-                .map_err(sql)?
-                .collect::<rusqlite::Result<Vec<_>>>(),
-            Some((lo, hi)) => self
-                .conn
-                .prepare_cached(&format!(
-                    "SELECT {cols} FROM {DEFAULT_PREFIX}node WHERE deleted_at IS NULL AND path >= ?1 AND path < ?2"
-                ))
-                .map_err(sql)?
-                .query_map([lo, hi], map)
-                .map_err(sql)?
-                .collect::<rusqlite::Result<Vec<_>>>(),
-        };
-        rows.map_err(sql)
+        // The same query `ls -R` runs, so every listing command returns the same row. This
+        // used to be a six-column projection, which is why `tree --json` returned less than
+        // `tree` printed.
+        Ok(self.db().list(prefix, true)?.into_iter().map(entry).collect())
     }
 
     fn ls(&mut self, path: &str, recursive: bool) -> Result<Vec<Entry>> {
-        Ok(self
-            .db()
-            .list(path, recursive)?
-            .into_iter()
-            .map(|e| Entry {
-                path: e.path,
-                name: e.name,
-                kind: kind_name(e.kind),
-                nbytes: e.nbytes,
-                nlines: e.nlines,
-                updated_at: Some(e.updated_at),
-                nwords: e.nwords,
-                versions: Some(e.versions),
-                created_at: Some(e.created_at),
-                updated_by: e.updated_by,
-                files: e.files,
-                folders: e.folders,
-                authors: e
-                    .authors
-                    .into_iter()
-                    .map(|a| Author {
-                        author: a.author,
-                        commits: a.commits,
-                        last_ts: Some(a.last_ts),
-                    })
-                    .collect(),
-            })
-            .collect())
+        Ok(self.db().list(path, recursive)?.into_iter().map(entry).collect())
     }
 
-    fn stat(&mut self, path: &str) -> Result<Stat> {
-        let path = normalize_path(path)?;
-        let n = self.db().node_by_path(&path)?.ok_or_else(|| not_found(&path))?;
-        Ok(Stat {
-            path: n.path,
-            kind: kind_name(n.kind),
-            version: n.version,
-            nbytes: n.nbytes,
-            nlines: n.nlines,
-            updated_at: Some(n.updated_at),
-            updated_by: n.updated_by,
-        })
+    fn mkdir(&mut self, path: &str) -> Result<()> {
+        self.out(self.db().ensure_folder(path).map(|_| ()))
+    }
+
+    fn stat(&mut self, path: &str) -> Result<Entry> {
+        Ok(entry(self.db().entry(path)?))
     }
 
     fn read(&mut self, path: &str, v: Option<i64>) -> Result<(Vec<u8>, i64)> {
@@ -229,7 +591,7 @@ impl Store for SqliteStore {
         self.consistent(|db| match v {
             Some(v) => Ok((db.read_version(&path, version(v))?, v)),
             None => {
-                let n = db.node_by_path(&path)?.ok_or_else(|| not_found(&path))?;
+                let n = db.node_for(&path)?.ok_or_else(|| not_found(&path))?;
                 Ok((db.read(&path)?, n.version))
             }
         })
@@ -239,17 +601,96 @@ impl Store for SqliteStore {
         Ok(self.db().section(path, heading)?)
     }
 
-    fn search(&mut self, query: &str, prefix: &str, limit: i64) -> Result<Vec<Hit>> {
+    fn property_keys(&mut self, prefix: &str, limit: i64) -> Result<Vec<crate::store::PropKey>> {
         Ok(self
             .db()
-            .search(query, prefix, limit.max(1) as usize)?
+            .property_keys(prefix, limit.max(1) as usize)?
+            .into_iter()
+            .map(|k| crate::store::PropKey {
+                key: k.key,
+                docs: k.docs,
+                values: k.values,
+                kind: k.kind,
+            })
+            .collect())
+    }
+    fn property_values(&mut self, key: &str, prefix: &str, limit: i64) -> Result<Vec<crate::store::PropValue>> {
+        Ok(self
+            .db()
+            .property_values(key, prefix, limit.max(1) as usize)?
+            .into_iter()
+            .map(|v| crate::store::PropValue { value: v.value, docs: v.docs })
+            .collect())
+    }
+    fn outline(
+        &mut self,
+        prefix: &str,
+        heading: Option<&str>,
+        mode: &str,
+        max_level: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<crate::store::OutlineRow>> {
+        let m = textdb_sqlite::sections::Match::parse(mode);
+        Ok(textdb_sqlite::sections::outline(&self.conn, DEFAULT_PREFIX, &self.view, prefix, heading, m, max_level, limit.max(1) as usize)?
+            .into_iter()
+            .map(|r| crate::store::OutlineRow {
+                path: r.path,
+                heading: r.heading,
+                heading_path: r.heading_path,
+                level: r.level,
+                line_from: r.line_from,
+                line_to: r.line_to,
+                nwords: r.nwords,
+                nwords_total: r.nwords_total,
+                nbytes: r.file_nbytes,
+                nlines: r.file_nlines,
+                file_nwords: r.file_nwords,
+                version: r.file_version,
+                updated_at: r.updated_at,
+                updated_by: r.updated_by,
+            })
+            .collect())
+    }
+    fn heading_names(&mut self, prefix: &str, starts: &str, limit: i64) -> Result<Vec<crate::store::HeadingName>> {
+        Ok(textdb_sqlite::sections::heading_names(&self.conn, DEFAULT_PREFIX, &self.view, prefix, starts, limit.max(1) as usize)?
+            .into_iter()
+            .map(|(heading, sections, docs)| crate::store::HeadingName { heading, sections, docs })
+            .collect())
+    }
+    fn property_find(&mut self, query: &str, folder: &str, limit: i64) -> Result<Vec<crate::store::PropHit>> {
+        Ok(self
+            .db()
+            .property_find(query, folder, limit.max(1) as usize)?
+            .into_iter()
+            .map(|h| crate::store::PropHit {
+                path: h.path,
+                nbytes: h.nbytes,
+                updated_at: h.updated_at,
+                frontmatter: h.frontmatter.and_then(|t| serde_json::from_str(&t).ok()),
+            })
+            .collect())
+    }
+    fn search(&mut self, query: &str, prefix: &str, limit: i64, per_file: i64) -> Result<Vec<Hit>> {
+        Ok(self
+            .db()
+            .search_lines(query, prefix, limit.max(1) as usize, per_file.max(1) as usize)?
             .into_iter()
             .map(|h| Hit {
                 path: h.path,
+                version: h.version,
                 line: h.line,
-                snippet: h.snippet,
-                rank: h.rank,
+                text: h.text,
+                section: h.section,
+                score: Some(h.score),
+                more: h.more,
             })
+            .collect())
+    }
+
+    fn sections_of(&mut self, path: &str) -> Result<Vec<(i64, i64, String)>> {
+        Ok(textdb_sqlite::sections::outline(&self.conn, DEFAULT_PREFIX, &self.view, path, None, textdb_sqlite::sections::Match::Exact, None, 10_000)?
+            .into_iter()
+            .map(|r| (r.line_from, r.line_to, r.heading_path))
             .collect())
     }
 
@@ -261,15 +702,15 @@ impl Store for SqliteStore {
         author: Option<&str>,
         message: Option<&str>,
     ) -> Result<Written> {
-        Ok(written(self.db().write(path, content, base_version.map(version), author, message)?))
+        Ok(written(self.out(self.db().write(path, content, base_version.map(version), author, message))?))
     }
 
     fn edit(&mut self, path: &str, old: &[u8], new: &[u8], author: Option<&str>, message: Option<&str>) -> Result<Written> {
-        Ok(written(self.db().with_message(message).edit(path, old, new, author)?))
+        Ok(written(self.out(self.db().with_message(message).edit(path, old, new, author))?))
     }
 
     fn append(&mut self, path: &str, tail: &[u8], author: Option<&str>, message: Option<&str>) -> Result<Written> {
-        Ok(written(self.db().with_message(message).append(path, tail, author)?))
+        Ok(written(self.out(self.db().with_message(message).append(path, tail, author))?))
     }
 
     fn replace_lines(
@@ -282,14 +723,14 @@ impl Store for SqliteStore {
         author: Option<&str>,
         message: Option<&str>,
     ) -> Result<Written> {
-        Ok(written(self.db().with_message(message).replace_lines(
+        Ok(written(self.out(self.db().with_message(message).replace_lines(
             path,
             version(from),
             version(to),
             text,
             base_version.map(version),
             author,
-        )?))
+        ))?))
     }
 
     fn history(&mut self, path: &str) -> Result<Vec<Commit>> {
@@ -303,6 +744,8 @@ impl Store for SqliteStore {
                 ts: c.ts,
                 message: c.message,
                 nbytes: c.nbytes,
+                nlines: c.nlines,
+                nwords: c.nwords,
                 kind: c.kind,
                 base_version: c.base_version,
             })
@@ -358,11 +801,13 @@ impl Store for SqliteStore {
             .into_iter()
             .map(|r| (r.from as u64, r.to as u64, r.text.clone().into_bytes()))
             .collect();
-        Ok(written(self.db().with_message(message).replace_line_ranges(path, &ranges, base_version.map(version), author)?))
+        Ok(written(self.out(self.db().with_message(message).replace_line_ranges(path, &ranges, base_version.map(version), author))?))
     }
 
     fn links(&mut self, path: &str, statuses: &[&str]) -> Result<Vec<super::LinkRow>> {
-        let path = normalize_path(path)?;
+        // The subtree the caller named, in store terms; `link_rows` adds the visible-set filter
+        // and turns both ends of each link back into the caller's paths.
+        let path = self.db().store_path(path)?;
         let (lo, hi) = subtree_bounds(&path).unwrap_or_else(|| ("/".into(), "0".into()));
         let only = if statuses.is_empty() {
             String::new()
@@ -373,7 +818,9 @@ impl Store for SqliteStore {
     }
 
     fn backlinks(&mut self, path: &str) -> Result<Vec<super::LinkRow>> {
-        let path = normalize_path(path)?;
+        // Links *from* files outside the caller's shares are dropped by `link_rows`, which is
+        // what #12 B13 asks for: you learn who links to your document only from inside your view.
+        let path = self.db().store_path(path)?;
         let (lo, hi) = subtree_bounds(&path).unwrap_or_else(|| ("/".into(), "0".into()));
         self.link_rows(
             &format!(
@@ -405,6 +852,7 @@ impl Store for SqliteStore {
                 target: c.target,
                 now_at: c.now_at,
                 version: c.version.map(|v| v as i64),
+                outside: c.outside,
             })
             .collect())
     }
@@ -429,6 +877,14 @@ impl Store for SqliteStore {
                 author: e.author,
             })
             .collect())
+    }
+
+    fn trash(&mut self, parent: Option<i64>) -> Result<Vec<TrashRow>> {
+        Ok(self.db().trash(parent)?.into_iter().map(trash_row).collect())
+    }
+
+    fn trash_restore(&mut self, id: i64, author: Option<&str>) -> Result<TrashRow> {
+        Ok(trash_row(self.db().restore(id, author)?))
     }
 
     fn set_session_path_history(&mut self, on: Option<bool>) -> Result<()> {
@@ -498,7 +954,11 @@ impl Store for SqliteStore {
         progress: &mut dyn FnMut(&ImportStats),
         on_error: &mut dyn FnMut(&str, &StoreError),
     ) -> Result<ImportStats> {
-        let db = TextDb::attach(&self.conn, DEFAULT_PREFIX, true);
+        // `self.db()`, not a bare `attach`: a handle without the connection's view is the owner's,
+        // and `import` would then write wherever it was pointed. It was the one entry point that
+        // still did that — every file below goes through `upsert`, which refuses a path outside a
+        // writable share once the view is attached.
+        let db = self.db();
         let mut stats = ImportStats::default();
         let mut pending = 0;
         self.conn.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
@@ -529,34 +989,41 @@ impl Store for SqliteStore {
     }
 
     fn file_heads(&mut self, prefix: &str) -> Result<Vec<FileHead>> {
-        let prefix = normalize_path(prefix)?;
+        use rusqlite::types::Value;
+        // What sync compares against disk, so it decides the shape of a checkout: the account's
+        // own layout, and nothing from outside its shares.
+        let prefix = self.db().store_path(prefix)?;
         let cols = "path, version, updated_by";
-        let map = |r: &rusqlite::Row| -> rusqlite::Result<FileHead> {
-            Ok(FileHead {
-                path: r.get(0)?,
-                version: r.get(1)?,
-                updated_by: r.get(2)?,
+        let (scope, args): (String, Vec<Value>) = match subtree_bounds(&prefix) {
+            None => ("1".into(), vec![]),
+            Some((lo, hi)) => ("path >= ?1 AND path < ?2".into(), vec![Value::Text(lo), Value::Text(hi)]),
+        };
+        let (vis, vis_args) = self.visible("path", args.len());
+        let mut all = args;
+        all.extend(vis_args);
+        let rows = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT {cols} FROM {DEFAULT_PREFIX}node WHERE deleted_at IS NULL AND kind = 1 AND ({scope}) AND ({vis})"
+            ))
+            .map_err(sql)?
+            .query_map(rusqlite::params_from_iter(all.iter()), |r| {
+                Ok(FileHead {
+                    path: r.get(0)?,
+                    version: r.get(1)?,
+                    updated_by: r.get(2)?,
+                })
             })
-        };
-        let rows = match subtree_bounds(&prefix) {
-            None => self
-                .conn
-                .prepare_cached(&format!("SELECT {cols} FROM {DEFAULT_PREFIX}node WHERE deleted_at IS NULL AND kind = 1"))
-                .map_err(sql)?
-                .query_map([], map)
-                .map_err(sql)?
-                .collect::<rusqlite::Result<Vec<_>>>(),
-            Some((lo, hi)) => self
-                .conn
-                .prepare_cached(&format!(
-                    "SELECT {cols} FROM {DEFAULT_PREFIX}node WHERE deleted_at IS NULL AND kind = 1 AND path >= ?1 AND path < ?2"
-                ))
-                .map_err(sql)?
-                .query_map([lo, hi], map)
-                .map_err(sql)?
-                .collect::<rusqlite::Result<Vec<_>>>(),
-        };
-        rows.map_err(sql)
+            .map_err(sql)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|mut h| {
+                h.path = self.seen(&h.path)?;
+                Some(h)
+            })
+            .collect())
     }
 
     fn sync_bases(&mut self, prefix: &str) -> Result<Vec<SyncBase>> {
@@ -612,7 +1079,8 @@ impl Store for SqliteStore {
     }
 
     fn sql(&mut self, query: &str, params: &[String], author: Option<&str>, write: bool, dry_run: bool) -> Result<SqlResult> {
-        self.conn.execute_batch(&sql_views(DEFAULT_PREFIX)).map_err(sql)?;
+        let views = sql_views(DEFAULT_PREFIX, &self.view);
+        self.conn.execute_batch(&views).map_err(sql)?;
         let before = self.db().last_seq()?;
         let batch = if write { Some(new_batch_id(&self.conn)?) } else { None };
         // Read-only covers everything the statement runs, the textdb functions' own writes
@@ -729,14 +1197,23 @@ impl Store for SqliteStore {
         let p = DEFAULT_PREFIX;
         let git = base.git.as_ref();
         let tx = self.conn.transaction().map_err(sql)?;
-        let id: i64 = tx
+        // Compare-and-swap: the row must still be at the generation this sync read, or another
+        // one replaced the base meanwhile and this run's view of both sides is stale. `WHERE` on
+        // a conflicting upsert makes the row come back empty rather than overwritten.
+        //
+        // The base is saved last, after the store and disk writes, so this does not stop them —
+        // what it stops is a stale base overwriting the one the other process recorded, which
+        // would make the *next* sync take this run's view as the agreed state and miss theirs.
+        let id: Option<i64> = tx
             .query_row(
                 &format!(
-                    "INSERT INTO {p}sync(prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean, rules) \
-                     VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4, ?5, ?6, ?7, ?8, ?9) \
+                    "INSERT INTO {p}sync(prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean, rules, generation, dir_id) \
+                     VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4, ?5, ?6, ?7, ?8, ?9, ?10 + 1, ?11) \
                      ON CONFLICT(prefix, dir) DO UPDATE SET seq = excluded.seq, synced_at = excluded.synced_at, \
                      author = excluded.author, git_commit = excluded.git_commit, git_branch = excluded.git_branch, \
-                     git_remote = excluded.git_remote, git_clean = excluded.git_clean, rules = excluded.rules RETURNING id"
+                     git_remote = excluded.git_remote, git_clean = excluded.git_clean, rules = excluded.rules, \
+                     generation = {p}sync.generation + 1, dir_id = excluded.dir_id \
+                     WHERE {p}sync.generation = ?10 RETURNING id"
                 ),
                 rusqlite::params![
                     base.prefix,
@@ -748,10 +1225,28 @@ impl Store for SqliteStore {
                     git.and_then(|g| g.remote.as_deref()),
                     git.map(|g| g.clean),
                     base.rules,
+                    base.generation,
+                    base.dir_id,
                 ],
                 |r| r.get(0),
             )
+            .optional()
             .map_err(sql)?;
+        let Some(id) = id else {
+            return Err(StoreError::contention(format!(
+                "{} and {} were synced by another process while this one was running, so this run's base was not \
+                 recorded. What it wrote is in the store and on disk; run sync again to reconcile against the base \
+                 that process left",
+                base.prefix, base.dir
+            )));
+        };
+        // A sync that changed nothing still arrives here with the whole base, and rewriting it
+        // meant a DELETE and an INSERT per file — hundreds of statements and their WAL records
+        // for a run whose answer was "nothing to do". Read the rows first and skip the rewrite
+        // when they already say this; one indexed scan against two statements per file.
+        if same_sync_files(&tx, p, id, &base.files)? {
+            return tx.commit().map_err(sql);
+        }
         tx.execute(&format!("DELETE FROM {p}sync_file WHERE sync_id = ?1"), [id]).map_err(sql)?;
         {
             let mut insert = tx
@@ -810,6 +1305,23 @@ fn new_batch_id(conn: &Connection) -> Result<String> {
         .map_err(sql)
 }
 
+fn trash_row(e: textdb_sqlite::trash::TrashEntry) -> TrashRow {
+    TrashRow {
+        id: e.id,
+        name: e.name,
+        kind: if e.kind == 1 { "file".into() } else { "folder".into() },
+        path: e.path,
+        version: e.version,
+        nbytes: e.nbytes,
+        nlines: e.nlines,
+        files: e.files,
+        updated_at: e.updated_at,
+        updated_by: e.updated_by,
+        deleted_at: e.deleted_at,
+        deleted_by: e.deleted_by,
+    }
+}
+
 fn batch_change(i: textdb_sqlite::bulk::BatchItem) -> BatchChange {
     BatchChange {
         op: i.op,
@@ -821,43 +1333,106 @@ fn batch_change(i: textdb_sqlite::bulk::BatchItem) -> BatchChange {
     }
 }
 
-fn sql_views(p: &str) -> String {
+/// The views `textdb sql` offers, built for one connection's view of the store.
+///
+/// Every one of them reads `textdb_nodes`, which is the node table with the account's paths and
+/// nothing it cannot see. For the owner that view is the table — same expression, same predicate,
+/// so SQLite flattens it away and the plan is what it was before accounts existed. For a token
+/// session the filter and the translation are written into the definition rather than applied by
+/// each query, which is what keeps `files`, `commits` and the rest honest without every one of
+/// them having to remember (#12 K).
+///
+/// Dropped and made again on each `sql` call: a connection that authenticates in the middle of
+/// its life must not keep the views it had before.
+fn sql_views(p: &str, view: &textdb_core::access::View) -> String {
+    use textdb_sqlite::access::{to_view_literal, view_name_literal, visible_literal};
+    let path_expr = to_view_literal(view, "path").unwrap_or_else(|| "path".to_string());
+    let name_expr = view_name_literal(view, "path", "name").unwrap_or_else(|| "name".to_string());
+    let vis = visible_literal(view, "path").map(|v| format!(" AND ({v})")).unwrap_or_default();
+    // The node columns every view below draws on, less `path` and `name`, which the two
+    // expressions above replace, and less the internal ones (`parent_id`, `root`, `deleted_at`)
+    // that no surface has ever shown.
+    const REST: &str = "id, kind, version, nbytes, nlines, nwords, nauthors, created_at, updated_at, updated_by, \
+                        title, nsections, nprops, nlinks, nlinks_broken, \
+                        t_files, t_folders, t_bytes, t_lines, t_words, t_versions, t_sections, t_props, \
+                        t_links, t_links_broken, t_updated_at";
+    // `files` and `folders` are the canonical listing record filtered by kind: the same columns
+    // in the same order as textdb_ls, textdb_entry and kb.entry. `folders.parent` is `dir` now,
+    // the one name for it on every surface.
+    let listing = |kind: i64| {
+        format!(
+            "SELECT
+                  path, name,
+                  CASE kind WHEN 1 THEN 'file' ELSE 'folder' END AS kind,
+                  CASE kind WHEN 1 THEN version END AS version,
+                  CASE kind WHEN 1 THEN coalesce(nbytes, 0) ELSE t_bytes END AS nbytes,
+                  CASE kind WHEN 1 THEN coalesce(nlines, 0) ELSE t_lines END AS nlines,
+                  CASE WHEN kind = 0 AND t_updated_at > updated_at THEN t_updated_at ELSE updated_at END AS updated_at,
+                  updated_by, id,
+                  CASE WHEN path = '/' THEN NULL WHEN length(path) = length(name) + 1 THEN '/'
+                       ELSE substr(path, 1, length(path) - length(name) - 1) END AS dir,
+                  CASE WHEN path = '/' THEN 0 ELSE length(path) - length(replace(path, '/', '')) END AS depth,
+                  CASE WHEN kind = 1 AND name GLOB '?*.*'
+                       THEN lower(substr(name, length(rtrim(name, replace(name, '.', ''))) + 1)) END AS ext,
+                  title,
+                  CASE kind WHEN 1 THEN coalesce(nwords, 0) ELSE t_words END AS nwords,
+                  CASE kind WHEN 1 THEN nsections ELSE t_sections END AS nsections,
+                  CASE kind WHEN 1 THEN nprops ELSE t_props END AS nprops,
+                  CASE kind WHEN 1 THEN nlinks ELSE t_links END AS nlinks,
+                  CASE kind WHEN 1 THEN nlinks_broken ELSE t_links_broken END AS nlinks_broken,
+                  CASE kind WHEN 1 THEN version ELSE t_versions END AS versions,
+                  created_at,
+                  CASE kind WHEN 0 THEN t_files END AS files,
+                  CASE kind WHEN 0 THEN t_folders END AS folders,
+                  coalesce(nauthors, 0) AS nauthors
+           FROM textdb_nodes WHERE kind = {kind}"
+        )
+    };
     format!(
-        "CREATE TEMP VIEW IF NOT EXISTS files AS
-           SELECT id, path, name,
-                  CASE WHEN length(path) = length(name) + 1 THEN '/' ELSE substr(path, 1, length(path) - length(name) - 1) END AS dir,
-                  length(path) - length(replace(path, '/', '')) AS depth,
-                  CASE WHEN name GLOB '?*.*' THEN lower(substr(name, length(rtrim(name, replace(name, '.', ''))) + 1)) ELSE '' END AS ext,
-                  version, nbytes, nlines, nwords, nauthors, created_at, updated_at, updated_by
-           FROM {p}node WHERE kind = 1 AND deleted_at IS NULL
+        "DROP VIEW IF EXISTS temp.textdb_nodes;
+         DROP VIEW IF EXISTS temp.files; DROP VIEW IF EXISTS temp.folders;
+         DROP VIEW IF EXISTS temp.frontmatter; DROP VIEW IF EXISTS temp.sections;
+         DROP VIEW IF EXISTS temp.links; DROP VIEW IF EXISTS temp.properties;
+         DROP VIEW IF EXISTS temp.commits; DROP VIEW IF EXISTS temp.authors;
+         CREATE TEMP VIEW textdb_nodes AS
+           SELECT {path_expr} AS path, {name_expr} AS name, {REST}
+           FROM {p}node WHERE deleted_at IS NULL{vis};
+         CREATE TEMP VIEW files AS
+           {files}
            -- No limit really, but a view with one is not flattened into a query with a WHERE: without
            -- it SQLite may call `textdb_content(path)` in that WHERE on folder rows, which fails.
            LIMIT -1;
-         CREATE TEMP VIEW IF NOT EXISTS folders AS
-           SELECT id, path, name,
-                  CASE WHEN path = '/' THEN NULL WHEN length(path) = length(name) + 1 THEN '/'
-                       ELSE substr(path, 1, length(path) - length(name) - 1) END AS parent,
-                  CASE WHEN path = '/' THEN 0 ELSE length(path) - length(replace(path, '/', '')) END AS depth,
-                  t_files AS files, t_folders AS folders, t_bytes AS nbytes, t_lines AS nlines,
-                  t_words AS nwords, t_versions AS versions, t_updated_at AS updated_at
-           FROM {p}node WHERE kind = 0 AND deleted_at IS NULL;
-         CREATE TEMP VIEW IF NOT EXISTS frontmatter AS
-           SELECT n.path, f.data FROM {p}frontmatter f JOIN {p}node n ON n.id = f.file_id AND n.deleted_at IS NULL;
-         CREATE TEMP VIEW IF NOT EXISTS sections AS
-           SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to
-           FROM {p}section s JOIN {p}node n ON n.id = s.file_id AND n.deleted_at IS NULL;
-         CREATE TEMP VIEW IF NOT EXISTS links AS
-           SELECT n.path, l.target_path AS target, l.line, l.kind, l.anchor, l.alias, l.status,
+         CREATE TEMP VIEW folders AS
+           {folders};
+         CREATE TEMP VIEW frontmatter AS
+           SELECT n.path, f.data FROM {p}frontmatter f JOIN textdb_nodes n ON n.id = f.file_id;
+         CREATE TEMP VIEW sections AS
+           SELECT n.path, s.heading_path AS heading, s.level, s.line_from, s.line_to,
+                  s.heading AS title, s.nwords, s.nwords_total,
+                  n.nbytes, n.nlines, n.nwords AS file_nwords, n.version, n.updated_at, n.updated_by
+           FROM {p}section s JOIN textdb_nodes n ON n.id = s.file_id;
+         CREATE TEMP VIEW links AS
+           SELECT n.path, n.version, l.line, coalesce(l.kind, '') AS kind,
+                  -- A target this account cannot see is the id reference its content reads as,
+                  -- never the path the link was written with (#12 E).
+                  CASE WHEN l.resolved_id IS NOT NULL AND r.id IS NULL THEN 'textdb:' || l.resolved_id
+                       ELSE l.target_path END AS target,
+                  l.anchor, l.alias, l.status,
                   CASE WHEN r.path LIKE '%.tdbasset' THEN substr(r.path, 1, length(r.path) - 9) ELSE r.path END AS resolved,
                   r.path LIKE '%.tdbasset' AS asset
-           FROM {p}link l JOIN {p}node n ON n.id = l.file_id AND n.deleted_at IS NULL
-           LEFT JOIN {p}node r ON r.id = l.resolved_id AND r.deleted_at IS NULL;
-         CREATE TEMP VIEW IF NOT EXISTS commits AS
-           SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines, c.batch
-           FROM {p}commit c JOIN {p}node n ON n.id = c.file_id AND n.deleted_at IS NULL;
-         CREATE TEMP VIEW IF NOT EXISTS authors AS
+           FROM {p}link l JOIN textdb_nodes n ON n.id = l.file_id
+           LEFT JOIN textdb_nodes r ON r.id = l.resolved_id;
+         CREATE TEMP VIEW properties AS
+           SELECT n.path, r.key, r.val_txt AS value, r.val_num AS number, r.ord
+           FROM {p}property r JOIN textdb_nodes n ON n.id = r.file_id;
+         CREATE TEMP VIEW commits AS
+           SELECT n.path, c.version, c.author, c.ts, c.message, c.kind, c.base_version, c.nbytes, c.nlines, c.nwords, c.batch
+           FROM {p}commit c JOIN textdb_nodes n ON n.id = c.file_id;
+         CREATE TEMP VIEW authors AS
            SELECT n.path, nullif(a.author, '') AS author, a.commits, a.first_ts, a.last_ts
-           FROM {p}file_author a JOIN {p}node n ON n.id = a.file_id AND n.deleted_at IS NULL;"
+           FROM {p}file_author a JOIN textdb_nodes n ON n.id = a.file_id;",
+        files = listing(1),
+        folders = listing(0),
     )
 }
 
@@ -875,9 +1450,25 @@ fn sql_value(v: rusqlite::types::ValueRef) -> serde_json::Value {
     }
 }
 
-/// A statement's own error: the SQL is the caller's, so it is reported as invalid input.
+/// A statement's own error: the SQL is the caller's, so it is reported as invalid input —
+/// unless the store itself refused a row, in which case the answer is the store's.
+///
+/// A virtual table or a `textdb_*` function raises through SQLite, which wraps the message and
+/// loses the kind. The message still opens with the code, so a write refused for want of rights
+/// is `TX005 forbidden` here as it is everywhere else, and exits 7 rather than 2 (#12 C, K).
 fn statement_error(e: rusqlite::Error, write: bool) -> StoreError {
     let message = e.to_string();
+    if let Some(at) = message.find("TX00") {
+        let code = &message[at..(at + 5).min(message.len())];
+        let rest = message[at..].to_string();
+        match code {
+            "TX001" => return StoreError::conflict(rest),
+            "TX002" => return StoreError::contention(rest),
+            "TX003" => return StoreError::not_found(rest),
+            "TX005" => return StoreError::forbidden(rest),
+            _ => {}
+        }
+    }
     if !write && message.contains("readonly") {
         StoreError::invalid(format!("{message}: this statement changes the store; run it with --write"))
     } else {
@@ -885,9 +1476,60 @@ fn statement_error(e: rusqlite::Error, write: bool) -> StoreError {
     }
 }
 
+// Whether the statement being compiled is the caller's own, and the name of the table an
+// authorizer refused it.
+//
+// The authorizer below fires for *every* statement this connection compiles, the virtual table's
+// own reads of `kb_node` included, and those are the implementation rather than the caller. They
+// are compiled while a statement runs; the caller's is compiled here, between these two calls,
+// which is the difference the flag records.
+thread_local! {
+    static COMPILING_CALLER_SQL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REFUSED_TABLE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Refuse a token session the store's own tables (#12 K2).
+///
+/// `kb` and the `textdb_*` functions are the surface; `kb_node`, `kb_commit`, `kb_grant` and the
+/// rest are the owner's, and reading them would walk straight past every filter this feature
+/// adds. The views `sql_views` defines read them too, which is why the accessor decides: SQLite
+/// names the view a read came through, and a read with no view behind it is the caller's own.
+fn install_raw_table_guard(conn: &Connection, prefix: &str) -> Result<()> {
+    let prefix = prefix.to_string();
+    conn.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+        use rusqlite::hooks::{AuthAction, Authorization};
+        if !COMPILING_CALLER_SQL.with(std::cell::Cell::get) || ctx.accessor.is_some() {
+            return Authorization::Allow;
+        }
+        let table = match ctx.action {
+            AuthAction::Read { table_name, .. } => table_name,
+            AuthAction::Insert { table_name } | AuthAction::Update { table_name, .. } => table_name,
+            AuthAction::Delete { table_name } | AuthAction::DropTable { table_name } => table_name,
+            AuthAction::AlterTable { table_name, .. } => table_name,
+            _ => return Authorization::Allow,
+        };
+        if !table.starts_with(&prefix) {
+            return Authorization::Allow;
+        }
+        REFUSED_TABLE.with(|t| *t.borrow_mut() = Some(table.to_string()));
+        Authorization::Deny
+    }))
+    .map_err(sql)
+}
+
 fn run_sql(conn: &Connection, query: &str, params: &[String], author: Option<&str>, write: bool) -> Result<SqlResult> {
     let fail = |e: rusqlite::Error| statement_error(e, write);
-    let mut stmt = conn.prepare(query).map_err(fail)?;
+    REFUSED_TABLE.with(|t| *t.borrow_mut() = None);
+    COMPILING_CALLER_SQL.with(|f| f.set(true));
+    let compiled = conn.prepare(query);
+    COMPILING_CALLER_SQL.with(|f| f.set(false));
+    if let Some(table) = REFUSED_TABLE.with(|t| t.borrow_mut().take()) {
+        return Err(StoreError::forbidden(format!(
+            "{table} is the store's own table and is not yours to read; the views and `kb` are ({})",
+            "files, folders, commits, links, properties, sections, authors, frontmatter"
+        )));
+    }
+    let mut stmt = compiled.map_err(fail)?;
     if !write && !stmt.readonly() {
         return Err(StoreError::invalid("this statement changes the store; run it with --write"));
     }
@@ -920,7 +1562,7 @@ fn run_sql(conn: &Connection, query: &str, params: &[String], author: Option<&st
     })
 }
 
-const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean, rules";
+const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean, rules, generation, dir_id";
 
 fn sync_row(r: &rusqlite::Row) -> rusqlite::Result<(i64, SyncBase)> {
     let clean: Option<bool> = r.get(9)?;
@@ -935,7 +1577,43 @@ fn sync_row(r: &rusqlite::Row) -> rusqlite::Result<(i64, SyncBase)> {
             author: r.get(5)?,
             git: clean.map(|clean| GitState { commit, branch, remote, clean }),
             rules: r.get(10)?,
+            generation: r.get(11)?,
+            dir_id: r.get(12)?,
             files: Vec::new(),
         },
     ))
+}
+
+/// Do the stored `sync_file` rows for `id` already say exactly what `want` says?
+///
+/// Compared as a map rather than in order: the rewrite this avoids did not preserve any
+/// order either, and `rel` is unique per sync, so the map is the meaning of the table.
+fn same_sync_files(tx: &rusqlite::Transaction<'_>, p: &str, id: i64, want: &[BaseFile]) -> Result<bool> {
+    type Row = (Option<i64>, String, Option<i64>, Option<i64>, bool);
+    let mut have: std::collections::HashMap<String, Row> = std::collections::HashMap::with_capacity(want.len());
+    {
+        let mut st = tx
+            .prepare_cached(&format!(
+                "SELECT rel, version, blob, disk_size, disk_mtime, conflict FROM {p}sync_file WHERE sync_id = ?1"
+            ))
+            .map_err(sql)?;
+        let rows = st
+            .query_map([id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? != 0),
+                ))
+            })
+            .map_err(sql)?;
+        for row in rows {
+            let (rel, rest) = row.map_err(sql)?;
+            have.insert(rel, rest);
+        }
+    }
+    if have.len() != want.len() {
+        return Ok(false);
+    }
+    Ok(want
+        .iter()
+        .all(|f| have.get(&f.rel) == Some(&(f.version, f.blob.clone(), f.disk_size, f.disk_mtime, f.conflict))))
 }

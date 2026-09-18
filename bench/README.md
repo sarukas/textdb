@@ -62,10 +62,47 @@ bench/scripts/make-results.py bench/out bench/RESULTS.md bench/scripts/results-n
 | `--work DIR` | `bench/data` | Where backends put their data. Wiped per backend per rep. |
 | `--drop-caches` | off | Drop the page cache before rep 1 for a cold-cache number. Linux only; elsewhere every rep is recorded `warm`. |
 | `--tests DIR` | `bench/harness/tests` | The matrix TOML. |
+| `--as-account` | off | Also run every textdb backend as a delegated account. See [Delegated access](#delegated-access). |
 | `-v` | off | Verbose. |
 
 `results.jsonl` appends, so point a second run at a fresh `--out` unless you mean to
 combine them (which is how `fs-git` gets added to a run for one test only).
+
+## Delegated access
+
+Every backend above opens its store as the **owner**, so every number the matrix has produced is
+the owner's: nothing measured a filtered read, a translated listing or a projected document.
+`--as-account` measures the other half.
+
+```sh
+./target/release/textdb-bench run --size s --as-account \
+    --backends textdb-sqlite,textdb-pg --pg postgres://postgres@localhost:54329/postgres
+```
+
+It adds a **delegated twin** beside each textdb backend — `textdb-sqlite@account`,
+`textdb-pg@account` — and runs both in the **same invocation**, the twin immediately after its
+owner in every test. That is the point of the flag rather than a second run: this container's own
+drift reaches 10× on a single cell, so owner and account have to be measured back to back to be
+comparable at all. `--backends textdb-pg@account` names a twin directly if only that column is
+wanted.
+
+Nothing else about the suite changes. The twin authenticates as an account whose **root is one
+folder** (`/bench`), so the path the suite writes is the path the account writes: `/notes/a.md`
+goes in as `/notes/a.md` and comes back as `/notes/a.md`, while the store holds
+`/bench/notes/a.md` and every operation crosses the view on the way. No path is rewritten in the
+harness — a suite that rewrote paths would be measuring its own string work alongside the store's,
+and every oracle would have to be taught the difference. Every oracle therefore applies unchanged:
+a twin that quietly stopped filtering would fail the same checks as any other backend.
+
+Two things it does not measure, both worth knowing before reading a number from it:
+
+- **The aliased namespace.** The other shape — where the account's root lists aliases and every
+  path gains a `/<alias>` prefix — would need exactly the harness-side rewriting above, and
+  differs by one `format!` inside `to_store`; everything expensive runs the same either way.
+- **Row-level security, on Postgres.** `kb.node`'s policy is deliberately not `FORCE`d, and
+  Postgres exempts a table's owner and any superuser from a policy. The harness connects as the
+  role that owns the extension, so a delegated Postgres run measures the `kb.*` view and function
+  surface and **not** the RLS layer under it.
 
 ## Run size
 
@@ -105,7 +142,7 @@ than shrinking them.
 
 ## The test matrix
 
-Ten families, defined as data in `harness/tests/*.toml`. `reps` repetitions per cell; the
+Twelve families, defined as data in `harness/tests/*.toml`. `reps` repetitions per cell; the
 report takes the median.
 
 ### RT — round-trip accuracy
@@ -187,6 +224,15 @@ that count is precisely what CW is there to report. Those violations are recorde
 Ground truth is the reference tokenizer (word boundary, case-insensitive), equivalent to
 `rg -w -i -F`. AND is document-level for every backend.
 
+Every case also checks the **snippet** — the text a store shows for a hit. The check is the
+weakest useful one: the snippet has to contain a term that was searched for, folded the way
+the index folds and word by word so a quoted phrase is not looked for with its spaces
+intact. Only true positives are judged, since a false positive has no term to show and
+`precision` already counts it; `snippet_coverage` records what share of hits carried one at
+all, so a backend with no snippets is not scored as though it had wrong ones. Finding a
+document and showing the wrong line is not a working search, and until this was checked
+three separate ways of doing exactly that went unnoticed.
+
 ### NS — namespace
 
 | Test | What it measures |
@@ -196,6 +242,72 @@ Ground truth is the reference tokenizer (word boundary, case-insensitive), equiv
 | NS-03 | Rename a folder with {1k, 10k, 50k} descendants: latency; all paths updated, contents unchanged, versions preserved |
 | NS-04 | Delete a folder with 10k descendants, then read a deleted file's last version |
 | NS-05 | Path characters: spaces, dots, Unicode, 255-byte name, 4 KiB path, `%` and `_` |
+
+### MD — the structure sidecar
+
+Markdown links, front matter, sections and the change feed: the operations textdb has and
+no baseline does. `fs` keeps no index of what a document links to, and the `sql-text-*`
+stores keep text and nothing derived from it, so **every cell here is `N/A` for them**,
+recorded with its reason. The family is not asking who is faster; it establishes what these
+operations cost, and — in MD-01 — what maintaining them costs the write path that every
+other family measures.
+
+| Test | What it measures |
+|---|---|
+| MD-01 | The same bytes written as `.md` (the extractor runs) and `.txt` (it does not), at 0/8/64 links per document: `create_overhead_pct` and `replace_overhead_pct` are what the sidecar costs a write |
+| MD-02 | A known link graph with planted dangling targets: outbound links per document, the whole subtree in one query, backlinks, and broken-link validation |
+| MD-03 | Rename a file that N others link to, under `link_updates` = off / report / rewrite: latency and documents rewritten per move |
+| MD-04 | Front matter: reading the parsed block per document, and setting one key with the rest of the document byte-identical |
+| MD-05 | Documents with 32 headings: listing sections, and fetching one section's body by heading |
+| MD-06 | Change feed: a watcher polling after every write, and one catching up from zero |
+| MD-07 | Front-matter property search: what the vault uses, what a property holds, and queries over both, with the per-keystroke autosuggest calls timed apart |
+| MD-08 | Headings above one document: a whole vault in one call, a heading query as `exact` / `prefix` / `contains` (the first two seek the folded index, the third scans), the level filter, and the per-keystroke autosuggest |
+
+MD-08's corpus distributes headings the way a vault does: `Summary` on every note, `Risks` on
+a sixteenth, and one heading unique to each document. A benchmark where every document has
+the same headings measures a seek that always returns everything, and one where every heading
+is unique measures a seek that always returns one row; neither is the question.
+
+Every case is generated with a **known** link graph, front matter and heading tree, so the
+oracle is what the generator wrote rather than whatever the backend returns. A backend that
+indexes nothing and answers instantly fails the check and publishes no timings. Links are
+written as relative `[text](./f00042.md)`, not wiki links, because a wiki link resolves by
+name across the whole store and its expected status would depend on what else the corpus
+happens to hold.
+
+Two things MD-01 controls for, because both would swamp the effect it measures:
+
+- The `.md` and `.txt` writes are **interleaved, alternating which goes first**. Writing all
+  of one kind and then all of the other hands the second a warmed page cache and a larger
+  store.
+- `links0` is not "no structure": those documents still have front matter and eight
+  headings, so its overhead is the cost of parsing and recording those. The *link* cost is
+  the difference between `links0` and the denser cases.
+
+### SY — sync
+
+Reconciling a store folder with a directory on disk, both ways: what an Obsidian vault or a
+git checkout actually does, and what nothing else in the matrix measured. `fs` *is* a
+directory and the `sql-text-*` stores have no working copy, so those cells are `N/A`.
+
+| Test | What it measures |
+|---|---|
+| SY-01 | First import; a no-op re-sync; a few files changed on disk; changed in the store; both sides changed disjointly (must merge, not conflict); a delete propagated |
+
+The first import happens once. The **no-op sync** happens constantly — every save hook, every
+watcher tick — so `us_per_file` and `vs_first_pct` on the `noop` case are the numbers that
+decide whether a large vault costs anything when nothing has changed.
+
+Sync is a CLI operation, not part of the SQL surface the backends otherwise drive, so the
+suite shells out to `$TEXTDB_BIN` (default `target/release/textdb`) the way `fs-git` shells
+out to `git`. Without that binary the cells record N/A with that reason.
+
+The directory deliberately lives in a temporary directory, **not** under `--work`. `--work`
+defaults to `bench/data`, inside this repository, and `sync` notices a git checkout: it
+attributes changes to git authors and skips what `.gitignore` excludes. `bench/data` is
+ignored, so the first version of this suite reported moving nothing — it measured the ignore
+rules rather than sync. Measuring the git-aware path is a separate test that would have to
+set up a real repository.
 
 ### DU — durability
 

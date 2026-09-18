@@ -14,6 +14,24 @@ use textdb_md::MarkdownExtractor;
 use crate::stats::Totals;
 use crate::storage::{sql_err, SqliteStorage};
 
+/// Documents rescored before the rows are cut to what was asked for.
+///
+/// Reranking is only worth what it changes: the order of what is shown. Scoring a document needs
+/// its text, and reading text is what a search spends its time on, so this is a flat bound rather
+/// than a multiple of the rows asked for. `limit` counts *rows* and a document supplies up to
+/// `per_file` of them, so the rows a caller actually reads come from far fewer documents than
+/// their number suggests — sized from `limit` instead, a default `search` reranked three hundred
+/// documents to show ten, and paid for every one of them.
+///
+/// A caller wanting more documents than this gets the rest in the retrieval order behind them.
+const RERANK_POOL: usize = 64;
+
+/// New chunks per batched `chunk_ref` insert.
+///
+/// Fixed so the statement text repeats and `prepare_cached` can hold it; a batch sized to
+/// whatever was left over would compile a new statement for every document.
+const CHUNK_REF_BATCH: usize = 64;
+
 pub const DEFAULT_PREFIX: &str = "kb_";
 
 #[derive(Clone, Debug)]
@@ -36,24 +54,58 @@ pub struct NodeRow {
 /// totals over every live file below it.
 #[derive(Clone, Debug)]
 pub struct Entry {
-    pub id: i64,
-    pub name: String,
+    // The minimal tier, in order: what every surface carries whatever the command, format,
+    // backend or SDK. It is the set an agent needs to find a file, read it, and then edit it
+    // safely — `version` most of all, because every line-numbered edit needs one.
     pub path: String,
+    pub name: String,
+    /// 0 folder, 1 file.
     pub kind: i64,
-    pub nbytes: Option<i64>,
-    pub nlines: Option<i64>,
-    pub nwords: Option<i64>,
-    /// A file's version; a folder's total of versions below it.
-    pub versions: i64,
-    /// A file's last commit or move; for a folder the latest change to it or anywhere below.
+    /// A file's current version — what `cat -n` shows and `--base-version` takes. `None` for
+    /// a folder, which has no version of its own.
+    pub version: Option<i64>,
+    /// A file's own size; a folder's total over the live files below it. Never null.
+    pub nbytes: i64,
+    pub nlines: i64,
+    /// A file's last commit or move; a folder's latest change anywhere below.
     pub updated_at: String,
     pub updated_by: Option<String>,
+
+    // The rest of the full tier.
+    pub id: i64,
+    /// The parent folder's path; `None` for the root. One name for what used to be spelled
+    /// `parent_path`, `dir`, `parent` and `parent_id` depending on the surface.
+    pub dir: Option<String>,
+    /// `/a.md` is 1; the root is 0.
+    pub depth: i64,
+    /// Lower case, no dot; `None` for a folder or a name without one.
+    pub ext: Option<String>,
+    /// Front matter `title`, else the first level-1 heading, else `None`.
+    pub title: Option<String>,
+    pub nwords: i64,
+    /// Headings, top-level front matter keys, links written in the file, and of those the
+    /// ones that do not reach a document. Folder rows are totals below.
+    pub nsections: i64,
+    pub nprops: i64,
+    pub nlinks: i64,
+    pub nlinks_broken: i64,
+    /// A file's version count (equal to `version`, kept so one sort key works for both
+    /// kinds); a folder's sum of the versions below it.
+    pub versions: i64,
     pub created_at: String,
     /// Folder only: live files and folders anywhere below it.
     pub files: Option<i64>,
     pub folders: Option<i64>,
-    /// File only: everyone who committed to it, most commits first.
+    /// Distinct authors: of the file, or of everything below the folder.
+    pub nauthors: i64,
+    /// Everyone who committed to it, most commits first. Empty for a folder.
     pub authors: Vec<AuthorCount>,
+    /// The share this row was reached through, and its rights (#12). `None` for the owner, who
+    /// reaches everything directly.
+    pub share: Option<String>,
+    pub rights: Option<String>,
+    /// Only on an account's root row: `(alias, rights)` per share, in path order.
+    pub shares: Vec<(String, String)>,
 }
 
 /// One author's commits to a file.
@@ -73,6 +125,9 @@ impl AuthorCount {
 }
 
 impl Entry {
+    /// An aliased account's root: the list of its shares, not a node.
+    pub const ROOT: i64 = 2;
+
     /// The entry as `textdb_ls` columns name it, `authors` as an array.
     pub fn to_json(&self) -> serde_json::Value {
         let file = self.kind == 1;
@@ -80,7 +135,7 @@ impl Entry {
             "id": self.id,
             "name": self.name,
             "path": self.path,
-            "kind": if file { "file" } else { "folder" },
+            "kind": match self.kind { 1 => "file", Entry::ROOT => "root", _ => "folder" },
             "nbytes": self.nbytes,
             "nlines": self.nlines,
             "nwords": self.nwords,
@@ -92,6 +147,11 @@ impl Entry {
             "folders": self.folders,
             "nauthors": if file { Some(self.authors.len()) } else { None },
             "authors": self.authors.iter().map(AuthorCount::to_json).collect::<Vec<_>>(),
+            // Only in an account's view; absent for the owner, whose paths are the store's own.
+            "share": self.share,
+            "rights": self.rights,
+            "shares": (self.kind == Entry::ROOT)
+                .then(|| self.shares.iter().map(|(a, r)| serde_json::json!({"alias": a, "rights": r})).collect::<Vec<_>>()),
         })
     }
 }
@@ -103,6 +163,10 @@ pub struct CommitRow {
     pub ts: String,
     pub message: Option<String>,
     pub nbytes: Option<i64>,
+    /// Lines and words as of this version. `nwords` is `None` for commits written before the
+    /// column existed; `kb_rebuild_counts()` fills those in.
+    pub nlines: Option<i64>,
+    pub nwords: Option<i64>,
     pub root: Hash,
     /// How the commit landed: `direct`, `rebased` or `merged`. `None` for commits written
     /// before the column existed.
@@ -132,14 +196,28 @@ pub struct ChangeRow {
     pub commit_kind: Option<String>,
     pub author: Option<String>,
     pub message: Option<String>,
+    /// Set when the row is about one account's view — a share granted, renamed or taken away —
+    /// rather than about the store. Its `path` is already that account's.
+    pub for_account: Option<String>,
 }
 
 #[derive(Clone, Debug)]
+/// One matching line. The store returns lines, not documents with a guessed line.
 pub struct Hit {
     pub path: String,
+    /// The version the line number belongs to.
+    pub version: i64,
     pub line: i64,
-    pub snippet: String,
-    pub rank: f64,
+    /// The whole matching line, cut to `terms::LINE_CUT`.
+    pub text: String,
+    /// The heading path the line sits under; `None` outside any heading.
+    pub section: Option<String>,
+    /// Relevance, higher is better, scaled to `(0, 1]` against the best hit of this query.
+    /// The raw engine number was negative on SQLite and positive on Postgres for the same
+    /// meaning, so nothing could compare them.
+    pub score: f64,
+    /// Matching lines in this file not returned because of `per_file`.
+    pub more: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -166,6 +244,11 @@ pub struct TextDb<'c> {
     /// What moves do to links pointing at what moved (`Some`), or the store's `link_updates`
     /// setting (`None`).
     pub link_updates: Option<crate::links::LinkUpdates>,
+    /// Whose connection this is (#12). `View::admin()` unless a bearer was presented, and then
+    /// every path in and out of this handle is that account's, and rows outside its shares are
+    /// not returned at all. The admin's view produces no predicate and no translation, so a store
+    /// that delegates nothing runs the queries it ran before this existed.
+    pub view: textdb_core::access::View,
 }
 
 pub(crate) fn to_hash(v: &[u8]) -> Result<Hash> {
@@ -247,7 +330,241 @@ impl<'c> TextDb<'c> {
             path_history: None,
             message: None,
             link_updates: None,
+            view: textdb_core::access::View::admin(),
         }
+    }
+
+    /// Answer as this account: its paths in and out, its shares and nothing else.
+    pub fn with_view(mut self, view: textdb_core::access::View) -> Self {
+        self.view = view;
+        self
+    }
+
+    /// The same handle as the owner: no filter, no translation, store paths in and out.
+    ///
+    /// For an operation whose rights have already been settled over the whole set it touches and
+    /// which then works in store paths — `revert_batch` is the one. Calling a public method with
+    /// a store path would translate it a second time (CLAUDE.md), and every path here is one the
+    /// account has already been shown to be allowed to write.
+    pub(crate) fn as_owner(&self) -> TextDb<'c> {
+        TextDb::attach(self.conn, &self.p, self.manage_tx)
+            .with_path_history(self.path_history)
+            .with_link_updates(self.link_updates)
+            .with_message(self.message.as_deref())
+    }
+
+    /// A path as the caller wrote it, as a store path.
+    pub fn store_path(&self, p: &str) -> Result<String> {
+        if let Some(p) = self.by_id(p)? {
+            return Ok(p);
+        }
+        let p = normalize_path(p)?;
+        if self.view.is_admin() {
+            return Ok(p);
+        }
+        crate::access::to_store(&self.view, &p)
+    }
+
+    /// The same, for an operation that writes: a read-only share is refused here rather than by
+    /// whatever the caller would have done next.
+    pub fn store_path_rw(&self, p: &str) -> Result<String> {
+        if let Some(sp) = self.by_id(p)? {
+            // An id says which document; it says nothing about whether you may write it.
+            if !self.view.is_admin() {
+                return crate::access::to_store_rw(&self.view, &self.view_path(&sp).unwrap_or_default());
+            }
+            return Ok(sp);
+        }
+        let p = normalize_path(p)?;
+        if self.view.is_admin() {
+            return Ok(p);
+        }
+        crate::access::to_store_rw(&self.view, &p)
+    }
+
+    /// `id:1234` — the store's stable reference, which means the same thing in every view.
+    ///
+    /// A path quoted from one account's namespace means nothing in another's, so this is what
+    /// goes in a message between agents, in a link to the web app, and in a log (#12 §2 rule 6).
+    /// Visibility still applies: an id the caller cannot see is not found, exactly as a path it
+    /// cannot see is, and for the same reason — otherwise ids would be an oracle for probing the
+    /// store one number at a time.
+    fn by_id(&self, p: &str) -> Result<Option<String>> {
+        // A leading slash because something normalised it on the way here: `id:4` given on a
+        // command line passes through `normalize_path` in more than one caller, and an id is not
+        // a path, so it comes out as `/id:4`. Accept both rather than chase every caller.
+        let p = p.strip_prefix('/').unwrap_or(p);
+        let Some(rest) = p.strip_prefix("id:") else { return Ok(None) };
+        let id: i64 = rest
+            .trim()
+            .parse()
+            .map_err(|_| TextdbError::InvalidEdit(format!("'{p}' is not an id; ids are numbers, as `id:1234`")))?;
+        let n = self.node_by_path_by_id(id)?;
+        match n {
+            Some(path) if self.view.can_see(&path) => Ok(Some(path)),
+            _ => Err(TextdbError::NotFound(p.to_string())),
+        }
+    }
+
+    fn node_by_path_by_id(&self, id: i64) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                &format!("SELECT path FROM {}node WHERE id = ?1 AND deleted_at IS NULL", self.p),
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)
+    }
+
+    /// The link targets written in a document, with where each is written and what it reached.
+    ///
+    /// Only what projection needs. One indexed lookup on `file_id`, and it returns nothing for
+    /// a document with no links written in place — which is most of them. It runs only for a
+    /// token session; the owner never reaches here.
+    fn target_spans(&self, file_id: i64) -> Result<Vec<textdb_core::access::TargetSpan>> {
+        let mut st = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT l.target_path, l.span_from, l.span_to, coalesce(l.kind, ''), r.path, l.resolved_id, l.alias \
+                 FROM {p}link l LEFT JOIN {p}node r ON r.id = l.resolved_id AND r.deleted_at IS NULL \
+                 WHERE l.file_id = ?1 AND l.span_from IS NOT NULL AND l.external = 0",
+                p = self.p
+            ))
+            .map_err(sql_err)?;
+        let rows = st
+            .query_map([file_id], |r| {
+                Ok(textdb_core::access::TargetSpan {
+                    target: r.get(0)?,
+                    from: r.get::<_, i64>(1)? as usize,
+                    to: r.get::<_, i64>(2)? as usize,
+                    kind: r.get(3)?,
+                    resolved: r.get(4)?,
+                    resolved_id: r.get(5)?,
+                    alias: r.get(6)?,
+                })
+            })
+            .map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+    }
+
+    /// A document as this caller reads it: root-absolute links in its own paths, and the ones it
+    /// cannot see as `textdb:<id>` (#12 part 2).
+    pub(crate) fn project_doc(&self, file_id: i64, text: Vec<u8>) -> Result<Vec<u8>> {
+        if self.view.is_admin() {
+            return Ok(text);
+        }
+        let spans = self.target_spans(file_id)?;
+        if spans.is_empty() {
+            return Ok(text);
+        }
+        Ok(textdb_core::access::project(&self.view, &text, &spans).0)
+    }
+
+    /// The inverse, for text arriving from a caller. The links are scanned from the text itself,
+    /// because it is what the caller wrote and has no rows yet.
+    pub(crate) fn unproject_doc(&self, text: &[u8]) -> Result<Vec<u8>> {
+        if self.view.is_admin() {
+            return Ok(text.to_vec());
+        }
+        let spans = self.scan_targets(text);
+        if spans.is_empty() {
+            return Ok(text.to_vec());
+        }
+        let by_id = |id: i64| {
+            self.conn
+                .query_row(
+                    &format!("SELECT path FROM {}node WHERE id = ?1 AND deleted_at IS NULL", self.p),
+                    [id],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+        };
+        Ok(textdb_core::access::unproject(&self.view, text, &spans, by_id))
+    }
+
+    /// The link targets written in some text, straight from the markdown extractor — the same
+    /// scanner the index is built with, so the projector and the index cannot disagree about
+    /// what is a link.
+    fn scan_targets(&self, text: &[u8]) -> Vec<textdb_core::access::TargetSpan> {
+        let Some(ex) = self.extractor.as_ref() else { return Vec::new() };
+        ex.extract(text)
+            .links
+            .into_iter()
+            .filter(|l| !l.external)
+            .filter_map(|l| {
+                l.span.map(|(a, b)| textdb_core::access::TargetSpan {
+                    target: l.target_path,
+                    from: a as usize,
+                    to: b as usize,
+                    kind: l.kind,
+                    resolved: None,
+                    resolved_id: None,
+                    alias: l.alias,
+                })
+            })
+            .collect()
+    }
+
+    /// Line replacements with each piece of text in the store's namespace.
+    fn unproject_ranges(&self, ranges: &[(u64, u64, Vec<u8>)]) -> Result<Vec<(u64, u64, Vec<u8>)>> {
+        if self.view.is_admin() {
+            return Ok(ranges.to_vec());
+        }
+        ranges
+            .iter()
+            .map(|(a, b, t)| Ok((*a, *b, self.unproject_doc(t)?)))
+            .collect()
+    }
+
+    /// Put the caller's own paths back into an error on its way out.
+    ///
+    /// Errors carry paths too — a conflict payload names the file it is about, and a not-found
+    /// names what was not found. Translating rows but not errors is how a store path leaks to an
+    /// account that must not learn the layout, and it leaks precisely when something went wrong,
+    /// which is when people paste the message somewhere.
+    pub fn to_view_err(&self, e: TextdbError) -> TextdbError {
+        if self.view.is_admin() {
+            return e;
+        }
+        let seen = |p: &str| self.view_path(p).unwrap_or_else(|| "(outside your shares)".to_string());
+        match e {
+            TextdbError::NotFound(p) if p.starts_with('/') => TextdbError::NotFound(seen(&p)),
+            TextdbError::Conflict(mut c) => {
+                c.path = seen(&c.path);
+                TextdbError::Conflict(c)
+            }
+            other => other,
+        }
+    }
+
+    /// A store path as this caller sees it, or `None` when it sees nothing there.
+    pub fn view_path(&self, p: &str) -> Option<String> {
+        self.view.to_view(p)
+    }
+
+    /// The path a node has in this caller's view, or `None` when it has none — the node is gone,
+    /// or it is outside every share. For a surface that addresses rows by id (the `kb` table) and
+    /// must then speak paths.
+    pub fn path_in_view(&self, id: i64) -> Result<Option<String>> {
+        Ok(self.node_by_id(id)?.filter(|n| n.deleted_at.is_none()).and_then(|n| self.view_path(&n.path)))
+    }
+
+    /// Translate an `Entry` in place, dropping it when the account cannot see it.
+    pub(crate) fn to_view_entry(&self, mut e: Entry) -> Option<Entry> {
+        if self.view.is_admin() {
+            return Some(e);
+        }
+        if let Some(g) = self.view.grant_for(&e.path) {
+            e.share = Some(g.alias.clone());
+            e.rights = Some(g.rights.as_str().to_string());
+        }
+        let p = self.view_path(&e.path)?;
+        e.name = if p == "/" { "/".to_string() } else { name_of(&p).to_string() };
+        e.dir = dir_of(&p);
+        e.depth = depth_of(&p);
+        e.path = p;
+        Some(e)
     }
 
     /// This handle's choice of what moves do to links; `None` follows the store's setting.
@@ -344,6 +661,15 @@ impl<'c> TextDb<'c> {
     pub(crate) const NODE_COLS: &'static str =
         "id, parent_id, name, kind, path, root, version, nbytes, nlines, updated_at, updated_by, deleted_at";
 
+    /// The node a *caller's* path names, translating it first.
+    ///
+    /// [`node_by_path`](Self::node_by_path) is the raw lookup and takes a store path; every
+    /// caller outside this module holds a caller path, so this is the one they want.
+    pub fn node_for(&self, path: &str) -> Result<Option<NodeRow>> {
+        let path = self.store_path(path)?;
+        self.node_by_path(&path)
+    }
+
     pub fn node_by_path(&self, path: &str) -> Result<Option<NodeRow>> {
         self.conn
             .prepare_cached(&format!(
@@ -393,7 +719,17 @@ impl<'c> TextDb<'c> {
 
     /// `mkdir -p`; returns the folder id.
     pub fn ensure_folder(&self, path: &str) -> Result<i64> {
-        let path = normalize_path(path)?;
+        let path = self.store_path_rw(path)?;
+        self.ensure_folder_at(&path).map_err(|e| self.to_view_err(e))
+    }
+
+    // The internal `*_at` variants take a path that is **already** a store path, so that one
+    // operation translates exactly once. Without the split, `upsert` translated and then called
+    // `create`, which translated the result again — and an account's own `/legal/contracts/x.md`,
+    // fed back in, names an alias it does not have. Public methods translate; `*_at` never does.
+
+    pub(crate) fn ensure_folder_at(&self, path: &str) -> Result<i64> {
+        let path = path.to_string();
         if path == "/" {
             return self.ensure_root();
         }
@@ -441,19 +777,25 @@ impl<'c> TextDb<'c> {
                 folders: missing.len() as i64,
                 ..Totals::default()
             };
-            self.add_to_ancestors(top, &added, &now)?;
+            self.add_to_ancestors(top, &added, &now, None)?;
         }
         Ok(parent)
     }
 
     /// Create a file (parents created), commit version 1.
     pub fn create(&self, path: &str, content: &[u8], author: Option<&str>, message: Option<&str>) -> Result<u64> {
-        let path = normalize_path(path)?;
+        let path = self.store_path_rw(path)?;
+        let content = self.unproject_doc(content)?;
+        self.create_at(&path, &content, author, message).map_err(|e| self.to_view_err(e))
+    }
+
+    pub(crate) fn create_at(&self, path: &str, content: &[u8], author: Option<&str>, message: Option<&str>) -> Result<u64> {
+        let path = path.to_string();
         self.tx(|db| {
             if db.node_by_path(&path)?.is_some() {
                 return Err(TextdbError::InvalidEdit(format!("{} already exists", path)));
             }
-            let parent = db.ensure_folder(parent_of(&path))?;
+            let parent = db.ensure_folder_at(parent_of(&path))?;
             let now = Self::now();
             db.conn
                 .prepare_cached(&format!(
@@ -488,13 +830,14 @@ impl<'c> TextDb<'c> {
     /// `INSERT … ON CONFLICT (path) DO UPDATE SET content = EXCLUDED.content` semantics:
     /// identical content produces no new version.
     pub fn upsert(&self, path: &str, content: &[u8], author: Option<&str>) -> Result<WriteResult> {
-        let path = normalize_path(path)?;
+        let path = self.store_path_rw(path)?;
+        let content = &self.unproject_doc(content)?;
         self.tx(|db| match db.node_by_path(&path)? {
             None => Ok(WriteResult {
-                version: db.create(&path, content, author, Some("import"))?,
+                version: db.create_at(&path, content, author, Some("import"))?,
                 kind: CommitKind::Direct,
             }),
-            Some(_) => db.update_content(&path, content, None, author, Some("import")),
+            Some(_) => db.update_content_at(&path, content, None, author, Some("import")),
         })
     }
 
@@ -526,7 +869,7 @@ impl<'c> TextDb<'c> {
         };
         self.conn
             .prepare_cached(&format!(
-                "INSERT INTO {}commit(file_id, version, root, parent_root, author, ts, message, nbytes, nlines, kind, base_version, batch) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                "INSERT INTO {}commit(file_id, version, root, parent_root, author, ts, message, nbytes, nlines, nwords, kind, base_version, batch) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?13, ?10, ?11, ?12)",
                 self.p
             ))
             .map_err(sql_err)?
@@ -542,7 +885,8 @@ impl<'c> TextDb<'c> {
                 nlines as i64,
                 c.kind.as_str(),
                 base_version,
-                crate::bulk::current_batch(self.conn)
+                crate::bulk::current_batch(self.conn),
+                nwords
             ])
             .map_err(sql_err)?;
         let op = if c.version == 1 { "create" } else { "commit" };
@@ -558,24 +902,41 @@ impl<'c> TextDb<'c> {
             author,
             message,
         )?;
-        self.conn
+        // `RETURNING commits` tells this apart from an author who has committed before:
+        // only a fresh row comes back as 1, and only then can `nauthors` have changed.
+        let first_by_author: i64 = self
+            .conn
             .prepare_cached(&format!(
                 "INSERT INTO {}file_author(file_id, author, commits, first_ts, last_ts) VALUES (?1, coalesce(?2, ''), 1, ?3, ?3) \
-                 ON CONFLICT(file_id, author) DO UPDATE SET commits = commits + 1, last_ts = excluded.last_ts",
+                 ON CONFLICT(file_id, author) DO UPDATE SET commits = commits + 1, last_ts = excluded.last_ts \
+                 RETURNING commits",
                 self.p
             ))
             .map_err(sql_err)?
-            .execute(params![file_id, author, now])
+            .query_row(params![file_id, author, now], |r| r.get(0))
             .map_err(sql_err)?;
-        self.conn
-            .prepare_cached(&format!(
-                "UPDATE {p}node SET nbytes = ?1, nlines = ?2, updated_by = ?3, nwords = ?5, \
-                 nauthors = (SELECT count(*) FROM {p}file_author WHERE file_id = ?4) WHERE id = ?4",
-                p = self.p
-            ))
-            .map_err(sql_err)?
-            .execute(params![nbytes as i64, nlines as i64, author, file_id, nwords])
-            .map_err(sql_err)?;
+        // Recounting the authors on every commit meant a scan of `file_author` per write to
+        // re-derive a number that only moves the first time someone writes to a file.
+        if first_by_author == 1 {
+            self.conn
+                .prepare_cached(&format!(
+                    "UPDATE {p}node SET nbytes = ?1, nlines = ?2, updated_by = ?3, nwords = ?5, \
+                     nauthors = (SELECT count(*) FROM {p}file_author WHERE file_id = ?4) WHERE id = ?4",
+                    p = self.p
+                ))
+                .map_err(sql_err)?
+                .execute(params![nbytes as i64, nlines as i64, author, file_id, nwords])
+                .map_err(sql_err)?;
+        } else {
+            self.conn
+                .prepare_cached(&format!(
+                    "UPDATE {p}node SET nbytes = ?1, nlines = ?2, updated_by = ?3, nwords = ?5 WHERE id = ?4",
+                    p = self.p
+                ))
+                .map_err(sql_err)?
+                .execute(params![nbytes as i64, nlines as i64, author, file_id, nwords])
+                .map_err(sql_err)?;
+        }
         let change = Totals {
             files: (c.version == 1) as i64,
             folders: 0,
@@ -583,21 +944,36 @@ impl<'c> TextDb<'c> {
             lines: nlines as i64 - old_lines.unwrap_or(0),
             words: nwords - old_words.unwrap_or(0),
             versions: 1,
+            // The structure counts move in `write_structure`, which knows what the extractor
+            // found; it rolls its own delta up so this one stays about the content.
+            ..Totals::default()
         };
-        self.add_to_ancestors(path, &change, &now)?;
+        self.add_to_ancestors(path, &change, &now, author)?;
         // Reverse index for search: chunk → file, recorded once per (chunk, file).
+        //
+        // One statement per new chunk meant 652 of them for a 1 MiB document. Batched into
+        // multi-row `VALUES` lists of a fixed size, so the statement text repeats and the
+        // cache holds it; the tail is one statement of whatever is left.
         let mut seen = std::collections::HashSet::new();
-        for h in &c.new_chunks {
-            if !seen.insert(*h) {
-                continue;
+        let fresh: Vec<&textdb_core::Hash> = c.new_chunks.iter().filter(|h| seen.insert(**h)).collect();
+        for batch in fresh.chunks(CHUNK_REF_BATCH) {
+            let marks = vec!["(?, ?, ?)"; batch.len()].join(",");
+            let mut args: Vec<rusqlite::types::Value> = Vec::with_capacity(batch.len() * 3);
+            for h in batch {
+                args.push(h.to_vec().into());
+                args.push(file_id.into());
+                args.push((c.version as i64).into());
             }
             self.conn
                 .prepare_cached(&format!(
-                    "INSERT OR IGNORE INTO {p}chunk_ref(chunk_id, file_id, version) SELECT id, ?2, ?3 FROM {p}chunk WHERE hash = ?1",
+                    // SQLite names a VALUES clause's columns `column1..N` and does not accept
+                    // the `AS v(h, f, v)` aliasing Postgres does.
+                    "INSERT OR IGNORE INTO {p}chunk_ref(chunk_id, file_id, version) \
+                     SELECT c.id, v.column2, v.column3 FROM (VALUES {marks}) AS v JOIN {p}chunk c ON c.hash = v.column1",
                     p = self.p
                 ))
                 .map_err(sql_err)?
-                .execute(params![&h[..], file_id, c.version as i64])
+                .execute(rusqlite::params_from_iter(args.iter()))
                 .map_err(sql_err)?;
         }
         // Structure rows (markdown only), kept for HEAD only: per-version rows cost more
@@ -611,6 +987,7 @@ impl<'c> TextDb<'c> {
                 let doc = st.document(&c.root)?.0;
                 let s = ex.extract(&doc);
                 self.write_structure(file_id, c.version as i64, &s)?;
+                self.write_structure_counts(file_id, path, &s, &now)?;
             }
         }
         if c.version == 1 {
@@ -618,6 +995,73 @@ impl<'c> TextDb<'c> {
             self.relink(&[crate::links::name_key(path)], &[])?;
         }
         Ok(())
+    }
+
+    /// Store what the extractor found on the node row, and roll the change into the folders.
+    ///
+    /// The same pattern the word count uses: counted once here from lists the extractor has
+    /// already built, so a listing reads "12 headings, 4 properties, 2 links" off the row
+    /// instead of running three queries per file. `nlinks_broken` starts from what the link
+    /// rows say now; `relink` keeps it current afterwards, since a link breaks when its
+    /// target is deleted rather than when this file is written.
+    fn write_structure_counts(
+        &self,
+        file_id: i64,
+        path: &str,
+        s: &textdb_core::structure::Structure,
+        now: &str,
+    ) -> Result<()> {
+        let title = document_title(s);
+        let sections = s.sections.len() as i64;
+        // Top-level front matter keys: `project.name` and `project.phase` are one property to
+        // a reader, the way `meta get project` shows it.
+        let props = s
+            .frontmatter
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .map_or(0, |o| o.len()) as i64;
+        let links = s.links.len() as i64;
+        let broken = self.broken_links_of(file_id)?;
+        let old: (i64, i64, i64, i64) = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT nsections, nprops, nlinks, nlinks_broken FROM {}node WHERE id = ?1",
+                self.p
+            ))
+            .map_err(sql_err)?
+            .query_row(params![file_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(sql_err)?;
+        self.conn
+            .prepare_cached(&format!(
+                "UPDATE {}node SET title = ?1, nsections = ?2, nprops = ?3, nlinks = ?4, nlinks_broken = ?5 WHERE id = ?6",
+                self.p
+            ))
+            .map_err(sql_err)?
+            .execute(params![title, sections, props, links, broken, file_id])
+            .map_err(sql_err)?;
+        let change = Totals {
+            sections: sections - old.0,
+            props: props - old.1,
+            links: links - old.2,
+            links_broken: broken - old.3,
+            ..Totals::default()
+        };
+        if change != Totals::default() {
+            self.add_to_ancestors(path, &change, now, None)?;
+        }
+        Ok(())
+    }
+
+    /// Links of `file_id` whose status means the link does not reach a document.
+    pub(crate) fn broken_links_of(&self, file_id: i64) -> Result<i64> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT count(*) FROM {}link WHERE file_id = ?1 AND status IN ('broken', 'anchor-missing', 'ambiguous')",
+                self.p
+            ))
+            .map_err(sql_err)?
+            .query_row(params![file_id], |r| r.get(0))
+            .map_err(sql_err)
     }
 
     /// Replace a file's structure rows, writing nothing when they already say the same thing.
@@ -632,7 +1076,15 @@ impl<'c> TextDb<'c> {
     /// A rewrite batches its inserts into one multi-`VALUES` statement per table instead of
     /// one statement per row.
     fn write_structure(&self, file_id: i64, version: i64, s: &textdb_core::structure::Structure) -> Result<()> {
-        if self.structure_matches(file_id, s)? {
+        let diff = self.structure_diff(file_id, s)?;
+        if diff != StructureDiff::Different {
+            // Word counts move on almost every body edit while the heading tree stays put, so
+            // they are refreshed on their own rather than forcing the whole rewrite below.
+            // One statement for the document, keyed on `line_from`: a heading owns its line.
+            if diff == StructureDiff::CountsOnly {
+                self.update_section_counts(file_id, &s.sections)?;
+            }
+            self.touch_property_version(file_id, version)?;
             for t in ["section", "link"] {
                 self.conn
                     .prepare_cached(&format!("UPDATE {}{} SET version = ?1 WHERE file_id = ?2 AND version <> ?1", self.p, t))
@@ -659,21 +1111,25 @@ impl<'c> TextDb<'c> {
                 .execute(params![file_id])
                 .map_err(sql_err)?;
         }
-        // SQLite's default parameter limit is 32766, so a document with a very large number
-        // of headings is written in several batches rather than one statement.
-        const MAX_ROWS_PER_BATCH: usize = 4000;
+        // SQLite's default parameter limit is 32766, so a document with a very large number of
+        // headings is written in several batches. The bound is *parameters*, not rows, so it
+        // is derived from the column count: a fixed 4000 rows was under the limit at six
+        // columns and over it at ten, which a heading-dense document found the hard way.
+        const COLS: usize = 10;
+        const MAX_ROWS_PER_BATCH: usize = 32_000 / COLS;
         for batch in s.sections.chunks(MAX_ROWS_PER_BATCH) {
             let mut sql = format!(
-                "INSERT INTO {}section(file_id, version, heading_path, level, line_from, line_to) VALUES ",
+                "INSERT INTO {}section(file_id, version, heading_path, level, line_from, line_to, \
+                 heading, heading_lc, nwords, nwords_total) VALUES ",
                 self.p
             );
             for i in 0..batch.len() {
                 if i > 0 {
                     sql.push(',');
                 }
-                sql.push_str("(?,?,?,?,?,?)");
+                sql.push_str("(?,?,?,?,?,?,?,?,?,?)");
             }
-            let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(batch.len() * 6);
+            let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(batch.len() * 10);
             for sec in batch {
                 vals.push(file_id.into());
                 vals.push(version.into());
@@ -681,6 +1137,10 @@ impl<'c> TextDb<'c> {
                 vals.push((sec.level as i64).into());
                 vals.push((sec.line_from as i64).into());
                 vals.push((sec.line_to as i64).into());
+                vals.push(sec.heading.clone().into());
+                vals.push(sec.heading.to_lowercase().into());
+                vals.push((sec.nwords as i64).into());
+                vals.push((sec.nwords_total as i64).into());
             }
             self.conn
                 .prepare_cached(&sql)
@@ -699,24 +1159,83 @@ impl<'c> TextDb<'c> {
                 .execute(params![file_id, version, fm.to_string()])
                 .map_err(sql_err)?;
         }
+        // The indexed form of the same front matter. Always called, including with `None`, so
+        // a document that loses its front matter loses its property rows with it.
+        self.write_property_rows(file_id, version, s.frontmatter.as_ref())?;
         // This file's links, and links to its headings, which may have changed.
         self.relink_where("l.file_id = ?1 OR (l.resolved_id = ?1 AND l.anchor IS NOT NULL)", vec![file_id.into()])?;
         Ok(())
     }
 
-    /// Do the stored rows for `file_id` already describe `s`, version aside?
-    fn structure_matches(&self, file_id: i64, s: &textdb_core::structure::Structure) -> Result<bool> {
+}
+
+/// What a commit changed about a document's structure rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StructureDiff {
+    /// Nothing; only the `version` column has to move forward.
+    Same,
+    /// The heading tree is intact but word counts under it moved — the common case for a
+    /// body edit, and much cheaper to serve than a rewrite.
+    CountsOnly,
+    /// Headings, links or front matter moved; the rows are rebuilt.
+    Different,
+}
+
+impl TextDb<'_> {
+    /// Refresh only the word counts of rows whose heading tree is already correct.
+    ///
+    /// `line_from` keys the update because a heading owns its line: two sections of one
+    /// document can never start on the same one.
+    fn update_section_counts(&self, file_id: i64, sections: &[textdb_core::structure::Section]) -> Result<()> {
+        // Three placeholders per row plus the file id; same parameter bound as the insert.
+        const MAX_ROWS_PER_BATCH: usize = 32_000 / 3;
+        for batch in sections.chunks(MAX_ROWS_PER_BATCH) {
+            let mut sql = format!(
+                "UPDATE {}section AS s SET nwords = v.column2, nwords_total = v.column3 FROM (VALUES ",
+                self.p
+            );
+            for i in 0..batch.len() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push_str("(?,?,?)");
+            }
+            sql.push_str(") AS v WHERE s.file_id = ? AND s.line_from = v.column1");
+            let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(batch.len() * 3 + 1);
+            for sec in batch {
+                vals.push((sec.line_from as i64).into());
+                vals.push((sec.nwords as i64).into());
+                vals.push((sec.nwords_total as i64).into());
+            }
+            vals.push(file_id.into());
+            self.conn
+                .prepare_cached(&sql)
+                .map_err(sql_err)?
+                .execute(rusqlite::params_from_iter(vals))
+                .map_err(sql_err)?;
+        }
+        Ok(())
+    }
+
+    /// How the stored rows for `file_id` differ from `s`, version aside.
+    ///
+    /// Three outcomes rather than two because the two kinds of change have very different
+    /// costs: a heading tree that has not moved needs no delete, no re-insert and no relink,
+    /// even when every word count under it has changed.
+    fn structure_diff(&self, file_id: i64, s: &textdb_core::structure::Structure) -> Result<StructureDiff> {
+        let mut counts_differ = false;
         let mut st = self
             .conn
             .prepare_cached(&format!(
-                "SELECT heading_path, level, line_from, line_to FROM {}section WHERE file_id = ?1 ORDER BY rowid",
+                "SELECT heading_path, level, line_from, line_to, nwords, nwords_total \
+                   FROM {}section WHERE file_id = ?1 ORDER BY rowid",
                 self.p
             ))
             .map_err(sql_err)?;
         let mut rows = st.query(params![file_id]).map_err(sql_err)?;
         for sec in &s.sections {
             let Some(r) = rows.next().map_err(sql_err)? else {
-                return Ok(false);
+                return Ok(StructureDiff::Different);
             };
             let stored: (String, i64, i64, i64) = (
                 r.get(0).map_err(sql_err)?,
@@ -725,11 +1244,15 @@ impl<'c> TextDb<'c> {
                 r.get(3).map_err(sql_err)?,
             );
             if stored != (sec.heading_path.clone(), sec.level as i64, sec.line_from as i64, sec.line_to as i64) {
-                return Ok(false);
+                return Ok(StructureDiff::Different);
+            }
+            let words: (Option<i64>, Option<i64>) = (r.get(4).map_err(sql_err)?, r.get(5).map_err(sql_err)?);
+            if words != (Some(sec.nwords as i64), Some(sec.nwords_total as i64)) {
+                counts_differ = true;
             }
         }
         if rows.next().map_err(sql_err)?.is_some() {
-            return Ok(false);
+            return Ok(StructureDiff::Different);
         }
         drop(rows);
 
@@ -743,7 +1266,7 @@ impl<'c> TextDb<'c> {
         let mut rows = st.query(params![file_id]).map_err(sql_err)?;
         for l in &s.links {
             let Some(r) = rows.next().map_err(sql_err)? else {
-                return Ok(false);
+                return Ok(StructureDiff::Different);
             };
             let stored = textdb_core::Link {
                 target_path: r.get(0).map_err(sql_err)?,
@@ -752,13 +1275,17 @@ impl<'c> TextDb<'c> {
                 anchor: r.get(3).map_err(sql_err)?,
                 alias: r.get(4).map_err(sql_err)?,
                 external: r.get::<_, i64>(5).map_err(sql_err)? != 0,
+                // Not read back: this comparison asks whether the *structure* changed, and a
+                // span moves whenever anything before it does, which would make every edit look
+                // like a structure change and re-index the whole document.
+                span: l.span,
             };
             if &stored != l {
-                return Ok(false);
+                return Ok(StructureDiff::Different);
             }
         }
         if rows.next().map_err(sql_err)?.is_some() {
-            return Ok(false);
+            return Ok(StructureDiff::Different);
         }
         drop(rows);
 
@@ -770,7 +1297,10 @@ impl<'c> TextDb<'c> {
             .optional()
             .map_err(sql_err)?;
         let want = s.frontmatter.as_ref().map(|fm| fm.to_string());
-        Ok(stored_fm.flatten() == want)
+        if stored_fm.flatten() != want {
+            return Ok(StructureDiff::Different);
+        }
+        Ok(if counts_differ { StructureDiff::CountsOnly } else { StructureDiff::Same })
     }
 
     pub fn read(&self, path: &str) -> Result<Vec<u8>> {
@@ -784,10 +1314,17 @@ impl<'c> TextDb<'c> {
     /// virtual table's content column — wants the shared buffer and the UTF-8 answer that
     /// came with it, since both are properties of content the cache is keyed by.
     pub fn read_shared(&self, path: &str) -> Result<(std::sync::Arc<Vec<u8>>, bool)> {
-        let path = normalize_path(path)?;
+        let path = self.store_path(path)?;
         let n = self.file_by_path(&path)?;
         let root = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
-        self.storage().document(&root)
+        let (bytes, utf8) = self.storage().document(&root)?;
+        if self.view.is_admin() {
+            return Ok((bytes, utf8));
+        }
+        // The account reads its own paths inside the document too, or its checkout is a vault
+        // full of links that resolve nowhere (#12 Q6).
+        let projected = self.project_doc(n.id, (*bytes).clone())?;
+        Ok((std::sync::Arc::new(projected), utf8))
     }
 
     pub fn root_of_version(&self, file_id: i64, version: u64) -> Result<Hash> {
@@ -818,10 +1355,36 @@ impl<'c> TextDb<'c> {
     /// and cannot serve a filter on `version` alone). `node_by_path_any` instead tries the
     /// indexed live lookup first and only falls back to the scan when the path is not live.
     pub fn read_version_shared(&self, path: &str, version: u64) -> Result<(std::sync::Arc<Vec<u8>>, bool)> {
-        let path = normalize_path(path)?;
+        let path = self.store_path(path)?;
         let n = self.node_by_path_any(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let root = self.root_of_version(n.id, version)?;
-        self.storage().document(&root)
+        let (bytes, utf8) = self.storage().document(&root)?;
+        if self.view.is_admin() {
+            return Ok((bytes, utf8));
+        }
+        // Projected with the link rows as they are *now*: the index holds the current version's
+        // links, so an old version's spans may not line up. Re-scanning the old text is what
+        // keeps the rewrite honest — the same scanner, applied to the bytes in hand.
+        let spans = self.scan_targets_resolved(&bytes)?;
+        Ok((std::sync::Arc::new(textdb_core::access::project(&self.view, &bytes, &spans).0), utf8))
+    }
+
+    /// As `scan_targets`, but resolving each target store-wide so the projector knows which
+    /// document it reached — needed where there are no link rows to read: an older version, or
+    /// text that has not been committed.
+    fn scan_targets_resolved(&self, text: &[u8]) -> Result<Vec<textdb_core::access::TargetSpan>> {
+        let mut spans = self.scan_targets(text);
+        for s in &mut spans {
+            let store = format!("/{}", s.target.trim_start_matches('/'));
+            for candidate in [store.clone(), format!("{store}.md")] {
+                if let Some(n) = self.node_by_path(&candidate)? {
+                    s.resolved = Some(n.path);
+                    s.resolved_id = Some(n.id);
+                    break;
+                }
+            }
+        }
+        Ok(spans)
     }
 
     /// Replace the whole content (`UPDATE kb SET content = …`). The diff OLD→NEW is
@@ -834,7 +1397,25 @@ impl<'c> TextDb<'c> {
         author: Option<&str>,
         message: Option<&str>,
     ) -> Result<WriteResult> {
-        let path = normalize_path(path)?;
+        let path = self.store_path_rw(path)?;
+        let new_content = self.unproject_doc(new_content)?;
+        self.update_content_at(&path, &new_content, base_version, author, message).map_err(|e| self.to_view_err(e))
+    }
+
+    // The internal `*_at` variants take a path that is **already** a store path, so that one
+    // operation translates exactly once. Without the split, `upsert` translated and then called
+    // `create`, which translated the result again — and an account's own `/legal/contracts/x.md`,
+    // fed back in, names an alias it does not have. Public methods translate; `*_at` never does.
+
+    pub(crate) fn update_content_at(
+        &self,
+        path: &str,
+        new_content: &[u8],
+        base_version: Option<u64>,
+        author: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<WriteResult> {
+        let path = path.to_string();
         self.tx(|db| {
             let n = db.file_by_path(&path)?;
             let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
@@ -878,7 +1459,24 @@ impl<'c> TextDb<'c> {
         author: Option<&str>,
         message: Option<&str>,
     ) -> Result<WriteResult> {
-        let path = normalize_path(path)?;
+        let path = self.store_path_rw(path)?;
+        self.commit_edits_at(&path, edits, base_version, author, message).map_err(|e| self.to_view_err(e))
+    }
+
+    // The internal `*_at` variants take a path that is **already** a store path, so that one
+    // operation translates exactly once. Without the split, `upsert` translated and then called
+    // `create`, which translated the result again — and an account's own `/legal/contracts/x.md`,
+    // fed back in, names an alias it does not have. Public methods translate; `*_at` never does.
+
+    pub(crate) fn commit_edits_at(
+        &self,
+        path: &str,
+        edits: &[Edit],
+        base_version: Option<u64>,
+        author: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<WriteResult> {
+        let path = path.to_string();
         self.tx(|db| {
             let n = db.file_by_path(&path)?;
             let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
@@ -901,7 +1499,12 @@ impl<'c> TextDb<'c> {
 
     /// Strict replace: `old` must occur exactly once in the current content.
     pub fn edit(&self, path: &str, old: &[u8], new: &[u8], author: Option<&str>) -> Result<WriteResult> {
-        let path = normalize_path(path)?;
+        let path = self.store_path_rw(path)?;
+        // The anchor is matched against the stored text, so it has to be in the store's
+        // namespace before the match is attempted — an account anchoring on a link it can see
+        // would otherwise never find it (#12 E16).
+        let old = &self.unproject_doc(old)?;
+        let new = &self.unproject_doc(new)?;
         self.tx(|db| {
             let n = db.file_by_path(&path)?;
             let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
@@ -921,7 +1524,8 @@ impl<'c> TextDb<'c> {
     }
 
     pub fn append(&self, path: &str, tail: &[u8], author: Option<&str>) -> Result<WriteResult> {
-        let path = normalize_path(path)?;
+        let path = self.store_path_rw(path)?;
+        let tail = &self.unproject_doc(tail)?;
         self.tx(|db| {
             let n = db.file_by_path(&path)?;
             let cur = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
@@ -951,8 +1555,9 @@ impl<'c> TextDb<'c> {
     /// [`link_updates_mode`](Self::link_updates_mode) says, and returning those that no longer
     /// reach it (rewritten or not).
     pub fn rename_links(&self, from: &str, to: &str, author: Option<&str>) -> Result<Vec<crate::links::LinkChange>> {
-        let from = normalize_path(from)?;
-        let to = normalize_path(to)?;
+        let from = self.store_path_rw(from)?;
+        crate::access::refuse_share_root(&self.view, &from, "move")?;
+        let to = self.store_path_rw(to)?;
         self.tx(|db| {
             if from == "/" || to == "/" {
                 return Err(TextdbError::InvalidEdit("cannot move the root".into()));
@@ -964,13 +1569,20 @@ impl<'c> TextDb<'c> {
             if db.node_by_path(&to)?.is_some() {
                 return Err(TextdbError::InvalidEdit(format!("{} already exists", to)));
             }
-            let parent = db.ensure_folder(parent_of(&to))?;
+            let parent = db.ensure_folder_at(parent_of(&to))?;
             let now = Self::now();
-            let before = db.files_at(&from)?;
+            // Listing the subtree is only ever for the link bookkeeping below, so a store
+            // that records no links skips both.
+            let linked = db.has_links()?;
+            let before = if linked { db.files_at(&from)? } else { Vec::new() };
             let mode = db.link_updates_mode()?;
-            let pointing = if mode == crate::links::LinkUpdates::Off { Vec::new() } else { db.links_into(&before)? };
+            let pointing = if mode == crate::links::LinkUpdates::Off || !linked {
+                Vec::new()
+            } else {
+                db.links_into(&before)?
+            };
             let moved = db.subtree_totals(src.id)?;
-            db.add_to_ancestors(&from, &moved.neg(), &now)?;
+            db.add_to_ancestors(&from, &moved.neg(), &now, None)?;
             let seq = db.record_change("move", src.id, src.kind, &to, Some(&from), None, None, None, author, db.message.as_deref())?;
             if db.path_history_enabled()? {
                 db.record_path_events(PathOp::classify(&from, &to), &src, Some(&to), author, seq, &now)?;
@@ -994,12 +1606,17 @@ impl<'c> TextDb<'c> {
                 .map_err(sql_err)?
                 .execute(params![to, name_of(&to), parent, now, src.id])
                 .map_err(sql_err)?;
-            db.add_to_ancestors(&to, &moved, &now)?;
-            let after = db.files_at(&to)?;
-            let mut names: Vec<String> = before.iter().chain(&after).map(|(_, p)| crate::links::name_key(p)).collect();
-            names.sort();
-            names.dedup();
-            db.relink(&names, &after.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
+            db.add_to_ancestors(&to, &moved, &now, None)?;
+            if linked {
+                // The same files with the same ids under the new prefix: exactly the
+                // substitution the UPDATE above performed. Asking the database to list the
+                // subtree a second time cost another full scan to learn what is already known.
+                let after: Vec<(i64, String)> = before.iter().map(|(id, p)| (*id, format!("{}{}", to, &p[from.len()..]))).collect();
+                let mut names: Vec<String> = before.iter().chain(&after).map(|(_, p)| crate::links::name_key(p)).collect();
+                names.sort();
+                names.dedup();
+                db.relink(&names, &after.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
+            }
             db.follow_move(pointing, &from, &to, mode, author)
         })
     }
@@ -1011,16 +1628,19 @@ impl<'c> TextDb<'c> {
 
     /// As [`delete`](Self::delete), attributing the change in the feed.
     pub fn delete_by(&self, path: &str, author: Option<&str>) -> Result<()> {
-        let path = normalize_path(path)?;
+        let path = self.store_path_rw(path)?;
+        crate::access::refuse_share_root(&self.view, &path, "delete")?;
         self.tx(|db| {
             if path == "/" {
                 return Err(TextdbError::InvalidEdit("cannot delete the root".into()));
             }
             let n = db.node_by_path(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
             let now = Self::now();
-            let files = db.files_at(&path)?;
+            // As in the rename above: the listing exists only for the link bookkeeping.
+            let linked = db.has_links()?;
+            let files = if linked { db.files_at(&path)? } else { Vec::new() };
             let gone = db.subtree_totals(n.id)?;
-            db.add_to_ancestors(&path, &gone.neg(), &now)?;
+            db.add_to_ancestors(&path, &gone.neg(), &now, None)?;
             let seq = db.record_change("delete", n.id, n.kind, &path, None, None, None, None, author, db.message.as_deref())?;
             if db.path_history_enabled()? {
                 db.record_path_events(PathOp::Delete, &n, None, author, seq, &now)?;
@@ -1035,8 +1655,10 @@ impl<'c> TextDb<'c> {
                 .map_err(sql_err)?
                 .execute(params![path, now, lo, hi])
                 .map_err(sql_err)?;
-            let names: Vec<String> = files.iter().map(|(_, p)| crate::links::name_key(p)).collect();
-            db.relink(&names, &files.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
+            if linked {
+                let names: Vec<String> = files.iter().map(|(_, p)| crate::links::name_key(p)).collect();
+                db.relink(&names, &files.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
+            }
             Ok(())
         })
     }
@@ -1050,8 +1672,18 @@ impl<'c> TextDb<'c> {
     /// path.
     pub fn list(&self, path: &str, recursive: bool) -> Result<Vec<Entry>> {
         use rusqlite::types::Value;
-        let path = normalize_path(path)?;
-        let dir = self.node_by_path(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
+        use textdb_core::access::{Namespace, Resolved};
+        let given = normalize_path(path)?;
+        // An aliased account's root is not a folder: it is the list of its shares. `-R` below it
+        // is the union of their subtrees, which the visible-set predicate already is.
+        if !self.view.is_admin() && self.view.namespace() == Namespace::Aliased && matches!(self.view.to_store(&given), Resolved::Root) {
+            if recursive {
+                return self.entries_where("path <> '/'", vec![], "path");
+            }
+            return self.share_entries();
+        }
+        let path = self.store_path(&given)?;
+        let dir = self.node_by_path(&path)?.ok_or_else(|| TextdbError::NotFound(given.clone()))?;
         match (recursive, subtree_bounds(&path)) {
             (false, _) => self.entries_where("parent_id = ?1", vec![Value::Integer(dir.id)], "name"),
             (true, None) => self.entries_where("path <> '/'", vec![], "path"),
@@ -1061,16 +1693,111 @@ impl<'c> TextDb<'c> {
 
     /// The live file or folder at `path` as a listing shows it; the root too.
     pub fn entry(&self, path: &str) -> Result<Entry> {
-        let path = normalize_path(path)?;
-        let n = self.node_by_path(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
+        use textdb_core::access::{Namespace, Resolved};
+        let given = normalize_path(path)?;
+        if !self.view.is_admin() && self.view.namespace() == Namespace::Aliased && matches!(self.view.to_store(&given), Resolved::Root) {
+            return self.root_entry();
+        }
+        let path = self.store_path(&given)?;
+        let n = self.node_by_path(&path)?.ok_or_else(|| TextdbError::NotFound(given.clone()))?;
         self.entries_where("id = ?1", vec![rusqlite::types::Value::Integer(n.id)], "id")?
             .pop()
-            .ok_or(TextdbError::NotFound(path))
+            .ok_or(TextdbError::NotFound(given))
+    }
+
+    /// One row per live share, as the account's root lists them: the share root's own totals,
+    /// under the alias. A folder in every respect except that it lives nowhere in the store.
+    fn share_entries(&self) -> Result<Vec<Entry>> {
+        let mut out = Vec::new();
+        for g in self.view.grants().live() {
+            let rows = self.entries_where("id = ?1", vec![rusqlite::types::Value::Integer(g.node_id)], "id")?;
+            if let Some(mut e) = rows.into_iter().next() {
+                e.path = format!("/{}", g.alias);
+                e.name = g.alias.clone();
+                e.dir = Some("/".to_string());
+                e.depth = 1;
+                out.push(e);
+            }
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
+    /// The account's root itself: the totals of every share it holds, added up. Not a folder —
+    /// nothing can be written at it — but a listing needs a record for it like any other.
+    fn root_entry(&self) -> Result<Entry> {
+        let shares = self.share_entries()?;
+        let mut e = Entry {
+            path: "/".into(),
+            name: "/".into(),
+            // Neither file (1) nor folder (0): an aliased account's root is the list of its
+            // shares. Nothing can be written at it and it has no node, so calling it a folder
+            // would be a small lie that every caller would then have to special-case anyway.
+            kind: Entry::ROOT,
+            version: None,
+            nbytes: 0,
+            nlines: 0,
+            updated_at: String::new(),
+            updated_by: None,
+            id: 0,
+            dir: None,
+            depth: 0,
+            ext: None,
+            title: None,
+            nwords: 0,
+            nsections: 0,
+            nprops: 0,
+            nlinks: 0,
+            nlinks_broken: 0,
+            versions: 0,
+            created_at: String::new(),
+            files: Some(0),
+            folders: Some(0),
+            nauthors: 0,
+            authors: Vec::new(),
+            share: None,
+            rights: None,
+            shares: shares.iter().map(|s| (s.name.clone(), s.rights.clone().unwrap_or_default())).collect(),
+        };
+        for s in &shares {
+            e.nbytes += s.nbytes;
+            e.nlines += s.nlines;
+            e.nwords += s.nwords;
+            e.versions += s.versions;
+            e.nsections += s.nsections;
+            e.nprops += s.nprops;
+            e.nlinks += s.nlinks;
+            e.nlinks_broken += s.nlinks_broken;
+            e.files = Some(e.files.unwrap_or(0) + s.files.unwrap_or(0));
+            // The share root itself is a folder below the account's root, so it counts.
+            e.folders = Some(e.folders.unwrap_or(0) + s.folders.unwrap_or(0) + 1);
+            if s.updated_at > e.updated_at {
+                e.updated_at = s.updated_at.clone();
+                e.updated_by = s.updated_by.clone();
+            }
+            if e.created_at.is_empty() || (!s.created_at.is_empty() && s.created_at < e.created_at) {
+                e.created_at = s.created_at.clone();
+            }
+        }
+        Ok(e)
     }
 
     /// Live nodes matching `scope`, a condition over unqualified node columns: the same
     /// condition selects the nodes and, joined, their authors.
     fn entries_where(&self, scope: &str, args: Vec<rusqlite::types::Value>, order: &str) -> Result<Vec<Entry>> {
+        // The account's visible set, folded into the caller's condition once so that both
+        // statements below — the authors and the rows — select exactly the same nodes. The admin
+        // adds nothing, so the SQL is the SQL that ran before this existed.
+        let (scope, args) = match crate::access::visible_sql(&self.view, "path") {
+            None => (scope.to_string(), args),
+            Some((pred, mut extra)) => {
+                let pred = crate::access::renumber(&pred, args.len());
+                let mut all = args;
+                all.append(&mut extra);
+                (format!("({scope}) AND ({pred})"), all)
+            }
+        };
+        let scope = scope.as_str();
         let mut authors: std::collections::HashMap<i64, Vec<AuthorCount>> = std::collections::HashMap::new();
         {
             let mut stmt = self
@@ -1096,74 +1823,103 @@ impl<'c> TextDb<'c> {
             .conn
             .prepare_cached(&format!(
                 "SELECT id, name, path, kind, \
-                 CASE kind WHEN 1 THEN nbytes ELSE t_bytes END, CASE kind WHEN 1 THEN nlines ELSE t_lines END, \
-                 CASE kind WHEN 1 THEN nwords ELSE t_words END, CASE kind WHEN 1 THEN version ELSE t_versions END, \
-                 CASE WHEN kind = 0 AND t_updated_at > updated_at THEN t_updated_at ELSE updated_at END, \
-                 updated_by, created_at, CASE kind WHEN 0 THEN t_files END, CASE kind WHEN 0 THEN t_folders END \
-                 FROM {}node WHERE deleted_at IS NULL AND {scope} ORDER BY {order}",
-                self.p
+                 CASE kind WHEN 1 THEN coalesce(nbytes, 0) ELSE t_bytes END, \
+                 CASE kind WHEN 1 THEN coalesce(nlines, 0) ELSE t_lines END, \
+                 CASE kind WHEN 1 THEN coalesce(nwords, 0) ELSE t_words END, \
+                 CASE kind WHEN 1 THEN version ELSE t_versions END, \
+                 CASE WHEN kind = 0 AND t_updated_at >= updated_at THEN t_updated_at ELSE updated_at END, \
+                 -- `>=`, not `>`: a folder is created and its first file committed in the same
+                 -- operation, so the two stamps tie and the folder would name nobody.
+                 CASE WHEN kind = 0 AND t_updated_at >= updated_at THEN t_updated_by ELSE updated_by END, created_at, CASE kind WHEN 0 THEN t_files END, CASE kind WHEN 0 THEN t_folders END, \
+                 CASE kind WHEN 1 THEN version END, title, \
+                 CASE kind WHEN 1 THEN nsections ELSE t_sections END, \
+                 CASE kind WHEN 1 THEN nprops ELSE t_props END, \
+                 CASE kind WHEN 1 THEN nlinks ELSE t_links END, \
+                 CASE kind WHEN 1 THEN nlinks_broken ELSE t_links_broken END, \
+                 CASE kind WHEN 1 THEN coalesce(nauthors, 0) ELSE ( \
+                   SELECT count(DISTINCT a.author) FROM {p}file_author a JOIN {p}node f ON f.id = a.file_id \
+                    WHERE f.deleted_at IS NULL AND f.kind = 1 \
+                      AND f.path >= CASE {p}node.path WHEN '/' THEN '/' ELSE {p}node.path || '/' END \
+                      AND f.path < CASE {p}node.path WHEN '/' THEN '0' ELSE {p}node.path || '0' END) END \
+                 FROM {p}node WHERE deleted_at IS NULL AND {scope} ORDER BY {order}",
+                p = self.p
             ))
             .map_err(sql_err)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(args.iter()), |r| {
                 let id: i64 = r.get(0)?;
+                let path: String = r.get(2)?;
+                let kind: i64 = r.get(3)?;
                 Ok(Entry {
-                    id,
+                    path: path.clone(),
                     name: r.get(1)?,
-                    path: r.get(2)?,
-                    kind: r.get(3)?,
+                    kind,
+                    version: r.get(13)?,
                     nbytes: r.get(4)?,
                     nlines: r.get(5)?,
-                    nwords: r.get(6)?,
-                    versions: r.get(7)?,
                     updated_at: r.get(8)?,
                     updated_by: r.get(9)?,
+                    id,
+                    dir: dir_of(&path),
+                    depth: depth_of(&path),
+                    ext: (kind == 1).then(|| ext_of(&path)).flatten(),
+                    title: r.get(14)?,
+                    nwords: r.get(6)?,
+                    nsections: r.get(15)?,
+                    nprops: r.get(16)?,
+                    nlinks: r.get(17)?,
+                    nlinks_broken: r.get(18)?,
+                    versions: r.get(7)?,
                     created_at: r.get(10)?,
                     files: r.get(11)?,
                     folders: r.get(12)?,
+                    nauthors: r.get(19)?,
                     authors: authors.remove(&id).unwrap_or_default(),
+                    share: None,
+                    rights: None,
+                    shares: Vec::new(),
                 })
             })
             .map_err(sql_err)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)?;
+        Ok(rows.into_iter().filter_map(|e| self.to_view_entry(e)).collect())
     }
 
     /// All live files under `prefix` (a folder path), sorted by path.
     pub fn list_files(&self, prefix: &str) -> Result<Vec<NodeRow>> {
-        let prefix = normalize_path(prefix)?;
+        use rusqlite::types::Value;
+        let prefix = self.store_path(prefix)?;
         // Two statements rather than one with `?1 = '/' OR …`: the root case has no bounds,
         // and a query that has to evaluate the alternative cannot use the range for a seek.
-        match subtree_bounds(&prefix) {
-            None => {
-                let mut stmt = self
-                    .conn
-                    .prepare_cached(&format!(
-                        "SELECT {} FROM {}node WHERE kind = 1 AND deleted_at IS NULL ORDER BY path",
-                        Self::NODE_COLS,
-                        self.p
-                    ))
-                    .map_err(sql_err)?;
-                let rows = stmt.query_map([], Self::row_from).map_err(sql_err)?;
-                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+        // For an account, the root is not "everything" but "everything under my shares", which
+        // the visible-set predicate already says.
+        let (scope, args): (String, Vec<Value>) = match subtree_bounds(&prefix) {
+            None => ("1".into(), vec![]),
+            Some((lo, hi)) => ("path >= ?1 AND path < ?2".into(), vec![Value::Text(lo), Value::Text(hi)]),
+        };
+        let (scope, args) = match crate::access::visible_sql(&self.view, "path") {
+            None => (scope, args),
+            Some((pred, mut extra)) => {
+                let pred = crate::access::renumber(&pred, args.len());
+                let mut all = args;
+                all.append(&mut extra);
+                (format!("({scope}) AND ({pred})"), all)
             }
-            Some((lo, hi)) => {
-                let mut stmt = self
-                    .conn
-                    .prepare_cached(&format!(
-                        "SELECT {} FROM {}node WHERE kind = 1 AND deleted_at IS NULL \
-                         AND path >= ?1 AND path < ?2 ORDER BY path",
-                        Self::NODE_COLS,
-                        self.p
-                    ))
-                    .map_err(sql_err)?;
-                let rows = stmt.query_map(params![lo, hi], Self::row_from).map_err(sql_err)?;
-                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
-            }
-        }
+        };
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT {} FROM {}node WHERE kind = 1 AND deleted_at IS NULL AND ({scope}) ORDER BY path",
+                Self::NODE_COLS,
+                self.p
+            ))
+            .map_err(sql_err)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), Self::row_from).map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
     }
 
     pub fn history(&self, path: &str) -> Result<Vec<CommitRow>> {
-        let path = normalize_path(path)?;
+        let path = self.store_path(path)?;
         let n = self.node_by_path_any(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         self.commits_of(n.id)
     }
@@ -1173,7 +1929,8 @@ impl<'c> TextDb<'c> {
         let mut stmt = self
             .conn
             .prepare_cached(&format!(
-                "SELECT version, author, ts, message, nbytes, root, kind, base_version FROM {}commit WHERE file_id = ?1 ORDER BY version",
+                "SELECT version, author, ts, message, nbytes, root, kind, base_version, nlines, nwords \
+                   FROM {}commit WHERE file_id = ?1 ORDER BY version",
                 self.p
             ))
             .map_err(sql_err)?;
@@ -1189,6 +1946,8 @@ impl<'c> TextDb<'c> {
                     root: to_hash(&root).unwrap_or([0u8; 32]),
                     kind: r.get(6)?,
                     base_version: r.get(7)?,
+                    nlines: r.get(8)?,
+                    nwords: r.get(9)?,
                 })
             })
             .map_err(sql_err)?;
@@ -1197,7 +1956,7 @@ impl<'c> TextDb<'c> {
 
     /// Lines `[from, to]`, 1-based inclusive.
     pub fn lines(&self, path: &str, from: u64, to: u64) -> Result<Vec<u8>> {
-        let path = normalize_path(path)?;
+        let path = self.store_path(path)?;
         let n = self.file_by_path(&path)?;
         let root = n.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         if from == 0 || to < from {
@@ -1208,7 +1967,7 @@ impl<'c> TextDb<'c> {
 
     /// Text of the section whose heading matches `heading` (HEAD version).
     pub fn section(&self, path: &str, heading: &str) -> Result<Option<Vec<u8>>> {
-        let path = normalize_path(path)?;
+        let path = self.store_path(path)?;
         let n = self.file_by_path(&path)?;
         let mut stmt = self
             .conn
@@ -1228,7 +1987,7 @@ impl<'c> TextDb<'c> {
     }
 
     pub fn diff(&self, path: &str, v1: u64, v2: u64) -> Result<String> {
-        let path = normalize_path(path)?;
+        let path = self.store_path(path)?;
         let n = self.node_by_path_any(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let a = self.root_of_version(n.id, v1)?;
         let b = self.root_of_version(n.id, v2)?;
@@ -1236,14 +1995,27 @@ impl<'c> TextDb<'c> {
         if body.is_empty() {
             return Ok(String::new());
         }
-        Ok(format!("--- {p}@{v1}\n+++ {p}@{v2}\n{body}", p = path, v1 = v1, v2 = v2, body = body))
+        // The header names the path the caller asked about, not the store's, and the body is text
+        // the caller reads.
+        //
+        // The body is projected as one blob, which is an approximation: the extractor is run over
+        // text whose lines carry `+`/`-`/` ` prefixes, so a link whose enclosing block structure
+        // depended on the line's first character — a fence, a list — may be recognised
+        // differently than it was in the document. Where a link *is* recognised the span is
+        // right and the rewrite is right; what can happen is that one is missed and shows a store
+        // path in a diff. `hunks` does not have this problem, because each side is whole text.
+        // The exact fix is to project each version and diff the projected texts, which needs
+        // `unified_diff` to take bytes rather than two roots.
+        let shown = self.view_path(&path).unwrap_or(path);
+        let body = String::from_utf8_lossy(&self.project_text(body.as_bytes())?).into_owned();
+        Ok(format!("--- {p}@{v1}\n+++ {p}@{v2}\n{body}", p = shown, v1 = v1, v2 = v2, body = body))
     }
 
     /// Line hunks that turn version `v1` of a file into version `v2`, for a client patching
     /// what it already displays. Version 0 is the empty document before the file existed,
     /// so `hunks(path, 0, 1)` is the whole first version as one insertion.
     pub fn hunks(&self, path: &str, v1: u64, v2: u64) -> Result<Vec<LineHunk>> {
-        let path = normalize_path(path)?;
+        let path = self.store_path(path)?;
         let n = self.node_by_path_any(&path)?.ok_or_else(|| TextdbError::NotFound(path.clone()))?;
         let st = self.storage();
         if v1 == v2 {
@@ -1271,14 +2043,87 @@ impl<'c> TextDb<'c> {
         }
         let a = self.root_of_version(n.id, v1)?;
         let b = self.root_of_version(n.id, v2)?;
-        textdb_core::line_hunks(&st, &a, &b)
+        let hunks = textdb_core::line_hunks(&st, &a, &b)?;
+        if self.view.is_admin() {
+            return Ok(hunks);
+        }
+        // A diff is text the caller reads, so it is projected like any other. Each side is
+        // rewritten against its own version's links — resolved by scanning, because the index
+        // holds the current version's and an older one's spans would not line up.
+        hunks
+            .into_iter()
+            .map(|mut h| {
+                h.old_text = self.project_text(&h.old_text)?;
+                h.new_text = self.project_text(&h.new_text)?;
+                Ok(h)
+            })
+            .collect()
+    }
+
+    /// May this connection write at this *store* path?
+    ///
+    /// Takes a store path, not a caller's, because its callers are inside the binding and already
+    /// hold one — `store_path_rw` is the entry-point form.
+    pub(crate) fn can_write_store_path(&self, store_path: &str) -> bool {
+        if self.view.is_admin() {
+            return true;
+        }
+        self.view.grant_for(store_path).is_some_and(|g| g.live() && g.rights.can_write())
+    }
+
+    /// `(predicate, params)` restricting `col` to this connection's visible set, numbered from
+    /// `offset + 1`. `("1", [])` for the owner, so the SQL is what it was before #12.
+    pub(crate) fn visible_for(&self, col: &str, offset: usize) -> (String, Vec<rusqlite::types::Value>) {
+        match crate::access::visible_sql(&self.view, col) {
+            None => ("1".to_string(), Vec::new()),
+            Some((pred, args)) => (crate::access::renumber(&pred, offset), args),
+        }
+    }
+
+    /// The same with bare `?` placeholders, for a statement that numbers none of its own.
+    ///
+    /// Mixing the two is a trap SQLite does not report: numbering some placeholders `?N` while
+    /// others are bare makes it continue its own numbering past the highest explicit index, and
+    /// the bare ones then bind to parameters nobody passed. `property_find` already carries a
+    /// comment about losing an afternoon to exactly that.
+    pub(crate) fn visible_bare(&self, col: &str) -> (String, Vec<rusqlite::types::Value>) {
+        match crate::access::visible_sql(&self.view, col) {
+            None => ("1".to_string(), Vec::new()),
+            Some((pred, args)) => {
+                let mut out = String::with_capacity(pred.len());
+                let mut it = pred.chars().peekable();
+                while let Some(c) = it.next() {
+                    out.push(c);
+                    if c == '?' {
+                        while it.peek().is_some_and(|d| d.is_ascii_digit()) {
+                            it.next();
+                        }
+                    }
+                }
+                (out, args)
+            }
+        }
+    }
+
+    /// Project a fragment that has no link rows of its own — an old version, a hunk, a conflict
+    /// region — by scanning it with the same extractor the index is built with and resolving
+    /// each target store-wide.
+    pub(crate) fn project_text(&self, text: &[u8]) -> Result<Vec<u8>> {
+        if self.view.is_admin() || text.is_empty() {
+            return Ok(text.to_vec());
+        }
+        let spans = self.scan_targets_resolved(text)?;
+        if spans.is_empty() {
+            return Ok(text.to_vec());
+        }
+        Ok(textdb_core::access::project(&self.view, text, &spans).0)
     }
 
     /// The chunks of a file at `version` (HEAD when `None`), in document order, with where
     /// each one sits. Unchanged content keeps its hash from one version to the next, so a
     /// client comparing two listings knows which parts of a document it can leave alone.
     pub fn chunks(&self, path: &str, version: Option<u64>) -> Result<Vec<LeafRef>> {
-        let path = normalize_path(path)?;
+        let path = self.store_path(path)?;
         let root = match version {
             None => self.file_by_path(&path)?.root.ok_or_else(|| TextdbError::NotFound(path.clone()))?,
             Some(v) => {
@@ -1298,13 +2143,14 @@ impl<'c> TextDb<'c> {
         author: Option<&str>,
         message: Option<&str>,
     ) -> Result<WriteResult> {
-        let path = normalize_path(path)?;
+        let path = self.store_path_rw(path)?;
+        let content = &self.unproject_doc(content)?;
         self.tx(|db| match db.node_by_path(&path)? {
             None => Ok(WriteResult {
-                version: db.create(&path, content, author, message)?,
+                version: db.create_at(&path, content, author, message)?,
                 kind: CommitKind::Direct,
             }),
-            Some(_) => db.update_content(&path, content, base_version, author, message),
+            Some(_) => db.update_content_at(&path, content, base_version, author, message),
         })
     }
 
@@ -1338,7 +2184,8 @@ impl<'c> TextDb<'c> {
         base_version: Option<u64>,
         author: Option<&str>,
     ) -> Result<WriteResult> {
-        let path = normalize_path(path)?;
+        let path = self.store_path_rw(path)?;
+        let ranges = &self.unproject_ranges(ranges)?;
         let mut sorted: Vec<&(u64, u64, Vec<u8>)> = ranges.iter().collect();
         sorted.sort_by_key(|r| r.0);
         if sorted.is_empty() {
@@ -1392,7 +2239,7 @@ impl<'c> TextDb<'c> {
             };
             edits.push(Edit::new(start, end, replacement));
         }
-        self.commit_edits(&path, &edits, Some(base_v), author, self.message.as_deref().or(Some("replace-lines")))
+        self.commit_edits_at(&path, &edits, Some(base_v), author, self.message.as_deref().or(Some("replace-lines")))
     }
 
     /// Append one row to the change feed. Callers run it inside the operation's own
@@ -1439,16 +2286,56 @@ impl<'c> TextDb<'c> {
 
     /// Change-feed rows with `seq > since`, oldest first, at most `limit` of them.
     pub fn feed(&self, since: i64, limit: usize) -> Result<Vec<ChangeRow>> {
+        // Scoped to the account's shares. A change to something it cannot see is not an event it
+        // is told about at all — not even as a gap, which `--since` already tolerates (#12 F).
+        // The filter is on the change's own recorded path, so an event about a node that has
+        // since moved still lands in the view it happened in.
+        // Two kinds of row: what happened in the store, filtered to what this account can see;
+        // and what happened to this account's shares, which is already its own and which nobody
+        // else's feed carries. A revocation is the second kind, and has to be — by the time it
+        // lands, the account can no longer see the folder it is about.
+        //
+        // `?1` is `since` and `?2` the limit, so the visible set numbers from 3 and the account
+        // name takes the index after it.
+        let (vis_sql, vis_args) = match crate::access::visible_sql(&self.view, "path") {
+            None => ("for_account IS NULL".to_string(), Vec::new()),
+            Some((pred, mut args)) => {
+                // Either end of a move. A subtree that left the view has its new path outside it
+                // and its old path inside; one that arrived has it the other way round. Both are
+                // events here — a delete and a create — and taking the row on its new path alone
+                // would drop the first of them silently, which is the one that matters.
+                let (old_pred, old_args) = crate::access::visible_sql(&self.view, "old_path").unwrap_or_else(|| ("0".to_string(), Vec::new()));
+                let both = format!(
+                    "({}) OR ({})",
+                    crate::access::renumber(&pred, 2),
+                    crate::access::renumber(&old_pred, 2 + args.len())
+                );
+                let me = 2 + args.len() + old_args.len() + 1;
+                args.extend(old_args);
+                (format!("(for_account IS NULL AND ({both})) OR for_account = ?{me}"), args)
+            }
+        };
         let mut stmt = self
             .conn
             .prepare_cached(&format!(
-                "SELECT seq, ts, op, node_id, node_kind, path, old_path, version, base_version, commit_kind, author, message \
-                 FROM {}change WHERE seq > ?1 ORDER BY seq LIMIT ?2",
-                self.p
+                "SELECT seq, ts, op, node_id, node_kind, path, old_path, version, base_version, commit_kind, author, message, \
+                        for_account \
+                 FROM {p}change WHERE seq > ?1 AND ({vis}) ORDER BY seq LIMIT ?2",
+                p = self.p,
+                vis = vis_sql,
             ))
             .map_err(sql_err)?;
+        let mut args: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Integer(since),
+            rusqlite::types::Value::Integer(limit.min(i64::MAX as usize) as i64),
+        ];
+        let any_vis = !vis_args.is_empty() || !self.view.is_admin();
+        args.extend(vis_args.iter().cloned());
+        if any_vis {
+            args.push(rusqlite::types::Value::Text(self.view.name().unwrap_or_default().to_string()));
+        }
         let rows = stmt
-            .query_map(params![since, limit.min(i64::MAX as usize) as i64], |r| {
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
                 Ok(ChangeRow {
                     seq: r.get(0)?,
                     ts: r.get(1)?,
@@ -1462,8 +2349,90 @@ impl<'c> TextDb<'c> {
                     commit_kind: r.get(9)?,
                     author: r.get(10)?,
                     message: r.get(11)?,
+                    for_account: r.get(12)?,
                 })
             })
+            .map_err(sql_err)?;
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for c in rows {
+            self.to_view_change(c, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Turn one stored change into what this account's feed says about it, appending to `out`.
+    ///
+    /// Usually one row becomes one row. A move across the edge of the view is the exception: what
+    /// left is a delete and what arrived is a create, and because a folder moves as a single row
+    /// the files under it have to be named one by one — a sync that heard only "the folder is
+    /// gone" would have nothing to match its files against. The files are those the store holds
+    /// *now*, so a subtree that moved twice is reported at its latest shape; the feed is a
+    /// projection of the view, not a second history.
+    fn to_view_change(&self, mut c: ChangeRow, out: &mut Vec<ChangeRow>) -> Result<()> {
+        // A row about this account's own shares already carries its paths: it is about the alias,
+        // which has no store path to translate from.
+        if c.for_account.is_some() {
+            out.push(c);
+            return Ok(());
+        }
+        let here = self.view_path(&c.path);
+        let there = c.old_path.as_deref().and_then(|p| self.view_path(p));
+        if c.op != "move" || c.old_path.is_none() {
+            if let Some(p) = here {
+                c.path = p;
+                c.old_path = there;
+                out.push(c);
+            }
+            return Ok(());
+        }
+        // The share root itself moved. The account holds the node, not the path it sits at, so
+        // its own paths did not change and there is nothing to say (#12 F4).
+        if self.view.grants().iter().any(|g| g.node_id == c.node_id) {
+            return Ok(());
+        }
+        let old_store = c.old_path.clone().unwrap_or_default();
+        match (here, there) {
+            // Both ends visible: the move it is.
+            (Some(p), Some(from)) => {
+                c.path = p;
+                c.old_path = Some(from);
+                out.push(c);
+            }
+            // Moved in from outside: everything under it is new here.
+            (Some(_), None) => {
+                for (path, _) in self.files_under(&c.path)? {
+                    let Some(view) = self.view_path(&path) else { continue };
+                    out.push(ChangeRow { op: "create".to_string(), path: view, old_path: None, ..c.clone() });
+                }
+            }
+            // Moved out: what this account had at the old paths is gone.
+            (None, Some(_)) => {
+                for (path, _) in self.files_under(&c.path)? {
+                    let was = format!("{old_store}{}", &path[c.path.len()..]);
+                    let Some(view) = self.view_path(&was) else { continue };
+                    out.push(ChangeRow { op: "delete".to_string(), path: view, old_path: None, ..c.clone() });
+                }
+            }
+            (None, None) => {}
+        }
+        Ok(())
+    }
+
+    /// The files at or below `store_path` as it stands now, as `(path, id)`. The store's own
+    /// paths: the caller decides what to do with them.
+    fn files_under(&self, store_path: &str) -> Result<Vec<(String, i64)>> {
+        let (lo, hi) = (format!("{store_path}/"), format!("{store_path}0"));
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT path, id FROM {p}node \
+                 WHERE kind = 1 AND deleted_at IS NULL AND (path = ?1 OR (path >= ?2 AND path < ?3)) ORDER BY path",
+                p = self.p,
+            ))
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![store_path, lo, hi], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(sql_err)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
     }
@@ -1483,103 +2452,304 @@ impl<'c> TextDb<'c> {
     /// phrase; `foo*` is a prefix. Each term is looked up in the chunk FTS index, chunk hits
     /// are mapped to files through `chunk_ref`, and the per-term file sets are intersected.
     pub fn search(&self, query: &str, prefix: &str, limit: usize) -> Result<Vec<Hit>> {
-        let prefix = normalize_path(prefix)?;
+        self.search_lines(query, prefix, limit, usize::MAX)
+    }
+
+    /// Matching lines, at most `per_file` of them from any one document.
+    ///
+    /// `limit` counts rows, not documents: one meaning for the word on every surface.
+    pub fn search_lines(&self, query: &str, prefix: &str, limit: usize, per_file: usize) -> Result<Vec<Hit>> {
+        // Candidates are found with a generous window: `limit` rows may all come from one
+        // document, so the number of documents to consider is not the number of rows wanted.
+        let (terms, candidates, dfs) = self.search_candidates(query, prefix, limit)?;
+        let corpus = self.corpus(prefix);
+        self.resolve_hits(&terms, candidates, &dfs, &corpus, limit, per_file)
+    }
+
+    /// The documents a query matches, best first, without resolving a line or a snippet.
+    ///
+    /// This is the half of `search` the index can answer on its own. Resolving each candidate
+    /// costs a node lookup, a chunk fetch and a walk of the document's tree to turn a chunk
+    /// into a line number, so a caller that only needs to know *which* documents matched —
+    /// a file list, a count, a facet — should not pay for it.
+    pub fn search_paths(&self, query: &str, prefix: &str, limit: usize) -> Result<Vec<(String, f64)>> {
+        let (terms, candidates, dfs) = self.search_candidates(query, prefix, limit)?;
+        let corpus = self.corpus(prefix);
+        let candidates = self.rescore(&terms, &candidates, &dfs, &corpus)?;
+        let mut st = self
+            .conn
+            .prepare_cached(&format!("SELECT path FROM {}node WHERE id = ?1 AND deleted_at IS NULL", self.p))
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for (file_id, rank) in candidates.into_iter().take(limit) {
+            if let Some(path) = st
+                .query_row(params![file_id], |r| r.get::<_, String>(0))
+                .optional()
+                .map_err(sql_err)?
+            {
+                out.push((path, rank));
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The query's terms, and the `(file_id, chunk_id, rank)` of every document that matches
+    /// every one of them, best first.
+    #[allow(clippy::type_complexity)]
+    fn search_candidates(&self, query: &str, prefix: &str, limit: usize) -> Result<(Vec<String>, Vec<(i64, f64)>, Vec<u64>)> {
+        let prefix = self.store_path(prefix)?;
         let terms = query_terms(query);
         if terms.is_empty() {
-            return Ok(vec![]);
+            return Ok((terms, vec![], vec![]));
         }
-        let st = self.storage();
+        // The prefix above narrows to what the caller asked for; this narrows to what they may
+        // see at all. For an account searching `/`, the second is the whole of the restriction.
+        let (vis_sql, vis_args) = match crate::access::visible_sql(&self.view, "n.path") {
+            None => ("1".to_string(), Vec::new()),
+            Some((pred, args)) => (crate::access::renumber(&pred, 3), args),
+        };
         // Per term: file_id → (chunk_id, rank) of the best chunk hit.
-        let mut per_term: Vec<std::collections::HashMap<i64, (i64, f64)>> = Vec::new();
+        // Per term: the documents that hold it, with the rank the index gave the best chunk of
+        // each — used only to decide which documents reach the reranking pool. `df` is the size
+        // of that set *before* the limit, which is what BM25's idf needs and what a `count(*)`
+        // window computed after the filter and before the truncation gives for nothing.
+        let mut per_term: Vec<std::collections::HashMap<i64, f64>> = Vec::new();
+        let mut dfs: Vec<u64> = Vec::new();
         // The index is over chunks, so every hit has to be resolved to the files that
         // contain it. Doing that one chunk at a time meant up to `limit * 50` extra
         // statements per term; the join does it in one, and `ORDER BY rank` is what makes
         // the first row seen for a file its best chunk, as before.
+        //
+        // **The limit is on the outside, and that is the whole of it.** With it on the FTS
+        // subquery the store took the best `limit * 50` chunks *in the whole index* and then
+        // applied the folder and the visibility filter to whatever was left — so past that many
+        // matches elsewhere a scoped search answered with nothing. A folder of five documents
+        // whose every document held the word came back empty inside a store of 200,000, and so
+        // did an account whose entire vault was that folder. Postgres never had it, because its
+        // filter and its limit are in one query; this is now the same shape, and the two engines
+        // answer the same question the same way.
+        //
+        // It costs what correctness costs here: ranking by bm25 visits every matching row, so a
+        // term common across a large store is now bounded by how many chunks hold it rather than
+        // by `limit`. A *scoped* search is bounded by the folder, which is the case that was
+        // wrong and is also the one that matters for a delegated account.
         let mut fts_stmt = self
             .conn
             .prepare_cached(&format!(
-                "SELECT r.file_id, f.chunk_id, f.rank                  FROM (SELECT rowid AS chunk_id, rank AS rank FROM {p}fts WHERE {p}fts MATCH ?1 ORDER BY rank LIMIT ?2) f                  JOIN {p}chunk_ref r ON r.chunk_id = f.chunk_id                  JOIN {p}node n ON n.id = r.file_id                  WHERE n.deleted_at IS NULL AND n.kind = 1                    AND (?3 = '/' OR substr(n.path, 1, length(?3) + 1) = ?3 || '/')                  ORDER BY f.rank",
-                p = self.p
+                "SELECT file_id, rank, count(*) OVER () AS df FROM ( \
+                    SELECT r.file_id AS file_id, min(f.rank) AS rank \
+                      FROM (SELECT rowid AS chunk_id, rank AS rank FROM {p}fts WHERE {p}fts MATCH ?1) f \
+                      JOIN {p}chunk_ref r ON r.chunk_id = f.chunk_id \
+                      JOIN {p}node n ON n.id = r.file_id \
+                     WHERE n.deleted_at IS NULL AND n.kind = 1 \
+                       AND (?3 = '/' OR substr(n.path, 1, length(?3) + 1) = ?3 || '/') AND ({vis}) \
+                     GROUP BY r.file_id \
+                  ) ORDER BY rank LIMIT ?2",
+                p = self.p,
+                vis = vis_sql,
             ))
             .map_err(sql_err)?;
         for t in &terms {
             let q = fts5_term(t);
-            let mut files: std::collections::HashMap<i64, (i64, f64)> = Default::default();
+            let mut files: std::collections::HashMap<i64, f64> = Default::default();
+            let mut df = 0u64;
+            let mut args: Vec<rusqlite::types::Value> = vec![
+                rusqlite::types::Value::Text(q),
+                rusqlite::types::Value::Integer((limit.max(1) * 50) as i64),
+                rusqlite::types::Value::Text(prefix.clone()),
+            ];
+            args.extend(vis_args.iter().cloned());
             let rows = fts_stmt
-                .query_map(params![q, (limit.max(1) * 50) as i64, prefix], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?))
+                .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, i64>(2)?))
                 })
                 .map_err(sql_err)?;
             for row in rows {
-                let (file_id, chunk_id, rank) = row.map_err(sql_err)?;
-                files.entry(file_id).or_insert((chunk_id, rank));
+                let (file_id, rank, n) = row.map_err(sql_err)?;
+                df = n.max(0) as u64;
+                files.entry(file_id).or_insert(rank);
             }
             per_term.push(files);
+            dfs.push(df);
         }
-        // Intersect file sets; order by the first term's rank.
-        let mut candidates: Vec<(i64, i64, f64)> = per_term[0]
+        // Intersect file sets; order by the first term's rank, which is the retrieval order and
+        // decides which documents reach the pool, not what a caller sees.
+        let mut candidates: Vec<(i64, f64)> = per_term[0]
             .iter()
             .filter(|(id, _)| per_term[1..].iter().all(|m| m.contains_key(id)))
-            .map(|(id, (chunk, rank))| (*id, *chunk, *rank))
+            .map(|(id, rank)| (*id, *rank))
             .collect();
-        candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-        let mut hits = Vec::new();
+        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok((terms, candidates, dfs))
+    }
+
+    /// Documents in the scope, and words across them: what BM25 normalises a length against.
+    ///
+    /// Both come off the folder row, where the listing surfaces already keep them folded, so the
+    /// corpus statistics are an indexed lookup rather than an aggregate over the store.
+    fn corpus(&self, prefix: &str) -> textdb_core::bm25::Corpus {
+        let e = self.entry(prefix).ok();
+        match e {
+            // A folder carries totals over everything below it; a single file is a corpus of one.
+            Some(e) if e.kind == 0 => textdb_core::bm25::Corpus {
+                ndocs: e.files.unwrap_or(0).max(0) as u64,
+                total_words: e.nwords.max(0) as u64,
+            },
+            Some(e) => textdb_core::bm25::Corpus { ndocs: 1, total_words: e.nwords.max(0) as u64 },
+            None => textdb_core::bm25::Corpus { ndocs: 0, total_words: 0 },
+        }
+    }
+
+    /// Turn candidates into hit rows: every line of each matching document that actually
+    /// holds one of the query's terms.
+    ///
+    /// The index works on chunks, so on its own it can say which documents match and only
+    /// guess at the line. This reads each candidate and lists the lines, which is what makes
+    /// `line` a fact rather than a hint — and drops a document whose words only ever appear
+    /// apart, which document-level AND would otherwise report with a line holding none of
+    /// them.
+    /// The candidates, in the order a caller should see them, with their score.
+    ///
+    /// Only the head of the pool is rescored. Scoring needs a document's text and reading it is
+    /// the expensive part of a search, so rescoring everything the retrieval found would make a
+    /// ten-row answer read five hundred documents. The head is `RERANK_POOL` documents or three
+    /// times the rows asked for, whichever is larger, which is enough for the order of what is
+    /// shown to be decided by BM25 rather than by which engine answered; the tail keeps the
+    /// engine's own order and is only reached when the head could not fill the rows.
+    fn rescore(
+        &self,
+        terms: &[String],
+        candidates: &[(i64, f64)],
+        dfs: &[u64],
+        corpus: &textdb_core::bm25::Corpus,
+    ) -> Result<Vec<(i64, f64)>> {
+        use textdb_core::bm25::{normalise, score, TermDf};
+        let parsed = textdb_core::terms::parse(terms.to_vec());
+        let head = candidates.len().min(RERANK_POOL);
+        let td: Vec<TermDf> = parsed
+            .iter()
+            .enumerate()
+            .map(|(i, term)| TermDf { term, df: dfs.get(i).copied().unwrap_or(1) })
+            .collect();
+        let st = self.storage();
+        let mut node = self
+            .conn
+            .prepare_cached(&format!("SELECT root FROM {}node WHERE id = ?1 AND deleted_at IS NULL", self.p))
+            .map_err(sql_err)?;
+        let mut scored: Vec<(i64, f64)> = Vec::with_capacity(head);
+        for (file_id, _) in &candidates[..head] {
+            let root: Option<Vec<u8>> =
+                node.query_row(params![file_id], |r| r.get(0)).optional().map_err(sql_err)?;
+            let s = match root {
+                Some(root) => {
+                    let body = st.document(&to_hash(&root)?)?.0;
+                    score(&td, &String::from_utf8_lossy(&body), corpus)
+                }
+                None => 0.0,
+            };
+            scored.push((*file_id, s));
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut only: Vec<f64> = scored.iter().map(|(_, s)| *s).collect();
+        normalise(&mut only);
+        for (row, s) in scored.iter_mut().zip(only) {
+            row.1 = s;
+        }
+        // The tail was never scored, so it sorts below everything that was.
+        scored.extend(candidates[head..].iter().map(|(id, _)| (*id, 0.0)));
+        Ok(scored)
+    }
+
+    fn resolve_hits(
+        &self,
+        terms: &[String],
+        candidates: Vec<(i64, f64)>,
+        dfs: &[u64],
+        corpus: &textdb_core::bm25::Corpus,
+        limit: usize,
+        per_file: usize,
+    ) -> Result<Vec<Hit>> {
+        let st = self.storage();
+        let parsed = textdb_core::terms::parse(terms.to_vec());
+        if parsed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let per_file = per_file.max(1);
         let mut node_stmt = self
             .conn
-            .prepare_cached(&format!("SELECT path, root FROM {}node WHERE id = ?1 AND deleted_at IS NULL", self.p))
+            .prepare_cached(&format!(
+                "SELECT path, root, version FROM {}node WHERE id = ?1 AND deleted_at IS NULL",
+                self.p
+            ))
             .map_err(sql_err)?;
-        let mut chunk_stmt = self
-            .conn
-            .prepare_cached(&format!("SELECT hash, bytes FROM {}chunk WHERE id = ?1", self.p))
-            .map_err(sql_err)?;
-        for (file_id, chunk_id, rank) in candidates {
-            let (path, root): (String, Vec<u8>) = match node_stmt
-                .query_row(params![file_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        // **The engine's rank chose the pool; `textdb_core::bm25` chooses the order.** FTS5's
+        // `rank` is a chunk-level bm25 and Postgres's `ts_rank` is not bm25 at all, so the same
+        // query against the same documents used to come back in a different order depending on
+        // which engine answered. Both are still used to find the documents — that is what an
+        // index is for — and neither decides what a caller sees.
+        //
+        // Reranking costs reading documents that may not be shown: the score needs the text, and
+        // the text is only worth having for the ones that are. The pool is bounded for that
+        // reason, and the documents in it were mostly going to be read anyway.
+        let scored = self.rescore(terms, &candidates, dfs, corpus)?;
+        let mut hits: Vec<Hit> = Vec::new();
+        for (file_id, rank) in scored {
+            if hits.len() >= limit {
+                break;
+            }
+            let (path, root, version): (String, Vec<u8>, i64) = match node_stmt
+                .query_row(params![file_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
                 .optional()
                 .map_err(sql_err)?
             {
                 Some(x) => x,
                 None => continue,
             };
-            let (hash, bytes): (Vec<u8>, Vec<u8>) = chunk_stmt
-                .query_row(params![chunk_id], |r| Ok((r.get(0)?, r.get(1)?)))
-                .map_err(sql_err)?;
-            let root = to_hash(&root)?;
-            let hash = to_hash(&hash)?;
-            // Verify the chunk is still part of HEAD (chunk_ref is append-only) and get its line.
-            let leaf = match textdb_core::tree::find_leaf(&st, &root, &hash)? {
-                Some(l) => l,
-                None => {
-                    // The chunk left this file; fall back to a HEAD scan for the terms.
-                    let body = (*st.document(&root)?.0).clone();
-                    let (line, snippet) = locate_terms(&body, &terms);
-                    if snippet.is_empty() {
-                        continue;
-                    }
-                    hits.push(Hit {
-                        path,
-                        line: line as i64 + 1,
-                        snippet,
-                        rank,
-                    });
-                    if hits.len() >= limit {
-                        break;
-                    }
-                    continue;
-                }
+            // The candidate set is already filtered to the visible shares; this is the other
+            // half, turning the store's path into the one the caller asked in.
+            let Some(path) = self.view_path(&path) else { continue };
+            let body = st.document(&to_hash(&root)?)?.0;
+            let body = String::from_utf8_lossy(&body);
+            let Some(lines) = textdb_core::terms::matching_lines(&parsed, &body) else {
+                continue;
             };
-            let (line_in_chunk, snippet) = locate_terms(&bytes, &terms);
-            hits.push(Hit {
-                path,
-                line: leaf.line_off as i64 + line_in_chunk as i64 + 1,
-                snippet,
-                rank,
-            });
-            if hits.len() >= limit {
-                break;
+            let shown = lines.len().min(per_file);
+            let more = (lines.len() - shown) as i64;
+            let sections = self.section_spans(file_id)?;
+            for (n, line) in lines.into_iter().take(per_file) {
+                if hits.len() >= limit {
+                    break;
+                }
+                hits.push(Hit {
+                    path: path.clone(),
+                    version,
+                    line: n as i64,
+                    text: textdb_core::terms::show(line, &parsed),
+                    section: section_at(&sections, n as i64),
+                    score: rank,
+                    more,
+                });
             }
         }
         Ok(hits)
+    }
+
+    /// A file's heading spans, deepest last, for naming the section a line falls in.
+    fn section_spans(&self, file_id: i64) -> Result<Vec<(i64, i64, String)>> {
+        let mut st = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT line_from, line_to, heading_path FROM {}section WHERE file_id = ?1 ORDER BY line_from, level",
+                self.p
+            ))
+            .map_err(sql_err)?;
+        let rows = st
+            .query_map(params![file_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
     }
 
     pub fn export(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
@@ -1587,7 +2757,9 @@ impl<'c> TextDb<'c> {
         let mut out = Vec::new();
         for n in self.list_files(prefix)? {
             if let Some(root) = n.root {
-                out.push((n.path, (*st.document(&root)?.0).clone()));
+                // The view's own layout, which is what makes a checkout a working vault.
+                let Some(path) = self.view_path(&n.path) else { continue };
+                out.push((path, (*st.document(&root)?.0).clone()));
             }
         }
         Ok(out)
@@ -1681,29 +2853,67 @@ pub fn fts5_term(t: &str) -> String {
     }
 }
 
+/// The parent folder of an absolute path; `None` for the root.
+///
+/// Spelled `dir` on every surface now — it used to be `parent_path` on the `kb` table, `dir`
+/// on the `files` view, `parent` on `folders` and `parent_id` on Postgres.
+pub fn dir_of(path: &str) -> Option<String> {
+    if path == "/" {
+        return None;
+    }
+    Some(parent_of(path).to_string())
+}
+
+/// How deep a path sits: the root is 0, `/a.md` is 1, `/a/b.md` is 2.
+pub fn depth_of(path: &str) -> i64 {
+    if path == "/" {
+        return 0;
+    }
+    path.matches('/').count() as i64
+}
+
+/// A file's extension, lower case and without the dot; `None` when the name has none.
+///
+/// A leading dot is not an extension: `.gitignore` is a name, not an extension of nothing.
+pub fn ext_of(path: &str) -> Option<String> {
+    let name = name_of(path);
+    let (stem, ext) = name.rsplit_once('.')?;
+    (!stem.is_empty() && !ext.is_empty()).then(|| ext.to_ascii_lowercase())
+}
+
+/// The heading path a line falls under: the deepest span that contains it.
+///
+/// Spans are nested — a level-3 heading's range sits inside its parent's — so the last one
+/// that contains the line is the most specific, which is the one a reader means.
+fn section_at(spans: &[(i64, i64, String)], line: i64) -> Option<String> {
+    spans
+        .iter()
+        .filter(|(from, to, _)| *from <= line && line <= *to)
+        .next_back()
+        .map(|(_, _, h)| h.clone())
+}
+
+/// A document's title: its front matter `title`, else its first level-1 heading, else none.
+///
+/// Front matter wins because it is the one a writer set deliberately; the heading is what a
+/// reader sees when they did not. Anything else — a level-2 heading, the file name — would be
+/// guessing, so it stays `NULL` and a caller can fall back to `name` itself.
+fn document_title(s: &textdb_core::structure::Structure) -> Option<String> {
+    let from_meta = s
+        .frontmatter
+        .as_ref()
+        .and_then(|v| v.get("title"))
+        .and_then(|t| match t {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Null => None,
+            other => Some(other.to_string()),
+        })
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    from_meta.or_else(|| s.sections.iter().find(|x| x.level == 1).map(|x| x.heading.clone()))
+}
+
 /// FTS5 syntax for a whole query (terms ANDed within one document row).
 pub fn fts5_query(q: &str) -> String {
     query_terms(q).iter().map(|t| fts5_term(t)).collect::<Vec<_>>().join(" AND ")
-}
-
-/// The line (0-based, within `bytes`) holding the most of the query's terms — the first such
-/// line — and that line as the snippet; line 0 when none holds any. Terms are compared as lower
-/// case text, a prefix without its `*`. The chunk is the best-ranked one for the first term, so
-/// it may hold only some of the terms: the document holds them all, not necessarily this line.
-fn locate_terms(bytes: &[u8], terms: &[String]) -> (usize, String) {
-    let raw = String::from_utf8_lossy(bytes);
-    let wanted: Vec<String> = terms.iter().map(|t| t.trim_end_matches('*').to_lowercase()).filter(|t| !t.is_empty()).collect();
-    let (mut best_count, mut best_line) = (0, 0);
-    for (i, line) in raw.lines().enumerate() {
-        let lower = line.to_lowercase();
-        let n = wanted.iter().filter(|t| lower.contains(t.as_str())).count();
-        if n > best_count {
-            (best_count, best_line) = (n, i);
-            if n == wanted.len() {
-                break;
-            }
-        }
-    }
-    let snippet = raw.lines().nth(best_line).unwrap_or("").chars().take(200).collect();
-    (best_line, snippet)
 }

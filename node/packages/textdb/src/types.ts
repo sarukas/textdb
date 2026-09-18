@@ -10,28 +10,50 @@ export interface Info {
 }
 
 /** A file or folder in a listing. A folder's size, lines, words and versions are totals over every file below it. */
+/**
+ * One listing row: the same twenty-four keys as every other surface, in this order.
+ *
+ * Every key is always present; one that does not apply is `null`.
+ */
 export interface Entry {
-  id: number;
-  name: string;
+  // The minimal tier: what every surface carries.
   path: string;
+  name: string;
   kind: NodeKind;
-  nbytes: number | null;
-  nlines: number | null;
-  /** Words, as `wc -w` counts them. */
-  nwords: number | null;
-  /** A file's version; a folder's total of versions below it. */
-  versions: number;
-  /** A file's last commit or move; a folder's latest change, to it or anywhere below. */
+  /** A file's current version — what `cat -n` shows and `base_version` takes; null for a folder. */
+  version: number | null;
+  /** A file's own size; a folder's total over the live files below it. */
+  nbytes: number;
+  nlines: number;
+  /** ISO-8601 UTC with milliseconds and `Z`, on both backends. */
   updated_at: string;
   updated_by: string | null;
+
+  // The rest of the full tier.
+  id: number;
+  /** The parent folder; null for the root. */
+  dir: string | null;
+  depth: number;
+  /** Lower case, no dot; null for a folder or a name without one. */
+  ext: string | null;
+  /** Front matter `title`, else the first level-1 heading, else null. */
+  title: string | null;
+  /** Words, as `wc -w` counts them. */
+  nwords: number;
+  /** Headings, top-level front-matter keys, links, and links that reach nothing. */
+  nsections: number;
+  nprops: number;
+  nlinks: number;
+  nlinks_broken: number;
+  /** A file's version count; a folder's sum of the versions below it. */
+  versions: number;
   created_at: string;
   /** Folder: live files anywhere below it; null for a file. */
   files: number | null;
   /** Folder: live folders anywhere below it; null for a file. */
   folders: number | null;
-  /** File: distinct commit authors; null for a folder. */
-  nauthors: number | null;
-  /** File: who committed to it, most commits first; empty for a folder. */
+  nauthors: number;
+  /** Who committed to it, most commits first; empty for a folder. */
   authors: AuthorCount[];
 }
 
@@ -71,6 +93,8 @@ export interface ListPage {
   /** Entries matching the filters, across all pages. */
   total: number;
   offset: number;
+  /** The page size actually applied, which the caller's request may have been clamped to. */
+  limit: number;
   entries: Entry[];
 }
 
@@ -99,10 +123,49 @@ export interface HistoryEntry {
   author: string | null;
   ts: string;
   message: string | null;
-  nbytes: number;
   /** Null for commits recorded by a build that predates commit kinds. */
   kind: CommitKind | null;
   base_version: number | null;
+  nbytes: number;
+  /** The file's size in lines and words as of this version. */
+  nlines: number | null;
+  nwords: number | null;
+}
+
+/** One link: the canonical row of `docs/shapes.md`, the same ten keys on every surface. */
+export interface Link {
+  /** The file the link is written in. */
+  path: string;
+  /** The version the line number belongs to; pass it as `baseVersion` when editing by line. */
+  version: number;
+  line: number;
+  kind: 'wiki' | 'embed' | 'md' | 'image';
+  target: string;
+  anchor: string | null;
+  alias: string | null;
+  status: 'ok' | 'ambiguous' | 'anchor-missing' | 'broken' | 'not-in-store' | 'external' | null;
+  /** The file it points to; for an asset, the asset rather than its `.tdbasset` pointer. */
+  resolved: string | null;
+  asset: boolean;
+}
+
+/** Which links a `links` call returns: those a status names, or all of them. */
+export type LinkStatus = NonNullable<Link['status']>;
+
+export const LINK_STATUSES: readonly LinkStatus[] = [
+  'ok',
+  'ambiguous',
+  'anchor-missing',
+  'broken',
+  'not-in-store',
+  'external',
+];
+
+export interface LinkOptions {
+  /** Keep only links with this status; `broken` is the one worth asking for. */
+  status?: LinkStatus;
+  /** Default 10000. */
+  limit?: number;
 }
 
 export interface Hunk {
@@ -114,12 +177,90 @@ export interface Hunk {
   new_text: string;
 }
 
+/**
+ * One matching line — the same seven keys as the CLI and the SQL functions.
+ *
+ * One row per matching *line*, not per document with a guessed line.
+ */
 export interface SearchHit {
   path: string;
+  /** The version the line number belongs to; pass it as `base_version` when editing. */
+  version: number;
   line: number;
-  snippet: string;
-  rank: number;
+  /** The matching line, windowed around the match when longer than the cut. */
+  text: string;
+  /** The heading path the line sits under; null outside any heading. */
+  section: string | null;
+  /** Relevance, higher is better, scaled to (0, 1]; null when nothing ranked. */
+  score: number | null;
+  /** Matching lines in this file not returned because of `perFile`. */
+  more: number;
 }
+
+/** A front-matter property name in use across the store. */
+export interface PropertyKey {
+  key: string;
+  /** Documents carrying it — a note with three tags counts once. */
+  docs: number;
+  /**
+   * Distinct values it takes.
+   *
+   * `values_n` and not `values` on every surface: `values` is reserved in SQL, so a column
+   * named that would need quoting in every query that touched it.
+   */
+  values_n: number;
+  /** `number`, `text` or `mixed`; a UI offers `>` and `<` only where they mean something. */
+  kind: 'number' | 'text' | 'mixed';
+}
+
+/** One value a property takes, and how many documents use it. */
+export interface PropertyValue {
+  value: string | null;
+  docs: number;
+}
+
+/** A document matched by a property query. */
+export interface PropertyHit {
+  path: string;
+  nbytes: number;
+  updated_at: string;
+  /** The whole front matter, so a result table can show any column without a query per row. */
+  frontmatter: Record<string, unknown> | null;
+}
+
+/** One markdown heading, with its document's own figures alongside. */
+export interface OutlineEntry {
+  path: string;
+  /** The last component of the heading path, as written. */
+  heading: string;
+  /** The breadcrumb, `Parent / Child`. */
+  headingPath: string;
+  /** 1 for `#`, 2 for `##`, and so on. */
+  level: number;
+  lineFrom: number;
+  lineTo: number;
+  /** Words in the section's own lines. */
+  nwords: number | null;
+  /** Words in the section and everything nested under it. */
+  nwordsTotal: number | null;
+  /** The document's own figures, repeated on each of its rows. */
+  nbytes: number | null;
+  nlines: number | null;
+  fileNwords: number | null;
+  version: number;
+  updated_at: string;
+  updatedBy: string | null;
+}
+
+/** A distinct heading in use across the scope asked about. */
+export interface HeadingName {
+  heading: string;
+  sections: number;
+  docs: number;
+}
+
+/** How `outline` matches the heading it is given. */
+export type HeadingMatch = 'exact' | 'prefix' | 'contains';
 
 export interface WriteResult {
   version: number;
