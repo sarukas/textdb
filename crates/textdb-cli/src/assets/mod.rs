@@ -981,6 +981,15 @@ impl StoreFiles {
                 n => format!("{n} pointers cannot be read ({first} among them), so what their bytes are for is not known"),
             })));
         }
+        // An account is answered in its own view, so a pointer of another account naming these
+        // bytes is not visible here, and "nothing else names them" would be a guess -- one that ends
+        // with somebody else's asset naming bytes on a thirty-day clock in a provider's trash. Until
+        // the store can answer what no view hides, an account's session takes nothing away.
+        if self.in_use.delegated.unwrap_or(true) {
+            return Ok(Some(StoreCopy::LeftBecause(
+                "this session is an account's, which sees only its own pointers, so whether another asset still needs these bytes is not known here".to_string(),
+            )));
+        }
         Ok(self.in_use.shared(store, location, own).then_some(StoreCopy::Left))
     }
 
@@ -1061,15 +1070,25 @@ fn location_key(location: &str) -> String {
 /// location. Read again, for the pointers that changed, whenever the store changed.
 struct InUse {
     seq: i64,
+    /// Whether this connection is an account's rather than the owner's, asked once. An account is
+    /// answered in its own view, so the pointers below are only the ones it may see: what else
+    /// names a store's bytes cannot be known from here at all.
+    delegated: Option<bool>,
     pointers: HashMap<String, (i64, Option<(String, String)>)>,
 }
 
 impl InUse {
     fn new() -> InUse {
-        InUse { seq: -1, pointers: HashMap::new() }
+        InUse { seq: -1, pointers: HashMap::new(), delegated: None }
     }
 
     fn refresh(&mut self, st: &mut dyn Store) -> Result<()> {
+        if self.delegated.is_none() {
+            // A store that cannot say who is asking is treated as an account's: this answer decides
+            // whether bytes in somebody's drive are taken away, and the safe way to be wrong is to
+            // keep them.
+            self.delegated = Some(st.whoami().map_or(true, |me| me.account.is_some()));
+        }
         let seq = st.last_seq()?;
         if seq == self.seq {
             return Ok(());
@@ -1095,6 +1114,11 @@ impl InUse {
 
     /// Whether a pointer other than the asset `own`'s names `location` in `store`.
     fn shared(&self, store: &str, location: &str, own: &str) -> bool {
+        // Not knowing counts as shared (see `delegated`). A push then puts its bytes beside what is
+        // there rather than over it, which is what it already does for bytes another pointer names.
+        if self.delegated.unwrap_or(true) {
+            return true;
+        }
         let key = (store.to_string(), location_key(location));
         self.pointers
             .iter()
@@ -1963,6 +1987,12 @@ pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
         // read as "nothing needs these bytes", and someone acts on it by hand in their own drive.
         let named = match in_use.refresh(st) {
             Err(e) => Err(format!("the store's pointers could not be read ({})", e.message)),
+            // The reason `keeps` gives, for the same cause: an account sees its own pointers, so
+            // files another account's pointers name would be listed here as named by nothing -- and
+            // this list is acted on by hand, in somebody's drive.
+            Ok(()) if in_use.delegated.unwrap_or(true) => Err(
+                "this session is an account's, which sees only its own pointers, so what no pointer names cannot be told from here".to_string(),
+            ),
             Ok(()) => {
                 let mut unreadable: Vec<&str> = in_use.pointers.iter().filter(|(_, (_, names))| names.is_none()).map(|(p, _)| p.as_str()).collect();
                 unreadable.sort();

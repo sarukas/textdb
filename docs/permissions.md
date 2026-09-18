@@ -1,130 +1,111 @@
-# Who may do what
+# Who may do what, and what the asset stores do not yet know about it
 
-This note is about permissions in textdb: what the store enforces today, what the asset
-stores added to the question, and what would have to be decided before textdb could claim
-to control access at all. It proposes options; it settles nothing.
+textdb has a delegated-access model: accounts, shares, tokens, and a view the store itself
+enforces. The asset stores were built before it and know nothing about it. This note says
+what the model is, where the assets work does not fit it, and what to do in what order.
 
-## What textdb enforces today: nothing
+`docs/cli.md` has the user-facing side ("Delegating folders to accounts"); this is the
+implementer's view.
 
-There is no permission model, and it is worth being plain about that rather than implying a
-gap in an otherwise-complete scheme:
+## What the store enforces
 
-- No principals, roles, groups or owners. A document has authors, not an owner.
-- No access-control lists, and no row-level security on the Postgres side. A connection that
-  can read the store can read every document in it, including every version in its history
-  and everything in its trash.
-- No server authentication. `textdb-server` serves whoever reaches it; its only concession is
-  that CORS allows local origins.
-- `--author` is self-asserted. Nothing verifies it, and nothing stops one person writing as
-  another. It is provenance for humans reading history, not identity.
-- The `textdb` SQL views and functions run with the caller's rights. There is no
-  `SECURITY DEFINER` boundary, so no privilege is held on a caller's behalf.
+- **The owner** is whoever opens the store without a token: on SQLite anyone who can open the
+  file, on Postgres a superuser. Both already mean "you own the store".
+- **An account** (`--kind agent` or `person`) is given whole folders and sees nothing else. A
+  share is a folder and everything below it — no partial folders, no deny rules — under an
+  alias belonging to the grant, with rights `ro` or `rw`.
+- **A token** is a bearer, printed once and stored hashed, optionally expiring, revocable.
+  `authenticate` is called once per connection and everything afterwards is answered in that
+  account's view.
+- **The rule lives in the store, not the CLI**, because the CLI is not the only caller:
+  SQLite applies a visibility predicate to its queries, Postgres answers through `kb.entry`
+  and row-level security, and both refuse the admin operations for a token session rather
+  than trusting a client to do it.
+- **Paths are per view; ids are not.** `id:1234` is what one view can hand another.
+- **`forbidden` is not `not found`**: TX005 (exit 7) under an alias the account has or had,
+  TX003 (exit 5) otherwise — the distinction that stops a sync deleting a checkout when a
+  share is revoked.
+- **`--author` is refused on a token session**: an account writes as itself. (For the owner
+  `--author` remains self-asserted, which is provenance, not identity.)
 
-The enforcement that does exist is the enforcement of whatever holds the store: filesystem
-permissions on a SQLite file, and database grants (`CONNECT`, table privileges) on Postgres.
-That is real, but it is all-or-nothing per store -- there is no "this folder, this person".
+## Where the assets work does not fit it
 
-So "supporting central/local vault permission handling like the rest of textdb now does" has
-no existing model to match. Anything here is new design.
+Nothing under `crates/textdb-cli/src/assets/` asks who the caller is — there is not one
+`whoami` in it — and no test pairs an asset with an account or a token. Four consequences,
+the first of which loses data.
 
-## What the asset stores changed
+### 1. A delete can take away bytes another account still points at
 
-Assets moved bytes out of the store and into somebody's provider -- a Google Drive, an rclone
-remote, a folder on disk. That introduces a second authority with its own idea of who may do
-what, and four problems follow from it.
+`InUse` reads `st.file_heads("/")` to answer "does any pointer other than this one name these
+bytes?". That read is account-scoped by design (SQLite `visible()`, Postgres `kb.entry`), so
+on a token session it answers from the pointers **this account can see**. Three decisions are
+made from that answer, and each is wrong in the unsafe direction when a pointer is invisible:
 
-### 1. An `asset_store` row has no owner
+- **A sync trashes the file in the provider** when a pointer is deleted and "nothing else
+  names it". Account A deletes its pointer; account B's pointer to the same bytes is not in
+  A's view; the file goes to the drive's trash, and B's asset is left naming bytes that are
+  on a 30-day clock. Nothing textdb offers puts them back: `push` only takes `new` and
+  `modified` assets.
+- **A push replaces bytes in place** when no other pointer names the location.
+- **`verify` lists a store's files that "no pointer names"**, which is read as "nothing needs
+  these", and someone acts on it by hand.
 
-`kb.asset_store` holds a name, a driver and a root. Anyone who can write the store can add a
-store, point it anywhere that machine can reach, or repoint an existing one. A pointer names
-its store by name, so repointing a name silently changes where every asset of that name is
-read from and written to.
+The fix is not to widen the account's view. It is to ask the store a question that is *not*
+view-scoped — "is this item named by any pointer anywhere?" — because the question is about a
+provider's bytes, which are shared across every account of the store. That belongs in the
+`Store` trait and in both engines' SQL, for the same reason the rest of the rule does.
 
-On a shared (central) store this is the sharpest edge in the current design: it is a write
-that redirects other people's reads and writes, and nothing records who made it.
+Until that exists, a token session must not make any of those three decisions.
 
-Options:
+### 2. A pointer names bytes; nothing checks that they are the account's to name
 
-- **Rows are data, and the store's write permission is the control.** Simplest, and honest
-  about the fact that a shared store is already a shared trust boundary. Add an audit trail
-  (who added or changed a store row, when) so a redirect is at least visible.
-- **Rows are owned.** Add a declared owner to a store row and refuse changes from anyone
-  else. Requires identity, which textdb does not have, so it would be self-asserted like
-  `--author` -- a speed bump, not a control.
-- **Rows are configuration, not data.** Move store definitions out of the store and into each
-  computer's own configuration, so a central store carries pointers but never the definition
-  of where the bytes live. Strongest separation; costs the convenience of a vault that works
-  as soon as you clone it, and means a pointer's `store` name must resolve per machine.
+A pointer's `item` is whatever the pointer says. For a path-addressed store (`local`, or an
+rclone remote that is not Drive) an account with `rw` on its own share can write a pointer
+naming `/accounts/someone-else/secret.pdf` and pull those bytes into its checkout. For a
+Drive store the item is a file id, so the same move needs an id the account has seen — which
+narrows it without closing it. The store root itself is the only boundary the driver enforces
+(`find_id` refuses ids outside it), and that root is exactly where every account's assets are.
 
-### 2. Provider credentials are per person, and textdb does not hold them
+### 3. The provider is a second authority, and the two say nothing about each other
 
-An rclone remote is configured on a computer, by a person, with that person's token. Two
-people syncing one central store will read the same pointers through different credentials
-and therefore see different things: one may read an asset, another may not, and a third may
-have write access where the first has read-only.
+rclone remotes are configured per computer with a person's own token. An account's rights in
+textdb neither grant nor withhold provider access: `ro` on a share does not stop someone who
+has the drive from fetching the bytes, and `rw` does not mean the provider will accept a
+write. Consequently a store-side state (`changed-in-store`, `trashed-in-store`, …) is a fact
+about *this computer's* access, not about the asset — which is not how it currently reads.
 
-This is arguably correct -- the provider is the authority on its own files, and textdb should
-not be in the business of holding a team's credentials. But it means a store-side state is a
-statement about *this* computer's access, not about the asset. It should be presented that
-way, and it currently is not.
+Related, and unchanged from before: a provider's "you may not" arrives looking exactly like
+"it did not work". A denial is durable and needs saying; a failure is worth retrying. They
+should not share a message.
 
-### 3. A pointer tells every reader where the bytes are
+### 4. Store rows have no owner
 
-A `.tdbasset` pointer carries `store`, `item` and now `item-path`. Anyone who can read the
-document can read those -- a Drive file id, and a path that may itself be informative
-(`/clients/acme/2026-layoffs.pdf`). The pointer does not grant access: a reader still needs
-the provider's permission to fetch the bytes. But it does leak metadata, and on Drive a file
-id is exactly what a share link is built from, so it is not nothing.
+`kb.asset_store(name, driver, root, options)` is data in the store, and a pointer names its
+store by name. Whoever can write those rows can point a name somewhere else and thereby
+change where every asset of that name is read from and written to. Whether an account can see
+or change those rows at all is not currently stated anywhere, and should be.
 
-The rule worth keeping, whatever else is decided: **a pointer must never carry anything that
-grants access.** No tokens, no signed URLs, no share links. Today it does not, and that
-should be a stated invariant rather than an accident.
+## What to do, in order
 
-### 4. "You may not" and "it did not work" look the same
+1. **Refuse the three unsafe decisions on a token session** — trashing or moving a file in a
+   provider during a sync, replacing bytes in place during a push, and listing a store's
+   unnamed files — each with a message saying why rather than a silent skip. This is a small
+   change and it closes the data-loss path.
+2. **Add the store-answered question** `is this item named by any pointer anywhere?`,
+   unscoped, in the `Store` trait and both engines, and let a token session make those
+   decisions again on its answer. Test it with two accounts naming one file.
+3. **Bind a pointer's item to what the account may name**: refuse to pull or push an item that
+   is neither the asset's own path nor an item already recorded by a pointer in the caller's
+   view.
+4. **Decide whether `asset_store` rows are visible to accounts**, and record who changed one.
+5. **Give a provider's denial its own state**, distinct from a store that could not be
+   reached, and present the store-side states as facts about this computer's access.
 
-A provider's denial arrives as a failed rclone run. textdb currently reports that as a store
-that could not be reached -- the same as a network failure, an expired token, or a drive that
-is simply down. The consequences differ sharply: a transient failure should be retried and
-says nothing about the asset, while a denial is a durable fact about this person and this
-file that no amount of retrying will change, and that the person needs to see in order to go
-and ask someone for access.
+Steps 1 and 5 need no decisions from anyone. Steps 2–4 are design choices, and 2 is the one
+that makes delegated access and asset stores actually compatible rather than merely coexisting.
 
-This is the one item here with an obvious answer and no dependency on a permission model:
-distinguish a denial from a failure, give it a state of its own (`not-permitted`, say),
-report it with the file it concerns, and never retry it silently. It also needs to be a state
-that only ever replaces `ok` in the same way the other store-side states do, and must never
-be mistaken for "the asset is gone" -- a denial is not grounds for trashing or re-pushing
-anything.
+## Not in scope here
 
-## If textdb were to control access itself
-
-Not proposed -- recorded so the shape is known before anybody starts:
-
-- Identity has to come first, and has to be verified rather than asserted. Until then every
-  other control is a suggestion.
-- Any document scope (a "this folder, these people" rule) belongs in the `Store` trait and in
-  SQL, not in the CLI. Enforcement in a client is not enforcement: the store is reachable by
-  other clients, by `textdb sql`, and by psql.
-- Postgres could enforce a scope with row-level security and `SECURITY DEFINER` functions;
-  SQLite cannot, so the two backends would stop being equivalent. That divergence needs a
-  decision, not a discovery.
-- History and trash must be in scope from the start. A rule that hides a document but leaves
-  its versions, its hunks and its trashed copies readable hides nothing.
-- Assets are the hard part: a rule inside textdb cannot constrain a provider, so a document
-  nobody may read can still have bytes anybody with the drive may fetch. Either the provider
-  is the authority (and textdb's rules are advisory for assets), or assets need a store that
-  textdb itself mediates.
-
-## What this work should do next, in order
-
-1. Distinguish a provider's denial from a transient failure, with its own state and message.
-   No design decisions blocked on anybody.
-2. State the pointer invariant in the format documentation: a pointer carries what finds
-   bytes, never what grants access to them.
-3. Record who changed an `asset_store` row, and say in the documentation that adding or
-   repointing a store is a write that redirects everyone else's reads.
-4. Present store-side states as facts about this computer's access where that is what they
-   are, rather than as facts about the asset.
-
-Anything past that waits on a decision about identity, which is a product question rather
-than an implementation one.
+Whether textdb should mediate the bytes itself — an asset store the store proxies, so that a
+share's rights govern the bytes as well as the documents — is a product question. Today the
+provider is the authority on its own files, and a rule inside textdb cannot constrain it.
