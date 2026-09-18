@@ -34,8 +34,9 @@ Until this branch there was not one `whoami` under `crates/textdb-cli/src/assets
 paired an asset with an account or a token. Five consequences, four of them now answered: the first
 lost data, the second laid a store out differently for every caller, the third let a pointer name
 bytes it was never granted, and the fifth left a store's own row ownerless. What is open is the
-fourth — the provider being a second authority, which no rule inside textdb can settle — and the
-presentation of the states that come of it.
+fourth, the provider being a second authority: rclone runs with each person's own credentials, and
+no rule inside textdb can constrain a drive. What follows from that is said rather than solved — a
+refusal is told apart from a failure, and each state says whose fact it is.
 
 ### 1. A delete can take away bytes another account still points at
 
@@ -178,13 +179,18 @@ move of the bytes, written up as "Moving a store (not built)" in [`assets.md`](a
    `unchecked:`. Whose fact it is, is said on every surface that shows it: the note beside the
    state in `assets status` ("its asset store team refused *this computer* the file"), `verify`'s
    two columns, the state table in [`assets.md`](assets.md), and in the web pane both the note and
-   the badge's own words. What is *not* done is structural, and is not obviously right: splitting an
-   asset's `state` into an asset-side field and a store-side one. `conflict` is what makes it
-   awkward — it is a here-state that only a store-side fact produces (changed here *and* there), so
-   two fields would have to be recombined by every reader to get back the one summary they are
-   given now.
+   the badge's own words.
 
-What is left is the choice in step 5, and outside this file the store-to-store move.
+   The one structural question this left — whether an asset's `state` should split into an
+   asset-side field and a store-side one, as `verify`'s two columns do — is **decided: it stays one
+   field.** `conflict` is why. It is a here-state that only a store-side fact produces (changed here
+   *and* there), so two fields would have to be recombined by every reader to get back the one
+   summary they are handed now, and the surface that most needs a single answer — the web pane's
+   badge — would be the one recombining. `state` is the worst thing known about an asset, `note`
+   says whose fact it is, and `verify` is where the two sides are shown apart.
+
+Nothing here is left open. Outside this file: the store-to-store move of an asset store's bytes,
+designed and deliberately not built (see [`assets.md`](assets.md), "Moving a store").
 
 ## What runs it
 
