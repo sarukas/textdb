@@ -4572,9 +4572,14 @@ mod tests {
         assert_eq!(one::<String>(content).as_deref(), Some("ONE\nGlobex two\n- item\nx\nend\n"));
         assert_eq!(one::<String>("SELECT message FROM kb.commit WHERE file_id = kb._node_id('/p/a.md') AND version = 7").as_deref(), Some("replace"));
 
-        // The snippet is the line holding the most terms; history has sizes.
+        // A row per line that holds a term, in the document's own order -- not one row per document
+        // carrying its best-ranked chunk's best line, which is what these functions answered before
+        // `textdb_core::terms` gave every surface the same `line`. History still has sizes.
         Spi::run("SELECT kb.write('/s.md', E'alpha\\nbeta\\nalpha beta\\n')").unwrap();
-        assert_eq!(one::<i64>("SELECT line FROM kb.search('alpha beta')"), Some(3));
+        assert_eq!(
+            one::<String>("SELECT string_agg(line::text, ',' ORDER BY line) FROM kb.search('alpha beta')").as_deref(),
+            Some("1,2,3")
+        );
         assert_eq!(one::<i64>("SELECT nbytes FROM kb.history('/s.md')"), Some(22));
     }
 
