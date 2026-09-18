@@ -3110,9 +3110,21 @@ fn a_synced_directory_remembers_its_store_and_folder() {
     assert!(moved.stderr.contains("paired with the store"), "{}", moved.stderr);
 
     // One argument is the folder in the store, so a lone directory is a mistake worth naming.
+    // Where the directory cannot be a store path at all -- a Windows one, which begins with a
+    // drive letter -- the argument itself is refused as it is read, and the message names the
+    // shell rewrite that usually causes it. Elsewhere the path is a plausible one and the sync
+    // gets far enough to say it is a directory.
     let mistake = run(textdb(&db).arg("sync").arg(&dir), None);
-    assert_eq!(mistake.status, 6, "{}", mistake.stdout);
-    assert!(mistake.stderr.contains("is a directory on this computer"), "{}", mistake.stderr);
+    match cfg!(windows) {
+        true => {
+            assert_eq!(mistake.status, 2, "{}", mistake.stderr);
+            assert!(mistake.stderr.contains("is a Windows path, not a path in the store"), "{}", mistake.stderr);
+        }
+        false => {
+            assert_eq!(mistake.status, 6, "{}", mistake.stdout);
+            assert!(mistake.stderr.contains("is a directory on this computer"), "{}", mistake.stderr);
+        }
+    }
 
     // --force says so on purpose, and the pairing follows.
     ok(textdb(&db).args(["sync", "--force", "/elsewhere"]).arg(&dir), None);
@@ -3334,15 +3346,11 @@ fn a_killed_sync_leaves_no_half_written_file() {
     let _ = child.kill();
     let _ = child.wait();
 
-    // Whatever it managed, every file is one of the two whole texts.
-    let mut newly = 0;
+    // Whatever it managed, every file is one of the two whole texts. How many it reached is not
+    // the claim and cannot be one: the run was killed on a timer.
     for i in 0..60 {
         let text = std::fs::read_to_string(dir.join(format!("n{i}.md"))).unwrap();
-        if text == new {
-            newly += 1;
-        } else {
-            assert_eq!(text, old, "n{i}.md is neither the old text nor the new one ({} bytes)", text.len());
-        }
+        assert!(text == new || text == old, "n{i}.md is neither the old text nor the new one ({} bytes)", text.len());
     }
 
     // The staging files of a run that was killed do not pile up: the next sync holds the lock, so
