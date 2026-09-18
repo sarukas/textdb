@@ -285,6 +285,30 @@ export type AssetState =
   | "invalid-item"
   | "not-permitted";
 
+
+/** One asset store, as `assets stores` reports it. */
+export interface AssetStoreRow {
+  name: string;
+  driver: string;
+  /** The store-side identity, shared by everyone: a folder, or an rclone remote path. */
+  root: string;
+  /** Where *this server's machine* reaches it, when it was bound locally. */
+  bound_to: string | null;
+  /** The file or environment variable that said so. */
+  bound_by: string | null;
+  reachable: boolean;
+  problem: string | null;
+}
+
+/** What `assets verify` answers: each asset's two sides, and the store's files nothing names. */
+export interface AssetVerification {
+  prefix: string;
+  dir: string;
+  assets: { path: string; here: string; asset_store: string; note: string | null }[];
+  unnamed: { store?: string; at?: string; unchecked?: string }[];
+  problems: number;
+}
+
 export interface AssetStatus {
   prefix: string;
   dir: string;
@@ -602,6 +626,19 @@ export const api = {
     request<{ rel: string; text: string }>("GET", `/api/sync/conflict?${qs({ prefix, rel })}`),
   syncResolve: (body: { prefix: string; rel: string; keep: "textdb" | "disk"; author?: string }) =>
     request<SyncReport>("POST", "/api/sync/resolve", body),
+  // Asset stores: declared once for everyone, bound per machine. Adding or removing one is the
+  // owner's and the store refuses anyone else; binding is this server's own configuration.
+  assetStores: () => request<AssetStoreRow[]>("GET", "/api/assets/stores"),
+  putAssetStore: (body: { name: string; driver?: string; root: string }) =>
+    request<{ stores: AssetStoreRow[] }>("POST", "/api/assets/stores", body),
+  removeAssetStore: (name: string) => request<{ stores: AssetStoreRow[] }>("POST", "/api/assets/stores/remove", { name }),
+  /** Where this server's machine reaches the store; '' clears it. */
+  bindAssetStore: (name: string, location: string) =>
+    request<{ stores: AssetStoreRow[] }>("POST", "/api/assets/stores/bind", { name, location }),
+  relocateAssets: (body: { prefix: string; paths: string[]; author?: string }) =>
+    request<Record<string, unknown>>("POST", "/api/assets/relocate", body),
+  verifyAssets: (prefix: string, path?: string, signal?: AbortSignal) =>
+    request<AssetVerification>("GET", `/api/assets/verify?${qs({ prefix, path })}`, undefined, signal),
   assets: (prefix: string, path?: string, signal?: AbortSignal) =>
     request<AssetStatus>("GET", `/api/assets?${qs({ prefix, path })}`, undefined, signal),
   pullAssets: (body: { prefix: string; paths?: string[]; author?: string }) =>

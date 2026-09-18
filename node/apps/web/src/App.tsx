@@ -13,6 +13,7 @@ import {
 import { AccessPanel } from "./components/AccessPanel";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { AssetPane } from "./components/AssetPane";
+import { AssetsPanel } from "./components/AssetsPanel";
 import { DocumentPane, type Mode, type OpenDoc } from "./components/DocumentPane";
 import { isPointer, syncLinkFor } from "./assets/model";
 import { ExportDialog } from "./components/ExportDialog";
@@ -74,6 +75,8 @@ export function App() {
   const [who, setWho] = useState<Whoami | null>(null);
   /** The access panel, and the folder it was opened from when it was opened from one. */
   const [access, setAccess] = useState<{ folder: string | null } | null>(null);
+  /** The assets panel, and the asset it was opened on when it was opened from one. */
+  const [assetsAt, setAssetsAt] = useState<{ path: string | null } | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [lastSeq, setLastSeq] = useState(0);
   const [feed, setFeed] = useState<FeedItem[]>([]);
@@ -275,6 +278,7 @@ export function App() {
     <div className={`app${feedOpen ? "" : " feed-collapsed"}`}>
       <Header
         onAccess={() => setAccess({ folder: folder })}
+        onAssets={() => setAssetsAt({ path: null })}
         who={who}
         onWho={(w) => {
           setWho(w);
@@ -290,6 +294,17 @@ export function App() {
         onImport={() => setImporting(true)}
       />
       {access && <AccessPanel folder={access.folder} onClose={() => setAccess(null)} />}
+      {assetsAt && (
+        <AssetsPanel
+          links={syncLinks}
+          path={assetsAt.path}
+          author={author}
+          onClose={() => {
+            setAssetsAt(null);
+            loadSyncLinks();
+          }}
+        />
+      )}
       {importing && <ImportDialog author={author} onClose={() => setImporting(false)} onOpen={openFile} />}
       {exporting !== null && <ExportDialog key={exporting} path={exporting} onClose={() => setExporting(null)} />}
       {syncLink && (
@@ -421,6 +436,7 @@ export function App() {
               onAction={onPathAction}
               onOpenFolder={openFolder}
               onPathChange={onPathChange}
+              onWhere={(asset) => setAssetsAt({ path: asset })}
             />
           ) : open ? (
             <DocumentPane

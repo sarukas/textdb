@@ -28,6 +28,30 @@ export interface AssetItem {
   note?: string;
 }
 
+
+/** One asset store, as `textdb assets stores --json` reports it. */
+export interface AssetStoreRow {
+  name: string;
+  driver: string;
+  /** The store-side identity: a folder, or an rclone remote path. Shared by everyone. */
+  root: string;
+  /** Where *this machine* reaches it, when it was bound locally. */
+  bound_to: string | null;
+  /** Which file or environment variable said so. */
+  bound_by: string | null;
+  reachable: boolean;
+  problem: string | null;
+}
+
+/** What `assets verify --json` answers: each asset's two sides, and the store's loose files. */
+export interface AssetVerification {
+  prefix: string;
+  dir: string;
+  assets: { path: string; here: string; asset_store: string; note: string | null }[];
+  unnamed: { store?: string; at?: string; unchecked?: string }[];
+  problems: number;
+}
+
 export interface AssetStatus {
   prefix: string;
   dir: string;
@@ -225,6 +249,60 @@ export class AssetService {
     });
   }
 
+  /**
+   * The asset stores this textdb store declares, with whether this machine can reach each one.
+   *
+   * Not scoped to a folder: a store is the store's, and the same one serves every vault. Adding or
+   * removing one is the owner's, and it is the *store* that refuses anyone else -- so the bearer
+   * goes to the CLI rather than being judged here.
+   */
+  stores(bearer?: string): Promise<AssetStoreRow[]> {
+    return this.run(['assets', 'stores'], 'stores', undefined, bearer) as unknown as Promise<AssetStoreRow[]>;
+  }
+
+  putStore(name: string, driver: string, root: string, bearer?: string): Promise<unknown> {
+    return this.run(['assets', 'stores', `--add=${name}`, `--driver=${driver}`, `--root=${root}`], 'stores', undefined, bearer);
+  }
+
+  removeStore(name: string, bearer?: string): Promise<unknown> {
+    return this.run(['assets', 'stores', `--remove=${name}`], 'stores', undefined, bearer);
+  }
+
+  /**
+   * Bind a store to where **this server's machine** reaches it, or clear the binding with ''.
+   *
+   * Per-machine configuration, written to this server's own config file, not to the textdb store:
+   * the same shared drive is mounted differently by everyone, and that is the whole point of a
+   * binding. It needs nothing of the store, so no bearer goes with it.
+   */
+  bindStore(name: string, location: string): Promise<unknown> {
+    return this.run(['assets', 'stores', `--bind=${name}=${location}`], 'stores');
+  }
+
+  /** Move the files of `moved-here` assets to their asset's own place in the store. */
+  async relocate(prefix: string, paths: string[], author: string | undefined): Promise<Record<string, unknown>> {
+    const link = await this.syncedLink(prefix);
+    const targets = this.targets(link.prefix, paths);
+    const who = argument('author', author);
+    return this.sync.exclusive(link.prefix, async () => this.run(['assets', 'relocate', '--dir', link.dir, '--', ...targets], 'moved', who));
+  }
+
+  /**
+   * Hash every asset here and in its store, and list the store's files no pointer names.
+   *
+   * `verify` exits 1 when it finds problems, which is an answer and not a failure: the report is
+   * what was asked for.
+   */
+  async verify(prefix: string, scope?: string): Promise<AssetVerification> {
+    const link = await this.syncedLink(prefix);
+    const args = ['assets', 'verify', '--dir', link.dir];
+    // A path narrows the check to one asset. Without one this is the whole vault, and only a
+    // whole-vault verify lists the store's files that no pointer names -- so nothing is passed
+    // rather than the folder itself, which would read as a scope and leave that list out.
+    if (scope !== undefined) args.push('--', ...this.targets(link.prefix, [scope]));
+    return this.run(args, 'assets') as unknown as Promise<AssetVerification>;
+  }
+
   /** The file on disk of the asset at `assetPath`: only an asset's own file, only inside the folder's directory. */
   async file(prefix: string, assetPath: string): Promise<AssetFile> {
     const link = this.sync.link(prefix);
@@ -283,21 +361,43 @@ export class AssetService {
    * `textdb --json ARGS`: the printed report, the object with `key`, whatever the exit status (a
    * push that left conflicts exits 3 and still reports); otherwise the CLI's error.
    */
-  private async run(args: string[], key: string, author?: string): Promise<Record<string, unknown>> {
+  private async run(args: string[], key: string, author?: string, bearer?: string): Promise<Record<string, unknown>> {
     const cli = this.sync.cliPath;
     if (!cli) throw badRequest(this.sync.unavailable ?? 'the textdb CLI was not found');
     const global = ['--store', this.db, '--json'];
     // One argument, so a name starting with a dash is a name.
     if (author) global.push(`--author=${author}`);
+    // The store decides who may do this, not this server: a command that is the owner's is refused
+    // by the store when a bearer is presented, and allowed when an admin-kind one is.
+    if (bearer) global.push(`--token=${bearer}`);
     const { stdout, stderr, status } = await this.slot(() => runCli(cli, [...global, ...args]));
     const printed = [...jsonLines(stdout), ...jsonLines(stderr)];
     const report = printed.find((o) => key in o);
     if (report) return report;
+    // Some answers are a bare array -- `assets stores` is a list of stores and nothing else.
+    if (status === 0) {
+      const array = [stdout, stderr].map(asArray).find((a) => a !== undefined);
+      if (array) return array as unknown as Record<string, unknown>;
+    }
     // With --json the CLI prints its error as `{"error": {"code", "message", …}}`.
     const found = printed.find((o) => typeof o.error === 'object' && o.error !== null)?.error as Record<string, unknown> | undefined;
-    const code = typeof found?.code === 'string' && /^TX00[0-4]$/.test(found.code) ? (found.code as ErrorCode) : 'TX000';
+    // Every TX code, `TX005 forbidden` included: a refusal that arrived as a 500 would read as a
+    // fault of the server's.
+    const code = typeof found?.code === 'string' && /^TX\d{3}$/.test(found.code) ? (found.code as ErrorCode) : 'TX000';
     const message = typeof found?.message === 'string' ? found.message : (stderr || stdout).trim().slice(0, 2000);
     throw new CodedError(code, message || `textdb ${args.slice(0, 2).join(' ')} exited with status ${status}`);
+  }
+}
+
+/** A JSON array on its own, which is what a listing answers with. */
+function asArray(text: string): unknown[] | undefined {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('[')) return undefined;
+  try {
+    const value: unknown = JSON.parse(trimmed);
+    return Array.isArray(value) ? value : undefined;
+  } catch {
+    return undefined;
   }
 }
 

@@ -21,6 +21,8 @@ interface Props {
   onOpenFolder: (path: string) => void;
   /** The pointer moved (renamed here, by someone else, or with a folder above it). */
   onPathChange: (path: string) => void;
+  /** Show where this asset’s bytes are: the store, this machine’s binding, the item, the file. */
+  onWhere: (asset: string) => void;
 }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -29,7 +31,7 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
  * An asset, opened through its pointer: what state its file on the server's disk is in, a preview
  * of it where a browser can show one, pull and push, and the versions of its pointer.
  */
-export function AssetPane({ pointer, link, hub, author, onAction, onOpenFolder, onPathChange }: Props) {
+export function AssetPane({ pointer, link, hub, author, onAction, onOpenFolder, onPathChange, onWhere }: Props) {
   const toast = useToast();
   const now = useNow(30_000);
   const asset = assetPath(pointer);
@@ -253,6 +255,14 @@ export function AssetPane({ pointer, link, hub, author, onAction, onOpenFolder, 
                 Download
               </a>
             )}
+            <button
+              type="button"
+              className="btn btn-ghost btn-small"
+              onClick={() => onWhere(asset)}
+              title="Where its bytes are: the store, this machine’s binding, the item, the file"
+            >
+              Where?
+            </button>
             <button
               type="button"
               className="btn btn-ghost btn-small"

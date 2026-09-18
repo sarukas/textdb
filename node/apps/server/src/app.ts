@@ -361,6 +361,37 @@ export function createApp(corpora: Corpora, hub: ChangeHub, options: AppOptions)
     const service = assetService(assets);
     return c.json(await service.push(bodyString(body, 'prefix'), bodyPaths(body), bodyOptionalString(body, 'message'), bodyOptionalString(body, 'author')));
   });
+  // The asset stores this textdb store declares: the owner's to change, and it is the store that
+  // says so. A binding is this server's own machine and needs nothing of the store.
+  app.get('/api/assets/stores', async (c) => c.json(await assetService(assets).stores(bearerOf(c))));
+  app.post('/api/assets/stores', async (c) => {
+    const body = await jsonBody(c);
+    const service = assetService(assets);
+    await service.putStore(bodyString(body, 'name'), bodyOptionalString(body, 'driver') ?? 'local', bodyString(body, 'root'), bearerOf(c));
+    return c.json({ stores: await service.stores(bearerOf(c)) });
+  });
+  app.post('/api/assets/stores/remove', async (c) => {
+    const body = await jsonBody(c);
+    const service = assetService(assets);
+    await service.removeStore(bodyString(body, 'name'), bearerOf(c));
+    return c.json({ stores: await service.stores(bearerOf(c)) });
+  });
+  app.post('/api/assets/stores/bind', async (c) => {
+    ownerOnly(c, 'binding an asset store to this machine');
+    const body = await jsonBody(c);
+    const service = assetService(assets);
+    await service.bindStore(bodyString(body, 'name'), bodyOptionalString(body, 'location') ?? '');
+    return c.json({ stores: await service.stores() });
+  });
+  app.post('/api/assets/relocate', async (c) => {
+    ownerOnly(c, 'moving the files of assets in their store');
+    const body = await jsonBody(c);
+    return c.json(await assetService(assets).relocate(bodyString(body, 'prefix'), bodyPaths(body), bodyOptionalString(body, 'author')));
+  });
+  app.get('/api/assets/verify', async (c) => {
+    ownerOnly(c, 'verifying the assets of a synced directory');
+    return c.json(await assetService(assets).verify(queryString(c, 'prefix'), c.req.query('path') || undefined));
+  });
   app.get('/api/assets/file', async (c) => {
     ownerOnly(c, 'the file of an asset on this server');
     // Hono answers HEAD through this handler and drops the body: no file is opened for one.

@@ -177,3 +177,139 @@ describe('assets of a synced folder', { skip: cli ? false : 'the textdb CLI is n
     assert.deepEqual(Buffer.from(await (await fetch(fileUrl('/notes/img/pic.png'))).arrayBuffer()), png);
   });
 });
+
+/**
+ * The asset stores themselves, over HTTP.
+ *
+ * A store is declared once for everyone -- name, driver, and the root they all know it by -- and
+ * *bound* on each machine to where that machine reaches it. The web app configures both, so the
+ * server has to keep them apart: the declaration goes to the textdb store, the binding to this
+ * server's own config file. The refusals are the store's, and arrive as codes rather than as
+ * this server's opinion.
+ */
+describe('asset stores over HTTP', { skip: cli ? false : 'the textdb CLI is not built (or set TEXTDB_CLI)' }, () => {
+  let tmp: ReturnType<typeof tempDir>;
+  let server: RunningServer;
+  let notes: string;
+  let bucket: string;
+  const previousConfig = process.env.TEXTDB_CONFIG_DIR;
+  const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 4, 5, 6]);
+
+  async function call(method: string, route: string, body?: unknown) {
+    const res = await fetch(`${server.url}${route}`, {
+      method,
+      headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: res.status, body: (await res.json()) as Record<string, any> };
+  }
+
+  before(async () => {
+    tmp = tempDir();
+    process.env.TEXTDB_CONFIG_DIR = path.join(tmp.dir, 'config');
+    notes = path.join(tmp.dir, 'notes');
+    bucket = path.join(tmp.dir, 'bucket');
+    mkdirSync(path.join(notes, 'img'), { recursive: true });
+    mkdirSync(bucket);
+    writeFileSync(path.join(notes, 'img', 'pic.png'), png);
+    server = await startServer({
+      store: path.join(tmp.dir, 'kb.db'),
+      port: 0,
+      webDist: path.join(tmp.dir, 'web'),
+      pingMs: 100,
+      watchIntervalMs: 20,
+      sync: [{ prefix: '/notes', dir: notes }],
+      cli: cli ?? undefined,
+    });
+  });
+
+  after(async () => {
+    await server.close();
+    tmp.remove();
+    if (previousConfig === undefined) delete process.env.TEXTDB_CONFIG_DIR;
+    else process.env.TEXTDB_CONFIG_DIR = previousConfig;
+  });
+
+  test('declared for everyone, bound for this machine, and not removed while in use', async () => {
+    assert.deepEqual((await call('GET', '/api/assets/stores')).body, []);
+
+    // Declared: the root is what every machine knows it by.
+    const added = await call('POST', '/api/assets/stores', { name: 'team', driver: 'local', root: bucket });
+    assert.equal(added.status, 200, JSON.stringify(added.body));
+    assert.deepEqual(
+      added.body.stores.map((s: Record<string, unknown>) => [s.name, s.driver, s.root, s.bound_to, s.reachable]),
+      [['team', 'local', bucket, null, true]],
+    );
+
+    // Bound: where *this* machine reaches it, which is this server's own configuration and not the
+    // store's -- so nothing about the declaration moves.
+    const elsewhere = path.join(tmp.dir, 'mounted');
+    mkdirSync(elsewhere);
+    const bound = await call('POST', '/api/assets/stores/bind', { name: 'team', location: elsewhere });
+    assert.equal(bound.status, 200, JSON.stringify(bound.body));
+    assert.deepEqual(
+      bound.body.stores.map((s: Record<string, unknown>) => [s.root, s.bound_to, s.reachable]),
+      [[bucket, elsewhere, true]],
+    );
+    assert.ok(typeof bound.body.stores[0].bound_by === 'string', 'the binding says which file it came from');
+
+    // A binding this machine cannot follow is a fact about this machine: reported, not an error.
+    const broken = await call('POST', '/api/assets/stores/bind', { name: 'team', location: path.join(tmp.dir, 'no-such-mount') });
+    assert.equal(broken.status, 200, JSON.stringify(broken.body));
+    assert.equal(broken.body.stores[0].reachable, false);
+    assert.ok(broken.body.stores[0].problem, 'and says what is wrong with it');
+
+    // Cleared, and the store is reachable at its root again.
+    const cleared = await call('POST', '/api/assets/stores/bind', { name: 'team', location: '' });
+    assert.deepEqual(
+      cleared.body.stores.map((s: Record<string, unknown>) => [s.bound_to, s.reachable]),
+      [[null, true]],
+    );
+
+    // With bytes in it, removing the store is refused: the files would have to move with it.
+    assert.equal((await call('POST', '/api/sync', { prefix: '/notes' })).status, 200);
+    const pushed = await call('POST', '/api/assets/push', { prefix: '/notes', author: 'web' });
+    assert.equal(pushed.status, 200, JSON.stringify(pushed.body));
+    assert.equal(pushed.body.pushed.length, 1);
+    const refused = await call('POST', '/api/assets/stores/remove', { name: 'team' });
+    assert.equal(refused.status, 400, JSON.stringify(refused.body));
+    assert.equal(refused.body.code, 'TX004');
+    assert.match(refused.body.message, /1 pointer names its files/);
+    // And it is still there, unchanged.
+    assert.deepEqual((await call('GET', '/api/assets/stores')).body.map((s: { name: string }) => s.name), ['team']);
+  });
+
+  test('verify answers both sides of every asset, and the store’s files no pointer names', async () => {
+    const verified = await call('GET', '/api/assets/verify?prefix=/notes');
+    assert.equal(verified.status, 200, JSON.stringify(verified.body));
+    assert.equal(verified.body.problems, 0);
+    assert.deepEqual(
+      verified.body.assets.map((a: Record<string, unknown>) => [a.path, a.here, a.asset_store]),
+      [['/notes/img/pic.png', 'ok', 'ok']],
+    );
+    assert.deepEqual(verified.body.unnamed, []);
+
+    // A file somebody put in the store by hand. Told of, never counted as a problem -- whose bytes
+    // those are is not textdb's to decide -- and only for a whole vault, which is why a verify of
+    // the folder passes no scope at all.
+    writeFileSync(path.join(bucket, 'notes', 'stray.png'), png);
+    const loose = await call('GET', '/api/assets/verify?prefix=/notes');
+    assert.deepEqual(
+      loose.body.unnamed.map((u: Record<string, unknown>) => [u.store, u.at]),
+      [['team', '/notes/stray.png']],
+    );
+    assert.equal(loose.body.problems, 0);
+
+    // One asset's own check is one asset's: the drive is not listed for it.
+    const one = await call('GET', `/api/assets/verify?prefix=/notes&path=${encodeURIComponent('/notes/img/pic.png')}`);
+    assert.equal(one.body.assets.length, 1);
+    assert.deepEqual(one.body.unnamed, []);
+
+    // Relocate answers a report of what it moved. Nothing here: a store that keeps its files by
+    // path holds them where the pointer says, and it is a store with ids of its own -- a drive --
+    // whose files stay put when an asset moves.
+    const relocated = await call('POST', '/api/assets/relocate', { prefix: '/notes', author: 'web' });
+    assert.equal(relocated.status, 200, JSON.stringify(relocated.body));
+    assert.deepEqual([relocated.body.moved, relocated.body.failed], [[], []]);
+  });
+});

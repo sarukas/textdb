@@ -14,6 +14,8 @@ interface Props {
   who: Whoami | null;
   onWho: (who: Whoami | null) => void;
   onAccess: () => void;
+  /** Open the assets panel: the stores, and where every asset’s bytes are. */
+  onAssets: () => void;
 }
 
 const STATE_LABEL: Record<ConnectionState, string> = {
@@ -22,7 +24,7 @@ const STATE_LABEL: Record<ConnectionState, string> = {
   offline: "Offline",
 };
 
-export function Header({ info, connection, lastSeq, author, onAuthor, onImport, who, onWho, onAccess }: Props) {
+export function Header({ info, connection, lastSeq, author, onAuthor, onImport, who, onWho, onAccess, onAssets }: Props) {
   const db = info?.db ?? "";
   return (
     <header className="header">
@@ -58,6 +60,9 @@ export function Header({ info, connection, lastSeq, author, onAuthor, onImport, 
       </div>
       <button type="button" className="btn btn-small import-button" onClick={onImport}>
         Import folder…
+      </button>
+      <button type="button" className="btn btn-small" onClick={onAssets} title="Asset stores, and where every asset’s bytes actually are">
+        Assets…
       </button>
       <SessionMenu who={who} onChange={onWho} onAccess={onAccess} />
       <label className="author-field">
