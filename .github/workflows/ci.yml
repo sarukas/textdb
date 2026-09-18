@@ -82,6 +82,12 @@ jobs:
       - run: cargo test --release -p textdb-cli --test cli_pg
         env:
           TEXTDB_TEST_PG: postgres://ci:ci@localhost:5432/postgres
+      # The delegated-access catalogue (#12), which runs on both engines: SQLite always, and
+      # Postgres because TEXTDB_TEST_PG is set -- L5 of the catalogue requires both, and this is
+      # the only job with the extension installed. Behind a feature, so it needs asking for.
+      - run: cargo test --release -p textdb-cli --features access-tests --test access
+        env:
+          TEXTDB_TEST_PG: postgres://ci:ci@localhost:5432/postgres
       # A crashed backend shows only as a closed connection in the tests; the server log says which
       # statement it was running.
       - if: failure()
