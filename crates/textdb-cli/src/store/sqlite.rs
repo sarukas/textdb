@@ -170,6 +170,37 @@ fn version(v: i64) -> u64 {
 }
 
 impl SqliteStore {
+    /// What every pointer this store holds names: `(store, location key)` and the key of the asset
+    /// it belongs to, with the pointers this build could not read counted rather than guessed at.
+    ///
+    /// No visibility predicate and no translation into the caller's paths: whose bytes a store's
+    /// files are is a question about bytes every account of the store shares, and an answer from
+    /// one account's view has it taking away another's. What is read here stays here -- the callers
+    /// above return counts and yes-or-no, never a path.
+    fn every_pointer_names(&self) -> Result<(Vec<((String, String), String)>, usize)> {
+        use crate::assets::pointer::{asset_path, SUFFIX};
+        use crate::assets::{location_key, pointer_names};
+        let like = format!("%{SUFFIX}");
+        let paths: Vec<String> = self
+            .conn
+            .prepare_cached(&format!("SELECT path FROM {DEFAULT_PREFIX}node WHERE deleted_at IS NULL AND kind = 1 AND path LIKE ?1"))
+            .map_err(sql)?
+            .query_map(rusqlite::params![like], |r| r.get(0))
+            .map_err(sql)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql)?;
+        let raw = TextDb::attach(&self.conn, DEFAULT_PREFIX, true).with_path_history(self.path_history);
+        let (mut out, mut unreadable) = (Vec::new(), 0);
+        for path in paths {
+            let text = raw.read(&path).ok().and_then(|b| String::from_utf8(b).ok());
+            match text.as_deref().and_then(|t| pointer_names(&path, t)) {
+                None => unreadable += 1,
+                Some(names) => out.push((names, location_key(asset_path(&path)))),
+            }
+        }
+        Ok((out, unreadable))
+    }
+
     pub fn open(path: &str) -> Result<Self> {
         let conn = textdb_sqlite::open(path).map_err(sql)?;
         // The virtual table is what the Python and Node clients query, and creating it lays
@@ -1005,39 +1036,24 @@ impl Store for SqliteStore {
     }
 
     fn asset_item_users(&mut self, store: &str, location: &str, own: &str) -> Result<Option<crate::store::ItemUsers>> {
-        use crate::assets::pointer::{asset_path, SUFFIX};
-        use crate::assets::{location_key, pointer_names};
-        // Every pointer this store holds, with no visibility predicate and no translation into the
-        // caller's paths: whether a provider's bytes are still needed is a question about bytes
-        // every account of the store shares, and an answer from one account's view has it taking
-        // away another's. Counts are all that leaves: the paths read here stay here.
+        use crate::assets::location_key;
         let want = (store.to_string(), location_key(location));
         // `own` is already the owner's path, as the paths read below are: the assets it is
         // compared with are the store's own, not a view's.
         let mine = location_key(own);
-        let like = format!("%{SUFFIX}");
-        let paths: Vec<String> = self
-            .conn
-            .prepare_cached(&format!("SELECT path FROM {DEFAULT_PREFIX}node WHERE deleted_at IS NULL AND kind = 1 AND path LIKE ?1"))
-            .map_err(sql)?
-            .query_map(rusqlite::params![like], |r| r.get(0))
-            .map_err(sql)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(sql)?;
-        // Attached without the view this connection reads through, since those paths are the
-        // store's own and reading them as the caller would find nothing.
-        let raw = TextDb::attach(&self.conn, DEFAULT_PREFIX, true).with_path_history(self.path_history);
-        let (mut others, mut unreadable) = (0, 0);
-        for path in paths {
-            let text = raw.read(&path).ok().and_then(|b| String::from_utf8(b).ok());
-            match text.as_deref().and_then(|t| pointer_names(&path, t)) {
-                None => unreadable += 1,
-                Some(names) if names == want && location_key(asset_path(&path)) != mine => others += 1,
-                Some(_) => {}
-            }
-        }
+        let (all, unreadable) = self.every_pointer_names()?;
+        let others = all.iter().filter(|(names, asset)| *names == want && *asset != mine).count();
         Ok(Some(crate::store::ItemUsers { others, unreadable }))
     }
+
+    fn asset_items_named(&mut self, store: &str, locations: &[String]) -> Result<Option<crate::store::ItemsNamed>> {
+        use crate::assets::location_key;
+        let (all, unreadable) = self.every_pointer_names()?;
+        let named: std::collections::HashSet<(String, String)> = all.into_iter().map(|(names, _)| names).collect();
+        let answers = locations.iter().map(|l| named.contains(&(store.to_string(), location_key(l)))).collect();
+        Ok(Some(crate::store::ItemsNamed { named: answers, unreadable }))
+    }
+
 
     fn file_heads(&mut self, prefix: &str) -> Result<Vec<FileHead>> {
         use rusqlite::types::Value;

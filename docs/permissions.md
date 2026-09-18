@@ -63,9 +63,13 @@ an owner's connection, which is what the CLI has, reads the table whole. Either 
 path is translated out of the caller's namespace before it is compared, or an account's own pointer
 counts as a stranger's and its bytes are never its own to replace.
 
-Two things stay conservative for an account, deliberately: `verify` does not list a store's unnamed
-files (that needs the set-shaped question, not a count for one location), and a Postgres connection
-under an enforced policy is told "cannot tell", so it keeps the bytes.
+`verify` asks the set-shaped form of the same question, `Store::asset_items_named`: which of the
+places a store holds any pointer names, over all of them, yes or no and nothing else. So an account
+is told what its store holds that nothing needs, without a file another account's pointer names
+being called unnamed -- M13.
+
+One thing stays conservative, deliberately: a Postgres connection under an enforced policy is told
+"cannot tell", and then nothing is taken away and nothing is called unneeded.
 
 ### 2. What a push records is the owner's path
 
@@ -131,9 +135,9 @@ or change those rows at all is not currently stated anywhere, and should be.
 
 1. ~~Refuse the unsafe decisions on a token session.~~ **Done**, and still what happens wherever
    the store cannot answer the question below.
-2. ~~Add the store-answered question.~~ **Done**: `Store::asset_item_users`, with M11 in the
-   access catalogue covering two accounts naming one file. One gap remains: `verify`'s unnamed
-   listing wants the set-shaped version of the same question.
+2. ~~Add the store-answered question.~~ **Done**, in both shapes: `Store::asset_item_users` for
+   one place (M11, two accounts naming one file) and `Store::asset_items_named` for a store's
+   whole listing (M13, `verify` telling an account what nothing needs).
 3. ~~Bind a pointer's item to what the account may name.~~ **Done** for items that are paths,
    which is every store but a drive: `Store::may_name`, refused in pull, push and verify, with M12
    covering it. A drive's ids are bounded by the store root only, as before.

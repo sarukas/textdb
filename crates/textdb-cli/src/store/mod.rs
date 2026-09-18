@@ -684,6 +684,16 @@ pub struct ItemUsers {
     pub unreadable: usize,
 }
 
+/// Which places in an asset store some pointer names, and how many pointers could not be read.
+#[derive(Debug, Clone)]
+pub struct ItemsNamed {
+    /// One answer per location asked about, in the order they were given.
+    pub named: Vec<bool>,
+    /// Pointers this build could not read at all, so what their bytes are for is not known and
+    /// nothing should be called unnamed on the strength of this.
+    pub unreadable: usize,
+}
+
 pub trait Store {
     // ------------------------------------------------------------ accounts, tokens and shares
     //
@@ -912,6 +922,17 @@ pub trait Store {
     /// back as it was given. Asked for a vault at a time, since a store may answer over a network.
     fn owner_paths(&mut self, paths: &[String]) -> Result<Vec<String>> {
         Ok(paths.to_vec())
+    }
+
+    /// Which of `locations` in the asset store `store` any pointer names, in the order given and
+    /// over every pointer the store holds rather than the caller's view.
+    ///
+    /// The set-shaped form of `asset_item_users`, for saying which of a store's files nothing needs
+    /// any more: from a view, files another account's pointers name would read as named by nothing,
+    /// and that list is acted on by hand in somebody's drive. `None` where the store cannot answer
+    /// without the caller's view.
+    fn asset_items_named(&mut self, _store: &str, _locations: &[String]) -> Result<Option<ItemsNamed>> {
+        Ok(None)
     }
 
     /// Whether `location` -- a place in an asset store, which is laid out in the owner's paths --

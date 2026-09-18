@@ -2078,12 +2078,6 @@ pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
         // read as "nothing needs these bytes", and someone acts on it by hand in their own drive.
         let named = match in_use.refresh(st) {
             Err(e) => Err(format!("the store's pointers could not be read ({})", e.message)),
-            // The reason `keeps` gives, for the same cause: an account sees its own pointers, so
-            // files another account's pointers name would be listed here as named by nothing -- and
-            // this list is acted on by hand, in somebody's drive.
-            Ok(()) if in_use.delegated.unwrap_or(true) => Err(
-                "this session is an account's, which sees only its own pointers, so what no pointer names cannot be told from here".to_string(),
-            ),
             Ok(()) => {
                 let mut unreadable: Vec<&str> = in_use.pointers.iter().filter(|(_, (_, names))| names.is_none()).map(|(p, _)| p.as_str()).collect();
                 unreadable.sort();
@@ -2104,31 +2098,54 @@ pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
                 }
             }
         };
+        // An account sees its own pointers and no others, so it asks the store, which sees them all
+        // and answers yes or no about the places asked after -- never which asset needs them.
+        let delegated = in_use.delegated.unwrap_or(true);
         let stores: BTreeSet<String> = found.iter().filter_map(|i| i.pointer.as_ref().map(|p| p.store.clone())).collect();
         for store in stores {
-            let listed = match &named {
-                // Said of the store itself: it is why none of its files are spoken for here.
-                Err(why) => Err(StoreError::other(why.clone())),
-                Ok(_) => match drivers.get(&store) {
-                    Ok(d) => d.files(),
-                    Err(e) => Err(StoreError::other(e)),
-                },
+            let files = match drivers.get(&store).map_err(StoreError::other).and_then(|d| d.files()) {
+                Ok(Some(files)) => files,
+                Ok(None) => continue,
+                Err(e) => {
+                    unnamed.push(json!({ "store": store, "unchecked": e.message }));
+                    continue;
+                }
             };
-            match (listed, &named) {
-                (Ok(Some(files)), Ok(named)) => unnamed.extend(
-                    files
-                        .into_iter()
-                        .filter(|(item, at)| {
-                            !named.contains(&(store.clone(), location_key(item))) && !named.contains(&(store.clone(), location_key(at)))
-                        })
-                        .map(|(_, at)| json!({ "store": store, "at": at })),
+            // A pointer an earlier build wrote names its file by the path it sits at, one pushed
+            // since by the id the drive keeps it under: a file is named when either says so, or
+            // every asset not pushed again since would read as named by nothing.
+            let says: std::result::Result<Vec<bool>, String> = match (delegated, &named) {
+                (false, Err(why)) => Err(why.clone()),
+                (false, Ok(named)) => Ok(files
+                    .iter()
+                    .map(|(item, at)| {
+                        named.contains(&(store.clone(), location_key(item))) || named.contains(&(store.clone(), location_key(at)))
+                    })
+                    .collect()),
+                (true, _) => {
+                    let asked: Vec<String> = files.iter().flat_map(|(item, at)| [item.clone(), at.clone()]).collect();
+                    match st.asset_items_named(&store, &asked) {
+                        Err(e) => Err(e.message),
+                        Ok(None) => Err("this session is an account's, and this store cannot say what its pointers name".to_string()),
+                        Ok(Some(a)) if a.unreadable > 0 => Err(match a.unreadable {
+                            1 => "a pointer in the store cannot be read, so what the store's files are for is not known".to_string(),
+                            n => format!("{n} pointers in the store cannot be read, so what the store's files are for is not known"),
+                        }),
+                        // Two places asked of each file, its item and its path, so a pair is a file.
+                        Ok(Some(a)) => Ok(a.named.chunks(2).map(|pair| pair.iter().any(|named| *named)).collect()),
+                    }
+                }
+            };
+            match says {
+                Err(why) => unnamed.push(json!({ "store": store, "unchecked": why })),
+                Ok(flags) => unnamed.extend(
+                    files.into_iter().zip(flags).filter(|(_, named)| !named).map(|((_, at), _)| json!({ "store": store, "at": at })),
                 ),
-                (Ok(_), _) => {}
-                (Err(e), _) => unnamed.push(json!({ "store": store, "unchecked": e.message })),
             }
         }
     }
     if json {
+
         emit_json(&json!({ "prefix": v.prefix, "dir": v.dir.display().to_string(), "assets": rows, "unnamed": unnamed, "problems": problems }))?;
     } else {
         let mut s = format!("verified {} assets of {} in {}\n", rows.len(), v.prefix, v.dir.display());

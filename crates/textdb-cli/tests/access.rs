@@ -2106,7 +2106,7 @@ fn l_the_catalogue_runs_on_both_engines() {
 // happens.
 
 /// The working-loop rows, kept separate from `CATALOGUE` so neither list pretends to be the other.
-const EXTRA: &[&str] = &["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M12"];
+const EXTRA: &[&str] = &["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M12", "M13"];
 
 /// Two checkouts of one `rw` share, one per account: accounts-agent sees it at `contracts/`,
 /// contracts-agent is single-root and sees it at `/`. The pair every M row works with.
@@ -2582,5 +2582,49 @@ fn m_a_pointer_cannot_fetch_bytes_from_a_folder_the_account_was_not_granted() {
         std::fs::remove_file(o.join("hr/secret.png")).unwrap();
         ok(f.as_("admin").args(["assets", "pull", "--dir"]).arg(&o), None);
         assert_eq!(std::fs::read(o.join("hr/secret.png")).unwrap(), [137u8, 80, 78, 71, 0, 9], "M12: the owner was refused its own bytes");
+    });
+}
+
+/// M13: what a store holds that nothing needs, told to an account. Its own view holds one pointer
+/// of the store's several, so answering from it would call another account's file unnamed -- and
+/// that list is acted on by hand, in somebody's drive. The store answers instead, over every
+/// pointer it holds, and says only yes or no about the places asked after.
+#[test]
+fn m_an_account_is_told_what_a_store_holds_that_no_pointer_names() {
+    scenarios!("M13");
+    on_each_engine(|f| {
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket).unwrap();
+        ok(f.as_("admin").args(["assets", "stores", "--add", "bucket", "--driver", "local", "--root"]).arg(&bucket), None);
+
+        // An asset of a folder granted to nobody: named by a pointer this account cannot see.
+        let o = tmp.path().join("o");
+        ok(f.as_("admin").args(["sync", "/"]).arg(&o), None);
+        std::fs::create_dir_all(o.join("hr")).unwrap();
+        std::fs::write(o.join("hr/secret.png"), [137u8, 80, 78, 71, 0, 9]).unwrap();
+        ok(f.as_("admin").args(["sync", "/"]).arg(&o), None);
+        ok(f.as_("admin").args(["assets", "push", "--dir"]).arg(&o), None);
+
+        // The account's own asset, and a file somebody dropped in the store that nothing names.
+        let a = tmp.path().join("a");
+        ok(f.as_("accounts-agent").args(["sync", "/"]).arg(&a), None);
+        std::fs::write(a.join("contracts/x.png"), [137u8, 80, 78, 71, 0, 1]).unwrap();
+        ok(f.as_("accounts-agent").args(["sync", "/"]).arg(&a), None);
+        ok(f.as_("accounts-agent").args(["assets", "push", "--dir"]).arg(&a), None);
+        std::fs::write(bucket.join("loose.png"), [137u8, 80, 78, 71, 0, 7]).unwrap();
+
+        let seen = ok(f.as_("accounts-agent").args(["--json", "assets", "verify", "--dir"]).arg(&a), None).json();
+        let unnamed: Vec<String> =
+            seen["unnamed"].as_array().unwrap().iter().filter_map(|u| u["at"].as_str().map(str::to_string)).collect();
+        assert_eq!(unnamed, vec!["/loose.png".to_string()], "M13: {seen}");
+        // Not a problem of textdb's to count: whose files those are is not for it to decide.
+        assert_eq!(seen["problems"], 0, "M13: {seen}");
+        // Said plainly, since this is the failure that matters: the file of a pointer outside this
+        // account's view is spoken for, and a reader acting on this list must not remove it.
+        assert!(
+            !seen["unnamed"].to_string().contains("secret"),
+            "M13: a file named by a pointer outside the account's view was listed as needed by nothing: {seen}"
+        );
     });
 }
