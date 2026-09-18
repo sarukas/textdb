@@ -26,6 +26,10 @@ const STATE_LABEL: Record<ConnectionState, string> = {
 
 export function Header({ info, connection, lastSeq, author, onAuthor, onImport, who, onWho, onAccess, onAssets }: Props) {
   const db = info?.db ?? "";
+  // The folder the store file is in. Which vault this is, is not the file's name -- every one of
+  // them is `kb.db` -- it is where it sits, and a Postgres store sits in no folder at all.
+  const cut = Math.max(db.lastIndexOf("/"), db.lastIndexOf("\\"));
+  const dir = info?.backend === "sqlite" && cut > 0 ? db.slice(0, cut) : null;
   return (
     <header className="header">
       <div className="brand">
@@ -55,6 +59,16 @@ export function Header({ info, connection, lastSeq, author, onAuthor, onImport, 
             <span title={`This store is ${info.backend}`} className="store-backend">
               {info.backend}
             </span>
+            {dir && (
+              <>
+                <span className="sep" aria-hidden="true" />
+                {/* Clipped at the front, because the end of a path is the part that says which
+                    vault this is; the whole of it is in the tooltip and selects as one piece. */}
+                <span className="store-dir" title={db} aria-label={`Folder: ${dir}`}>
+                  <bdi>{dir}</bdi>
+                </span>
+              </>
+            )}
           </>
         )}
       </div>

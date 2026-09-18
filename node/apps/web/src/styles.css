@@ -350,6 +350,16 @@ kbd {
   text-overflow: ellipsis;
   max-width: 24ch;
 }
+/* The folder the store sits in. `direction: rtl` puts the ellipsis at the *start*, so what survives
+   on a narrow window is the end of the path -- the folder someone recognises -- and the `<bdi>`
+   inside keeps the path itself reading left to right. */
+.store-dir {
+  direction: rtl;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 34ch;
+  min-width: 6ch;
+}
 .sep {
   width: 1px;
   height: 14px;

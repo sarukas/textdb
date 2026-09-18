@@ -3081,6 +3081,37 @@ fn a_synced_directory_remembers_its_store_and_folder() {
     assert!(config.contains("prefix = \"/docs\""), "{config}");
     assert!(config.contains("id = \""), "{config}");
 
+    // And anything else can ask what this directory is paired with, without running a sync and
+    // without reading `.textdb/config` itself: that file is this CLI's to change, and the web
+    // server starts on a synced directory by asking here.
+    let mut asked = Command::new(env!("CARGO_BIN_EXE_textdb"));
+    asked
+        .current_dir(dir.join("notes/deep"))
+        .env_remove("TEXTDB_STORE")
+        .env("TEXTDB_CONFIG_DIR", tmp.path().join("config"))
+        .args(["--json", "config"]);
+    let paired = ok(&mut asked, None).json();
+    assert_eq!(paired["directory"]["prefix"], "/docs", "{paired}");
+    let said_dir = paired["directory"]["dir"].as_str().unwrap_or_default();
+    let said_store = paired["directory"]["store"].as_str().unwrap_or_default();
+    // The directory itself, not the one the command ran in; both spelled without Windows'
+    // verbatim `\?\` prefix, which nothing else on either side of this wants to be handed.
+    let real = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+    assert_eq!(real(said_dir), real(&dir.display().to_string()), "{paired}");
+    assert_eq!(real(said_store), real(&db.display().to_string()), "{paired}");
+    assert!(!said_dir.starts_with(r"\?\") && !said_store.starts_with(r"\?\"), "{paired}");
+    assert!(paired["directory"]["account"].is_null(), "{paired}");
+
+    // Outside a synced tree there is no pairing to report, and that is an answer rather than a
+    // failure: the same question, asked where nothing was synced.
+    let mut elsewhere = Command::new(env!("CARGO_BIN_EXE_textdb"));
+    elsewhere
+        .current_dir(tmp.path())
+        .env_remove("TEXTDB_STORE")
+        .env("TEXTDB_CONFIG_DIR", tmp.path().join("config"))
+        .args(["--json", "config"]);
+    assert!(ok(&mut elsewhere, None).json()["directory"].is_null());
+
     // No arguments at all, three levels down: the pairing supplies the folder, the directory and
     // the store, so `-s` is not needed either.
     let mut bare = Command::new(env!("CARGO_BIN_EXE_textdb"));

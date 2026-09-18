@@ -54,12 +54,21 @@ export function findCli(explicit?: string | null): string | null {
   return null;
 }
 
-/** One run, with its exit status: a non-zero status is an answer here, not a throw. */
-export function runCli(cli: string, args: string[]): Promise<{ stdout: string; stderr: string; status: number }> {
+/**
+ * One run, with its exit status: a non-zero status is an answer here, not a throw.
+ *
+ * `cwd` matters for the commands that read the directory they are run in -- `sync` and `config`,
+ * which answer for the directory's own pairing with a folder of a store.
+ */
+export function runCli(
+  cli: string,
+  args: string[],
+  options: { cwd?: string } = {},
+): Promise<{ stdout: string; stderr: string; status: number }> {
   const env = { ...process.env };
   for (const name of FROM_ARGUMENTS) delete env[name];
   return new Promise((resolve, reject) => {
-    execFile(cli, args, { env, maxBuffer: 256 * 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
+    execFile(cli, args, { env, cwd: options.cwd, maxBuffer: 256 * 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
       const code = (error as { code?: unknown } | null)?.code;
       if (error && typeof code !== 'number') return reject(error);
       resolve({ stdout, stderr, status: typeof code === 'number' ? code : 0 });

@@ -59,6 +59,23 @@ directory (`crates/textdb-sqlite-ext/target/release/`), which is where the serve
 
 ## Start
 
+### On a directory you synced
+
+`textdb sync` pairs a directory with a folder of a store and records it in its `.textdb/config`, so
+everything the server needs is already on disk. One command reads that pairing and starts on it:
+
+```sh
+cd node/apps/server
+npm run open -- /path/to/vault          # or `npm run open -- .` from inside it
+```
+
+It prints the directory, the folder and store it is paired with, and the URL of that folder's page,
+and opens a browser there (`--no-browser` to skip, `PORT=…` for another port). The pairing comes
+from `textdb config --json`, which reports it for the directory it is run in — nothing here parses
+`.textdb/config`, which is the CLI's file to change.
+
+### On a store
+
 ```sh
 cd node/apps/server
 TEXTDB_DB=/data/kb.db npm start          # textdb server listening on http://127.0.0.1:4317 (store /data/kb.db)
@@ -104,6 +121,7 @@ the web app, the CLI, SQL:
 |---|---|
 | `npm start` | Run the server |
 | `npm run dev` | Run it with `--watch`: restarts when the server's source changes |
+| `npm run open -- DIR [--no-browser]` | Start on a synced directory, working out its store and folder from its own `.textdb/config` (via `textdb config --json`), and open the browser on that folder |
 | `npm run seed -- --db kb.db --files 2000 [--seed 1] [--batch 250]` | Write a deterministic synthetic markdown corpus (areas like `guides/`, `runbooks/`, `teams/`; frontmatter, headings, lists, code) in transactions of `--batch` files |
 | `npm run agent-sim -- --db kb.db --path /guides/intro.md [--interval 1500] [--author agent-sim]` | A simulated agent in a separate process: every `--interval` ms it reads the file and edits a line against the version it read, so you can watch remote edits land |
 | `npm test` · `npm run typecheck` | Tests (a real server on a temporary store) · type check |

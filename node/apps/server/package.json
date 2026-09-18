@@ -10,6 +10,7 @@
   "scripts": {
     "start": "node --no-warnings --import tsx src/main.ts",
     "dev": "node --no-warnings --import tsx --watch src/main.ts",
+    "open": "node --no-warnings --import tsx scripts/open.ts",
     "seed": "node --no-warnings --import tsx scripts/seed.ts",
     "agent-sim": "node --no-warnings --import tsx scripts/agent-sim.ts",
     "test": "node --no-warnings --import tsx --test \"test/*.test.ts\"",

@@ -2777,17 +2777,39 @@ fn show_config(cli: &Cli, matches: &ArgMatches) -> Result<()> {
         Some(on) => (if on { "on" } else { "off" }, source("path_history")),
         None => ("the store's path_history setting (on unless turned off)", "default"),
     };
+    // What this *directory* is paired with, when it is inside a synced tree. `textdb sync` on its
+    // own reads it to know what to sync with what; saying it here is how anything else -- the web
+    // server, a hook, a script -- asks the same question without running a sync and without
+    // parsing `.textdb/config`, which is this CLI's file to change.
+    let paired = std::env::current_dir().ok().and_then(|here| root::Config::find(&here)).map(|(root, c)| {
+        // Spelled as anything else would spell them: `sync::dir_key` drops Windows' verbatim
+        // `\\?\` prefix, which is what canonicalising a path here hands back and what no other
+        // tool wants to be given.
+        let store = match config::parse_store(&c.store_for(&root)) {
+            config::StoreUrl::Sqlite(path) => sync::dir_key(std::path::Path::new(&path)),
+            config::StoreUrl::Postgres(_) => config::redact(&c.store_for(&root)),
+        };
+        (sync::dir_key(&root), c.prefix.clone(), store, c.account.clone())
+    });
     if cli.json {
         return emit_json(&json!({
             "store": { "value": store, "source": source("store"), "backend": backend },
             "author": { "value": cli.author, "source": source("author") },
             "path_history": { "value": cli.path_history, "source": path_history_source },
+            "directory": paired.as_ref().map(|(dir, prefix, store, account)| json!({
+                "dir": dir, "prefix": prefix, "store": store, "account": account,
+            })),
         }));
     }
-    line(format!(
+    let mut text = format!(
         "store         {store}  [{}] -> {backend}\nauthor        {}  [{}]\npath history  {path_history}  [{path_history_source}]",
         source("store"),
         cli.author,
         source("author")
-    ))
+    );
+    if let Some((dir, prefix, store, account)) = &paired {
+        let whose = account.as_deref().map(|a| format!(" as {a}")).unwrap_or_default();
+        text.push_str(&format!("\ndirectory     {dir}  ->  {prefix} in {store}{whose}  [.textdb/config]"));
+    }
+    line(text)
 }

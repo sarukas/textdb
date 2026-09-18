@@ -61,6 +61,7 @@ environment and its own author name, and the instructions in
    export MSYS_NO_PATHCONV=1                       # Git Bash on Windows only
    export PATH=/path/to/textdb/target/release:$PATH
    textdb config                                   # prints store, author and path history, and where each came from
+                                                   # and, inside a synced directory, the folder and store it is paired with
    ```
 
    Windows `cmd` (a `set` value takes no quotes; the setting lasts for that window):
@@ -345,6 +346,14 @@ git -C ~/src/handbook pull                     # the checkout moves on: files ad
 textdb sync /handbook ~/src/handbook --dry-run # what would change on each side
 textdb sync /handbook ~/src/handbook --commit  # carry changes both ways, commit what landed on disk
 git -C ~/src/handbook push
+```
+
+**To see what you synced**, the directory already knows which folder of which store it is paired
+with, so the web app needs no configuration of its own:
+
+```sh
+cd node/apps/server && npm run open -- ~/src/handbook   # opens that folder's page
+textdb config                                           # or ask: the pairing, at the bottom
 ```
 
 - **The sync base.** After each sync the store records, per folder and directory, every file's
