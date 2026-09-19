@@ -341,6 +341,21 @@ impl Store for Counting {
     fn all_sync_bases(&mut self) -> Result<Vec<SyncBase>> {
         fwd!(self, "all_sync_bases", up = 0, call = self.inner.all_sync_bases(), down = rows)
     }
+    fn owner_paths(&mut self, paths: &[String]) -> Result<Vec<String>> {
+        fwd!(self, "owner_paths", up = paths.iter().map(String::len).sum::<usize>(), call = self.inner.owner_paths(paths), down = |v: &Vec<String>| v.iter().map(String::len).sum())
+    }
+    fn asset_items_named(&mut self, store: &str, locations: &[String]) -> Result<Option<ItemsNamed>> {
+        fwd!(self, "asset_items_named", up = s(store) + locations.iter().map(String::len).sum::<usize>(), call = self.inner.asset_items_named(store, locations), down = |v: &Option<ItemsNamed>| v.as_ref().map_or(0, |n| n.named.len() + N))
+    }
+    fn may_name(&mut self, location: &str) -> Result<bool> {
+        fwd!(self, "may_name", up = s(location), call = self.inner.may_name(location), down = |_: &bool| 1)
+    }
+    fn asset_item_users(&mut self, store: &str, location: &str, own: &str) -> Result<Option<ItemUsers>> {
+        fwd!(self, "asset_item_users", up = s(store) + s(location) + s(own), call = self.inner.asset_item_users(store, location, own), down = |v: &Option<ItemUsers>| v.map_or(0, |_| 2 * N))
+    }
+    fn asset_store_users(&mut self, store: &str) -> Result<Option<usize>> {
+        fwd!(self, "asset_store_users", up = s(store), call = self.inner.asset_store_users(store), down = |v: &Option<usize>| v.map_or(0, |_| N))
+    }
     fn asset_stores(&mut self) -> Result<Vec<AssetStore>> {
         fwd!(self, "asset_stores", up = 0, call = self.inner.asset_stores(), down = rows)
     }
