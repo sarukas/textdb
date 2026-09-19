@@ -329,6 +329,17 @@ impl Store for Counting {
     fn put_sync_files(&mut self, prefix: &str, dir: &str, files: &[BaseFile]) -> Result<bool> {
         fwd!(self, "put_sync_files", up = s(prefix) + s(dir) + files.iter().map(base_file).sum::<usize>(), call = self.inner.put_sync_files(prefix, dir, files), down = |_: &bool| 1)
     }
+    fn sync_head(&mut self, prefix: &str, dir: &str) -> Result<Option<SyncBase>> {
+        fwd!(self, "sync_head", up = s(prefix) + s(dir), call = self.inner.sync_head(prefix, dir), down = |v: &Option<SyncBase>| v.as_ref().map_or(0, j))
+    }
+    fn file_heads_delta(&mut self, prefix: &str, dir: &str) -> Result<Option<HeadsDelta>> {
+        fwd!(self, "file_heads_delta", up = s(prefix) + s(dir), call = self.inner.file_heads_delta(prefix, dir), down = |v: &Option<HeadsDelta>| {
+            v.as_ref().map_or(0, |d| d.changed.iter().map(head).sum::<usize>() + d.gone.iter().map(String::len).sum::<usize>())
+        })
+    }
+    fn save_sync_base_delta(&mut self, base: &SyncBase, upsert: &[BaseFile], remove: &[String]) -> Result<()> {
+        fwd!(self, "save_sync_base_delta", up = j(base) + upsert.iter().map(base_file).sum::<usize>() + remove.iter().map(String::len).sum::<usize>(), call = self.inner.save_sync_base_delta(base, upsert, remove), down = unit)
+    }
     fn rename_sync_dir(&mut self, prefix: &str, from: &str, to: &str) -> Result<()> {
         fwd!(self, "rename_sync_dir", up = s(prefix) + s(from) + s(to), call = self.inner.rename_sync_dir(prefix, from, to), down = unit)
     }

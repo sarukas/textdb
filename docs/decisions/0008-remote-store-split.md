@@ -1,6 +1,6 @@
 # ADR 0008 — Split the CLI into a local client and a remote store, wire-optimal at the seam
 
-Status: accepted; step 1 implemented (this change), steps 2–5 planned
+Status: accepted; steps 1 and 2 implemented, steps 3–5 planned
 
 ## Context
 
@@ -87,11 +87,45 @@ first sync of the file is the 1,749-byte whole-file write every design pays):
 
 `crates/textdb-cli/tests/cli.rs::sync_moves_changed_lines_not_whole_files` holds the assertions.
 
-Deferred from step 1, both vault-sized terms rather than file-sized ones: the per-run heads
-listing (`file_heads` of every file under the prefix), and `save_sync_base`, which sends every
-file's base row on every sync, about fifty bytes a file. Replacing the first with the feed
-since the last sequence number touches the classification of every file; the second wants a
-base that is saved as a delta. Each is a change of its own.
+### 1b. Step 2: the vault-sized terms
+
+Step 1 left three terms that grow with the vault rather than the change, each about fifty
+bytes a file: the sync base's rows read at the start of every sync (`sync_base`), the listing
+of every file's head (`file_heads`), and the whole base written back at the end
+(`save_sync_base`). On a 2,000-file vault they were about 300 KB before a line moved. Step 2
+removes all three without changing what sync decides:
+
+- **The base rows live in the checkout too.** `.textdb/sync-rows.json` holds the directory's
+  copy at the store's generation. A sync reads only the base's head row (`sync_head`) and uses
+  the copy while the generation matches; another machine saving over the base bumps the
+  generation, and the copy is read past and refreshed. An asset push, which writes rows
+  without a generation bump, drops the copy.
+- **The store answers the difference, not the listing.** `file_heads_delta(prefix, dir)`
+  returns the files whose version is not their base row's (or that have no row) and the rows
+  whose file is gone; sync rebuilds the full listing from its rows and that. On Postgres it is
+  one join between `kb.entry` and `kb.sync_file`; on SQLite, where both sides are in-process,
+  the difference is taken in Rust by the same helper. A renamed share alias falls back to the
+  listing, since the rows' paths were rewritten locally.
+- **The base is saved as a delta.** `save_sync_base_delta` carries the same compare-and-swap
+  on the generation and only the rows that differ from the ones the sync started with, plus
+  the paths to drop.
+- **A rebased push lands on disk at once.** When the store rebases a commit over one that
+  arrived meanwhile, `push` fetches the hunks from the held base to the new version, rebuilds
+  the store's text and writes it to disk, recording the version. Before, the version was left
+  unknown and the next sync read the file whole to find out; the content hash on write results
+  that the table above asked for is not needed once the hunks are there.
+
+Measured on the 2,000-file vault, SQLite, with the counter (bytes):
+
+| Scenario | Before step 2 | After |
+|---|---|---|
+| Nothing changed | ≈ 300,000 | 470 (plus, once, the rows whose disk mtimes became trustworthy) |
+| One local line edited | ≈ 300,000 + 1,750 | 1,081 |
+| One store line edited | ≈ 300,000 + 1,750 | 1,295 |
+
+Batch and the chunk have-and-put exchange move to step 3: a batch is a message-layer concern
+and belongs with the `Request` enum, and the chunk exchange is the first piece of the replica.
+Restore-then-apply for a re-created file stays open.
 
 ### 2. The seam is the `Store` trait, defined as messages and streams, never as a wire
 
@@ -126,12 +160,12 @@ To be carrier-agnostic:
 
 ### 3. Order of work
 
-1. **This change:** base cache, hunks down, ranges up, wire counter.
-2. Trait additions the cost table demands: content hash on feed rows and on `Written`,
-   restore-then-apply for a re-created file, batch, chunk have-and-put for the no-cache fallback;
-   heads listing replaced by the feed.
+1. **Done:** base cache, hunks down, ranges up, wire counter.
+2. **Done:** the vault-sized terms (§1b): base rows kept in the checkout, heads as a delta,
+   the base saved as a delta, a rebased push applied to disk at once.
 3. `textdb-proto`: the message types, codecs and `Transport`, with the loopback transport
-   running the whole test suite.
+   running the whole test suite; batch as a first-class message; chunk have-and-put for the
+   no-cache fallback.
 4. First carrier: HTTPS. WebSocket and Flight as later `Transport` implementations.
 5. Gateway deployment and the asset-store delegation endpoint on the same service.
 

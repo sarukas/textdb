@@ -14,7 +14,7 @@ use super::{
     AccountRow, BaseFile, BatchChange, Change, Chunk, Commit, Entry, FileHead, GitState, Hit, Hunk, ImportStats, LineRange, LinkRow,
     MovedBack, MovedLink, PathEvent, RestoredFile, Result, RevertOutcome, ShareRow, SqlResult, Store, StoreError, SyncBase, TokenRow,
     Whoami, Written,
-};
+ HeadsDelta};
 
 /// The views `textdb sql` offers, as in SQLite: the live store by path. Temporary, so they live
 /// in this session only.
@@ -82,6 +82,45 @@ CREATE TABLE IF NOT EXISTS kb.asset_store (
   name text PRIMARY KEY, driver text NOT NULL, root text NOT NULL, options text,
   created_at timestamptz NOT NULL DEFAULT now()
 );";
+
+
+/// The sync row of `base` at its new generation, or contention when another process saved it
+/// since this one read it. Shared by the whole-base and the delta saves.
+fn cas_sync_row(tx: &mut postgres::Transaction<'_>, base: &SyncBase) -> Result<i64> {
+    let git = base.git.as_ref();
+    let (commit, branch, remote) = (
+        git.and_then(|g| g.commit.clone()),
+        git.and_then(|g| g.branch.clone()),
+        git.and_then(|g| g.remote.clone()),
+    );
+    let clean = git.map(|g| g.clean);
+    // Compare-and-swap, as on SQLite: the row must still be at the generation this sync read.
+    // `WHERE` on the conflict clause makes a stale save return no row rather than overwrite.
+    // As there, this runs after the writes: it protects the next sync's starting point, not
+    // this one's output.
+    let id: i64 = tx
+        .query_opt(
+            "INSERT INTO kb.sync(prefix, dir, seq, author, git_commit, git_branch, git_remote, git_clean, rules, generation, dir_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::bigint + 1, $11) \
+             ON CONFLICT (prefix, dir) DO UPDATE SET seq = excluded.seq, synced_at = now(), author = excluded.author, \
+             git_commit = excluded.git_commit, git_branch = excluded.git_branch, git_remote = excluded.git_remote, \
+             git_clean = excluded.git_clean, rules = excluded.rules, generation = kb.sync.generation + 1, \
+             dir_id = excluded.dir_id \
+             WHERE kb.sync.generation = $10::bigint RETURNING id",
+            &[&base.prefix, &base.dir, &base.seq, &base.author, &commit, &branch, &remote, &clean, &base.rules, &base.generation, &base.dir_id],
+        )
+        .map_err(pg)?
+        .ok_or_else(|| {
+            StoreError::contention(format!(
+                "{} and {} were synced by another process while this one was running, so this run's base was \
+                 not recorded. What it wrote is in the store and on disk; run sync again to reconcile against \
+                 the base that process left",
+                base.prefix, base.dir
+            ))
+        })?
+        .get(0);
+    Ok(id)
+}
 
 fn sync_row(r: &Row) -> (i64, SyncBase) {
     let clean: Option<bool> = r.get(9);
@@ -1336,6 +1375,92 @@ impl Store for PgStore {
         Ok(rows.iter().map(|r| sync_row(r).1).collect())
     }
 
+    fn sync_head(&mut self, prefix: &str, dir: &str) -> Result<Option<SyncBase>> {
+        self.ensure_sync_tables()?;
+        Ok(self
+            .client
+            .query_opt(&format!("SELECT {SYNC_COLS} FROM kb.sync WHERE prefix = $1 AND dir = $2"), &[&prefix, &dir])
+            .map_err(pg)?
+            .map(|row| sync_row(&row).1))
+    }
+
+    fn file_heads_delta(&mut self, prefix: &str, dir: &str) -> Result<Option<HeadsDelta>> {
+        self.ensure_sync_tables()?;
+        let scope = normalize_path(prefix)?;
+        // As in `file_heads`: the prefix has to resolve, and the files come from `kb.entry`, in
+        // the caller's paths. The base rows are relative to the caller's prefix, so the join is
+        // on the path with the prefix taken off, and the whole difference is one round trip
+        // each way instead of a listing of everything under the prefix.
+        if scope != "/" {
+            self.client.query_one("SELECT kb.resolve($1)", &[&scope]).map_err(pg)?;
+        }
+        let Some(row) = self
+            .client
+            .query_opt("SELECT id FROM kb.sync WHERE prefix = $1 AND dir = $2", &[&prefix, &dir])
+            .map_err(pg)?
+        else {
+            return Ok(None);
+        };
+        let id: i64 = row.get(0);
+        let changed = self
+            .client
+            .query(
+                "SELECT e.path, e.version, e.updated_by FROM kb.entry e \
+                 LEFT JOIN kb.sync_file f ON f.sync_id = $2::bigint \
+                   AND f.rel = CASE WHEN $1::text = '/' THEN substr(e.path, 2) ELSE substr(e.path, length($1::text) + 2) END \
+                 WHERE e.kind = 'file' AND ($1::text = '/' OR e.path = $1::text OR e.path LIKE kb._subtree_like($1::text)) \
+                   AND (f.rel IS NULL OR f.version IS NULL OR f.version <> e.version)",
+                &[&scope, &id],
+            )
+            .map_err(pg)?;
+        let gone = self
+            .client
+            .query(
+                "SELECT f.rel FROM kb.sync_file f WHERE f.sync_id = $2::bigint AND NOT EXISTS (\
+                   SELECT 1 FROM kb.entry e WHERE e.kind = 'file' \
+                     AND e.path = CASE WHEN $1::text = '/' THEN '/' || f.rel ELSE $1::text || '/' || f.rel END)",
+                &[&scope, &id],
+            )
+            .map_err(pg)?;
+        Ok(Some(HeadsDelta {
+            changed: changed
+                .iter()
+                .map(|r| FileHead {
+                    path: r.get(0),
+                    version: r.get(1),
+                    updated_by: r.get(2),
+                })
+                .collect(),
+            gone: gone.iter().map(|r| r.get(0)).collect(),
+        }))
+    }
+
+    fn save_sync_base_delta(&mut self, base: &SyncBase, upsert: &[BaseFile], remove: &[String]) -> Result<()> {
+        self.ensure_sync_tables()?;
+        let mut tx = self.client.transaction().map_err(pg)?;
+        let id = cas_sync_row(&mut tx, base)?;
+        if !remove.is_empty() {
+            tx.execute("DELETE FROM kb.sync_file WHERE sync_id = $1 AND rel = ANY($2::text[])", &[&id, &remove]).map_err(pg)?;
+        }
+        if !upsert.is_empty() {
+            let rels: Vec<&str> = upsert.iter().map(|f| f.rel.as_str()).collect();
+            let versions: Vec<Option<i64>> = upsert.iter().map(|f| f.version).collect();
+            let blobs: Vec<&str> = upsert.iter().map(|f| f.blob.as_str()).collect();
+            let sizes: Vec<Option<i64>> = upsert.iter().map(|f| f.disk_size).collect();
+            let mtimes: Vec<Option<i64>> = upsert.iter().map(|f| f.disk_mtime).collect();
+            let conflicts: Vec<bool> = upsert.iter().map(|f| f.conflict).collect();
+            tx.execute(
+                "INSERT INTO kb.sync_file(sync_id, rel, version, blob, disk_size, disk_mtime, conflict) \
+                 SELECT $1, * FROM unnest($2::text[], $3::bigint[], $4::text[], $5::bigint[], $6::bigint[], $7::bool[]) \
+                 ON CONFLICT (sync_id, rel) DO UPDATE SET version = excluded.version, blob = excluded.blob, \
+                   disk_size = excluded.disk_size, disk_mtime = excluded.disk_mtime, conflict = excluded.conflict",
+                &[&id, &rels, &versions, &blobs, &sizes, &mtimes, &conflicts],
+            )
+            .map_err(pg)?;
+        }
+        tx.commit().map_err(pg)
+    }
+
     fn sync_base(&mut self, prefix: &str, dir: &str) -> Result<Option<SyncBase>> {
         self.ensure_sync_tables()?;
         let Some(row) = self
@@ -1564,39 +1689,8 @@ impl Store for PgStore {
 
     fn save_sync_base(&mut self, base: &SyncBase) -> Result<()> {
         self.ensure_sync_tables()?;
-        let git = base.git.as_ref();
-        let (commit, branch, remote) = (
-            git.and_then(|g| g.commit.clone()),
-            git.and_then(|g| g.branch.clone()),
-            git.and_then(|g| g.remote.clone()),
-        );
-        let clean = git.map(|g| g.clean);
         let mut tx = self.client.transaction().map_err(pg)?;
-        // Compare-and-swap, as on SQLite: the row must still be at the generation this sync read.
-        // `WHERE` on the conflict clause makes a stale save return no row rather than overwrite.
-        // As there, this runs after the writes: it protects the next sync's starting point, not
-        // this one's output.
-        let id: i64 = tx
-            .query_opt(
-                "INSERT INTO kb.sync(prefix, dir, seq, author, git_commit, git_branch, git_remote, git_clean, rules, generation, dir_id) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::bigint + 1, $11) \
-                 ON CONFLICT (prefix, dir) DO UPDATE SET seq = excluded.seq, synced_at = now(), author = excluded.author, \
-                 git_commit = excluded.git_commit, git_branch = excluded.git_branch, git_remote = excluded.git_remote, \
-                 git_clean = excluded.git_clean, rules = excluded.rules, generation = kb.sync.generation + 1, \
-                 dir_id = excluded.dir_id \
-                 WHERE kb.sync.generation = $10::bigint RETURNING id",
-                &[&base.prefix, &base.dir, &base.seq, &base.author, &commit, &branch, &remote, &clean, &base.rules, &base.generation, &base.dir_id],
-            )
-            .map_err(pg)?
-            .ok_or_else(|| {
-                StoreError::contention(format!(
-                    "{} and {} were synced by another process while this one was running, so this run's base was \
-                     not recorded. What it wrote is in the store and on disk; run sync again to reconcile against \
-                     the base that process left",
-                    base.prefix, base.dir
-                ))
-            })?
-            .get(0);
+        let id = cas_sync_row(&mut tx, base)?;
         // As in the SQLite store: a sync that changed nothing still arrives with the whole
         // base, and rewriting it cost a DELETE and an INSERT of every row for a run whose
         // answer was "nothing to do". One indexed read to find that out instead.

@@ -464,6 +464,35 @@ pub struct FileHead {
     pub updated_by: Option<String>,
 }
 
+/// What differs between the files under a prefix now and the base rows a synced directory
+/// recorded, answered by the store over the rows it holds (ADR 0008, step 2): the files whose
+/// version is not the row's, or that have no row, and the rows whose file is gone. A sync
+/// rebuilds the full listing from its rows and this, so the listing never crosses the seam.
+#[derive(Debug, Default)]
+pub struct HeadsDelta {
+    pub changed: Vec<FileHead>,
+    pub gone: Vec<String>,
+}
+
+/// `heads` against `rows`, as [`Store::file_heads_delta`] answers: the difference taken here,
+/// for a store that has both at hand.
+pub fn heads_delta(prefix: &str, rows: &[BaseFile], heads: Vec<FileHead>) -> HeadsDelta {
+    let skip = if prefix == "/" { 1 } else { prefix.len() + 1 };
+    let by_rel: std::collections::HashMap<&str, Option<i64>> = rows.iter().map(|f| (f.rel.as_str(), f.version)).collect();
+    let mut seen = std::collections::HashSet::with_capacity(heads.len());
+    let mut delta = HeadsDelta::default();
+    for h in heads {
+        let rel = h.path.get(skip..).unwrap_or_default();
+        seen.insert(rel.to_string());
+        match by_rel.get(rel) {
+            Some(Some(v)) if *v == h.version => {}
+            _ => delta.changed.push(h),
+        }
+    }
+    delta.gone = rows.iter().filter(|f| !seen.contains(&f.rel)).map(|f| f.rel.clone()).collect();
+    delta
+}
+
 /// The git checkout a directory was in when it was synced.
 #[derive(Debug, Clone, Serialize)]
 pub struct GitState {
@@ -503,7 +532,7 @@ pub struct SyncBase {
 }
 
 /// One file both sides agreed on at the last sync.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BaseFile {
     /// Relative to the folder and the directory, `/`-separated.
     pub rel: String,
@@ -897,6 +926,22 @@ pub trait Store {
     /// Put `files` in the base of `prefix` synced with `dir`, replacing the rows of the same paths
     /// and leaving the others, and when it was synced, as they are; `false` when there is no base.
     fn put_sync_files(&mut self, prefix: &str, dir: &str, files: &[BaseFile]) -> Result<bool>;
+    /// The base of `prefix` synced with `dir` without its rows: what `sync_base` says, with
+    /// `files` empty. A sync reads this first and fetches the rows only when the store's
+    /// generation is not the one the directory's own copy of them was made at (ADR 0008, step 2).
+    fn sync_head(&mut self, prefix: &str, dir: &str) -> Result<Option<SyncBase>> {
+        Ok(self.sync_base(prefix, dir)?.map(|mut b| {
+            b.files.clear();
+            b
+        }))
+    }
+    /// What differs between the files under `prefix` now and the base rows of `dir`, answered
+    /// over the rows the store holds; `None` when there is no base for the pair.
+    fn file_heads_delta(&mut self, prefix: &str, dir: &str) -> Result<Option<HeadsDelta>>;
+    /// Save the base as `save_sync_base` does — the same compare-and-swap on its generation —
+    /// with only the rows that changed: `upsert` replaces the rows of the same paths, `remove`
+    /// drops those paths, and every other row stays as it is. `base.files` is ignored.
+    fn save_sync_base_delta(&mut self, base: &SyncBase, upsert: &[BaseFile], remove: &[String]) -> Result<()>;
     /// Record the base of `prefix` synced with `from` as synced with `to` (the same directory
     /// under another form of its name).
     fn rename_sync_dir(&mut self, prefix: &str, from: &str, to: &str) -> Result<()>;

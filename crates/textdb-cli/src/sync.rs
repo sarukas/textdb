@@ -24,7 +24,7 @@ use textdb_core::myers::{diff3_marked, line_diff, split_lines};
 use textdb_sqlite::normalize_path;
 
 use crate::portable::{self, Platform};
-use crate::basecache::BaseCache;
+use crate::basecache::{BaseCache, RowsCopy};
 use crate::store::{BaseFile, FileHead, GitState, Hunk, LineRange, Store, StoreError, SyncBase, Written};
 use crate::{emit_json, git, out, Result};
 
@@ -221,6 +221,54 @@ pub fn find_sync_base(st: &mut dyn Store, prefix: &str, key: &str) -> Result<Opt
         (None, Some(legacy)) => st.sync_base(prefix, &legacy),
         (None, None) => Ok(None),
     }
+}
+
+/// `find_sync_base` for a sync: the rows come from the copy the directory keeps when the
+/// store's base is still at the generation that copy was made at, and from the store otherwise
+/// (ADR 0008, step 2).
+fn load_sync_base(st: &mut dyn Store, prefix: &str, key: &str, dir: &Path) -> Result<Option<SyncBase>> {
+    let head = match (st.sync_head(prefix, key)?, legacy_dir_key(key)) {
+        (Some(b), _) => Some(b),
+        (None, Some(legacy)) => st.sync_head(prefix, &legacy)?,
+        (None, None) => None,
+    };
+    let Some(mut head) = head else { return Ok(None) };
+    match RowsCopy::read(dir) {
+        Some(copy) if copy.prefix == head.prefix && copy.dir == head.dir && copy.generation == head.generation => {
+            head.files = copy.files;
+            Ok(Some(head))
+        }
+        _ => {
+            let Some(full) = st.sync_base(&head.prefix, &head.dir)? else { return Ok(None) };
+            RowsCopy { prefix: full.prefix.clone(), dir: full.dir.clone(), generation: full.generation, files: full.files.clone() }.write(dir);
+            Ok(Some(full))
+        }
+    }
+}
+
+/// The store's files under `prefix` as `heads_by_rel` lists them, rebuilt from the base rows
+/// the directory holds and what the store says differs from them, so that what crosses the seam
+/// is the difference and not a listing of every file (ADR 0008, step 2).
+fn heads_from_delta(st: &mut dyn Store, prefix: &str, base: &SyncBase) -> Result<BTreeMap<String, FileHead>> {
+    let Some(delta) = st.file_heads_delta(prefix, &base.dir)? else { return heads_by_rel(st, prefix) };
+    let skip = if prefix == "/" { 1 } else { prefix.len() + 1 };
+    let mut heads: BTreeMap<String, FileHead> = base
+        .files
+        .iter()
+        .filter_map(|f| f.version.map(|v| (f.rel.clone(), FileHead { path: store_path(prefix, &f.rel), version: v, updated_by: None })))
+        .collect();
+    for h in delta.changed {
+        heads.insert(h.path[skip..].to_string(), h);
+    }
+    for rel in delta.gone {
+        heads.remove(&rel);
+    }
+    Ok(heads)
+}
+
+/// Do two base rows say the same?
+fn same_base_row(a: &BaseFile, b: &BaseFile) -> bool {
+    a.version == b.version && a.blob == b.blob && a.disk_size == b.disk_size && a.disk_mtime == b.disk_mtime && a.conflict == b.conflict
 }
 
 fn store_path(prefix: &str, rel: &str) -> String {
@@ -773,22 +821,33 @@ impl Sides<'_> {
     /// Commit `bytes` as the line ranges that changed since `base_version` when this directory
     /// holds that version's text — the store's current text it rebuilt, or the base it kept —
     /// else whole (ADR 0008).
-    fn push(&mut self, rel: &str, bytes: &[u8], base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> Result<Written> {
+    ///
+    /// When the store had to rebase the commit over one that landed meanwhile, what it holds now
+    /// is more than `bytes`: that text, rebuilt from the held base and the hunks since, comes
+    /// back with the result so the caller can put it on disk at once rather than leave the
+    /// version unknown for the next sync to read the file whole.
+    fn push(&mut self, rel: &str, bytes: &[u8], base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> Result<(Written, Option<Vec<u8>>)> {
         let path = store_path(&self.prefix, rel);
-        if let Some(v) = base_version {
-            let held = match self.textdb.get(rel) {
-                Some((text, version)) if *version == v => Some(text.clone()),
-                _ => None,
-            };
-            let held = held.or_else(|| {
-                let (base_version, blob) = self.bases.get(rel)?.clone();
-                (base_version == Some(v)).then_some(blob).and_then(|blob| self.base_text(rel, &blob))
-            });
-            if let Some(ranges) = held.and_then(|base| ranges_between(&base, bytes)) {
-                return self.st.replace_ranges(&path, &ranges, Some(v), author, message);
-            }
-        }
-        self.st.write(&path, bytes, base_version, author, message)
+        let Some(v) = base_version else {
+            return Ok((self.st.write(&path, bytes, None, author, message)?, None));
+        };
+        let held = match self.textdb.get(rel) {
+            Some((text, version)) if *version == v => Some(text.clone()),
+            _ => None,
+        };
+        let held = held.or_else(|| {
+            let (base_version, blob) = self.bases.get(rel)?.clone();
+            (base_version == Some(v)).then_some(blob).and_then(|blob| self.base_text(rel, &blob))
+        });
+        let w = match held.as_deref().and_then(|base| ranges_between(base, bytes)) {
+            Some(ranges) => self.st.replace_ranges(&path, &ranges, Some(v), author, message)?,
+            None => self.st.write(&path, bytes, Some(v), author, message)?,
+        };
+        let rebuilt = match (w.kind.as_str(), held) {
+            ("rebased", Some(base)) => self.st.hunks(&path, v, w.version).ok().and_then(|hunks| apply_hunks(&base, &hunks)),
+            _ => None,
+        };
+        Ok((w, rebuilt))
     }
 
     fn disk(&mut self, rel: &str) -> Result<Vec<u8>> {
@@ -1389,7 +1448,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
     let shares = st.share_state()?;
     let denied: Vec<String> = shares.iter().filter(|(_, s)| s == "denied").map(|(a, _)| a.clone()).collect();
     let read_only: Vec<String> = shares.iter().filter(|(_, s)| s == "ro").map(|(a, _)| a.clone()).collect();
-    let mut stored = find_sync_base(st, &prefix, &key)?;
+    let mut stored = load_sync_base(st, &prefix, &key, &o.dir)?;
     let mut moved_from: Option<String> = None;
     // A directory that was moved or renamed: the base is its own, found by the id it carries, so
     // the sync continues from where it left off instead of treating every file as new.
@@ -1403,7 +1462,7 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
                 st.rename_sync_dir(&prefix, &b.dir, &key)?;
             }
             moved_from = Some(b.dir.clone());
-            stored = find_sync_base(st, &prefix, &key)?.or_else(|| Some(SyncBase { dir: key.clone(), ..b }));
+            stored = load_sync_base(st, &prefix, &key, &o.dir)?.or_else(|| Some(SyncBase { dir: key.clone(), ..b }));
         }
     }
     // A base an older build recorded under another form of the directory's name takes this one,
@@ -1452,7 +1511,13 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         )));
     }
     let generation = stored.as_ref().map_or(0, |b| b.generation);
-    let heads = heads_by_rel(st, &prefix)?;
+    // With a base, the listing is rebuilt from its rows and the difference the store reports.
+    // A renamed share alias rewrote the rows' paths above, which the store's rows do not know
+    // of, so that sync lists everything as before.
+    let heads = match stored.as_ref().filter(|_| renamed_aliases.is_empty()) {
+        Some(b) => heads_from_delta(st, &prefix, b)?,
+        None => heads_by_rel(st, &prefix)?,
+    };
     let mut report = Report {
         prefix: prefix.clone(),
         dir: key.clone(),
@@ -2440,7 +2505,14 @@ fn apply(
             None => (author, format!("sync from {key}")),
         };
         match sides.push(rel, &bytes, *base_version, Some(who), Some(&message)) {
-            Ok(w) => {
+            // The store rebased this over a commit that landed meanwhile and holds the merge of
+            // both; it is on disk now, as the next sync would otherwise have put it.
+            Ok((w, Some(merged))) if write_disk(dir, rel, &merged).is_ok() => {
+                sides.cache.put(&merged);
+                report.merged.push(rel.clone());
+                rows.insert(rel.clone(), base_row(dir, rel, Some(w.version), blob_id(&merged), false));
+            }
+            Ok((w, _)) => {
                 sides.cache.put(&bytes);
                 rows.insert(rel.clone(), base_row(dir, rel, exact(&w.kind, w.version), blob_id(&bytes), false));
             }
@@ -2450,13 +2522,20 @@ fn apply(
     for (rel, version, merged) in &plan.merges {
         let message = format!("sync: merged with the changes in {key}");
         match sides.push(rel, merged, Some(*version), Some(author), Some(&message)) {
-            Ok(w) => match write_disk(dir, rel, merged) {
-                Ok(()) => {
-                    sides.cache.put(merged);
-                    rows.insert(rel.clone(), base_row(dir, rel, exact(&w.kind, w.version), blob_id(merged), false));
+            Ok((w, again)) => {
+                // Rebased once more over a commit that landed while merging: the store's text.
+                let (text, version) = match again {
+                    Some(text) => (text, Some(w.version)),
+                    None => (merged.clone(), exact(&w.kind, w.version)),
+                };
+                match write_disk(dir, rel, &text) {
+                    Ok(()) => {
+                        sides.cache.put(&text);
+                        rows.insert(rel.clone(), base_row(dir, rel, version, blob_id(&text), false));
+                    }
+                    Err(e) => failed(report, &mut rows, rel, e.to_string()),
                 }
-                Err(e) => failed(report, &mut rows, rel, e.to_string()),
-            },
+            }
             Err(e) => failed(report, &mut rows, rel, failure(&e)),
         }
     }
@@ -2634,7 +2713,10 @@ fn apply(
         g.commit = r.commit.clone();
         g.clean = r.clean;
     }
-    sides.st.save_sync_base(&SyncBase {
+    // Only the rows that differ from what the store holds cross the seam (ADR 0008, step 2):
+    // the store keeps the rest, and the directory keeps its own copy of all of them at the
+    // generation the save leaves behind.
+    let saved = SyncBase {
         prefix: prefix.clone(),
         dir: key.to_string(),
         seq,
@@ -2649,8 +2731,18 @@ fn apply(
         rules: serde_json::to_string(rules).ok(),
         generation,
         dir_id: Some(dir_id.to_string()),
-        files: rows.into_values().collect(),
-    })?;
+        files: Vec::new(),
+    };
+    if stored_rows.is_empty() {
+        // A first sync, or a base this run could not read the rows of: written whole, so that
+        // nothing the store may hold under this pair survives it.
+        sides.st.save_sync_base(&SyncBase { files: rows.values().cloned().collect(), ..saved })?;
+    } else {
+        let upsert: Vec<BaseFile> = rows.values().filter(|r| stored_rows.get(&r.rel).is_none_or(|s| !same_base_row(s, r))).cloned().collect();
+        let remove: Vec<String> = stored_rows.keys().filter(|rel| !rows.contains_key(*rel)).cloned().collect();
+        sides.st.save_sync_base_delta(&saved, &upsert, &remove)?;
+    }
+    RowsCopy { prefix: prefix.clone(), dir: key.to_string(), generation: generation + 1, files: rows.into_values().collect() }.write(dir);
     // Written last, and only by a sync that got this far: the pairing this directory will be
     // found by from now on. Kept as it was when it is already right, so an id stays stable.
     let paired = crate::root::Config {

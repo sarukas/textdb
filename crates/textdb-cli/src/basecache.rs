@@ -13,7 +13,54 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
+use crate::store::BaseFile;
 use crate::sync::blob_id;
+
+/// The directory's own copy of its base rows, at the store generation they were read or saved
+/// at (ADR 0008, step 2). The store's rows stay the authority — another machine syncing the
+/// same directory saves over them and bumps the generation, and this copy is then stale and
+/// read past — but as long as the generation is the one here, the rows need not cross the seam.
+#[derive(Serialize, Deserialize)]
+pub struct RowsCopy {
+    pub prefix: String,
+    pub dir: String,
+    pub generation: i64,
+    pub files: Vec<BaseFile>,
+}
+
+impl RowsCopy {
+    fn file(dir: &Path) -> PathBuf {
+        dir.join(".textdb").join("sync-rows.json")
+    }
+
+    pub fn read(dir: &Path) -> Option<RowsCopy> {
+        serde_json::from_slice(&std::fs::read(Self::file(dir)).ok()?).ok()
+    }
+
+    /// Written whole and renamed into place; only where `.textdb/` already is, so a dry run of
+    /// a directory never synced leaves nothing behind. A failure is silent: the copy is never
+    /// required.
+    pub fn write(&self, dir: &Path) {
+        let path = Self::file(dir);
+        let Some(parent) = path.parent() else { return };
+        if !parent.is_dir() {
+            return;
+        }
+        let Ok(json) = serde_json::to_vec(self) else { return };
+        let tmp = parent.join(format!(".sync-rows.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// Drop the copy: something wrote rows to the store's base past the generation, so the next
+    /// sync reads them from the store.
+    pub fn forget(dir: &Path) {
+        let _ = std::fs::remove_file(Self::file(dir));
+    }
+}
 
 pub struct BaseCache {
     root: PathBuf,

@@ -1414,6 +1414,8 @@ fn record_in_sync_base(st: &mut dyn Store, v: &Vault, written: &[Written]) -> Re
         })
         .collect();
     st.put_sync_files(&base.prefix, &base.dir, &rows)?;
+    // Rows written past the base's generation: the directory's copy of them is stale now.
+    crate::basecache::RowsCopy::forget(&v.dir);
     Ok(())
 }
 

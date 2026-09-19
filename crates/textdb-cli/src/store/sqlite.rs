@@ -1109,6 +1109,44 @@ impl Store for SqliteStore {
         Ok(rows)
     }
 
+    fn sync_head(&mut self, prefix: &str, dir: &str) -> Result<Option<SyncBase>> {
+        Ok(self
+            .conn
+            .query_row(&format!("SELECT {SYNC_COLS} FROM {DEFAULT_PREFIX}sync WHERE prefix = ?1 AND dir = ?2"), [prefix, dir], sync_row)
+            .optional()
+            .map_err(sql)?
+            .map(|(_, base)| base))
+    }
+
+    fn file_heads_delta(&mut self, prefix: &str, dir: &str) -> Result<Option<super::HeadsDelta>> {
+        // In process, so both sides of the difference are already here and it is taken in
+        // Rust. The Postgres store takes it in SQL, so that only the difference crosses its wire.
+        let Some(base) = self.sync_base(prefix, dir)? else { return Ok(None) };
+        Ok(Some(super::heads_delta(prefix, &base.files, self.file_heads(prefix)?)))
+    }
+
+    fn save_sync_base_delta(&mut self, base: &SyncBase, upsert: &[BaseFile], remove: &[String]) -> Result<()> {
+        let p = DEFAULT_PREFIX;
+        let tx = self.conn.transaction().map_err(sql)?;
+        let id = cas_sync_row(&tx, p, base)?;
+        {
+            let mut del = tx.prepare_cached(&format!("DELETE FROM {p}sync_file WHERE sync_id = ?1 AND rel = ?2")).map_err(sql)?;
+            for rel in remove {
+                del.execute(rusqlite::params![id, rel]).map_err(sql)?;
+            }
+            let mut put = tx
+                .prepare_cached(&format!(
+                    "INSERT OR REPLACE INTO {p}sync_file(sync_id, rel, version, blob, disk_size, disk_mtime, conflict) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                ))
+                .map_err(sql)?;
+            for f in upsert {
+                put.execute(rusqlite::params![id, f.rel, f.version, f.blob, f.disk_size, f.disk_mtime, f.conflict]).map_err(sql)?;
+            }
+        }
+        tx.commit().map_err(sql)
+    }
+
     fn sync_base(&mut self, prefix: &str, dir: &str) -> Result<Option<SyncBase>> {
         let found = self
             .conn
@@ -1276,51 +1314,8 @@ impl Store for SqliteStore {
 
     fn save_sync_base(&mut self, base: &SyncBase) -> Result<()> {
         let p = DEFAULT_PREFIX;
-        let git = base.git.as_ref();
         let tx = self.conn.transaction().map_err(sql)?;
-        // Compare-and-swap: the row must still be at the generation this sync read, or another
-        // one replaced the base meanwhile and this run's view of both sides is stale. `WHERE` on
-        // a conflicting upsert makes the row come back empty rather than overwritten.
-        //
-        // The base is saved last, after the store and disk writes, so this does not stop them —
-        // what it stops is a stale base overwriting the one the other process recorded, which
-        // would make the *next* sync take this run's view as the agreed state and miss theirs.
-        let id: Option<i64> = tx
-            .query_row(
-                &format!(
-                    "INSERT INTO {p}sync(prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean, rules, generation, dir_id) \
-                     VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4, ?5, ?6, ?7, ?8, ?9, ?10 + 1, ?11) \
-                     ON CONFLICT(prefix, dir) DO UPDATE SET seq = excluded.seq, synced_at = excluded.synced_at, \
-                     author = excluded.author, git_commit = excluded.git_commit, git_branch = excluded.git_branch, \
-                     git_remote = excluded.git_remote, git_clean = excluded.git_clean, rules = excluded.rules, \
-                     generation = {p}sync.generation + 1, dir_id = excluded.dir_id \
-                     WHERE {p}sync.generation = ?10 RETURNING id"
-                ),
-                rusqlite::params![
-                    base.prefix,
-                    base.dir,
-                    base.seq,
-                    base.author,
-                    git.and_then(|g| g.commit.as_deref()),
-                    git.and_then(|g| g.branch.as_deref()),
-                    git.and_then(|g| g.remote.as_deref()),
-                    git.map(|g| g.clean),
-                    base.rules,
-                    base.generation,
-                    base.dir_id,
-                ],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(sql)?;
-        let Some(id) = id else {
-            return Err(StoreError::contention(format!(
-                "{} and {} were synced by another process while this one was running, so this run's base was not \
-                 recorded. What it wrote is in the store and on disk; run sync again to reconcile against the base \
-                 that process left",
-                base.prefix, base.dir
-            )));
-        };
+        let id = cas_sync_row(&tx, p, base)?;
         // A sync that changed nothing still arrives here with the whole base, and rewriting it
         // meant a DELETE and an INSERT per file — hundreds of statements and their WAL records
         // for a run whose answer was "nothing to do". Read the rows first and skip the rewrite
@@ -1641,6 +1636,57 @@ fn run_sql(conn: &Connection, query: &str, params: &[String], author: Option<&st
         rows: out,
         ..SqlResult::default()
     })
+}
+
+
+/// The sync row of `base` at its new generation, or contention when another process saved it
+/// since this one read it. Shared by the whole-base and the delta saves.
+fn cas_sync_row(tx: &rusqlite::Transaction<'_>, p: &str, base: &SyncBase) -> Result<i64> {
+    let git = base.git.as_ref();
+    // Compare-and-swap: the row must still be at the generation this sync read, or another
+    // one replaced the base meanwhile and this run's view of both sides is stale. `WHERE` on
+    // a conflicting upsert makes the row come back empty rather than overwritten.
+    //
+    // The base is saved last, after the store and disk writes, so this does not stop them —
+    // what it stops is a stale base overwriting the one the other process recorded, which
+    // would make the *next* sync take this run's view as the agreed state and miss theirs.
+    let id: Option<i64> = tx
+        .query_row(
+            &format!(
+                "INSERT INTO {p}sync(prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean, rules, generation, dir_id) \
+                 VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4, ?5, ?6, ?7, ?8, ?9, ?10 + 1, ?11) \
+                 ON CONFLICT(prefix, dir) DO UPDATE SET seq = excluded.seq, synced_at = excluded.synced_at, \
+                 author = excluded.author, git_commit = excluded.git_commit, git_branch = excluded.git_branch, \
+                 git_remote = excluded.git_remote, git_clean = excluded.git_clean, rules = excluded.rules, \
+                 generation = {p}sync.generation + 1, dir_id = excluded.dir_id \
+                 WHERE {p}sync.generation = ?10 RETURNING id"
+            ),
+            rusqlite::params![
+                base.prefix,
+                base.dir,
+                base.seq,
+                base.author,
+                git.and_then(|g| g.commit.as_deref()),
+                git.and_then(|g| g.branch.as_deref()),
+                git.and_then(|g| g.remote.as_deref()),
+                git.map(|g| g.clean),
+                base.rules,
+                base.generation,
+                base.dir_id,
+            ],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql)?;
+    let Some(id) = id else {
+        return Err(StoreError::contention(format!(
+            "{} and {} were synced by another process while this one was running, so this run's base was not \
+             recorded. What it wrote is in the store and on disk; run sync again to reconcile against the base \
+             that process left",
+            base.prefix, base.dir
+        )));
+    };
+    Ok(id)
 }
 
 const SYNC_COLS: &str = "id, prefix, dir, seq, synced_at, author, git_commit, git_branch, git_remote, git_clean, rules, generation, dir_id";

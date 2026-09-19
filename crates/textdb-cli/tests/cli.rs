@@ -3632,3 +3632,76 @@ fn sync_moves_changed_lines_not_whole_files() {
     let gi = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
     assert!(gi.contains("\n/.textdb/base/\n"), "{gi}");
 }
+
+/// What sync moves across the store seam does not grow with the vault either (ADR 0008, step
+/// 2): after the first sync, the base rows come from the directory's own copy, the store answers
+/// which files differ from them rather than listing every file, and the base goes back as the
+/// rows that changed.
+#[test]
+fn sync_cost_does_not_grow_with_the_vault() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let dir = tmp.path().join("notes");
+    for i in 0..300 {
+        let sub = dir.join(format!("d{}", i % 10));
+        std::fs::create_dir_all(&sub).unwrap();
+        let doc: String = (1..=30).map(|j| format!("line {j} of note {i}\n")).collect();
+        std::fs::write(sub.join(format!("n{i}.md")), doc).unwrap();
+    }
+    let stats = |name: &str| tmp.path().join(format!("{name}.json"));
+    let sync = |name: &str| {
+        let mut cmd = textdb(&store);
+        cmd.env("TEXTDB_WIRE_STATS", stats(name)).args(["--json", "sync", "/notes"]).arg(&dir);
+        let o = run(&mut cmd, None);
+        let text = std::fs::read_to_string(stats(name)).unwrap_or_else(|e| panic!("no wire stats for {name} ({e}): {}\n{}", o.stdout, o.stderr));
+        (o, serde_json::from_str::<Value>(&text).unwrap())
+    };
+    let calls = |wire: &Value, method: &str| wire["methods"][method]["calls"].as_u64().unwrap_or(0);
+    let up = |wire: &Value, method: &str| wire["methods"][method]["up"].as_u64().unwrap_or(0);
+
+    let (o, _) = sync("first");
+    assert_eq!(o.status, 0, "{}", o.stderr);
+    assert!(dir.join(".textdb/sync-rows.json").is_file());
+    // The second sync records the disk times the first could not yet trust; from the third on
+    // an unchanged vault costs nothing proportional to its size.
+    let (o, _) = sync("second");
+    assert_eq!(o.status, 0, "{}", o.stderr);
+    let (o, wire) = sync("quiet");
+    assert_eq!(o.status, 0, "{}", o.stderr);
+    assert_eq!((calls(&wire, "file_heads"), calls(&wire, "sync_base"), calls(&wire, "sync_head"), calls(&wire, "file_heads_delta")), (0, 0, 1, 1), "{wire}");
+    assert!(wire["total"].as_u64().unwrap() < 2_000, "an unchanged 300-file vault: {wire}");
+
+    // One line edited here: a range up, a base delta of one row, nothing listed.
+    let path = dir.join("d7/n77.md");
+    std::fs::write(&path, std::fs::read_to_string(&path).unwrap().replacen("line 20 of note 77", "EDITED", 1)).unwrap();
+    let (o, wire) = sync("local");
+    assert_eq!(o.status, 0, "{}", o.stderr);
+    assert_eq!((calls(&wire, "file_heads"), calls(&wire, "replace_ranges")), (0, 1), "{wire}");
+    assert!(up(&wire, "save_sync_base_delta") < 1_000 && wire["total"].as_u64().unwrap() < 3_000, "{wire}");
+
+    // One line edited in the store, and one file deleted there: the delta names both, the hunk
+    // comes down, the deletion is followed on disk.
+    ok(textdb(&store).args(["replace-lines", "/notes/d3/n33.md", "5", "5", "--text", "STORE\n"]), None);
+    ok(textdb(&store).args(["rm", "/notes/d5/n55.md"]), None);
+    let (o, wire) = sync("store");
+    assert_eq!(o.status, 0, "{}", o.stderr);
+    assert_eq!((calls(&wire, "file_heads"), calls(&wire, "read"), calls(&wire, "hunks")), (0, 0, 1), "{wire}");
+    assert!(std::fs::read_to_string(dir.join("d3/n33.md")).unwrap().contains("STORE\n"));
+    assert!(!dir.join("d5/n55.md").exists());
+    assert!(wire["total"].as_u64().unwrap() < 3_000, "{wire}");
+
+    // Another machine saved the base meanwhile, so the store's generation is not the one the
+    // directory's copy was made at: the copy is read past, the rows come from the store once,
+    // and the sync is still right.
+    let copy = dir.join(".textdb/sync-rows.json");
+    let mut rows: Value = serde_json::from_str(&std::fs::read_to_string(&copy).unwrap()).unwrap();
+    rows["generation"] = serde_json::json!(rows["generation"].as_i64().unwrap() - 1);
+    std::fs::write(&copy, rows.to_string()).unwrap();
+    std::fs::write(&path, std::fs::read_to_string(&path).unwrap().replacen("EDITED", "EDITED AGAIN", 1)).unwrap();
+    let (o, wire) = sync("stale");
+    assert_eq!(o.status, 0, "{}", o.stderr);
+    assert_eq!((calls(&wire, "sync_base"), calls(&wire, "replace_ranges")), (1, 1), "{wire}");
+    assert!(ok(textdb(&store).args(["cat", "/notes/d7/n77.md"]), None).stdout.contains("EDITED AGAIN"));
+    let (_, wire) = sync("quiet-again");
+    assert_eq!(calls(&wire, "sync_base"), 0, "{wire}");
+}
