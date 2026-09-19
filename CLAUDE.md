@@ -96,6 +96,15 @@ take a path that is already a store path and never translate. Public methods tra
 never does, and an internal caller uses `*_at`. The same rule holds on the way out — a row's
 `path` is translated once, where the row is built.
 
+**The CLI leaves through `process::exit` on several paths** — a sync with conflicts (3), a
+rules stop (6), a broken pipe — so nothing that relies on `Drop` running at the end of `main`
+is reliable. The wire counter (`TEXTDB_WIRE_STATS`, ADR 0008) rewrites its file on every call
+for that reason; anything else that must be flushed at exit needs the same treatment.
+
+**The tree is not rustfmt-clean and CI does not run `cargo fmt`.** Hundreds of pre-existing
+diffs sit in files this repository never formatted; a `cargo fmt` touches all of them and
+drowns a change in noise. Match the surrounding style by hand instead.
+
 **Root discovery walks up from the working directory.** A synced directory anywhere above a test
 pairs it with a store the test knows nothing about, and a test that syncs the current directory
 syncs *this repository*. The harnesses pin `TEXTDB_CEILING_DIRECTORIES` to the working directory

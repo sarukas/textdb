@@ -20,11 +20,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use textdb_core::myers::diff3_marked;
+use textdb_core::myers::{diff3_marked, line_diff, split_lines};
 use textdb_sqlite::normalize_path;
 
 use crate::portable::{self, Platform};
-use crate::store::{BaseFile, FileHead, GitState, Store, StoreError, SyncBase};
+use crate::basecache::BaseCache;
+use crate::store::{BaseFile, FileHead, GitState, Hunk, LineRange, Store, StoreError, SyncBase, Written};
 use crate::{emit_json, git, out, Result};
 
 const OURS: &str = "textdb";
@@ -698,6 +699,16 @@ struct Sides<'a> {
     prefix: String,
     textdb: HashMap<String, (Vec<u8>, i64)>,
     disk: HashMap<String, Vec<u8>>,
+    /// The base text this directory kept (ADR 0008).
+    cache: BaseCache,
+    /// Each file's base as recorded: its store version and blob. Bases taken from git are left
+    /// out; their blob is git's and their text comes from git.
+    bases: HashMap<String, (Option<i64>, String)>,
+    /// Each file's current store version.
+    heads: HashMap<String, i64>,
+    /// Store paths deleted or moved away since the base was recorded: a file there again has
+    /// started its versions over, so its base version names nothing.
+    gone_since: HashSet<String>,
 }
 
 impl Sides<'_> {
@@ -705,9 +716,79 @@ impl Sides<'_> {
         if let Some(found) = self.textdb.get(rel) {
             return Ok(found.clone());
         }
-        let found = self.st.read(&store_path(&self.prefix, rel), None)?;
+        let path = store_path(&self.prefix, rel);
+        let found = match self.rebuilt(rel, &path) {
+            Some(found) => found,
+            None => self.st.read(&path, None)?,
+        };
+        // Whatever the store holds now is a base the next sync may diff against.
+        self.cache.put(&found.0);
         self.textdb.insert(rel.to_string(), found.clone());
         Ok(found)
+    }
+
+    /// The store's current text rebuilt from the base this directory kept and the hunks the
+    /// store made since, rather than read whole (ADR 0008). `None` when there is no base text
+    /// to build on, the file was recreated (its versions started over), or a hunk does not fit
+    /// the base it claims to replace — and then the file is read whole.
+    fn rebuilt(&mut self, rel: &str, path: &str) -> Option<(Vec<u8>, i64)> {
+        let (Some(base_version), blob) = self.bases.get(rel)?.clone() else { return None };
+        let head = *self.heads.get(rel)?;
+        if self.recreated(path) {
+            return None;
+        }
+        let base = self.base_text(rel, &blob)?;
+        if head == base_version {
+            return Some((base, head));
+        }
+        let hunks = self.st.hunks(path, base_version, head).ok()?;
+        apply_hunks(&base, &hunks).map(|text| (text, head))
+    }
+
+    /// The content `blob` names: from the cache, or the file on disk when it is unchanged.
+    fn base_text(&mut self, rel: &str, blob: &str) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.cache.get(blob) {
+            return Some(bytes);
+        }
+        let bytes = self.disk(rel).ok()?;
+        (blob_id(&bytes) == blob).then_some(bytes)
+    }
+
+    fn recreated(&self, path: &str) -> bool {
+        if self.gone_since.is_empty() {
+            return false;
+        }
+        let mut at = path;
+        loop {
+            if self.gone_since.contains(at) {
+                return true;
+            }
+            match at.rfind('/') {
+                Some(i) if i > 0 => at = &at[..i],
+                _ => return false,
+            }
+        }
+    }
+
+    /// Commit `bytes` as the line ranges that changed since `base_version` when this directory
+    /// holds that version's text — the store's current text it rebuilt, or the base it kept —
+    /// else whole (ADR 0008).
+    fn push(&mut self, rel: &str, bytes: &[u8], base_version: Option<i64>, author: Option<&str>, message: Option<&str>) -> Result<Written> {
+        let path = store_path(&self.prefix, rel);
+        if let Some(v) = base_version {
+            let held = match self.textdb.get(rel) {
+                Some((text, version)) if *version == v => Some(text.clone()),
+                _ => None,
+            };
+            let held = held.or_else(|| {
+                let (base_version, blob) = self.bases.get(rel)?.clone();
+                (base_version == Some(v)).then_some(blob).and_then(|blob| self.base_text(rel, &blob))
+            });
+            if let Some(ranges) = held.and_then(|base| ranges_between(&base, bytes)) {
+                return self.st.replace_ranges(&path, &ranges, Some(v), author, message);
+            }
+        }
+        self.st.write(&path, bytes, base_version, author, message)
     }
 
     fn disk(&mut self, rel: &str) -> Result<Vec<u8>> {
@@ -718,6 +799,55 @@ impl Sides<'_> {
         self.disk.insert(rel.to_string(), found.clone());
         Ok(found)
     }
+}
+
+/// `base` with `hunks` applied, each checked against the lines it says it replaces; `None`
+/// when one does not fit.
+fn apply_hunks(base: &[u8], hunks: &[Hunk]) -> Option<Vec<u8>> {
+    let lines = split_lines(base);
+    let mut out = Vec::with_capacity(base.len());
+    let mut at = 0usize;
+    for h in hunks {
+        let from = usize::try_from(h.old_from).ok()?.checked_sub(1)?;
+        let count = usize::try_from(h.old_count).ok()?;
+        if from < at || from + count > lines.len() {
+            return None;
+        }
+        for line in &lines[at..from] {
+            out.extend_from_slice(line);
+        }
+        if lines[from..from + count].concat() != h.old_text.as_bytes() {
+            return None;
+        }
+        out.extend_from_slice(h.new_text.as_bytes());
+        at = from + count;
+    }
+    for line in &lines[at..] {
+        out.extend_from_slice(line);
+    }
+    Some(out)
+}
+
+/// `new` as the line ranges of `base` that changed, for `replace_ranges` — only when they are
+/// fewer bytes than the file and splicing them into `base` gives `new` byte for byte. `None`
+/// otherwise, and the file is written whole.
+fn ranges_between(base: &[u8], new: &[u8]) -> Option<Vec<LineRange>> {
+    let (a, b) = (split_lines(base), split_lines(new));
+    let hunks = line_diff(&a, &b);
+    if hunks.is_empty() {
+        return None;
+    }
+    let mut ranges = Vec::with_capacity(hunks.len());
+    let mut bytes = 0;
+    for h in hunks {
+        let text = String::from_utf8(b[h.b_from..h.b_to].concat()).ok()?;
+        bytes += text.len();
+        ranges.push(LineRange { from: h.a_from as i64 + 1, to: h.a_to as i64, text });
+    }
+    if bytes >= new.len() {
+        return None;
+    }
+    (crate::store::splice_lines(base, &ranges).ok()? == new).then_some(ranges)
 }
 
 #[derive(Default)]
@@ -1431,6 +1561,10 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         prefix: prefix.clone(),
         textdb: HashMap::new(),
         disk: HashMap::new(),
+        cache: BaseCache::open(&o.dir, !o.dry_run),
+        bases: base.iter().filter(|(_, b)| !b.from_git).map(|(rel, b)| (rel.clone(), (b.version, b.blob.clone()))).collect(),
+        heads: heads.iter().map(|(rel, h)| (rel.clone(), h.version)).collect(),
+        gone_since: gone_since.clone(),
     };
     // The path, or a folder it is in, went away.
     let recreated = |rel: &str| {
@@ -1659,12 +1793,9 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
                 }
                 let base_bytes = match (b.from_git, b.version, &report.base_commit) {
                     (true, _, Some(commit)) => git::show(&o.dir, commit, &rel).ok(),
-                    (false, Some(v), _) => sides
-                        .st
-                        .read(&store_path(&prefix, &rel), Some(v))
-                        .ok()
-                        .map(|(bytes, _)| bytes)
-                        .filter(|bytes| blob_id(bytes) == b.blob),
+                    (false, Some(v), _) => sides.base_text(&rel, &b.blob).or_else(|| {
+                        sides.st.read(&store_path(&prefix, &rel), Some(v)).ok().map(|(bytes, _)| bytes).filter(|bytes| blob_id(bytes) == b.blob)
+                    }),
                     _ => None,
                 };
                 let (merged, conflicts) = diff3_marked(base_bytes.as_deref().unwrap_or(b""), &tb, &db, OURS, THEIRS);
@@ -2268,8 +2399,9 @@ fn apply(
             Some(change) => (change.author.as_str(), change.message()),
             None => (author, format!("sync from {key}")),
         };
-        match sides.st.write(&store_path(&prefix, rel), &bytes, *base_version, Some(who), Some(&message)) {
+        match sides.push(rel, &bytes, *base_version, Some(who), Some(&message)) {
             Ok(w) => {
+                sides.cache.put(&bytes);
                 rows.insert(rel.clone(), base_row(dir, rel, exact(&w.kind, w.version), blob_id(&bytes), false));
             }
             Err(e) => failed(report, &mut rows, rel, failure(&e)),
@@ -2277,9 +2409,10 @@ fn apply(
     }
     for (rel, version, merged) in &plan.merges {
         let message = format!("sync: merged with the changes in {key}");
-        match sides.st.write(&store_path(&prefix, rel), merged, Some(*version), Some(author), Some(&message)) {
+        match sides.push(rel, merged, Some(*version), Some(author), Some(&message)) {
             Ok(w) => match write_disk(dir, rel, merged) {
                 Ok(()) => {
+                    sides.cache.put(merged);
                     rows.insert(rel.clone(), base_row(dir, rel, exact(&w.kind, w.version), blob_id(merged), false));
                 }
                 Err(e) => failed(report, &mut rows, rel, e.to_string()),
@@ -2390,6 +2523,16 @@ fn apply(
             _ => b.blob.clone(),
         };
         rows.insert(rel.clone(), base_row(dir, rel, heads.get(rel).map(|h| h.version), blob, false));
+        // The file is the base the next sync diffs against once it is edited: keep its text now,
+        // while it still is that (ADR 0008). Read straight from disk, not into `sides`, so a
+        // vault synced before the cache existed is not held in memory to fill it.
+        if !b.from_git && !sides.cache.has(&b.blob) {
+            if let Ok(bytes) = std::fs::read(dir.join(rel)) {
+                if blob_id(&bytes) == b.blob {
+                    sides.cache.put(&bytes);
+                }
+            }
+        }
     }
     for rel in &plan.hold {
         if let Some(row) = stored_rows.get(rel) {

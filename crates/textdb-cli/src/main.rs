@@ -26,6 +26,7 @@ use store::{Change, Commit, Entry, ImportStats, PathEvent, Store, StoreError, Wr
 type Result<T> = std::result::Result<T, StoreError>;
 
 mod assets;
+mod basecache;
 mod git;
 mod links;
 mod lock;

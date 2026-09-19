@@ -3179,3 +3179,99 @@ fn a_folder_carries_the_authors_below_it() {
     let a = ls.as_array().unwrap().iter().find(|e| e["path"] == "/notes/a").unwrap();
     assert_eq!((a["nauthors"].as_i64(), a["updated_by"].as_str()), (Some(3), Some("carol")));
 }
+
+/// What sync moves across the store seam is proportional to the change, not to the file (ADR
+/// 0008): a local edit goes up as line ranges, a store edit comes down as hunks, a merge needs
+/// neither side whole, and `TEXTDB_WIRE_STATS` is how that is measured.
+#[test]
+fn sync_moves_changed_lines_not_whole_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let dir = tmp.path().join("notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    let doc: String = (1..=200).map(|i| format!("line {i} of a document long enough for the difference to show\n")).collect();
+    std::fs::write(dir.join("a.md"), &doc).unwrap();
+    let stats = |name: &str| tmp.path().join(format!("{name}.json"));
+    let sync = |name: &str| {
+        let mut cmd = textdb(&store);
+        cmd.env("TEXTDB_WIRE_STATS", stats(name)).args(["--json", "sync", "/notes"]).arg(&dir);
+        let o = run(&mut cmd, None);
+        let text = std::fs::read_to_string(stats(name)).unwrap_or_else(|e| panic!("no wire stats for {name} ({e}): {}\n{}", o.stdout, o.stderr));
+        (o, serde_json::from_str(&text).unwrap())
+    };
+    let bytes = |wire: &Value, method: &str, dir: &str| wire["methods"][method][dir].as_u64().unwrap_or(0);
+    let calls = |wire: &Value, method: &str| wire["methods"][method]["calls"].as_u64().unwrap_or(0);
+    let edit = |text: &str, from: &str, to: &str| {
+        assert_eq!(text.matches(from).count(), 1, "{from} once in the file");
+        text.replacen(from, to, 1)
+    };
+    let cat = || ok(textdb(&store).args(["cat", "/notes/a.md"]), None).stdout;
+    let disk = || std::fs::read_to_string(dir.join("a.md")).unwrap();
+
+    // The first sync has to send the file whole; nothing knows it yet.
+    let (first, wire) = sync("first");
+    assert_eq!(first.status, 0, "{}", first.stderr);
+    assert!(bytes(&wire, "write", "up") >= doc.len() as u64, "{wire}");
+    // Its text is kept as the base the next edit is diffed against.
+    assert!(dir.join(".textdb/base").is_dir());
+
+    // Local only: one line up as a range, nothing read.
+    std::fs::write(dir.join("a.md"), edit(&doc, "line 150 of", "LOCAL 150 of")).unwrap();
+    let (o, wire) = sync("local");
+    assert_eq!(o.status, 0, "{}", o.stderr);
+    assert_eq!((calls(&wire, "write"), calls(&wire, "read"), calls(&wire, "replace_ranges")), (0, 0, 1), "{wire}");
+    assert!(bytes(&wire, "replace_ranges", "up") < 200, "{wire}");
+    assert_eq!(cat(), disk());
+
+    // Store only: one hunk down, nothing read whole.
+    ok(textdb(&store).args(["replace-lines", "/notes/a.md", "20", "20", "--text", "STORE 20\n"]), None);
+    let (o, wire) = sync("store");
+    assert_eq!(o.status, 0, "{}", o.stderr);
+    assert_eq!((calls(&wire, "read"), calls(&wire, "hunks")), (0, 1), "{wire}");
+    assert!(bytes(&wire, "hunks", "down") < 200, "{wire}");
+    assert_eq!(cat(), disk());
+    assert!(disk().contains("STORE 20\n"));
+
+    // Both sides, different lines: a hunk down, a range up, no whole file either way.
+    ok(textdb(&store).args(["replace-lines", "/notes/a.md", "40", "40", "--text", "STORE 40\n"]), None);
+    std::fs::write(dir.join("a.md"), edit(&disk(), "line 160 of", "LOCAL 160 of")).unwrap();
+    let (o, wire) = sync("merge");
+    assert_eq!(o.status, 0, "{}", o.stderr);
+    assert_eq!(o.json()["merged"], serde_json::json!(["a.md"]));
+    assert_eq!((calls(&wire, "read"), calls(&wire, "write"), calls(&wire, "hunks"), calls(&wire, "replace_ranges")), (0, 0, 1, 1), "{wire}");
+    assert!(wire["total"].as_u64().unwrap() < 2000, "a merge of two one-line edits: {wire}");
+    assert_eq!(cat(), disk());
+    assert!(disk().contains("STORE 40\n") && disk().contains("LOCAL 160 of"));
+
+    // Both sides, the same line: the store's side comes down as a hunk, the conflict is found here,
+    // and its resolution goes up as a range.
+    ok(textdb(&store).args(["replace-lines", "/notes/a.md", "100", "100", "--text", "STORE 100\n"]), None);
+    std::fs::write(dir.join("a.md"), edit(&disk(), "line 100 of", "LOCAL 100 of")).unwrap();
+    let (o, wire) = sync("conflict");
+    assert_eq!(o.status, 3, "{}", o.stdout);
+    assert_eq!((calls(&wire, "read"), calls(&wire, "write")), (0, 0), "{wire}");
+    let marked = disk();
+    assert!(marked.contains("<<<<<<< textdb\nSTORE 100\n=======\nLOCAL 100 of"), "{marked}");
+    let resolved = marked.replace("<<<<<<< textdb\nSTORE 100\n=======\n", "").replace(">>>>>>> disk\n", "").replace("LOCAL 100 of", "BOTH 100 of");
+    std::fs::write(dir.join("a.md"), &resolved).unwrap();
+    let (o, wire) = sync("resolved");
+    assert_eq!(o.status, 0, "{}", o.stderr);
+    assert_eq!((calls(&wire, "write"), calls(&wire, "replace_ranges")), (0, 1), "{wire}");
+    assert_eq!(cat(), disk());
+    assert!(cat().contains("BOTH 100 of"));
+
+    // Without its base cache a checkout falls back to whole files, and refills the cache.
+    std::fs::remove_dir_all(dir.join(".textdb/base")).unwrap();
+    ok(textdb(&store).args(["replace-lines", "/notes/a.md", "5", "5", "--text", "STORE 5\n"]), None);
+    std::fs::write(dir.join("a.md"), edit(&disk(), "line 170 of", "LOCAL 170 of")).unwrap();
+    let (o, wire) = sync("nocache");
+    assert_eq!(o.status, 0, "{}", o.stderr);
+    assert_eq!(o.json()["merged"], serde_json::json!(["a.md"]));
+    assert!(calls(&wire, "read") >= 1, "{wire}");
+    assert_eq!(cat(), disk());
+    assert!(dir.join(".textdb/base").is_dir());
+    // And the managed .gitignore block leaves the cache out of git.
+    ok(textdb(&store).args(["assets", "gitignore", "--dir"]).arg(&dir), None);
+    let gi = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+    assert!(gi.contains("\n/.textdb/base/\n"), "{gi}");
+}

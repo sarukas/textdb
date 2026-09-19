@@ -375,6 +375,7 @@ impl Classifier {
         // After the rules, so none of their directory negations brings them back: what pull moved
         // aside in the vault is ignored, git's own files and pointers never are.
         out.push("/.textdb/trash/".to_string());
+        out.push("/.textdb/base/".to_string());
         out.push("!.git*".to_string());
         out.push(format!("!*{SUFFIX}"));
         out

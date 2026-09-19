@@ -2,6 +2,7 @@
 
 pub mod pg;
 pub mod sqlite;
+pub mod wire;
 
 use std::time::Duration;
 
@@ -328,7 +329,6 @@ pub fn sorted_ranges(ranges: &[LineRange]) -> Result<Vec<&LineRange>> {
 }
 
 /// `content` with `ranges` replaced, as `replace_line_ranges` in the SQLite binding does it.
-#[cfg(test)]
 pub fn splice_lines(content: &[u8], ranges: &[LineRange]) -> Result<Vec<u8>> {
     let sorted = sorted_ranges(ranges)?;
     let starts: Vec<usize> = std::iter::once(0)
@@ -900,8 +900,13 @@ pub trait Store {
 pub use crate::assets::driver::AssetStore;
 
 pub fn open(store: &str) -> Result<Box<dyn Store>> {
-    Ok(match parse_store(store) {
+    let opened: Box<dyn Store> = match parse_store(store) {
         StoreUrl::Sqlite(path) => Box::new(sqlite::SqliteStore::open(&path)?),
         StoreUrl::Postgres(url) => Box::new(pg::PgStore::connect(&url)?),
+    };
+    // `TEXTDB_WIRE_STATS=<path>|-`: count what crosses the seam (ADR 0008), written on exit.
+    Ok(match std::env::var("TEXTDB_WIRE_STATS") {
+        Ok(sink) if !sink.is_empty() => Box::new(wire::Counting::wrap(opened, sink)),
+        _ => opened,
     })
 }

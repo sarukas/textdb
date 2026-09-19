@@ -115,7 +115,7 @@ Git's attribute syntax, in the vault's `.gitattributes`, with a `textdb` attribu
 - The rules (with a hash of `.gitattributes`) are recorded with each sync base, so a change is
   reported before it takes in or pushes files unnoticed.
 - `textdb assets gitignore` keeps a managed block in `.gitignore` that ignores the asset patterns
-  and the vault's `.textdb/trash/`, and never `*.tdbasset`. Where the patterns get a file wrong (a
+  and the vault's `.textdb/trash/` and `.textdb/base/`, and never `*.tdbasset`. Where the patterns get a file wrong (a
   document under a `binary` rule, an asset only its bytes show) the block names that file; run
   it again as files come and go. Push notes pushed assets git does not ignore.
 
