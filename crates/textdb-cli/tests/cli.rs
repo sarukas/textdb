@@ -708,6 +708,21 @@ fn assets_push_pull_verify_links_and_gitignore() {
     assert_eq!(std::fs::read(vault.join("docs/deck.pdf")).unwrap(), b"%PDF-1.4 one");
     assert_eq!(ok(&mut t(&["--json", "assets", "verify"]), None).json()["problems"], 0);
 
+    // A file somebody else put in the asset store, which no pointer names: told of, and no problem
+    // of textdb's to count -- whose bytes those are is not for textdb to decide. The assets' own
+    // files are named by their pointers, so none of them is listed here.
+    std::fs::create_dir_all(bucket.join("img")).unwrap();
+    std::fs::write(bucket.join("img/nobodys.png"), b"\x89PNG theirs").unwrap();
+    let listed = ok(&mut t(&["--json", "assets", "verify"]), None).json();
+    assert_eq!(listed["problems"], 0, "{listed}");
+    let unnamed: Vec<&str> = listed["unnamed"].as_array().unwrap().iter().filter_map(|u| u["at"].as_str()).collect();
+    assert_eq!(unnamed, vec!["/img/nobodys.png"], "{listed}");
+    // One asset, or one folder, asked about on its own never lists a store's files: what a store
+    // holds that nothing names is a whole vault's question, and listing a drive is not free.
+    let one = ok(&mut t(&["--json", "assets", "verify", "/img"]), None).json();
+    assert_eq!(one["unnamed"].as_array().unwrap().len(), 0, "{one}");
+    std::fs::remove_file(bucket.join("img/nobodys.png")).unwrap();
+
     // Bytes damaged in the asset store: verify fails, and pull does not put them in place.
     std::fs::write(bucket.join("data/x.dat"), b"damaged").unwrap();
     let bad = run(&mut t(&["--json", "assets", "verify"]), None);
@@ -1128,15 +1143,249 @@ fn link_dir(target: &Path, link: &Path) -> bool {
     }
 }
 
-/// rclone for tests: `TEXTDB_RCLONE`, else `rclone` on the PATH. Without one the test is skipped,
-/// unless `TEXTDB_REQUIRE_RCLONE` is set (as in CI).
-fn test_rclone() -> Option<std::path::PathBuf> {
-    let exe = std::env::var_os("TEXTDB_RCLONE").filter(|e| !e.is_empty()).map_or_else(|| "rclone".into(), std::path::PathBuf::from);
-    let runs = Command::new(&exe).arg("version").output().is_ok_and(|o| o.status.success());
-    if !runs && std::env::var_os("TEXTDB_REQUIRE_RCLONE").is_some() {
-        panic!("TEXTDB_REQUIRE_RCLONE is set, but {} does not run", exe.display());
+/// rclone as the driver runs it: without flags from `RCLONE_*` variables (its configuration still
+/// comes through), which could send a test's commands somewhere the driver does not go.
+fn rclone_command(exe: &std::path::Path) -> Command {
+    let mut c = Command::new(exe);
+    for (key, _) in std::env::vars_os() {
+        let Some(key) = key.to_str() else { continue };
+        let upper = key.to_ascii_uppercase();
+        if upper.starts_with("RCLONE_") && !upper.starts_with("RCLONE_CONFIG") && upper != "RCLONE_PASSWORD_COMMAND" {
+            c.env_remove(key);
+        }
     }
-    runs.then_some(exe)
+    c
+}
+
+/// rclone for tests: `TEXTDB_RCLONE` only, as CI sets it, never one found on the PATH. These tests
+/// rewrite and rename files quickly, which security software on a person's own computer may take
+/// for ransomware. Without it the test is skipped, unless `TEXTDB_REQUIRE_RCLONE` is set.
+fn test_rclone() -> Option<std::path::PathBuf> {
+    let exe = std::env::var_os("TEXTDB_RCLONE").filter(|e| !e.is_empty()).map(std::path::PathBuf::from);
+    let runs = exe.as_ref().is_some_and(|exe| Command::new(exe).arg("version").output().is_ok_and(|o| o.status.success()));
+    if !runs && std::env::var_os("TEXTDB_REQUIRE_RCLONE").is_some() {
+        panic!("TEXTDB_REQUIRE_RCLONE is set, but TEXTDB_RCLONE does not name an rclone that runs");
+    }
+    exe.filter(|_| runs)
+}
+
+/// A Google Drive folder called `textdb-test` to test against (`TEXTDB_TEST_GDRIVE`, such as
+/// `gdrive:textdb-test`), and rclone; the test is skipped without one.
+fn test_gdrive() -> Option<(std::path::PathBuf, String)> {
+    let base = std::env::var("TEXTDB_TEST_GDRIVE").ok().filter(|b| !b.is_empty())?;
+    let base = base.trim_end_matches('/').to_string();
+    assert_eq!(base.rsplit(['/', ':']).next(), Some("textdb-test"), "TEXTDB_TEST_GDRIVE must name a folder called textdb-test, not {base}");
+    let rclone = test_rclone().expect("TEXTDB_TEST_GDRIVE is set, but rclone does not run");
+    let remote = base.split_once(':').map_or("", |(r, _)| r).to_string();
+    let listed = rclone_command(&rclone).args(["listremotes", "--long"]).output().unwrap();
+    let on_drive = String::from_utf8_lossy(&listed.stdout).lines().any(|l| l.split_once(':').is_some_and(|(n, t)| n.trim() == remote && t.split_whitespace().next() == Some("drive")));
+    assert!(on_drive, "TEXTDB_TEST_GDRIVE must be on a Google Drive remote, not {base}");
+    Some((rclone, base))
+}
+
+#[test]
+fn assets_on_google_drive_are_pulled_by_file_id_and_never_from_outside_the_store() {
+    let Some((rclone, base)) = test_gdrive() else { return };
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
+    let run_dir = format!("{base}/cli-{}-{nanos}", std::process::id());
+    let root = format!("{run_dir}/store");
+    let rc = |args: &[&str]| {
+        let out = rclone_command(&rclone).args(args).output().unwrap();
+        assert!(out.status.success(), "rclone {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    struct Purge(std::path::PathBuf, String);
+    impl Drop for Purge {
+        fn drop(&mut self) {
+            let _ = rclone_command(&self.0).args(["purge", "--drive-use-trash=false", &self.1]).output();
+        }
+    }
+    rc(&["mkdir", &root]);
+    let _purge = Purge(rclone.clone(), run_dir.clone());
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let (vault, config) = (tmp.path().join("vault"), tmp.path().join("config"));
+    std::fs::create_dir_all(vault.join("img")).unwrap();
+    std::fs::write(vault.join("notes.md"), "![[a.png]]\n").unwrap();
+    let bytes = [137u8, 80, 78, 71, 0, 1, 2];
+    std::fs::write(vault.join("img/a.png"), bytes).unwrap();
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.env("TEXTDB_CONFIG_DIR", &config).env("TEXTDB_RCLONE", &rclone).args(args);
+        c
+    };
+    let dir = vault.to_str().unwrap();
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "stores", "--add", "drive", "--driver", "rclone", "--root", &root]), None);
+    ok(&mut t(&["assets", "push", "--dir", dir]), None);
+    let pointer = std::fs::read_to_string(vault.join("img/a.png.tdbasset")).unwrap();
+    let id = pointer.lines().find_map(|l| l.strip_prefix("item: ")).unwrap().to_string();
+    assert!(!id.starts_with('/'), "the item is the Drive file id: {pointer}");
+
+    // What the drive holds is the asset's own state while the file here is still the bytes its
+    // pointer names: moved there it is `moved-in-store` and says where it went, trashed there it is
+    // `trashed-in-store`. Neither is the vault's to settle, and a pull still fetches either.
+    let asset_at = |path: &str| {
+        ok(&mut t(&["--json", "assets", "status", "--dir", dir]), None).json()["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["path"] == path)
+            .cloned()
+            .unwrap_or_else(|| panic!("{path} is not in `assets status`"))
+    };
+    // Renamed in the drive and then trashed there: pulled all the same, by its id.
+    rc(&["moveto", &format!("{root}/img/a.png"), &format!("{root}/elsewhere/renamed.png")]);
+    let moved_in_store = asset_at("/img/a.png");
+    assert_eq!(moved_in_store["state"], "moved-in-store", "{moved_in_store}");
+    assert!(
+        moved_in_store["in_store"].as_str().is_some_and(|at| at.ends_with("elsewhere/renamed.png")),
+        "the asset does not say where its file went in the drive: {moved_in_store}"
+    );
+    rc(&["deletefile", &format!("{root}/elsewhere/renamed.png")]);
+    let trashed_in_store = asset_at("/img/a.png");
+    assert_eq!(trashed_in_store["state"], "trashed-in-store", "{trashed_in_store}");
+    std::fs::remove_file(vault.join("img/a.png")).unwrap();
+    ok(&mut t(&["assets", "pull", "--dir", dir]), None);
+    assert_eq!(std::fs::read(vault.join("img/a.png")).unwrap(), bytes);
+
+    // A pointer naming a file outside the store is never pulled, whatever that file is.
+    rc(&["copyto", vault.join("notes.md").to_str().unwrap(), &format!("{run_dir}/outside/notes.md")]);
+    let outside: serde_json::Value = serde_json::from_str(&rc(&["lsjson", "--stat", &format!("{run_dir}/outside/notes.md")])).unwrap();
+    let outside_id = outside["ID"].as_str().unwrap();
+    let planted = pointer
+        .lines()
+        .map(|l| match l {
+            l if l.starts_with("item: ") => format!("item: {outside_id}"),
+            l if l.starts_with("id: ") => "id: 01a0a37c-6564-709a-9f90-00000000000c".to_string(),
+            l => l.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    ok(&mut t(&["write", "/img/c.png.tdbasset"]), Some(&planted));
+    run(&mut t(&["sync", "/", dir]), None);
+    let pulled = run(&mut t(&["assets", "pull", "--dir", dir]), None);
+    assert!(format!("{}{}", pulled.stdout, pulled.stderr).contains("names no file of the asset store"), "{} {}", pulled.stdout, pulled.stderr);
+    assert!(!vault.join("img/c.png").exists());
+    // Nothing about this vault is wrong once the bytes its pointer names are here -- but the store
+    // holds no file of that item, so that is what the asset says of itself, and neither a pull nor
+    // a push guesses at which file was meant. Taken away again, so what follows sees it as it was.
+    std::fs::write(vault.join("img/c.png"), bytes).unwrap();
+    let invalid_item = asset_at("/img/c.png");
+    assert_eq!(invalid_item["state"], "invalid-item", "{invalid_item}");
+    std::fs::remove_file(vault.join("img/c.png")).unwrap();
+
+    // A pointer deleted in textdb sends its file to Drive's trash -- but only once every pointer of
+    // the store can be read, since what bytes are for is not guessed at from the pointers that
+    // happened to parse. Two assets: one deleted while a pointer cannot be read, one after.
+    for (name, last) in [("d", 3u8), ("e", 4), ("f", 5)] {
+        std::fs::write(vault.join(format!("img/{name}.png")), [137u8, 80, 78, 71, 0, last]).unwrap();
+    }
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "push", "--dir", dir]), None);
+    let item_of = |name: &str| {
+        std::fs::read_to_string(vault.join(format!("img/{name}.png.tdbasset")))
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("item: ").map(str::to_string))
+            .unwrap()
+    };
+    let (id_d, id_e, id_f) = (item_of("d"), item_of("e"), item_of("f"));
+    let live = || rc(&["lsjson", "-R", "--files-only", &root]);
+    let there = live();
+    assert!([&id_d, &id_e, &id_f].iter().all(|id| there.contains(id.as_str())), "all three files are in the drive after the push: {there}");
+
+    // A pointer textdb cannot read counts as naming those bytes: nothing goes to Drive's trash, and
+    // the sync says which pointer it could not read rather than leaving it to be guessed at.
+    ok(&mut t(&["write", "/img/bad.png.tdbasset"]), Some("not a pointer at all\n"));
+    run(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["rm", "/img/d.png"]), None);
+    let unreadable = run(&mut t(&["--json", "sync", "/", dir]), None);
+    assert!(live().contains(&id_d), "a file went to Drive's trash while a pointer of the store could not be read");
+    let said = format!("{}{}", unreadable.stdout, unreadable.stderr);
+    assert!(said.contains("cannot be read") && said.contains("bad.png"), "the sync did not say which pointer it could not read: {said}");
+
+    // Bytes someone replaced in the drive are theirs: a deleted pointer does not take them away,
+    // whatever its own bytes were, and the sync says so. The file keeps its id through the
+    // replacement, so only the bytes tell the two apart.
+    ok(&mut t(&["rm", "/img/bad.png.tdbasset"]), None);
+    run(&mut t(&["sync", "/", dir]), None);
+    let theirs = vault.join("theirs.png");
+    std::fs::write(&theirs, [137u8, 80, 78, 71, 9, 9]).unwrap();
+    let at_e = rc(&["lsjson", "-R", "--files-only", &root]);
+    let path_of_e = serde_json::from_str::<Vec<serde_json::Value>>(&at_e)
+        .unwrap()
+        .into_iter()
+        .find(|l| l["ID"].as_str() == Some(id_e.as_str()))
+        .map(|l| l["Path"].as_str().unwrap().to_string())
+        .unwrap();
+    rc(&["copyto", "--ignore-times", theirs.to_str().unwrap(), &format!("{root}/{path_of_e}")]);
+    std::fs::remove_file(&theirs).unwrap();
+    // The file here is still the one the pointer names; the drive's is somebody else's now. The
+    // asset says so, and a pull would take those bytes as its new version rather than refuse them.
+    let changed_in_store = asset_at("/img/e.png");
+    assert_eq!(changed_in_store["state"], "changed-in-store", "{changed_in_store}");
+    ok(&mut t(&["rm", "/img/e.png"]), None);
+    let kept = run(&mut t(&["--json", "sync", "/", dir]), None);
+    assert!(live().contains(&id_e), "bytes replaced in the drive were sent to Drive's trash by a deleted pointer");
+    let said = format!("{}{}", kept.stdout, kept.stderr);
+    assert!(said.contains("other than the ones its pointer named"), "the sync did not say the bytes in the drive are not the pointer's: {said}");
+
+    // A pointer whose file in the drive still holds the bytes it named: that one does go to Drive's
+    // trash, where a pull by id would still find it for the thirty days Drive keeps it.
+    ok(&mut t(&["rm", "/img/f.png"]), None);
+    ok(&mut t(&["sync", "/", dir]), None);
+    assert!(!live().contains(&id_f), "the file is still live in the drive: {}", live());
+    let gone = rc(&["lsjson", "-R", "--files-only", "--drive-trashed-only", &root]);
+    assert!(gone.contains(&id_f), "the file is not in Drive's trash: {gone}");
+
+    // An asset moved in textdb leaves its file in the drive where it was: nothing moves a person's
+    // drive about on its own. The asset is `moved-here`, and the sync says so with the way out.
+    std::fs::write(vault.join("img/g.png"), [137u8, 80, 78, 71, 0, 6]).unwrap();
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "push", "--dir", dir]), None);
+    let id_g = item_of("g");
+    let where_of = |id: &str| {
+        serde_json::from_str::<Vec<serde_json::Value>>(&rc(&["lsjson", "-R", "--files-only", &root]))
+            .unwrap()
+            .into_iter()
+            .find(|l| l["ID"].as_str() == Some(id))
+            .map(|l| l["Path"].as_str().unwrap().to_string())
+    };
+    assert_eq!(where_of(&id_g).as_deref(), Some("img/g.png"));
+    ok(&mut t(&["mv", "/img/g.png", "/pics/g.png"]), None);
+    let after_mv = ok(&mut t(&["--json", "sync", "/", dir]), None).json();
+    assert_eq!(where_of(&id_g).as_deref(), Some("img/g.png"), "`mv` moved the file in the drive");
+    let notes = format!("{}", after_mv["assets"]["notes"]);
+    assert!(notes.contains("/pics/g.png") && notes.contains("relocate"), "the sync did not say the asset moved and how to settle it: {notes}");
+    let status = ok(&mut t(&["--json", "assets", "status", "--dir", dir]), None).json();
+    let moved_here = status["assets"].as_array().unwrap().iter().find(|a| a["path"] == "/pics/g.png").unwrap().clone();
+    assert_eq!(moved_here["state"], "moved-here", "{moved_here}");
+    assert_eq!(moved_here["in_store"], "/img/g.png", "{moved_here}");
+
+    // `relocate` moves it in the drive to the asset's own path, and Drive keeps the file's id
+    // through the move, so the pointer needs no rewriting and links in the drive still point at it.
+    ok(&mut t(&["assets", "relocate", "--dir", dir, "--dry-run"]), None);
+    assert_eq!(where_of(&id_g).as_deref(), Some("img/g.png"), "a dry run moved it");
+    ok(&mut t(&["assets", "relocate", "--dir", dir]), None);
+    assert_eq!(where_of(&id_g).as_deref(), Some("pics/g.png"), "the file did not move to the asset's path");
+    // Read where the pointer is now: the sync moved it with the asset, and Drive keeps the file's
+    // id through the move, so the pointer still names what it named before.
+    let item_at = |rel: &str| {
+        std::fs::read_to_string(vault.join(rel))
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("item: ").map(str::to_string))
+            .unwrap()
+    };
+    assert_eq!(item_at("pics/g.png.tdbasset"), id_g, "the move gave the file a new id");
+    let settled = ok(&mut t(&["--json", "assets", "status", "--dir", dir]), None).json();
+    let g = settled["assets"].as_array().unwrap().iter().find(|a| a["path"] == "/pics/g.png").unwrap().clone();
+    assert_eq!(g["state"], "ok", "{g}");
+    // Of this asset: others in this test were left broken on purpose (one in Drive's trash, one
+    // naming a file outside the store), and verify counts those as the problems they are.
+    assert_eq!(run(&mut t(&["assets", "verify", "/pics/g.png", "--dir", dir]), None).status, 0);
 }
 
 #[test]
@@ -1475,6 +1724,9 @@ fn sync_pairs_assets_with_their_real_files() {
     assert!(!v2.join("img/b.png").exists());
     let trash = deleted["assets"]["trash"].as_str().unwrap();
     assert_eq!(std::fs::read(v2.join(trash).join("img/b.png")).unwrap(), b"\x89PNG B");
+    // Its copy in the asset store stays where it is: a local store keeps no trash of the
+    // provider's own, and those bytes are there for whatever else may name them.
+    assert_eq!(std::fs::read(bucket.join("img/b.png")).unwrap(), b"\x89PNG B", "a deleted pointer took the local store's copy with it");
 
     // Renamed on disk: the pointer follows its file.
     ok(&mut t(&["sync", "/", d1]), None);
@@ -2858,9 +3110,21 @@ fn a_synced_directory_remembers_its_store_and_folder() {
     assert!(moved.stderr.contains("paired with the store"), "{}", moved.stderr);
 
     // One argument is the folder in the store, so a lone directory is a mistake worth naming.
+    // Where the directory cannot be a store path at all -- a Windows one, which begins with a
+    // drive letter -- the argument itself is refused as it is read, and the message names the
+    // shell rewrite that usually causes it. Elsewhere the path is a plausible one and the sync
+    // gets far enough to say it is a directory.
     let mistake = run(textdb(&db).arg("sync").arg(&dir), None);
-    assert_eq!(mistake.status, 6, "{}", mistake.stdout);
-    assert!(mistake.stderr.contains("is a directory on this computer"), "{}", mistake.stderr);
+    match cfg!(windows) {
+        true => {
+            assert_eq!(mistake.status, 2, "{}", mistake.stderr);
+            assert!(mistake.stderr.contains("is a Windows path, not a path in the store"), "{}", mistake.stderr);
+        }
+        false => {
+            assert_eq!(mistake.status, 6, "{}", mistake.stdout);
+            assert!(mistake.stderr.contains("is a directory on this computer"), "{}", mistake.stderr);
+        }
+    }
 
     // --force says so on purpose, and the pairing follows.
     ok(textdb(&db).args(["sync", "--force", "/elsewhere"]).arg(&dir), None);
@@ -3082,15 +3346,11 @@ fn a_killed_sync_leaves_no_half_written_file() {
     let _ = child.kill();
     let _ = child.wait();
 
-    // Whatever it managed, every file is one of the two whole texts.
-    let mut newly = 0;
+    // Whatever it managed, every file is one of the two whole texts. How many it reached is not
+    // the claim and cannot be one: the run was killed on a timer.
     for i in 0..60 {
         let text = std::fs::read_to_string(dir.join(format!("n{i}.md"))).unwrap();
-        if text == new {
-            newly += 1;
-        } else {
-            assert_eq!(text, old, "n{i}.md is neither the old text nor the new one ({} bytes)", text.len());
-        }
+        assert!(text == new || text == old, "n{i}.md is neither the old text nor the new one ({} bytes)", text.len());
     }
 
     // The staging files of a run that was killed do not pile up: the next sync holds the lock, so
@@ -3274,4 +3534,100 @@ fn sync_moves_changed_lines_not_whole_files() {
     ok(textdb(&store).args(["assets", "gitignore", "--dir"]).arg(&dir), None);
     let gi = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
     assert!(gi.contains("\n/.textdb/base/\n"), "{gi}");
+
+/// A provider that answers and refuses is not a provider that could not be reached. The first is a
+/// durable fact about this computer's access, which no retry changes and somebody has to go and ask
+/// A store name cannot be pointed somewhere else, or taken away, while pointers name its files.
+///
+/// The bytes are where the old root says and every pointer of that store names them by it, so a
+/// configuration edit would leave each of those pointers naming nothing -- on every computer that
+/// has not bound the store locally, while the ones that have go on working, which is worse than all
+/// of them failing. Moving a store is a move of the bytes (docs/assets.md, "Moving a store"); until
+/// there is a command for that, the edit that would break it is refused rather than made.
+#[test]
+fn a_store_in_use_cannot_be_repointed_or_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("kb.db");
+    let vault = tmp.path().join("vault");
+    let (bucket, elsewhere) = (tmp.path().join("bucket"), tmp.path().join("elsewhere"));
+    let config = tmp.path().join("config");
+    std::fs::create_dir_all(vault.join("img")).unwrap();
+    for d in [&bucket, &elsewhere] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(vault.join("img/a.png"), [137u8, 80, 78, 71, 0, 1]).unwrap();
+    let t = |args: &[&str]| {
+        let mut c = textdb(&store);
+        c.env("TEXTDB_CONFIG_DIR", &config).args(args);
+        c
+    };
+    let (here, there) = (bucket.to_str().unwrap().to_string(), elsewhere.to_str().unwrap().to_string());
+    ok(&mut t(&["sync", "/", vault.to_str().unwrap()]), None);
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", &here]), None);
+
+    // Nothing names it yet: repointing it is an edit like any other, and so is removing it.
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", &there]), None);
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", &here]), None);
+    ok(&mut t(&["assets", "stores", "--remove", "team"]), None);
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", &here]), None);
+
+    ok(&mut t(&["assets", "push", "--dir", vault.to_str().unwrap()]), None);
+    // One pointer names it now. Both edits are refused, and both say how many and why.
+    for args in [vec!["--add", "team", "--root", &there], vec!["--remove", "team"]] {
+        let refused = run(&mut t(&[&["assets", "stores"], &args[..]].concat()), None);
+        assert_eq!(refused.status, 6, "stdout: {}\nstderr: {}", refused.stdout, refused.stderr);
+        assert!(refused.stderr.contains("1 pointer names its files"), "{}", refused.stderr);
+        assert!(refused.stderr.contains("Moving a store"), "{}", refused.stderr);
+    }
+    // Refused, not half-done: the row is what it was, and a pull still finds the bytes.
+    let rows = ok(&mut t(&["--json", "assets", "stores"]), None).json();
+    assert_eq!(rows[0]["root"].as_str(), Some(here.as_str()), "{rows}");
+    std::fs::remove_file(vault.join("img/a.png")).unwrap();
+    ok(&mut t(&["assets", "pull", "--dir", vault.to_str().unwrap()]), None);
+    assert_eq!(std::fs::read(vault.join("img/a.png")).unwrap(), [137u8, 80, 78, 71, 0, 1]);
+
+    // Re-declaring the same place is not a repoint, so it stays allowed while in use.
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", &here]), None);
+    // And once nothing names it, both edits are available again.
+    std::fs::remove_file(vault.join("img/a.png.tdbasset")).unwrap();
+    ok(&mut t(&["sync", "/", vault.to_str().unwrap()]), None);
+    ok(&mut t(&["assets", "stores", "--add", "team", "--root", &there]), None);
+    ok(&mut t(&["assets", "stores", "--remove", "team"]), None);
+}
+
+/// about; the second is worth trying again and says nothing about the asset. They arrive here
+/// looking alike -- a run that exited non-zero -- so the driver reads what was said, and a refusal
+/// carries `forbidden` the way the same answer about a document does.
+#[test]
+fn a_store_that_refuses_this_computer_is_told_apart_from_one_it_cannot_reach() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, vault, remote, config) = fake_rclone_vault(tmp.path(), "textdb");
+    std::fs::write(vault.join("img/arch.png"), b"\x89PNG first").unwrap();
+    let t = |args: &[&str]| with_fake_rclone(&store, &remote, &config, args);
+    let denied = |args: &[&str]| {
+        let mut c = with_fake_rclone(&store, &remote, &config, args);
+        c.env("TEXTDB_FAKE_RCLONE_DENY", "1");
+        c
+    };
+    let dir = vault.to_str().unwrap();
+    ok(&mut t(&["sync", "/", dir]), None);
+    ok(&mut t(&["assets", "stores", "--add", "drive", "--driver", "rclone", "--root", "fake:textdb"]), None);
+    ok(&mut t(&["assets", "push", "--dir", dir]), None);
+    assert_eq!(ok(&mut t(&["--json", "assets", "verify", "--dir", dir]), None).json()["problems"], 0);
+
+    // The same store, now refusing. What it says is kept, and it is not called unreachable.
+    let refused = run(&mut denied(&["--json", "assets", "verify", "--dir", dir]), None);
+    assert_eq!(refused.status, 1, "{}{}", refused.stdout, refused.stderr);
+    // Two documents on stdout: the report, then the error that ended it.
+    let seen: serde_json::Value = serde_json::from_str(refused.stdout.lines().next().unwrap_or_default()).unwrap();
+    let said = seen["assets"][0]["asset_store"].as_str().unwrap_or_default().to_string();
+    assert!(said.starts_with("refused:"), "a refusal was reported as something else: {seen}");
+    assert!(said.contains("403") || said.contains("Insufficient permissions"), "what the provider said was lost: {seen}");
+
+    // A store that cannot be reached at all still reads as unchecked, not as a refusal.
+    std::fs::remove_dir_all(remote.join("textdb")).unwrap();
+    let gone = run(&mut t(&["--json", "assets", "verify", "--dir", dir]), None);
+    let told: serde_json::Value = serde_json::from_str(gone.stdout.lines().next().unwrap_or_default()).unwrap();
+    let missing = told["assets"][0]["asset_store"].as_str().unwrap_or_default().to_string();
+    assert!(!missing.starts_with("refused:"), "a store that is not there was called a refusal: {}", gone.stdout);
 }

@@ -263,6 +263,42 @@ fn entry_cols() -> String {
 }
 
 impl PgStore {
+    /// What every pointer this store holds names: `(store, location key)` and the key of the asset
+    /// it belongs to, with unreadable pointers counted rather than guessed at. `None` where this
+    /// connection cannot be told.
+    ///
+    /// Row-level security is the caller's view made the table's own rule, so where it is enforced
+    /// for this connection the raw table is filtered too and the honest answer is that this cannot
+    /// be told from here -- and then nothing is taken out of anybody's drive. A connection that
+    /// owns the tables reads them whole, which is the deployment the CLI has. `kb.node` and not a
+    /// view: the views answer in the caller's namespace, which is the thing to see past.
+    fn every_pointer_names(&mut self) -> Result<Option<(Vec<((String, String), String)>, usize)>> {
+        use crate::assets::pointer::{asset_path, SUFFIX};
+        use crate::assets::{location_key, pointer_names};
+        let enforced: bool = self.client.query_one("SELECT row_security_active('kb.node')", &[]).map_err(pg)?.get(0);
+        if enforced {
+            return Ok(None);
+        }
+        let like = format!("%{SUFFIX}");
+        let rows = self
+            .client
+            .query(
+                "SELECT n.path, kb._materialize(n.root) FROM kb.node n \n                 WHERE n.deleted_at IS NULL AND n.kind = 1 AND n.path LIKE $1",
+                &[&like],
+            )
+            .map_err(pg)?;
+        let (mut out, mut unreadable) = (Vec::new(), 0);
+        for r in &rows {
+            let path: String = r.get(0);
+            let text: Option<String> = r.get(1);
+            match text.as_deref().and_then(|t| pointer_names(&path, t)) {
+                None => unreadable += 1,
+                Some(names) => out.push((names, location_key(asset_path(&path)))),
+            }
+        }
+        Ok(Some((out, unreadable)))
+    }
+
     pub fn connect(url: &str) -> Result<Self> {
         Ok(PgStore {
             client: Client::connect(url, NoTls).map_err(pg)?,
@@ -1210,6 +1246,58 @@ impl Store for PgStore {
         Ok(self.client.query_one("SELECT kb.last_seq()", &[]).map_err(pg)?.get(0))
     }
 
+    fn may_name(&mut self, location: &str) -> Result<bool> {
+        // Not a path, so not this question's to answer: an id means a file, not a place.
+        if !location.starts_with('/') {
+            return Ok(true);
+        }
+        // `kb.to_view` is NULL for a path the caller cannot address, and the path itself for the
+        // owner -- the same rule every other read of a path goes through.
+        let row = self.client.query_one("SELECT kb.to_view($1) IS NOT NULL", &[&location]).map_err(pg)?;
+        Ok(row.get(0))
+    }
+
+    fn owner_paths(&mut self, paths: &[String]) -> Result<Vec<String>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One statement for the whole vault rather than a round trip per asset. `kb.to_store` is
+        // lexical -- an alias stands for a subtree -- so it answers for a path nothing is at yet,
+        // which is where a push is when it asks.
+        let rows = self
+            .client
+            .query("SELECT kb.to_store(p) FROM unnest($1::text[]) WITH ORDINALITY AS t(p, i) ORDER BY i", &[&paths])
+            .map_err(pg)?;
+        Ok(paths
+            .iter()
+            .zip(rows)
+            .map(|(given, r)| r.get::<_, Option<String>>(0).unwrap_or_else(|| given.clone()))
+            .collect())
+    }
+
+    fn asset_item_users(&mut self, store: &str, location: &str, own: &str) -> Result<Option<crate::store::ItemUsers>> {
+        use crate::assets::location_key;
+        let Some((all, unreadable)) = self.every_pointer_names()? else {
+            return Ok(None);
+        };
+        let want = (store.to_string(), location_key(location));
+        // `own` is already the owner's path, as `kb.node` holds: the assets it is compared with
+        // are the store's own, not a view's.
+        let mine = location_key(own);
+        let others = all.iter().filter(|(names, asset)| *names == want && *asset != mine).count();
+        Ok(Some(crate::store::ItemUsers { others, unreadable }))
+    }
+
+    fn asset_items_named(&mut self, store: &str, locations: &[String]) -> Result<Option<crate::store::ItemsNamed>> {
+        use crate::assets::location_key;
+        let Some((all, unreadable)) = self.every_pointer_names()? else {
+            return Ok(None);
+        };
+        let named: std::collections::HashSet<(String, String)> = all.into_iter().map(|(names, _)| names).collect();
+        let answers = locations.iter().map(|l| named.contains(&(store.to_string(), location_key(l)))).collect();
+        Ok(Some(crate::store::ItemsNamed { named: answers, unreadable }))
+    }
+
     fn file_heads(&mut self, prefix: &str) -> Result<Vec<FileHead>> {
         let prefix = normalize_path(prefix)?;
         // The prefix has to resolve before anything is read: a folder outside the caller's shares
@@ -1305,6 +1393,20 @@ impl Store for PgStore {
             .collect())
     }
 
+    /// How many pointers name the asset store, counted over every pointer the store holds: see the
+    /// trait. Unreadable pointers leave no answer, since a store's assets may be exactly those.
+    fn asset_store_users(&mut self, store: &str) -> Result<Option<usize>> {
+        let Some((named, unreadable)) = self.every_pointer_names()? else { return Ok(None) };
+        let users = named.iter().filter(|((s, _), _)| s == store).count();
+        Ok(match (users, unreadable) {
+            (0, 0) => Some(0),
+            (0, _) => None,
+            (n, _) => Some(n),
+        })
+    }
+
+    // The owner-only rule for the two below is the extension's, as a trigger on kb.asset_store
+    // (`asset_store_owner_only`): a hand-written INSERT or DELETE meets it as this does.
     fn put_asset_store(&mut self, s: &super::AssetStore) -> Result<()> {
         self.ensure_asset_tables()?;
         self.client

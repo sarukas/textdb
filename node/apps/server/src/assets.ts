@@ -9,11 +9,17 @@ import { runCli, type SyncService } from './sync.ts';
 /** One asset of a synced folder, as `textdb assets status --json` reports it. */
 export interface AssetItem {
   path: string;
-  /** ok, new, modified, outdated, conflict, not-pulled, conflict-copy, orphan, invalid-pointer or invalid-path. */
+  /**
+   * ok, new, modified, outdated, conflict, not-pulled, conflict-copy, orphan, invalid-pointer or
+   * invalid-path; and from what the asset store itself holds, changed-in-store, moved-here,
+   * moved-in-store, trashed-in-store, ambiguous, invalid-item or not-permitted.
+   */
   state: string;
   type: string;
   size?: number;
   store?: string;
+  /** Where the asset store keeps its file, when that is not where the asset's own path says. */
+  in_store?: string;
   sha256?: string;
   /** The pointer's version in the store. */
   version?: number;
@@ -61,8 +67,28 @@ const INLINE = new Set([
  * as that asset (modified, outdated), or a file the rules make an asset (new, orphan, conflict
  * copy). Never a file a pointer only names (conflict and the rest): anyone who can write a pointer
  * to the store must not be able to read any file of the directory through it.
+ *
+ * The states an asset store's own answer gives are safe for the same reason `ok` is: each of them
+ * takes the place of `ok` alone, so the file here was already the asset's own bytes, and what they
+ * say is about the store rather than about this file.
  */
-const SENDABLE = new Set(['ok', 'modified', 'outdated', 'new', 'orphan', 'conflict-copy']);
+const SENDABLE = new Set([
+  'ok',
+  'modified',
+  'outdated',
+  'new',
+  'orphan',
+  'conflict-copy',
+  'changed-in-store',
+  'moved-here',
+  'moved-in-store',
+  'trashed-in-store',
+  'ambiguous',
+  'invalid-item',
+  // The store refused this computer the file: a fact about this computer's access, which only
+  // ever replaces `ok` as the rest do, so the file on disk is still the asset's own bytes.
+  'not-permitted',
+]);
 
 /** Folders textdb never reads assets from or writes them to; keep in step with IGNORED_DIRS in crates/textdb-cli/src/assets/classify.rs. */
 const IGNORED_DIRS = new Set([

@@ -614,6 +614,26 @@ $$;
 -- recorded as the next step rather than half-done here.
 ALTER TABLE kb.node ENABLE ROW LEVEL SECURITY;
 CREATE POLICY node_visible ON kb.node USING (kb.visible(path));
+
+-- An asset store row is the owner's (docs/permissions.md). It says where a name's bytes are kept
+-- for every account and every computer, so pointing a name elsewhere -- or taking it away -- moves
+-- or orphans every asset of that name, and an account that could write one would do that to
+-- everybody. On the table rather than in a function, because the CLI reads and writes
+-- kb.asset_store directly (the table is older than this extension's copy of it) and a hand-written
+-- INSERT has to meet the rule as well. Which pointers name a store is a question about pointer
+-- documents, so that half of the rule is the CLI's; this half is the one that has to hold here.
+CREATE FUNCTION kb._asset_store_owner_only() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF kb.current_account() IS NOT NULL THEN
+    PERFORM kb._raise('TX005', 'only the owner of the store can declare or remove asset stores', NULL);
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER asset_store_owner_only BEFORE INSERT OR UPDATE OR DELETE ON kb.asset_store
+  FOR EACH ROW EXECUTE FUNCTION kb._asset_store_owner_only();
 "#,
     name = "kb_tables",
     bootstrap
@@ -4572,9 +4592,14 @@ mod tests {
         assert_eq!(one::<String>(content).as_deref(), Some("ONE\nGlobex two\n- item\nx\nend\n"));
         assert_eq!(one::<String>("SELECT message FROM kb.commit WHERE file_id = kb._node_id('/p/a.md') AND version = 7").as_deref(), Some("replace"));
 
-        // The snippet is the line holding the most terms; history has sizes.
+        // A row per line that holds a term, in the document's own order -- not one row per document
+        // carrying its best-ranked chunk's best line, which is what these functions answered before
+        // `textdb_core::terms` gave every surface the same `line`. History still has sizes.
         Spi::run("SELECT kb.write('/s.md', E'alpha\\nbeta\\nalpha beta\\n')").unwrap();
-        assert_eq!(one::<i64>("SELECT line FROM kb.search('alpha beta')"), Some(3));
+        assert_eq!(
+            one::<String>("SELECT string_agg(line::text, ',' ORDER BY line) FROM kb.search('alpha beta')").as_deref(),
+            Some("1,2,3")
+        );
         assert_eq!(one::<i64>("SELECT nbytes FROM kb.history('/s.md')"), Some(22));
     }
 

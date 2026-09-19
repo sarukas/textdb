@@ -673,6 +673,27 @@ pub struct TokenRow {
     pub live: bool,
 }
 
+/// How many pointers name one location in an asset store, counted over every pointer the store
+/// holds rather than the caller's view. Counts, and nothing else: which asset names those bytes,
+/// and where it is, stay inside the binding that looked.
+#[derive(Debug, Clone, Copy)]
+pub struct ItemUsers {
+    /// Pointers other than the asset's own that name the location.
+    pub others: usize,
+    /// Pointers this build could not read at all, so what their bytes are for is not known.
+    pub unreadable: usize,
+}
+
+/// Which places in an asset store some pointer names, and how many pointers could not be read.
+#[derive(Debug, Clone)]
+pub struct ItemsNamed {
+    /// One answer per location asked about, in the order they were given.
+    pub named: Vec<bool>,
+    /// Pointers this build could not read at all, so what their bytes are for is not known and
+    /// nothing should be called unnamed on the strength of this.
+    pub unreadable: usize,
+}
+
 pub trait Store {
     // ------------------------------------------------------------ accounts, tokens and shares
     //
@@ -891,9 +912,71 @@ pub trait Store {
     fn all_sync_bases(&mut self) -> Result<Vec<SyncBase>>;
     /// The asset stores declared in this store, by name.
     fn asset_stores(&mut self) -> Result<Vec<AssetStore>>;
+
+    /// The same paths in the owner's namespace: what an account's view is a projection of.
+    ///
+    /// An asset store is one place, shared by every account of the store, so where an asset's
+    /// bytes belong in it is the owner's path for that asset and not the caller's -- otherwise a
+    /// store's layout depends on who pushed to it, and one document's asset fills two places when
+    /// two accounts hold its folder under different names. A path that cannot be translated comes
+    /// back as it was given. Asked for a vault at a time, since a store may answer over a network.
+    fn owner_paths(&mut self, paths: &[String]) -> Result<Vec<String>> {
+        Ok(paths.to_vec())
+    }
+
+    /// Which of `locations` in the asset store `store` any pointer names, in the order given and
+    /// over every pointer the store holds rather than the caller's view.
+    ///
+    /// The set-shaped form of `asset_item_users`, for saying which of a store's files nothing needs
+    /// any more: from a view, files another account's pointers name would read as named by nothing,
+    /// and that list is acted on by hand in somebody's drive. `None` where the store cannot answer
+    /// without the caller's view.
+    fn asset_items_named(&mut self, _store: &str, _locations: &[String]) -> Result<Option<ItemsNamed>> {
+        Ok(None)
+    }
+
+    /// Whether `location` -- a place in an asset store, which is laid out in the owner's paths --
+    /// is one this caller may name at all.
+    ///
+    /// A pointer's item is whatever the pointer says, and an account with `rw` inside its own share
+    /// can write one naming bytes of a folder it was never granted. Where a store addresses its
+    /// files by path those are the owner's paths, so this is the question the store already answers
+    /// about any other path: can the caller address it. `true` for the owner, and for an item no
+    /// path can be made of -- a drive's file id is not a place in a namespace.
+    fn may_name(&mut self, _location: &str) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Whether any pointer other than the asset `own`'s names `location` in the asset store
+    /// `store`, answered over every pointer this store holds and not the caller's view.
+    ///
+    /// A provider's bytes are shared by every account of a store, so whether they are still needed
+    /// is not a question one account's view can answer: answered from a view, a delete takes away
+    /// bytes another account's pointer still names. `None` where the store cannot answer it without
+    /// that view, and then nothing is taken away.
+    fn asset_item_users(&mut self, _store: &str, _location: &str, _own: &str) -> Result<Option<ItemUsers>> {
+        Ok(None)
+    }
+    /// How many pointers name the asset store `store`, over every pointer this store holds rather
+    /// than the caller's view. `None` where a pointer could not be read at all, so no number is an
+    /// answer.
+    ///
+    /// What tells a store nothing needs any more from one a team's assets are in. `Some(0)` from a
+    /// store that cannot look at its pointers would say the wrong one of those, so the default is
+    /// `None`: not known, and nothing is done on the strength of it.
+    fn asset_store_users(&mut self, _store: &str) -> Result<Option<usize>> {
+        Ok(None)
+    }
+
     /// Declare an asset store, or change the one of that name.
+    ///
+    /// The owner's, and refused for a token session: a store row says where a name's bytes are
+    /// kept, for everyone, and pointing a name elsewhere moves every asset of that name for every
+    /// computer that has not bound it locally. Refused by the store rather than by the CLI, which
+    /// is not the only caller -- on Postgres by a trigger on the table, so a hand-written INSERT
+    /// meets the same rule.
     fn put_asset_store(&mut self, store: &AssetStore) -> Result<()>;
-    /// Remove an asset store's declaration; `false` when there was none.
+    /// Remove an asset store's declaration; `false` when there was none. The owner's, as above.
     fn remove_asset_store(&mut self, name: &str) -> Result<bool>;
 }
 

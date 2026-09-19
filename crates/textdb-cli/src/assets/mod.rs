@@ -473,13 +473,35 @@ impl VaultCache {
 pub struct Item {
     /// The asset's path in the store.
     pub path: String,
+    /// The same asset in the owner's namespace, which is where its bytes belong in an asset store:
+    /// one store is shared by every account, so its layout cannot be one caller's view of it. Equal
+    /// to `path` for the owner, and never sent anywhere -- an account is not told the layout its
+    /// own paths are a projection of.
+    #[serde(skip)]
+    pub owner_path: String,
     /// `ok`, `new`, `modified`, `outdated`, `conflict`, `not-pulled`, `conflict-copy`, `orphan`,
-    /// `invalid-pointer` or `invalid-path`.
+    /// `invalid-pointer` or `invalid-path`; and from what the asset store itself holds,
+    /// `moved-here` (the asset moved in textdb while its file stayed where it was),
+    /// `moved-in-store`, `changed-in-store`, `trashed-in-store`, `ambiguous` (two files of one
+    /// name there), `invalid-item` (no file of that item at all) or `not-permitted` (the store
+    /// refused this computer the file, which is about the computer and not the asset).
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<String>,
+    /// Where the asset store keeps the file now, when the store can tell and that is not where the
+    /// asset's own path says it should be.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_store: Option<String>,
+    /// The asset store holds other bytes in that very file than its pointer names: the fact itself,
+    /// not the state, since an asset waiting to be pulled or one already outdated keeps its own
+    /// state and must still follow those bytes.
+    #[serde(skip)]
+    pub store_changed: bool,
+    /// What a store said was added to this asset's note, whatever state it kept.
+    #[serde(skip)]
+    pub store_told: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// The media type: the pointer's, or from the name for a file without one.
@@ -512,9 +534,14 @@ impl Item {
     fn new(v: &Vault, rel: &str) -> Item {
         Item {
             path: store_path(&v.prefix, rel),
+            // The caller's until a store translates it, which is right for the owner already.
+            owner_path: store_path(&v.prefix, rel),
             state: "ok",
             size: None,
             store: None,
+            in_store: None,
+            store_changed: false,
+            store_told: false,
             note: None,
             media_type: pointer::media_type(rel).to_string(),
             sha256: None,
@@ -530,6 +557,17 @@ impl Item {
 
 fn in_scope(scope: &[String], path: &str) -> bool {
     scope.is_empty() || scope.iter().any(|s| under(s, path))
+}
+
+/// Where each of these assets belongs in an asset store: its path in the owner's namespace. Asked
+/// of the store in one go, and only of a store that answers -- for the owner every path is already
+/// its own.
+fn owner_places(st: &mut dyn Store, items: &mut [Item]) -> Result<()> {
+    let asked: Vec<String> = items.iter().map(|i| i.path.clone()).collect();
+    for (item, owner) in items.iter_mut().zip(st.owner_paths(&asked)?) {
+        item.owner_path = owner;
+    }
+    Ok(())
 }
 
 fn items(v: &Vault, scan: &Scan, cache: &mut VaultCache, scope: &[String]) -> Result<Vec<Item>> {
@@ -716,16 +754,164 @@ fn item_line(i: &Item) -> String {
     format!("  {:<16}{}{size}{note}\n", i.state, i.path)
 }
 
+/// Add what a store said to an asset's note, keeping any note it had: what the bytes here say is
+/// never replaced by what the store says, only added to.
+fn also_told(item: &mut Item, told: String) {
+    item.store_told = true;
+    item.note = Some(match item.note.take() {
+        Some(had) => format!("{had}; {told}"),
+        None => told,
+    });
+}
+
+/// Ask the stores that keep their files by an id of their own what they hold of each asset, and mark
+/// what they say: a file moved, replaced, trashed or doubled in the store, or an item the store has
+/// no file of at all. A store-side state goes over `ok` alone -- what the bytes here say comes
+/// first, and an asset waiting to be pulled still says so -- while any other state keeps its own and
+/// is told of this as well. A store that cannot be asked leaves its assets as they were and is named
+/// in what comes back, so nothing is silently taken for being as it was.
+pub(crate) fn mark_store_states(items: &mut [Item], mut ask: impl FnMut(&str, &str) -> Result<Option<driver::Found>>) -> Vec<String> {
+    let mut unasked: BTreeMap<String, String> = BTreeMap::new();
+    for item in items.iter_mut() {
+        let Some(p) = item.pointer.clone() else { continue };
+        let Some(named) = p.item.clone() else { continue };
+        if named.starts_with('/') {
+            continue;
+        }
+        // What the bytes here say holds its state; the first store-side fact takes an `ok` one, and
+        // every fact after it is told all the same.
+        let mut claimed = item.state != "ok";
+        let plain = !claimed;
+        match ask(&p.store, &named) {
+            // No file of that item at all: one purged from the store's own trash, or an id naming a
+            // file outside the store, which is never read, moved or trashed.
+            Ok(None) => {
+                if plain {
+                    item.state = "invalid-item";
+                }
+                also_told(item, format!("its asset store has no file of item {named}: purged from the store's trash, or a file outside the store, which textdb never touches"));
+            }
+            Ok(Some(f)) => {
+                // Compared as the store compares its own locations: a path differing only in letter
+                // case is the same place, not a move that could never be settled.
+                let elsewhere = location_key(&f.path) != location_key(&item.owner_path);
+                if elsewhere {
+                    item.in_store = Some(f.path.clone());
+                }
+                // The trash first: which of two files of a path an item means says nothing about a
+                // file that is in the store's own trash, and a pull by id fetches it from there.
+                if f.trashed {
+                    if !claimed {
+                        item.state = "trashed-in-store";
+                        claimed = true;
+                    }
+                    also_told(item, format!("its file is in the asset store's own trash (at {}): a pull still fetches it, until the store empties it", f.path));
+                } else if f.two_of_a_name {
+                    if !claimed {
+                        item.state = "ambiguous";
+                        claimed = true;
+                    }
+                    also_told(item, format!("the asset store holds two files at {}: which of them the pointer names cannot be said, so neither is read or written over -- keep one of them there", f.path));
+                } else {
+                    // Other bytes in that very file: a push keeps a file's id through replacing what
+                    // is in it, so the id alone says nothing of whose bytes are there now. Where the
+                    // provider keeps no SHA-256 (an old upload), a size that is not the pointer's
+                    // still says they are other bytes.
+                    let replaced = match &f.sha256 {
+                        Some(sha) => *sha != p.sha256,
+                        None => f.size != p.size,
+                    };
+                    if replaced {
+                        item.store_changed = true;
+                        if item.state == "modified" {
+                            // Changed here and there: neither side is taken over the other.
+                            item.state = "conflict";
+                            claimed = true;
+                            also_told(item, "its bytes changed here and in the asset store: pull to take the store's as the pointer's new version (the copy here is set aside), or push --force to replace the store's with this one".to_string());
+                        } else {
+                            if !claimed {
+                                item.state = "changed-in-store";
+                                claimed = true;
+                            }
+                            also_told(item, "the asset store holds other bytes than its pointer names: someone replaced them there, and a pull takes them as the pointer's new version".to_string());
+                        }
+                    }
+                    // Told as well as the change, never instead of it: a file both replaced and
+                    // moved is two things that happened, and one hiding the other tells neither.
+                    if elsewhere {
+                        // Which side moved it: the pointer records where the store last had the
+                        // bytes, so a path that is not that one was moved in the store.
+                        let recorded = p.item_path.as_deref();
+                        let by_store = recorded.is_some_and(|r| location_key(r) != location_key(&f.path));
+                        if !claimed {
+                            item.state = if by_store { "moved-in-store" } else { "moved-here" };
+                            claimed = true;
+                        }
+                        also_told(
+                            item,
+                            match (by_store, recorded) {
+                                (true, _) => format!(
+                                    "someone moved its file in the asset store, to {}: a pull still fetches it from there, and `textdb assets relocate {}` moves it back to the asset",
+                                    f.path, item.path
+                                ),
+                                (false, Some(_)) => format!(
+                                    "its file in the asset store is still at {}, where the asset used to be: `textdb assets relocate {}` moves it to the asset, or move the pointer back",
+                                    f.path, item.path
+                                ),
+                                // A pointer written before the store path was recorded: which side
+                                // moved cannot be told, so both places are given and neither blamed.
+                                (false, None) => format!(
+                                    "its file in the asset store is at {}, and this pointer does not say where the store last had it, so which side moved is not known: `textdb assets relocate {}` moves the file to the asset, or move the pointer back",
+                                    f.path, item.path
+                                ),
+                            },
+                        );
+                    }
+                }
+            }
+            // A store that refused is not a store that could not be reached. A failure is worth
+            // trying again and says nothing about the asset; a refusal is a durable fact about this
+            // computer's access, which no retry changes and somebody has to go and ask about. It
+            // takes an `ok` asset as the other store-side states do, and is told of either way.
+            Err(e) if e.code == "TX005" => {
+                if plain {
+                    item.state = "not-permitted";
+                }
+                also_told(item, format!("its asset store {} refused this computer the file: {}", p.store, e.message));
+            }
+            Err(e) => {
+                unasked.entry(p.store.clone()).or_insert(e.message);
+            }
+        }
+    }
+    unasked
+        .into_iter()
+        .map(|(store, why)| format!("the asset store {store} could not be asked what it holds ({why}): what was moved, replaced or trashed there is not told of"))
+        .collect()
+}
+
 pub fn status(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: bool) -> Result<()> {
     let v = vault(st, path, dir)?;
     let scan = scan(st, &v)?;
     let mut cache = VaultCache::open(&v);
     let scope = scope_of(&path.map(str::to_string).into_iter().collect::<Vec<_>>())?;
-    let items = items(&v, &scan, &mut cache, &scope)?;
+    let mut items = items(&v, &scan, &mut cache, &scope)?;
+    owner_places(st, &mut items)?;
+    // The stores are asked what they hold, so a file moved, replaced, trashed or doubled there
+    // shows as its own state; a store that cannot be reached says so and changes nothing.
+    let unasked = match StoreFiles::new(st) {
+        Ok(mut files) => mark_store_states(&mut items, |store, item| files.found(store, item)),
+        Err(e) => vec![format!("the asset stores could not be read ({}): assets moved in textdb are not told of", e.message)],
+    };
     cache.save();
     let c = counts(&items);
     if json {
-        return emit_json(&json!({ "prefix": v.prefix, "dir": v.dir.display().to_string(), "assets": items, "counts": c }));
+        // In the document too: a reader of the JSON must not take every asset for being in its
+        // place when a store was never asked.
+        return emit_json(&json!({ "prefix": v.prefix, "dir": v.dir.display().to_string(), "assets": items, "counts": c, "notes": unasked }));
+    }
+    for line in &unasked {
+        eprintln!("note: {line}");
     }
     let mut s = format!("assets of {} in {}\n", v.prefix, v.dir.display());
     for i in items.iter().filter(|i| i.state != "ok" || i.note.is_some()) {
@@ -749,11 +935,19 @@ pub struct PushOptions<'a> {
 struct Drivers {
     stores: Vec<AssetStore>,
     open: HashMap<String, std::result::Result<Box<dyn Driver>, String>>,
+    /// The stores that answered and refused rather than failing to answer. `get` hands back the
+    /// message alone, and those two read alike in it; this keeps them apart.
+    refused: HashSet<String>,
 }
 
 impl Drivers {
     fn new(st: &mut dyn Store) -> Result<Drivers> {
-        Ok(Drivers { stores: st.asset_stores()?, open: HashMap::new() })
+        Ok(Drivers { stores: st.asset_stores()?, open: HashMap::new(), refused: HashSet::new() })
+    }
+
+    /// Whether opening this store was refused rather than failing: see `refused`.
+    fn was_refused(&self, name: &str) -> bool {
+        self.refused.contains(name)
     }
 
     fn names(&self) -> Vec<String> {
@@ -763,7 +957,12 @@ impl Drivers {
     fn get(&mut self, name: &str) -> std::result::Result<&dyn Driver, String> {
         if !self.open.contains_key(name) {
             let opened = match self.stores.iter().find(|s| s.name == name) {
-                Some(s) => driver::open(s).map_err(|e| e.message),
+                Some(s) => driver::open(s).map_err(|e| {
+                    if e.code == "TX005" {
+                        self.refused.insert(name.to_string());
+                    }
+                    e.message
+                }),
                 None => Err(format!("no asset store named {name} is declared (textdb assets stores)")),
             };
             self.open.insert(name.to_string(), opened);
@@ -772,6 +971,128 @@ impl Drivers {
             Ok(d) => Ok(d.as_ref()),
             Err(e) => Err(e.clone()),
         }
+    }
+}
+
+/// What became of a store's own copy of an asset whose path changed.
+pub(crate) enum StoreMove {
+    /// At the asset's own path now; the item its pointer names (on Google Drive the id, which a
+    /// move leaves as it was).
+    Moved(Option<String>),
+    /// Left where it is, for a reason nobody needs telling.
+    Left,
+    /// Left where it is, for a reason a command tells of.
+    LeftBecause(String),
+}
+
+/// What became of a store's own copy of an asset whose pointer went away.
+pub(crate) enum StoreCopy {
+    /// In the store's own trash now, or there already.
+    Trashed,
+    /// Left where it is, for a reason nobody needs telling: another pointer names those bytes, or
+    /// the store keeps no trash of a provider's own.
+    Left,
+    /// Left where it is for a reason a sync tells of.
+    LeftBecause(String),
+}
+
+/// The asset stores' own files as a sync may change them: which pointers still name what, and the
+/// drivers to move or trash with. Made once for a command, since knowing what every pointer names
+/// reads the store's pointers, and each driver opens once.
+pub(crate) struct StoreFiles {
+    in_use: InUse,
+    drivers: Drivers,
+}
+
+impl StoreFiles {
+    pub(crate) fn new(st: &mut dyn Store) -> Result<StoreFiles> {
+        Ok(StoreFiles { in_use: InUse::new(), drivers: Drivers::new(st)? })
+    }
+
+    /// Why the file at `location` in the store `store` stays where it is, if it does: another
+    /// pointer than the asset `own`'s names it, or a pointer of the store cannot be read at all and
+    /// what its bytes are for is therefore not known. `None` leaves the file to the caller.
+    pub(crate) fn keeps(&mut self, st: &mut dyn Store, store: &str, location: &str, own: &str) -> Result<Option<StoreCopy>> {
+        self.in_use.refresh(st)?;
+        // A pointer textdb cannot read names nothing it can be sure of: what a store's files are
+        // for is not guessed at from the pointers that happened to parse. Said out loud, since one
+        // such pointer anywhere in the store stops every store of every asset being tidied.
+        let mut unreadable: Vec<&str> = self.in_use.pointers.iter().filter(|(_, (_, names))| names.is_none()).map(|(p, _)| p.as_str()).collect();
+        unreadable.sort();
+        if let Some(first) = unreadable.first() {
+            return Ok(Some(StoreCopy::LeftBecause(match unreadable.len() {
+                1 => format!("the pointer {first} cannot be read, so what its bytes are for is not known"),
+                n => format!("{n} pointers cannot be read ({first} among them), so what their bytes are for is not known"),
+            })));
+        }
+        // An account is answered in its own view, so a pointer of another account naming these
+        // bytes is not visible here, and "nothing else names them" would be a guess -- one that ends
+        // with somebody else's asset naming bytes on a thirty-day clock in a provider's trash. Until
+        // the store can answer what no view hides, an account's session takes nothing away.
+        if self.in_use.delegated.unwrap_or(true) {
+            // Asked of the store, which holds every pointer, and answered in counts: which asset
+            // needs the bytes, and where it is, is no part of what this session may learn.
+            return Ok(match st.asset_item_users(store, location, own)? {
+                None => Some(StoreCopy::LeftBecause(
+                    "this session is an account's, and this store cannot say whether another asset still needs these bytes".to_string(),
+                )),
+                Some(u) if u.unreadable > 0 => Some(StoreCopy::LeftBecause(match u.unreadable {
+                    1 => "a pointer in the store cannot be read, so what its bytes are for is not known".to_string(),
+                    n => format!("{n} pointers in the store cannot be read, so what their bytes are for is not known"),
+                })),
+                Some(u) if u.others > 0 => Some(StoreCopy::Left),
+                Some(_) => None,
+            });
+        }
+        Ok(self.in_use.shared(st, store, location, own)?.then_some(StoreCopy::Left))
+    }
+
+    /// The file the asset `own`'s pointer names, moved in its store to `to` (the asset's own path
+    /// now), once no other pointer names it: the item the pointer should name, or `None` where
+    /// nothing moved -- another pointer names those bytes, or the store keeps items by path and the
+    /// bytes stay for them.
+    pub(crate) fn moved(&mut self, st: &mut dyn Store, store: &str, item: &str, to: &str, own: &str) -> Result<StoreMove> {
+        // Items that are paths move with their pointer already: no driver is asked, so a store this
+        // computer cannot reach is not waited on for work that could not come to anything.
+        if item.starts_with('/') {
+            return Ok(StoreMove::Left);
+        }
+        if let Some(kept) = self.keeps(st, store, item, own)? {
+            return Ok(match kept {
+                StoreCopy::LeftBecause(why) => StoreMove::LeftBecause(why),
+                _ => StoreMove::Left,
+            });
+        }
+        Ok(StoreMove::Moved(self.drivers.get(store).map_err(StoreError::invalid)?.move_to(item, to)?))
+    }
+
+    /// What the store `store` knows of the file the item `item` names, when it can tell.
+    pub(crate) fn found(&mut self, store: &str, item: &str) -> Result<Option<driver::Found>> {
+        self.drivers.get(store).map_err(StoreError::invalid)?.found(item)
+    }
+
+    /// The driver of the store `store`, so a command asking what the stores hold and then reading
+    /// from them opens each of them once.
+    pub(crate) fn driver(&mut self, store: &str) -> std::result::Result<&dyn Driver, String> {
+        self.drivers.get(store)
+    }
+
+    /// The file the deleted pointer of the asset `own` named, holding the bytes `sha256`, sent to
+    /// its store's own trash once no pointer names it.
+    pub(crate) fn trashed(&mut self, st: &mut dyn Store, store: &str, item: &str, own: &str, sha256: &str) -> Result<StoreCopy> {
+        // A store keeping its files by path keeps no trash of a provider's own, so there is nothing
+        // to ask a driver -- and nothing to wait for where the store cannot be reached.
+        if item.starts_with('/') {
+            return Ok(StoreCopy::Left);
+        }
+        if let Some(kept) = self.keeps(st, store, item, own)? {
+            return Ok(kept);
+        }
+        let sent = self.drivers.get(store).map_err(StoreError::invalid)?.trash(item, sha256)?;
+        Ok(match sent {
+            true => StoreCopy::Trashed,
+            false => StoreCopy::Left,
+        })
     }
 }
 
@@ -788,25 +1109,49 @@ struct Written {
     text: String,
 }
 
-/// A location as [`InUse`] compares it: without case, since Windows and macOS keep `a.png` and
-/// `A.png` in the same file.
-fn location_key(location: &str) -> String {
-    location.to_lowercase()
+/// A location as [`InUse`] compares it: a store path without case, since Windows and macOS keep
+/// `a.png` and `A.png` in the same file; a provider's file id (Google Drive's) as it is, since ids
+/// differing only in case are other files.
+/// What a pointer document names: its asset store, and the location in it as locations are
+/// compared. `None` when the text is no pointer this build can read. The one place that is worked
+/// out, so a binding answering for a whole store agrees with the scan here.
+pub(crate) fn pointer_names(pointer_path: &str, text: &str) -> Option<(String, String)> {
+    let p = Pointer::parse(text.as_bytes()).ok()?;
+    let named = p.item.clone().unwrap_or_else(|| asset_path(pointer_path).to_string());
+    Some((p.store.clone(), location_key(&named)))
+}
+
+pub(crate) fn location_key(location: &str) -> String {
+    if location.starts_with('/') {
+        location.to_lowercase()
+    } else {
+        location.to_string()
+    }
 }
 
 /// What every pointer in the store names: by pointer path, its version and its asset store and
 /// location. Read again, for the pointers that changed, whenever the store changed.
 struct InUse {
     seq: i64,
+    /// Whether this connection is an account's rather than the owner's, asked once. An account is
+    /// answered in its own view, so the pointers below are only the ones it may see: what else
+    /// names a store's bytes cannot be known from here at all.
+    delegated: Option<bool>,
     pointers: HashMap<String, (i64, Option<(String, String)>)>,
 }
 
 impl InUse {
     fn new() -> InUse {
-        InUse { seq: -1, pointers: HashMap::new() }
+        InUse { seq: -1, pointers: HashMap::new(), delegated: None }
     }
 
     fn refresh(&mut self, st: &mut dyn Store) -> Result<()> {
+        if self.delegated.is_none() {
+            // A store that cannot say who is asking is treated as an account's: this answer decides
+            // whether bytes in somebody's drive are taken away, and the safe way to be wrong is to
+            // keep them.
+            self.delegated = Some(st.whoami().map_or(true, |me| me.account.is_some()));
+        }
         let seq = st.last_seq()?;
         if seq == self.seq {
             return Ok(());
@@ -831,23 +1176,69 @@ impl InUse {
     }
 
     /// Whether a pointer other than the asset `own`'s names `location` in `store`.
-    fn shared(&self, store: &str, location: &str, own: &str) -> bool {
+    fn shared(&self, st: &mut dyn Store, store: &str, location: &str, own: &str) -> Result<bool> {
+        // An account sees its own pointers, so the store is asked instead -- and what it cannot
+        // answer counts as shared, which leaves a push putting its bytes beside what is there
+        // rather than over it, as it already does for bytes another pointer names.
+        if self.delegated.unwrap_or(true) {
+            return Ok(st.asset_item_users(store, location, own)?.map_or(true, |u| u.others > 0 || u.unreadable > 0));
+        }
         let key = (store.to_string(), location_key(location));
-        self.pointers
+        Ok(self
+            .pointers
             .iter()
-            .any(|(path, (_, names))| names.as_ref() == Some(&key) && location_key(asset_path(path)) != location_key(own))
+            .any(|(path, (_, names))| names.as_ref() == Some(&key) && location_key(asset_path(path)) != location_key(own)))
     }
 
     /// Where the upload of `item` goes, and the bytes it may replace there: the asset's own where
     /// they are kept (its path, or the item its pointer names), unless another pointer names them
-    /// too; otherwise the asset's path, next to anything already there.
-    fn target<'p>(&self, store: &str, item: &'p Item) -> (String, Option<&'p str>) {
-        item.pointer
+    /// too or the asset store no longer has them (`gone`); otherwise the asset's path, next to
+    /// anything already there.
+    fn target<'p>(&self, st: &mut dyn Store, store: &str, item: &'p Item, gone: bool) -> Result<(String, Option<&'p str>)> {
+        let own = item
+            .pointer
             .as_ref()
-            .filter(|p| p.store == store)
-            .map(|p| (p.item.clone().unwrap_or_else(|| item.path.clone()), p.sha256.as_str()))
-            .filter(|(location, _)| !self.shared(store, location, &item.path))
-            .map_or_else(|| (item.path.clone(), None), |(location, sha)| (location, Some(sha)))
+            .filter(|p| p.store == store && !gone)
+            .map(|p| (p.item.clone().unwrap_or_else(|| item.owner_path.clone()), p.sha256.as_str()));
+        let Some((location, sha)) = own else {
+            return Ok((item.owner_path.clone(), None));
+        };
+        match self.shared(st, store, &location, &item.owner_path)? {
+            true => Ok((item.owner_path.clone(), None)),
+            false => Ok((location, Some(sha))),
+        }
+    }
+}
+
+/// Whether this session may name the place `item` is in the store `store`.
+///
+/// A store addressing its files by path names the place outright. A drive's id does not: an id is
+/// no place in a namespace, so the drive is asked where it keeps that file and the answer is what
+/// has to be nameable -- the store is laid out in the owner's paths, so that answer is a path like
+/// any other. A drive that cannot say leaves the store's own root as the only bound, which is what
+/// it was before this asked at all.
+fn may_name_place(st: &mut dyn Store, d: &dyn Driver, item: &str) -> Result<bool> {
+    match place_of(d, item)? {
+        Some(place) => st.may_name(&place),
+        // No file of that item in the store, so there is no place to ask after, and nothing to
+        // fetch or write over either: whatever comes next fails on its own account.
+        None => Ok(true),
+    }
+}
+
+/// The place in the store the item `item` is in, to be asked after before any bytes move: the item
+/// itself where it is a store path, and where the store keeps that id otherwise. `None` where the
+/// store has no file of that item at all.
+///
+/// A store that could not be asked is an error rather than a `None`. The two are not the same
+/// answer: nothing names the file of an id the store does not have, while a listing that failed
+/// says nothing about who may name what, and reading it as "no place to check" would let a failed
+/// listing stand in for permission. What comes next needs that same listing, so this refuses
+/// nothing a fetch would have gone on to do.
+fn place_of(d: &dyn Driver, item: &str) -> Result<Option<String>> {
+    match item.starts_with('/') {
+        true => Ok(Some(item.to_string())),
+        false => Ok(d.found(item)?.map(|found| found.path)),
     }
 }
 
@@ -894,6 +1285,13 @@ fn push_one(
         Err(e) => return Outcome::Failed(format!("{}: {e}", item.path)),
     };
     let old = item.pointer.as_ref();
+    // A provider's file id its pointer names that the asset store no longer has (a Drive file
+    // purged from Drive's trash, say): the upload goes to the asset's path.
+    let gone = old
+        .filter(|p| p.store == store)
+        .and_then(|p| p.item.as_deref())
+        .filter(|i| !i.starts_with('/'))
+        .is_some_and(|i| matches!(d.size(&item.owner_path, Some(i)), Ok(None)));
     // The target's lock is held until the pointer is committed, and which pointers name the
     // target is read again once it is held: a push that reuses bytes already there commits its
     // pointer before another push may decide to replace them.
@@ -902,7 +1300,10 @@ fn push_one(
         if let Err(e) = in_use.refresh(st) {
             return Outcome::Failed(format!("{}: {}", item.path, e.message));
         }
-        let (target, _) = in_use.target(&store, item);
+        let (target, _) = match in_use.target(st, &store, item, gone) {
+            Ok(t) => t,
+            Err(e) => return Outcome::Failed(format!("{}: {}", item.path, e.message)),
+        };
         let held = match d.lock(&target) {
             Ok(h) => h,
             Err(e) => return Outcome::Failed(format!("{}: {}", item.path, e.message)),
@@ -913,7 +1314,10 @@ fn push_one(
         if let Err(e) = in_use.refresh(st) {
             return Outcome::Failed(format!("{}: {}", item.path, e.message));
         }
-        let (again, replaces) = in_use.target(&store, item);
+        let (again, replaces) = match in_use.target(st, &store, item, gone) {
+            Ok(t) => t,
+            Err(e) => return Outcome::Failed(format!("{}: {}", item.path, e.message)),
+        };
         if again == target {
             decided = Some((target, replaces, held));
             break;
@@ -922,17 +1326,41 @@ fn push_one(
     let Some((target, replaces, _held)) = decided else {
         return Outcome::Conflict(format!("{}: the pointers naming its bytes kept changing during this push; run it again", item.path));
     };
+    // As a pull does: bytes never go to a place this session cannot name, whatever its pointer says.
+    match may_name_place(st, d, &target) {
+        Ok(false) => {
+            return Outcome::Failed(format!("{}: its pointer names {target} in the asset store {store}, which this session may not write", item.path))
+        }
+        Err(e) => return Outcome::Failed(format!("{}: {}", item.path, e.message)),
+        Ok(true) => {}
+    }
     let (provider_item, _also_held) = match d.put(&target, &src, &sha, replaces) {
         Ok(put) => put,
         Err(e) => return Outcome::Failed(format!("{}: {}", item.path, e.message)),
     };
+    let named = provider_item.or_else(|| old.filter(|p| p.store == store).and_then(|p| p.item.clone()));
+    // Where the store keeps these bytes now, for a store addressing its files by an id of its own:
+    // what tells a file someone moved in the store from an asset moved in textdb. Asked of the
+    // listing this push already made -- not taken to be the asset's own path, since a push replaces
+    // the bytes in the file where it stands. Kept as it was where the store cannot say.
+    let item_path = named
+        .as_deref()
+        .and_then(|i| d.found(i).ok().flatten())
+        .map(|f| f.path)
+        .or_else(|| old.filter(|p| p.store == store).and_then(|p| p.item_path.clone()));
     let p = Pointer {
         id: old.map_or_else(pointer::new_id, |p| p.id.clone()),
         sha256: sha.clone(),
         size,
         media_type: pointer::media_type(&item.rel).to_string(),
         store: store.clone(),
-        item: provider_item.or_else(|| old.filter(|p| p.store == store).and_then(|p| p.item.clone())),
+        // Always named, even where it is this asset's own place in the store. A pointer is a
+        // document: it is copied and it is moved, and an item left to mean "wherever this pointer
+        // is now" would have a copy naming bytes nobody put there and a move quietly renaming what
+        // an asset is made of. What it costs is that an account's pointer carries the owner's path
+        // for its bytes, which is the layout its own paths are a projection of.
+        item: named,
+        item_path,
         extra: old.map(|p| p.extra.clone()).unwrap_or_default(),
     };
     // The bytes are in the asset store and checked; now the pointer, unless another push got there first.
@@ -1102,22 +1530,49 @@ pub(crate) fn store_folders_inside(st: &mut dyn Store, dir: &Path) -> Vec<String
 pub(crate) fn not_pulled_after_conflict(st: &mut dyn Store, v: &Vault) -> Result<BTreeSet<String>> {
     let scan = scan(st, v)?;
     let mut cache = VaultCache::open(v);
-    let found = items(v, &scan, &mut cache, &[])?;
+    let mut found = items(v, &scan, &mut cache, &[])?;
+    owner_places(st, &mut found)?;
     cache.save();
     let originals: HashSet<String> = found.iter().filter(|i| i.state == "conflict-copy").filter_map(|i| pairing::original_of(&i.rel)).collect();
     Ok(found.iter().filter(|i| i.state == "not-pulled" && originals.contains(&i.rel)).map(|i| i.path.clone()).collect())
 }
 
-/// How many of the vault's assets are in each state.
-/// What it learns is saved only with `save` (not in a dry run).
-pub(crate) fn state_counts(st: &mut dyn Store, v: &Vault, save: bool) -> Result<BTreeMap<String, usize>> {
+/// How many of the vault's assets are in each state, and what to tell of the ones that moved in
+/// textdb while their store kept their file where it was. The stores are asked once: for a store
+/// keeping its files by path there is nothing to ask, so only a store with ids of its own (Google
+/// Drive) is reached at all, and one that cannot be reached leaves its assets as they are and says
+/// so. The move itself is never made here: `textdb assets relocate` makes it, `textdb mv` puts the
+/// pointer back.
+pub(crate) fn counts_and_moves(st: &mut dyn Store, v: &Vault, save: bool, stores: Option<&mut StoreFiles>) -> Result<(BTreeMap<String, usize>, Vec<String>)> {
     let scan = scan(st, v)?;
     let mut cache = VaultCache::open(v);
-    let found = items(v, &scan, &mut cache, &[])?;
+    let mut found = items(v, &scan, &mut cache, &[])?;
+    owner_places(st, &mut found)?;
+    // Whose stores to ask is the caller's to say, so a sync asks one set of them for its pull, its
+    // states and its deletions alike. A dry run asks nothing of anyone's provider -- it says what a
+    // sync would do here, and reaching a drive to tell of a move is not that -- so it passes none.
+    let mut notes = match stores {
+        None => Vec::new(),
+        Some(files) => mark_store_states(&mut found, |store, item| files.found(store, item)),
+    };
+    // One line each while they are few, one line for a folderful: a folder moved in textdb is
+    // hundreds of assets, and a sync saying so hundreds of times says nothing at all.
+    // Everything a store said, whatever state the asset kept: a `modified` file replaced in the
+    // store, an asset waiting to be pulled whose file was purged there -- the ones a state list
+    // would have hidden are exactly the ones worth saying.
+    let differ: Vec<&Item> = found.iter().filter(|i| i.store_told).collect();
+    match differ.len() {
+        0 => {}
+        1..=3 => notes.extend(differ.iter().map(|i| format!("{}: {}", i.path, i.note.as_deref().unwrap_or("it differs from what its asset store holds")))),
+        n => notes.push(format!(
+            "{n} assets differ from what their asset stores hold (the first is {}): `textdb assets status` says of each, and `textdb assets relocate` settles the ones whose file only stayed where the asset used to be",
+            differ[0].path
+        )),
+    }
     if save {
         cache.save();
     }
-    Ok(counts(&found).into_iter().map(|(state, n)| (state.to_string(), n)).collect())
+    Ok((counts(&found).into_iter().map(|(state, n)| (state.to_string(), n)).collect(), notes))
 }
 
 /// What a push did: the assets pushed (as JSON rows), their bytes, and what was left for a
@@ -1187,7 +1642,8 @@ pub(crate) fn push_run(st: &mut dyn Store, v: &Vault, scope: &[String], o: &Push
     check_scope(v, scope)?;
     let scan = scan(st, v)?;
     let mut cache = VaultCache::open(v);
-    let found = items(v, &scan, &mut cache, scope)?;
+    let mut found = items(v, &scan, &mut cache, scope)?;
+    owner_places(st, &mut found)?;
     let mut drivers = Drivers::new(st)?;
     let names = drivers.names();
     // The pointers this directory's last sync had: one only on disk now was deleted in the store.
@@ -1260,11 +1716,11 @@ pub(crate) fn linked_assets(st: &mut dyn Store, path: &str) -> Result<BTreeSet<S
     Ok(st.links(path, &[])?.into_iter().filter(|l| l.asset).filter_map(|l| l.resolved).collect())
 }
 
-pub fn pull(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, linked_from: Option<&str>, dry_run: bool, json: bool) -> Result<()> {
+pub fn pull(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, linked_from: Option<&str>, author: Option<&str>, dry_run: bool, json: bool) -> Result<()> {
     let v = vault(st, paths.first().map(String::as_str).or(linked_from), dir)?;
     let scope = scope_of(paths)?;
     let linked = linked_from.map(|p| linked_assets(st, p)).transpose()?;
-    let PullReport { pulled, bytes, kept, failed } = pull_run(st, &v, &scope, linked.as_ref(), dry_run)?;
+    let PullReport { pulled, bytes, kept, failed } = pull_run(st, &v, &scope, linked.as_ref(), author, dry_run, None)?;
     if json {
         emit_json(&json!({ "dry_run": dry_run, "pulled": pulled, "bytes": bytes, "kept": kept, "failed": failed }))?;
     } else {
@@ -1288,19 +1744,44 @@ pub fn pull(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, linked_fro
 
 /// Pull the vault's `not-pulled` and `outdated` assets within `scope` (all of them when it is
 /// empty), only those in `linked` when it is given.
-pub(crate) fn pull_run(st: &mut dyn Store, v: &Vault, scope: &[String], linked: Option<&BTreeSet<String>>, dry_run: bool) -> Result<PullReport> {
+pub(crate) fn pull_run(
+    st: &mut dyn Store,
+    v: &Vault,
+    scope: &[String],
+    linked: Option<&BTreeSet<String>>,
+    author: Option<&str>,
+    dry_run: bool,
+    stores: Option<&mut StoreFiles>,
+) -> Result<PullReport> {
     check_scope(v, scope)?;
     let scan = scan(st, v)?;
     let mut cache = VaultCache::open(v);
-    let found = items(v, &scan, &mut cache, scope)?;
-    let mut drivers = Drivers::new(st)?;
-    let (mut pulled, mut kept, mut failed, mut bytes) = (Vec::new(), Vec::new(), Vec::new(), 0u64);
+    let mut found = items(v, &scan, &mut cache, scope)?;
+    owner_places(st, &mut found)?;
+    // The caller's stores when it has them -- a sync's pull, states and deletions then list a drive
+    // and open its drivers once between them -- and this command's own otherwise.
+    let mut owned = None;
+    let files = match stores {
+        Some(files) => files,
+        None => owned.insert(StoreFiles::new(st)?),
+    };
+    // What the stores hold is asked before anything is fetched, so bytes someone replaced in a store
+    // are followed rather than refused as the wrong ones. A dry run asks nothing of anyone's
+    // provider: it says what a pull would do here, and reaching a drive to look is not that.
+    let mut kept: Vec<String> = match dry_run {
+        true => Vec::new(),
+        false => mark_store_states(&mut found, |store, item| files.found(store, item)),
+    };
+    let (mut pulled, mut failed, mut bytes) = (Vec::new(), Vec::new(), 0u64);
+    let mut written: Vec<Written> = Vec::new();
     for item in found {
         if linked.is_some_and(|l| !l.contains(&item.path)) {
             continue;
         }
         match item.state {
-            "not-pulled" | "outdated" => {}
+            // `changed-in-store`: someone put other bytes in that very file, and a pull takes them
+            // as the pointer's new version, the copy here going to the vault's trash first.
+            "not-pulled" | "outdated" | "changed-in-store" => {}
             "modified" => {
                 kept.push(format!("{}: changed here, so not replaced (push it, or delete it and pull)", item.path));
                 continue;
@@ -1317,13 +1798,28 @@ pub(crate) fn pull_run(st: &mut dyn Store, v: &Vault, scope: &[String], linked: 
             pulled.push(json!({ "path": item.path, "state": item.state, "size": p.size, "store": p.store }));
             continue;
         }
-        let d = match drivers.get(&p.store) {
+        let d = match files.driver(&p.store) {
             Ok(d) => d,
             Err(e) => {
                 failed.push(format!("{}: {e}", item.path));
                 continue;
             }
         };
+        // A pointer names whatever it says, and an account with `rw` inside its own share can
+        // write one naming bytes of a folder it was never granted. Asked before anything is
+        // fetched, and through a drive's id as well as a path.
+        let named = p.item.as_deref().unwrap_or(&item.owner_path);
+        match may_name_place(st, d, named) {
+            Ok(false) => {
+                failed.push(format!("{}: its pointer names {named} in the asset store {}, which this session may not read", item.path, p.store));
+                continue;
+            }
+            Err(e) => {
+                failed.push(format!("{}: {}", item.path, e.message));
+                continue;
+            }
+            Ok(true) => {}
+        }
         let file = item.file.clone().unwrap_or_else(|| item.rel.clone());
         // Never through a link or junction already in the directory: its folder may be anywhere.
         if through_link(&v.dir, &file) || through_link(&v.dir, ".textdb/trash/x") {
@@ -1332,22 +1828,70 @@ pub(crate) fn pull_run(st: &mut dyn Store, v: &Vault, scope: &[String], linked: 
         }
         let dest = v.dir.join(&file);
         let part = driver::partial(&dest);
+        // The bytes must be the ones the pointer names -- except for `changed-in-store`, where the
+        // point is that they are not: someone replaced them in the store, and these are taken as
+        // the pointer's new version, so what arrived is what the pointer will say.
+        // The fact, not the state: an asset waiting to be pulled, or one already outdated here, has
+        // its own state and must follow the store's bytes all the same -- keying this on the state
+        // would refuse them the very bytes they came for.
+        let follows_store = item.store_changed;
+        // A pointer this directory has not caught up with, or one the store has not got at all, is
+        // not one to commit over: a pull writes no pointer the store never agreed to.
+        if follows_store && (item.version.is_none() || item.disk_differs) {
+            kept.push(format!(
+                "{}: the asset store holds other bytes than its pointer names, and this directory's pointer is not the store's yet: sync first",
+                item.path
+            ));
+            continue;
+        }
         let fetched = dest
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
             .map_err(|e| e.to_string())
-            .and_then(|_| d.get(&item.path, p.item.as_deref(), &part).map_err(|e| e.message))
-            .and_then(|_| match hash_file(&part) {
-                Ok((sha, size)) if sha == p.sha256 && size == p.size => Ok(()),
-                Ok(_) => Err("the asset store holds other bytes than its pointer names (textdb assets verify)".to_string()),
-                Err(e) => Err(e.to_string()),
+            .and_then(|_| d.get(&item.owner_path, p.item.as_deref(), &part).map_err(|e| e.message))
+            .and_then(|_| hash_file(&part).map_err(|e| e.to_string()))
+            .and_then(|(sha, size)| match (follows_store, sha == p.sha256 && size == p.size) {
+                (false, false) => Err("the asset store holds other bytes than its pointer names (textdb assets verify)".to_string()),
+                _ => Ok((sha, size)),
             });
-        if let Err(e) = fetched {
-            let _ = std::fs::remove_file(&part);
-            failed.push(format!("{}: {e}", item.path));
-            continue;
+        let (sha, size) = match fetched {
+            Ok(got) => got,
+            Err(e) => {
+                let _ = std::fs::remove_file(&part);
+                failed.push(format!("{}: {e}", item.path));
+                continue;
+            }
+        };
+        // The pointer first, then the bytes. A commit that fails must leave the vault exactly as it
+        // was: once the file is in place, the asset reads as changed here, which a pull skips, so
+        // the store's bytes could never be taken again.
+        let mut committed = None;
+        if follows_store {
+            let mut told = p.clone();
+            (told.sha256, told.size) = (sha.clone(), size);
+            let pointer_path = format!("{}{SUFFIX}", item.path);
+            // Read again right before writing, as a push does: a write against the version this scan
+            // saw would otherwise be merged line by line with a pointer someone else committed
+            // meanwhile, leaving one that names bytes no file holds.
+            let wrote = match st.stat(&pointer_path).ok().and_then(|s| s.version) == item.version {
+                false => Err(StoreError::conflict("its pointer changed in the store during this pull; run it again".to_string())),
+                true => st
+                    .write(&pointer_path, told.to_text().as_bytes(), item.version, author, Some("assets pull: the asset store's bytes"))
+                    .and_then(|w| match w.kind.as_str() {
+                        "direct" | "noop" => Ok(w),
+                        other => Err(StoreError::conflict(format!("its pointer was {other} against a commit made during this pull; run it again"))),
+                    }),
+            };
+            match wrote {
+                Ok(w) => committed = Some(Written { path: pointer_path, version: w.version, text: told.to_text() }),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&part);
+                    failed.push(format!("{}: the asset store's bytes were not taken as its new version: {}", item.path, e.message));
+                    continue;
+                }
+            }
         }
-        if item.state == "outdated" {
+        if item.state == "outdated" || follows_store {
             // What is here is what this directory last had: kept in the vault's trash, not lost.
             let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |t| t.subsec_nanos());
             let trashed = v.dir.join(".textdb").join("trash").join(format!("{}-{nanos:09}", driver::stamp(SystemTime::now()))).join(&file);
@@ -1363,16 +1907,171 @@ pub(crate) fn pull_run(st: &mut dyn Store, v: &Vault, scope: &[String], linked: 
             failed.push(format!("{}: not put in place ({e})", item.path));
             continue;
         }
-        if let Ok(meta) = std::fs::metadata(&dest) {
-            cache.remember(&file, meta.len(), mtime_ns(&meta), &p.sha256);
+        // The pointer was committed before the bytes were placed, so what is left is to write it
+        // where a push writes it: to disk, and into this directory's sync base. Without that, every
+        // followed asset reads as "the pointer on disk is not the store's" and push refuses it.
+        if let Some(w) = committed {
+            let on_disk = v.dir.join(format!("{}{SUFFIX}", item.rel));
+            if let Err(e) = std::fs::write(&on_disk, w.text.as_bytes()) {
+                failed.push(format!("{}: its pointer is committed but could not be written to {} ({e}); the next sync writes it", item.path, on_disk.display()));
+                continue;
+            }
+            written.push(w);
         }
-        cache.saw(&item.rel, &p.sha256);
+        if let Ok(meta) = std::fs::metadata(&dest) {
+            cache.remember(&file, meta.len(), mtime_ns(&meta), &sha);
+        }
+        cache.saw(&item.rel, &sha);
         cache.add_present(&file);
-        bytes += p.size;
-        pulled.push(json!({ "path": item.path, "state": item.state, "size": p.size, "store": p.store }));
+        bytes += size;
+        pulled.push(json!({ "path": item.path, "state": item.state, "size": size, "store": p.store }));
     }
     cache.save();
+    // Recorded as synced only now that both sides have them, as a push records what it wrote: a
+    // base that does not know of these pointers would have the next sync take them in again.
+    if let Err(e) = record_in_sync_base(st, v, &written) {
+        kept.push(format!("the pointers this pull committed were not recorded in this directory's sync base ({}): the next sync compares them", e.message));
+    }
     Ok(PullReport { pulled, bytes, kept, failed })
+}
+
+/// What a relocate did: the files moved in their stores, what it left and why, and what failed.
+#[derive(Default)]
+pub(crate) struct RelocateReport {
+    pub moved: Vec<serde_json::Value>,
+    pub kept: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+pub fn relocate(st: &mut dyn Store, paths: &[String], dir: Option<&Path>, author: Option<&str>, dry_run: bool, json: bool) -> Result<()> {
+    let v = vault(st, paths.first().map(String::as_str), dir)?;
+    let scope = scope_of(paths)?;
+    let RelocateReport { moved, kept, failed } = relocate_run(st, &v, &scope, author, dry_run)?;
+    if json {
+        emit_json(&json!({ "dry_run": dry_run, "moved": moved, "kept": kept, "failed": failed }))?;
+    } else {
+        let mut s = format!("{} {} assets in their stores\n", if dry_run { "would move" } else { "moved" }, moved.len());
+        for m in &moved {
+            s.push_str(&format!("  {} -> {}\n", m["from"].as_str().unwrap_or(""), m["to"].as_str().unwrap_or("")));
+        }
+        for k in &kept {
+            s.push_str(&format!("  kept       {k}\n"));
+        }
+        for f in &failed {
+            s.push_str(&format!("  failed     {f}\n"));
+        }
+        out(s.as_bytes())?;
+    }
+    if !failed.is_empty() {
+        return Err(StoreError::other(format!("{} assets could not be moved in their stores", failed.len())));
+    }
+    Ok(())
+}
+
+/// Move the file of every `moved-here` asset within `scope` to the asset's own path in its store,
+/// keeping the provider's file and so its id. Nothing is moved onto bytes already there, and a file
+/// another pointer also names stays where it is.
+pub(crate) fn relocate_run(st: &mut dyn Store, v: &Vault, scope: &[String], author: Option<&str>, dry_run: bool) -> Result<RelocateReport> {
+    check_scope(v, scope)?;
+    let scan = scan(st, v)?;
+    let mut cache = VaultCache::open(v);
+    let mut found = items(v, &scan, &mut cache, scope)?;
+    owner_places(st, &mut found)?;
+    let mut files = StoreFiles::new(st)?;
+    let mut r = RelocateReport::default();
+    r.kept.extend(mark_store_states(&mut found, |store, item| files.found(store, item)));
+    for item in &found {
+        let (Some(p), Some(at)) = (&item.pointer, &item.in_store) else { continue };
+        let Some(named) = p.item.as_deref() else { continue };
+        let row = json!({ "path": item.path, "from": at, "to": item.path, "store": p.store });
+        // A file the store cannot place is not one to move: two of a name, in the store's own trash,
+        // or none of the store's at all. Nor one whose bytes there are not the pointer's: moving it
+        // would commit a pointer still naming the old ones -- pull or push it first.
+        if matches!(item.state, "ambiguous" | "trashed-in-store" | "invalid-item") || item.store_changed {
+            r.kept.push(format!("{}: {}", item.path, item.note.as_deref().unwrap_or("its file in the asset store cannot be moved")));
+            continue;
+        }
+        // A pointer this directory has not caught up with is not the one to move a store's file by.
+        if item.disk_differs {
+            r.kept.push(format!("{}: its pointer changed in the store since this directory was synced; sync first", item.path));
+            continue;
+        }
+        if dry_run {
+            // What would keep the file where it is is known without moving anything, so a dry run
+            // says `kept` for those rather than promising a move it would not make.
+            match files.keeps(st, &p.store, named, &item.owner_path)? {
+                Some(StoreCopy::LeftBecause(why)) => r.kept.push(format!("{}: {why}", item.path)),
+                Some(_) => r.kept.push(format!("{}: another pointer names those bytes, so they stay where they are", item.path)),
+                None => r.moved.push(row),
+            }
+            continue;
+        }
+        match files.moved(st, &p.store, named, &item.owner_path, &item.owner_path) {
+            // The item the pointer names after the move: on Google Drive the file's id, which a move
+            // leaves alone. The pointer is written all the same, because it records where the store
+            // keeps the bytes, and that is what just changed -- against the version this scan saw,
+            // so a pointer someone else committed meanwhile is not written over.
+            Ok(StoreMove::Moved(now)) if now.as_deref().is_none_or(|now| now == named) => {
+                let mut settled = p.clone();
+                settled.item_path = Some(item.owner_path.clone());
+                let pointer_path = format!("{}{SUFFIX}", item.path);
+                // Read again right before writing, as a push does: a write against a version this
+                // scan saw would otherwise be merged line by line with a pointer someone else
+                // committed meanwhile, leaving one that names bytes no file holds.
+                if st.stat(&pointer_path).ok().and_then(|s| s.version) != item.version {
+                    r.failed.push(format!(
+                        "{}: its file is at the asset's own path in the store now, but its pointer changed in the store meanwhile; run it again",
+                        item.path
+                    ));
+                    continue;
+                }
+                match st.write(&pointer_path, settled.to_text().as_bytes(), item.version, author, Some("assets relocate")).and_then(|w| match w.kind.as_str() {
+                    "direct" | "noop" => Ok(w),
+                    other => Err(StoreError::conflict(format!("its pointer was {other} against another commit"))),
+                }) {
+                    Ok(_) => r.moved.push(row),
+                    Err(e) => r.failed.push(format!(
+                        "{}: its file is at the asset's own path in the store now, but the pointer saying so was not committed ({}); run it again",
+                        item.path, e.message
+                    )),
+                }
+            }
+            Ok(StoreMove::Moved(now)) => r.failed.push(format!(
+                "{}: its file moved in the asset store, but the store now names it {} and not {named}: push it, so its pointer names what the store does",
+                item.path,
+                now.as_deref().unwrap_or("")
+            )),
+            Ok(StoreMove::LeftBecause(why)) => r.kept.push(format!("{}: {why}", item.path)),
+            Ok(StoreMove::Left) => r.kept.push(format!("{}: another pointer names those bytes, so they stay where they are", item.path)),
+            Err(e) => r.failed.push(format!("{}: {}", item.path, e.message)),
+        }
+    }
+    // A move whose pointer commit failed leaves the file at the asset's own path with the pointer
+    // still recording where the store used to keep it: nothing to move, only the record to settle.
+    // Until it is settled, the next status blames the store for a move nobody made. The version is
+    // read again first, so an asset this run has just written is left alone.
+    for item in found.iter().filter(|i| !dry_run && i.in_store.is_none() && !i.disk_differs) {
+        let Some(p) = &item.pointer else { continue };
+        let Some(named) = p.item.as_deref() else { continue };
+        if named.starts_with('/') || p.item_path.as_deref().is_none_or(|r| location_key(r) == location_key(&item.owner_path)) {
+            continue;
+        }
+        let mut settled = p.clone();
+        settled.item_path = Some(item.owner_path.clone());
+        let pointer_path = format!("{}{SUFFIX}", item.path);
+        if st.stat(&pointer_path).ok().and_then(|s| s.version) != item.version {
+            continue;
+        }
+        match st.write(&pointer_path, settled.to_text().as_bytes(), item.version, author, Some("assets relocate: where its store keeps it")) {
+            Ok(_) => r.moved.push(json!({ "path": item.path, "from": item.path, "to": item.path, "store": p.store, "record_only": true })),
+            Err(e) => r.failed.push(format!(
+                "{}: its file is at the asset's own path in the store, but the pointer saying so was not committed ({}); run it again",
+                item.path, e.message
+            )),
+        }
+    }
+    cache.save();
+    Ok(r)
 }
 
 pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: bool) -> Result<()> {
@@ -1381,7 +2080,8 @@ pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
     let scope = scope_of(&path.map(str::to_string).into_iter().collect::<Vec<_>>())?;
     let mut cache = VaultCache::open(&v);
     cache.fresh = true;
-    let found = items(&v, &scan, &mut cache, &scope)?;
+    let mut found = items(&v, &scan, &mut cache, &scope)?;
+    owner_places(st, &mut found)?;
     cache.save();
     let mut drivers = Drivers::new(st)?;
     let mut rows = Vec::new();
@@ -1393,10 +2093,21 @@ pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
                 "-".to_string()
             }
             (None, _) => "not pushed".to_string(),
+            // Not this session's to name, so not read: what a pull and a push refuse, this says.
+            (Some(p), _) if p.item.as_deref().is_some_and(|named| matches!(st.may_name(named), Ok(false))) => {
+                problems += 1;
+                "not this session's to name".to_string()
+            }
             (Some(p), _) => {
                 let checked = match drivers.get(&p.store) {
-                    Err(e) => Err(e),
-                    Ok(d) => d.hash(&item.path, p.item.as_deref()).map_err(|e| e.message),
+                    Err(e) => Err((None, e)),
+                    Ok(d) => d.hash(&item.owner_path, p.item.as_deref()).map_err(|e| (Some(e.code.clone()), e.message)),
+                };
+                // A driver that would not open at all hands back its message and no code, so the
+                // store itself is asked whether that was a refusal.
+                let checked = match checked {
+                    Err((None, why)) if drivers.was_refused(&p.store) => Err((Some("TX005".to_string()), why)),
+                    said => said,
                 };
                 match checked {
                     Ok(Some((sha, _))) if sha == p.sha256 => "ok".to_string(),
@@ -1408,17 +2119,104 @@ pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
                         problems += 1;
                         "missing".to_string()
                     }
-                    Err(e) => {
+                    // A store that refused this computer is not a store that could not be reached:
+                    // one is durable and about this computer's access, the other is worth trying
+                    // again. Said apart here, since this is where a person looks to find out.
+                    Err((Some(code), why)) if code == "TX005" => {
                         problems += 1;
-                        format!("unchecked: {e}")
+                        format!("refused: {why}")
+                    }
+                    Err((_, why)) => {
+                        problems += 1;
+                        format!("unchecked: {why}")
                     }
                 }
             }
         };
         rows.push(json!({ "path": item.path, "here": item.state, "asset_store": in_store, "note": item.note }));
     }
+    // Files in a store that no pointer names: an upload someone made by hand, a leftover of a push
+    // that never committed, the file of a pointer since deleted. Compared with what every pointer in
+    // the store names, not only this vault's, since other folders' assets live in the same store.
+    // Told of, never counted as problems: whose files those are is not for textdb to decide. Only
+    // for a whole vault -- a check of one asset has no business listing every file of a drive.
+    let mut unnamed = Vec::new();
+    if scope.is_empty() {
+        let mut in_use = InUse::new();
+        // What a store's files are for is never guessed at from the pointers that happened to parse.
+        // One pointer textdb cannot read and it names none of them, saying why instead: this list is
+        // read as "nothing needs these bytes", and someone acts on it by hand in their own drive.
+        let named = match in_use.refresh(st) {
+            Err(e) => Err(format!("the store's pointers could not be read ({})", e.message)),
+            Ok(()) => {
+                let mut unreadable: Vec<&str> = in_use.pointers.iter().filter(|(_, (_, names))| names.is_none()).map(|(p, _)| p.as_str()).collect();
+                unreadable.sort();
+                match unreadable.first() {
+                    Some(first) => Err(match unreadable.len() {
+                        1 => format!("the pointer {first} cannot be read, so what the store's files are for is not known"),
+                        n => format!("{n} pointers cannot be read ({first} among them), so what the store's files are for is not known"),
+                    }),
+                    // A pointer an earlier build wrote names its file by the path it sits at, one
+                    // pushed since by the id the drive keeps it under: a file is named when either
+                    // says so, or every asset not pushed again since would read as named by nothing.
+                    None => Ok(in_use
+                        .pointers
+                        .iter()
+                        .filter_map(|(pointer, (_, names))| names.as_ref().map(|(store, key)| (pointer, store, key)))
+                        .flat_map(|(pointer, store, key)| [(store.clone(), key.clone()), (store.clone(), location_key(asset_path(pointer)))])
+                        .collect::<HashSet<(String, String)>>()),
+                }
+            }
+        };
+        // An account sees its own pointers and no others, so it asks the store, which sees them all
+        // and answers yes or no about the places asked after -- never which asset needs them.
+        let delegated = in_use.delegated.unwrap_or(true);
+        let stores: BTreeSet<String> = found.iter().filter_map(|i| i.pointer.as_ref().map(|p| p.store.clone())).collect();
+        for store in stores {
+            let files = match drivers.get(&store).map_err(StoreError::other).and_then(|d| d.files()) {
+                Ok(Some(files)) => files,
+                Ok(None) => continue,
+                Err(e) => {
+                    unnamed.push(json!({ "store": store, "unchecked": e.message }));
+                    continue;
+                }
+            };
+            // A pointer an earlier build wrote names its file by the path it sits at, one pushed
+            // since by the id the drive keeps it under: a file is named when either says so, or
+            // every asset not pushed again since would read as named by nothing.
+            let says: std::result::Result<Vec<bool>, String> = match (delegated, &named) {
+                (false, Err(why)) => Err(why.clone()),
+                (false, Ok(named)) => Ok(files
+                    .iter()
+                    .map(|(item, at)| {
+                        named.contains(&(store.clone(), location_key(item))) || named.contains(&(store.clone(), location_key(at)))
+                    })
+                    .collect()),
+                (true, _) => {
+                    let asked: Vec<String> = files.iter().flat_map(|(item, at)| [item.clone(), at.clone()]).collect();
+                    match st.asset_items_named(&store, &asked) {
+                        Err(e) => Err(e.message),
+                        Ok(None) => Err("this session is an account's, and this store cannot say what its pointers name".to_string()),
+                        Ok(Some(a)) if a.unreadable > 0 => Err(match a.unreadable {
+                            1 => "a pointer in the store cannot be read, so what the store's files are for is not known".to_string(),
+                            n => format!("{n} pointers in the store cannot be read, so what the store's files are for is not known"),
+                        }),
+                        // Two places asked of each file, its item and its path, so a pair is a file.
+                        Ok(Some(a)) => Ok(a.named.chunks(2).map(|pair| pair.iter().any(|named| *named)).collect()),
+                    }
+                }
+            };
+            match says {
+                Err(why) => unnamed.push(json!({ "store": store, "unchecked": why })),
+                Ok(flags) => unnamed.extend(
+                    files.into_iter().zip(flags).filter(|(_, named)| !named).map(|((_, at), _)| json!({ "store": store, "at": at })),
+                ),
+            }
+        }
+    }
     if json {
-        emit_json(&json!({ "prefix": v.prefix, "dir": v.dir.display().to_string(), "assets": rows, "problems": problems }))?;
+
+        emit_json(&json!({ "prefix": v.prefix, "dir": v.dir.display().to_string(), "assets": rows, "unnamed": unnamed, "problems": problems }))?;
     } else {
         let mut s = format!("verified {} assets of {} in {}\n", rows.len(), v.prefix, v.dir.display());
         for r in rows.iter().filter(|r| r["here"] != "ok" || r["asset_store"] != "ok") {
@@ -1428,6 +2226,12 @@ pub fn verify(st: &mut dyn Store, path: Option<&str>, dir: Option<&Path>, json: 
                 r["here"].as_str().unwrap_or(""),
                 r["asset_store"].as_str().unwrap_or("")
             ));
+        }
+        for u in &unnamed {
+            match u["unchecked"].as_str() {
+                Some(why) => s.push_str(&format!("  the asset store {} could not be listed: {why}\n", u["store"].as_str().unwrap_or(""))),
+                None => s.push_str(&format!("  {} in the asset store {}: no pointer names it\n", u["at"].as_str().unwrap_or(""), u["store"].as_str().unwrap_or(""))),
+            }
         }
         s.push_str(&format!("{problems} problems\n"));
         out(s.as_bytes())?;
@@ -1580,6 +2384,28 @@ pub struct StoresOptions {
     pub bind: Option<String>,
 }
 
+/// Refuse `what` -- `"be removed"`, `"be pointed somewhere else"` -- while pointers name the asset
+/// store `name`, `subject` naming what cannot do it.
+///
+/// A store row says where a name's bytes are kept and every pointer of that store names them by it,
+/// so changing where the name points, or taking it away, leaves each of those pointers naming
+/// nothing -- on every computer that has not bound the store locally, while the ones that have go on
+/// working. That is not a configuration edit but a move of the bytes, one asset at a time, which is
+/// not built (docs/assets.md, "Moving a store").
+fn in_use_or(st: &mut dyn Store, name: &str, subject: &str, what: &str) -> Result<()> {
+    match st.asset_store_users(name)? {
+        Some(0) => Ok(()),
+        Some(n) => Err(StoreError::invalid(format!(
+            "{subject} cannot {what}: {n} {} name{} its files, and the bytes would have to move with it -- see docs/assets.md, \"Moving a store\"",
+            if n == 1 { "pointer" } else { "pointers" },
+            if n == 1 { "s" } else { "" }
+        ))),
+        None => Err(StoreError::invalid(format!(
+            "{subject} cannot {what}: whether any pointer names its files could not be established, since some pointer documents could not be read"
+        ))),
+    }
+}
+
 pub fn stores(st: &mut dyn Store, o: StoresOptions, json: bool) -> Result<()> {
     if let Some(name) = &o.add {
         if !pointer::valid_store_name(name) {
@@ -1596,6 +2422,14 @@ pub fn stores(st: &mut dyn Store, o: StoresOptions, json: bool) -> Result<()> {
         if let Some(problem) = (o.driver == "rclone").then(|| rclone::shared_root_problem(&root)).flatten() {
             return Err(StoreError::invalid(problem));
         }
+        // A name that is already declared somewhere else is not re-addressed here: the bytes are
+        // where the old root says, and every pointer names them. Moving a store means copying the
+        // files to the new one and settling each pointer as it goes -- see docs/assets.md.
+        if let Some(old) = st.asset_stores()?.into_iter().find(|s| s.name == *name) {
+            if old.root != root || old.driver != o.driver {
+                in_use_or(st, name, &format!("{name} is declared already, in {} ({}), and", old.root, old.driver), "be pointed somewhere else")?;
+            }
+        }
         // A local root is created here rather than left for the first push to fail on: `--add`
         // then `push` said "the folder is not there", with nothing in between to have made it.
         if o.driver == "local" && !std::path::Path::new(&root).exists() {
@@ -1604,6 +2438,7 @@ pub fn stores(st: &mut dyn Store, o: StoresOptions, json: bool) -> Result<()> {
         st.put_asset_store(&AssetStore { name: name.clone(), driver: o.driver.clone(), root, options: None, created_at: None })?;
     }
     if let Some(name) = &o.remove {
+        in_use_or(st, name, &format!("the asset store {name}"), "be removed")?;
         if !st.remove_asset_store(name)? {
             return Err(StoreError::not_found(format!("no asset store named {name}")));
         }
@@ -1666,6 +2501,47 @@ mod tests {
         assert_eq!(rel_under("/notes", "/notesx/a.png"), None);
     }
 
+    /// A store answering only where it keeps the file of an id, as a drive does: that place, no
+    /// file of that id, or no answer at all.
+    struct Places(std::result::Result<Option<&'static str>, ()>);
+
+    impl Driver for Places {
+        fn location(&self, path: &str) -> String {
+            path.to_string()
+        }
+        fn size(&self, _path: &str, _item: Option<&str>) -> Result<Option<u64>> {
+            unimplemented!()
+        }
+        fn hash(&self, _path: &str, _item: Option<&str>) -> Result<Option<(String, u64)>> {
+            unimplemented!()
+        }
+        fn put(&self, _path: &str, _src: &Path, _sha256: &str, _replaces: Option<&str>) -> Result<(Option<String>, driver::Held)> {
+            unimplemented!()
+        }
+        fn get(&self, _path: &str, _item: Option<&str>, _dest: &Path) -> Result<()> {
+            unimplemented!()
+        }
+        fn found(&self, _item: &str) -> Result<Option<driver::Found>> {
+            let told = self.0.map_err(|()| StoreError::other("the asset store could not be listed"))?;
+            Ok(told.map(|path| driver::Found { path: path.to_string(), sha256: None, size: 1, trashed: false, two_of_a_name: false }))
+        }
+    }
+
+    /// What a session may name is asked of the place the bytes are in, and an id is no place: the
+    /// store is asked where it keeps that id, and its answer is what has to be nameable.
+    #[test]
+    fn the_place_to_ask_after_is_a_path_even_where_the_pointer_names_an_id() {
+        let drive = Places(Ok(Some("/legal/contracts/x.png")));
+        assert_eq!(place_of(&drive, "1a2b3c4d5e6f7g").unwrap().as_deref(), Some("/legal/contracts/x.png"));
+        // A path item is the place it says, whatever the store would answer of an id.
+        assert_eq!(place_of(&drive, "/img/a.png").unwrap().as_deref(), Some("/img/a.png"));
+        // No file of that id in the store: no place to ask after, and no bytes to reach either.
+        assert_eq!(place_of(&Places(Ok(None)), "1a2b3c4d5e6f7g").unwrap(), None);
+        // A store that could not be asked is not a store that answered: the question stands, and
+        // is carried up as the failure it is rather than passed as though there were nothing to ask.
+        assert!(place_of(&Places(Err(())), "1a2b3c4d5e6f7g").is_err());
+    }
+
     #[test]
     fn portable_names() {
         for ok in ["img/a.png", "a b/c.pdf", "ünï/ø.jpg", "icons/x.png", "com10.png"] {
@@ -1674,5 +2550,123 @@ mod tests {
         for bad in ["", "a//b.png", "../x.png", "a/./b", "C:x.png", "a\\b.png", "x.png.", "x ", "CON.png", "con.d/x.png", "lpt1", "a/nul.txt", "q?.png"] {
             assert!(!portable_rel(bad), "{bad}");
         }
+    }
+
+    /// An asset at `/img/a.png` whose pointer names a Drive id, in the state `state`, with
+    /// `item_path` recording where the store last had the bytes.
+    fn asset(state: &'static str, item_path: Option<&str>) -> Item {
+        let v = Vault { prefix: "/".to_string(), dir: PathBuf::from("/vault") };
+        let mut item = Item::new(&v, "img/a.png");
+        item.state = state;
+        item.pointer = Some(Pointer {
+            id: "01926d1e-7b4a-7c1e-9d2f-3a5b6c7d8e9f".into(),
+            sha256: "9f".repeat(32),
+            size: 11,
+            media_type: "image/png".into(),
+            store: "drive".into(),
+            item: Some("1AbCdEfGhIjKlMnO".into()),
+            item_path: item_path.map(str::to_string),
+            extra: vec![],
+        });
+        item
+    }
+
+    /// What a store says of it: at `path`, those bytes, live and alone unless said otherwise.
+    fn holds(path: &str, sha256: Option<&str>, size: u64) -> driver::Found {
+        driver::Found { path: path.to_string(), sha256: sha256.map(str::to_string), size, trashed: false, two_of_a_name: false }
+    }
+
+    /// Ask the pass one question and give it one answer.
+    fn state_of(mut item: Item, found: Result<Option<driver::Found>>) -> Item {
+        let mut answer = Some(found);
+        let items = std::slice::from_mut(&mut item);
+        mark_store_states(items, |_, _| answer.take().unwrap_or(Ok(None)));
+        item
+    }
+
+    #[test]
+    fn what_a_store_holds_gives_an_asset_its_state_and_never_hides_what_the_bytes_here_say() {
+        let same = "9f".repeat(32);
+        let other = "ab".repeat(32);
+
+        // Where it is and what it holds, all as the pointer says: nothing to tell.
+        let plain = state_of(asset("ok", Some("/img/a.png")), Ok(Some(holds("/img/a.png", Some(&same), 11))));
+        assert_eq!(plain.state, "ok");
+        assert!(plain.note.is_none() && !plain.store_told && !plain.store_changed);
+
+        // No file of that item at all: purged from the store's trash, or outside the store.
+        let gone = state_of(asset("ok", None), Ok(None));
+        assert_eq!(gone.state, "invalid-item");
+        assert!(gone.note.as_deref().unwrap_or("").contains("no file of item"));
+
+        // Two files of one name, and its own trash: the trash first, since which of two files an
+        // item means says nothing about one that is in the trash and still fetched by id.
+        let two = state_of(asset("ok", Some("/img/a.png")), Ok(Some(driver::Found { two_of_a_name: true, ..holds("/img/a.png", Some(&same), 11) })));
+        assert_eq!(two.state, "ambiguous");
+        let binned = state_of(
+            asset("ok", Some("/img/a.png")),
+            Ok(Some(driver::Found { trashed: true, two_of_a_name: true, ..holds("/img/a.png", Some(&same), 11) })),
+        );
+        assert_eq!(binned.state, "trashed-in-store", "a file in the store's trash was called ambiguous");
+
+        // Other bytes in that very file, told as a fact and not only as a state, so an asset
+        // waiting to be pulled follows them too.
+        let changed = state_of(asset("ok", Some("/img/a.png")), Ok(Some(holds("/img/a.png", Some(&other), 11))));
+        assert_eq!(changed.state, "changed-in-store");
+        assert!(changed.store_changed);
+        let unpulled = state_of(asset("not-pulled", Some("/img/a.png")), Ok(Some(holds("/img/a.png", Some(&other), 11))));
+        assert_eq!(unpulled.state, "not-pulled", "an asset waiting to be pulled lost that state");
+        assert!(unpulled.store_changed && unpulled.store_told);
+
+        // No SHA-256 from the provider (an old upload): a size that is not the pointer's still says
+        // the bytes are other ones.
+        let by_size = state_of(asset("ok", Some("/img/a.png")), Ok(Some(holds("/img/a.png", None, 12))));
+        assert!(by_size.store_changed && by_size.state == "changed-in-store");
+        let same_size = state_of(asset("ok", Some("/img/a.png")), Ok(Some(holds("/img/a.png", None, 11))));
+        assert_eq!(same_size.state, "ok");
+
+        // Changed here and there: neither side is taken over the other.
+        let both = state_of(asset("modified", Some("/img/a.png")), Ok(Some(holds("/img/a.png", Some(&other), 11))));
+        assert_eq!(both.state, "conflict");
+        assert!(both.note.as_deref().unwrap_or("").contains("changed here and in the asset store"));
+
+        // Which side moved it: the record says where the store last had the bytes.
+        let by_us = state_of(asset("ok", Some("/old/a.png")), Ok(Some(holds("/old/a.png", Some(&same), 11))));
+        assert_eq!(by_us.state, "moved-here");
+        assert_eq!(by_us.in_store.as_deref(), Some("/old/a.png"));
+        let by_them = state_of(asset("ok", Some("/img/a.png")), Ok(Some(holds("/moved/a.png", Some(&same), 11))));
+        assert_eq!(by_them.state, "moved-in-store");
+        // A pointer written before the record existed: moved, but not which side did it.
+        let unrecorded = state_of(asset("ok", None), Ok(Some(holds("/old/a.png", Some(&same), 11))));
+        assert_eq!(unrecorded.state, "moved-here");
+        assert!(unrecorded.note.as_deref().unwrap_or("").contains("does not say where the store last had it"));
+
+        // Replaced *and* moved: both facts told, the change taking the state.
+        let twice = state_of(asset("ok", Some("/img/a.png")), Ok(Some(holds("/moved/a.png", Some(&other), 11))));
+        assert_eq!(twice.state, "changed-in-store");
+        let told = twice.note.as_deref().unwrap_or("");
+        assert!(told.contains("other bytes") && told.contains("/moved/a.png"), "{told}");
+
+        // A state the bytes here gave keeps it, and is told of the store's answer as well.
+        for state in ["modified", "outdated", "conflict", "invalid-pointer"] {
+            let kept = state_of(asset(state, Some("/img/a.png")), Ok(Some(driver::Found { trashed: true, ..holds("/img/a.png", Some(&same), 11) })));
+            assert_eq!(kept.state, state, "the store's answer took the state {state}");
+            assert!(kept.store_told && kept.note.is_some());
+        }
+
+        // A store that cannot be asked changes nothing and is named.
+        let mut unasked = asset("ok", Some("/img/a.png"));
+        let items = std::slice::from_mut(&mut unasked);
+        let said = mark_store_states(items, |_, _| Err(StoreError::other("gdrive: not reached".to_string())));
+        assert_eq!(unasked.state, "ok");
+        assert_eq!(said.len(), 1);
+        assert!(said[0].contains("drive") && said[0].contains("not reached"), "{:?}", said);
+
+        // An item that is a path is nothing to ask about: a local store answers none of this.
+        let mut local = asset("ok", None);
+        local.pointer.as_mut().unwrap().item = Some("/img/a.png".to_string());
+        let items = std::slice::from_mut(&mut local);
+        let quiet = mark_store_states(items, |_, _| panic!("a store keeping its files by path was asked"));
+        assert!(quiet.is_empty() && local.state == "ok" && !local.store_told);
     }
 }

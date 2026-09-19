@@ -175,6 +175,8 @@ export interface AssetItem {
   type: string;
   size?: number;
   store?: string;
+  /** Where the asset store keeps its file, when that is not where the asset's own path says. */
+  in_store?: string;
   sha256?: string;
   /** The pointer's version in the store. */
   version?: number;
@@ -193,7 +195,15 @@ export type AssetState =
   | "conflict-copy"
   | "orphan"
   | "invalid-pointer"
-  | "invalid-path";
+  | "invalid-path"
+  // What the asset store itself holds, where it keeps its files by an id of its own (Google Drive).
+  | "changed-in-store"
+  | "moved-here"
+  | "moved-in-store"
+  | "trashed-in-store"
+  | "ambiguous"
+  | "invalid-item"
+  | "not-permitted";
 
 export interface AssetStatus {
   prefix: string;

@@ -50,19 +50,26 @@ impl Config {
     /// The config of the directory `start` is in, or of one above it.
     ///
     /// Stops at a filesystem boundary, as git does, and at any directory named by
-    /// `TEXTDB_CEILING_DIRECTORIES` (`:`-separated). `TEXTDB_DIR` names a root outright.
+    /// `TEXTDB_CEILING_DIRECTORIES` (separated as `PATH` is: `;` on Windows, `:` elsewhere).
+    /// `TEXTDB_DIR` names a root outright.
     pub fn find(start: &Path) -> Option<(PathBuf, Config)> {
         if let Some(dir) = std::env::var_os("TEXTDB_DIR") {
             let dir = PathBuf::from(dir);
             return Config::read(&dir).ok().flatten().map(|c| (dir, c));
         }
         let start = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
-        let ceilings: Vec<PathBuf> = std::env::var("TEXTDB_CEILING_DIRECTORIES")
-            .unwrap_or_default()
-            .split(':')
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .collect();
+        // Separated as `PATH` is on this system, which is what `split_paths` knows: on Windows a
+        // path holds a colon of its own, so splitting on one left `C` and a stray tail and no
+        // ceiling could ever match. Each is resolved as `start` was, or a ceiling as somebody typed
+        // it never equals what the filesystem answered with -- on Windows a verbatim `//?/C:/...`.
+        let ceilings: Vec<PathBuf> = std::env::var_os("TEXTDB_CEILING_DIRECTORIES")
+            .map(|named| {
+                std::env::split_paths(&named)
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+                    .collect()
+            })
+            .unwrap_or_default();
         let device = device_of(&start);
         let mut at = start.as_path();
         loop {

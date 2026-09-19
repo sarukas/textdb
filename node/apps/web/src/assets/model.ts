@@ -45,6 +45,29 @@ const LABELS: Record<AssetState, StateLabel> = {
   orphan: { label: "Orphan", tone: "problem", hint: "Its pointer was moved or deleted in the store: the next sync moves or trashes the file." },
   "invalid-pointer": { label: "Invalid pointer", tone: "problem", hint: "The pointer document cannot be read." },
   "invalid-path": { label: "Invalid name", tone: "problem", hint: "The name cannot be a file on every system: rename it." },
+  "changed-in-store": { label: "Changed in store", tone: "action", hint: "Someone replaced its bytes in the asset store: pull to take them as its new version." },
+  "moved-here": {
+    label: "Moved here",
+    tone: "action",
+    hint: "The asset moved here while its file stayed where it was in the asset store: `textdb assets relocate` moves the file to it, or move the pointer back.",
+  },
+  "moved-in-store": {
+    label: "Moved in store",
+    tone: "action",
+    hint: "Someone moved its file in the asset store: the file here is still the asset's own bytes, and `textdb assets relocate` brings the file back to it.",
+  },
+  "trashed-in-store": {
+    label: "Trashed in store",
+    tone: "problem",
+    hint: "Its file is in the asset store's own trash: the copy here is still the asset's own bytes, but they go for good when the store empties its trash — restore the file there.",
+  },
+  ambiguous: { label: "Two in store", tone: "problem", hint: "The asset store holds two files of that name: keep one of them there, and neither is read or written over until then." },
+  "invalid-item": { label: "Not in store", tone: "problem", hint: "The asset store has no file of that item: purged from its trash, or a file outside the store." },
+  "not-permitted": {
+    label: "Not permitted",
+    tone: "problem",
+    hint: "The asset store refused this computer the file. That is about this computer's access, not the asset: ask whoever holds the store, then try again.",
+  },
 };
 
 export function stateLabel(state: string): StateLabel {
@@ -93,10 +116,17 @@ export function actionFor(item: Pick<AssetItem, "state">): "pull" | "push" | nul
   switch (item.state) {
     case "not-pulled":
     case "outdated":
+    // Its bytes in the store are not the ones its pointer names, and a pull takes them as the new
+    // version.
+    case "changed-in-store":
       return "pull";
     case "new":
     case "modified":
       return "push";
+    // A store-side state only ever replaces `ok`, so the file here is already the asset's own bytes
+    // and there is nothing to fetch: `trashed-in-store` is settled in the store (a pull would not
+    // take it, and no push puts those bytes back), the move states by `textdb assets relocate` or
+    // by moving the pointer back, `ambiguous` and `invalid-item` in the store itself.
     default:
       return null;
   }

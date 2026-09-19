@@ -1115,7 +1115,18 @@ pub struct AssetsReport {
 /// setting say, the files set aside for a conflict pulled again, and how many assets are in
 /// each state.
 #[allow(clippy::too_many_arguments)]
-fn sync_assets(st: &mut dyn Store, o: &Options, prefix: &str, plan: &Plan, attrs_changed: bool, has_pointers: bool, has_copies: bool, report: &mut Report) {
+fn sync_assets(
+    st: &mut dyn Store,
+    o: &Options,
+    prefix: &str,
+    plan: &Plan,
+    attrs_changed: bool,
+    has_pointers: bool,
+    has_copies: bool,
+    mut stores: Option<&mut crate::assets::StoreFiles>,
+    no_store_files: Option<&str>,
+    report: &mut Report,
+) {
     use crate::assets::{self, PushOptions};
     if report.assets.is_none() && !has_pointers && st.asset_stores().map_or(true, |s| s.is_empty()) {
         return;
@@ -1175,7 +1186,7 @@ fn sync_assets(st: &mut dyn Store, o: &Options, prefix: &str, plan: &Plan, attrs
                     Some(linked)
                 })
             };
-            match linked.and_then(|linked| assets::pull_run(st, &v, &[], linked.as_ref(), false)) {
+            match linked.and_then(|linked| assets::pull_run(st, &v, &[], linked.as_ref(), Some(&o.author), false, stores.as_deref_mut())) {
                 Ok(r) => {
                     a.pulled = r.pulled.iter().filter_map(|p| p["path"].as_str().map(str::to_string)).collect();
                     a.notes.extend(r.kept);
@@ -1185,8 +1196,18 @@ fn sync_assets(st: &mut dyn Store, o: &Options, prefix: &str, plan: &Plan, attrs
             }
         }
     }
-    match assets::state_counts(st, &v, !o.dry_run) {
-        Ok(counts) => a.counts = counts,
+    // The counts, and what to tell of an asset that moved in textdb while its store kept its file
+    // where it was: the sync says so and moves nothing of its own in a store.
+    // Said here rather than swallowed: a store nobody could read is why an asset changed in it says
+    // nothing of itself below.
+    if let Some(why) = no_store_files {
+        a.notes.push(format!("the asset stores could not be read ({why}): what was changed in them is not told of"));
+    }
+    match assets::counts_and_moves(st, &v, !o.dry_run, stores.as_deref_mut()) {
+        Ok((counts, notes)) => {
+            a.counts = counts;
+            a.notes.extend(notes);
+        }
         Err(e) => a.notes.push(format!("assets not listed: {}", e.message)),
     }
     a.mode = mode;
@@ -2214,7 +2235,21 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             }
         }
     }
+    // The asset stores this sync reads or changes, made once for the whole of it: knowing what every
+    // pointer names reads the store's pointers, each driver opens once, and a drive lists its files
+    // once -- the deletions, the pull and the states then ask the same one instead of a drive three
+    // times over. A store this computer cannot reach is a note where it matters, never a failed
+    // sync, and a dry run makes none: it asks nothing of anyone's provider.
+    let (mut store_files, mut no_store_files) = (None, None);
+    if !o.dry_run && !report.stopped && !report.stopped_by_rules {
+        match crate::assets::StoreFiles::new(&mut *sides.st) {
+            Ok(files) => store_files = Some(files),
+            // Never silently: a file's fate is not decided by something that failed unremarked.
+            Err(e) => no_store_files = Some(e.message),
+        }
+    }
     if !report.stopped && !report.stopped_by_rules && !o.dry_run {
+        let (stores, why) = (store_files.as_mut(), no_store_files.as_deref());
         apply(
             &mut sides,
             &o,
@@ -2225,6 +2260,8 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
             &changes,
             &key,
             from_commit.as_deref(),
+            stores,
+            why,
             &mut report,
             &rules,
             generation,
@@ -2234,7 +2271,8 @@ pub fn sync(st: &mut dyn Store, o: Options, json: bool) -> Result<()> {
         )?;
     }
     if !report.stopped && !report.stopped_by_rules {
-        sync_assets(&mut *sides.st, &o, &prefix, &plan, attrs_changed, has_pointers, has_copies, &mut report);
+        let (stores, why) = (store_files.as_mut(), no_store_files.as_deref());
+        sync_assets(&mut *sides.st, &o, &prefix, &plan, attrs_changed, has_pointers, has_copies, stores, why, &mut report);
     }
     let asset_failures = report.assets.as_ref().map_or(0, |a| a.failed.len());
     let asset_conflicts = report.assets.as_ref().map_or(0, |a| a.conflicts.len());
@@ -2323,6 +2361,8 @@ fn apply(
     changes: &HashMap<String, git::Change>,
     key: &str,
     from_commit: Option<&str>,
+    mut store_files: Option<&mut crate::assets::StoreFiles>,
+    no_store_files: Option<&str>,
     report: &mut Report,
     rules: &Rules,
     // What the base was at when this sync read it; saving checks it has not moved since.
@@ -2469,6 +2509,10 @@ fn apply(
             Err(e) => report.failed.push(note(from, format!("not moved to {to} with its folder: {e}"))),
         }
     }
+    // A pointer deleted in textdb takes the file it named with it in its asset store too, where the
+    // store keeps its files by an id of its own (Google Drive). What every pointer still names, and
+    // the drivers to do it with, are the ones the sync made for all of its steps; a store this
+    // computer cannot reach is a note below, never a failed sync.
     // A pointer deleted in textdb leaves disk only once its file is in the trash, so a move that
     // fails is tried again by the next sync rather than leaving the file to be pushed as new.
     let mut trash = None;
@@ -2480,10 +2524,29 @@ fn apply(
                 format!(".textdb/trash/{}-{nanos:09}", crate::assets::driver::stamp(now))
             })
             .clone();
+        // Read while the pointer is still on disk: the store has none of it after the deletion.
+        let named = sides.disk(pointer_rel).ok().and_then(|text| crate::assets::pointer::Pointer::parse(&text).ok());
+        if let Some(why) = &no_store_files {
+            report.kept.push(note(file, format!("its copy in its asset store stays there: {why}")));
+        }
         match move_disk(dir, file, &format!("{folder}/{file}")) {
             Ok(()) => {
                 had.forget(file);
                 moved(file, &format!("{folder}/{file}"));
+                // The store's own copy follows, once these bytes are safely in this directory's
+                // trash: a file the sync could not set aside here keeps its copy there.
+                if let (Some(files), Some(p)) = (store_files.as_deref_mut(), named.as_ref()) {
+                    let own = crate::assets::pointer::asset_path(&store_path(&prefix, pointer_rel)).to_string();
+                    let item = p.item.clone().unwrap_or_else(|| own.clone());
+                    let stays = |why: String| note(file, format!("its copy in the asset store {} stays there: {why}", p.store));
+                    match files.trashed(&mut *sides.st, &p.store, &item, &own, &p.sha256) {
+                        Ok(crate::assets::StoreCopy::LeftBecause(why)) => report.kept.push(stays(why)),
+                        Ok(_) => {}
+                        // Told of, never a failed sync: bytes are not lost to a sync that could not
+                        // make sure of them.
+                        Err(e) => report.kept.push(stays(e.message)),
+                    }
+                }
                 if let Err(e) = remove_disk(dir, pointer_rel) {
                     failed(report, &mut rows, pointer_rel, e.to_string());
                 }

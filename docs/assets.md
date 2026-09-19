@@ -68,6 +68,11 @@ item: 1AbCdEf…
 - `store`: the name of an asset store configured in the textdb store. `item`: the provider's
   stable item id; for a local-folder store, the store path the bytes were put at, so a pointer
   moved in the store still finds them until a push or stage 2's sync moves them too.
+- `item-path` (only where `item` is a provider's id): the store path the bytes were last put at, so
+  a file someone moved in the store is told from an asset moved in textdb. No part of identity, and
+  nothing finds bytes by it -- `item` does that. A pointer written before this key existed simply
+  has none, and then which side moved cannot be told: both places are reported and neither blamed,
+  until its next push records one.
 - Later stages add provider metadata lines (`provider-hash`, `provider-version`) for cheap
   change detection; they are not part of identity.
 - The real file is the pointer's path without `.tdbasset`. The pointer changes only when the
@@ -88,10 +93,92 @@ from a pointer changed elsewhere:
 | no | present, classified asset | `new` (push publishes it) |
 | no | a copy a keep-both conflict left, `NAME (conflict HOST DATE).ext` | `conflict-copy` (never pushed or paired; compare it, then delete or rename it) |
 | no | where this directory had an asset whose pointer was moved or deleted in the store | `orphan` (sync moves it after its pointer or trashes it; never pushed but with `push --force`) |
+| yes | same sha256, but its store keeps the file somewhere other than the asset's own path | `moved-here` (the asset moved in textdb and its file stayed: `assets relocate` moves the file to it, or `mv` the pointer back) |
+| yes | its store keeps the file somewhere else, and not where the pointer's `item-path` last recorded | `moved-in-store` (someone moved it there; a pull still fetches it by id, `assets relocate` brings it back to the asset) |
+| yes | its store holds other bytes in that very file | `changed-in-store` (someone replaced them there; a pull takes them as the pointer's new version, the copy here going to `.textdb/trash/`) |
+| yes | its store keeps the file in the provider's own trash | `trashed-in-store` (a pull still fetches it, until the provider empties it) |
+| yes | its store holds two files at that path (Google Drive allows it) | `ambiguous` (which one the pointer names cannot be said, so neither is read or written over) |
+| yes | its store has no file of that item at all | `invalid-item` (purged from the store's trash, or a file outside the store, which textdb never touches) |
+| yes | the store answered and refused this computer the file | `not-permitted` (a fact about this computer's access, not about the asset: nothing retries into it, and somebody has to be asked). A store addressing its files by path shows the same refusal as `refused: …` in `assets verify`, since a path needs no asking after |
+
+A store-side state goes over `ok` alone: what the bytes here say comes first, so a `modified`,
+`outdated` or `conflict` asset keeps that state and is told of the store's answer as well. The one
+exception is bytes changed on both sides -- `changed-in-store` over a `modified` file -- which is a
+`conflict`.
 
 A file whose name differs from a pointer's only in case is that asset (on Windows and macOS it
 is the same file); a second file differing only in case is a `conflict`. A pointer whose path
 cannot be a file on every system is `invalid-path`.
+
+## A binary dropped into a vault, and what a sync does with it
+
+Someone copies a few images into a synced folder and runs `textdb sync`. **Nothing is copied into
+the asset store, and the files stay exactly where they are.** The sync counts them as `new` assets
+and says so; their bytes are never read into textdb either, since a binary is never taken in as a
+document (one that `--ext` would otherwise have taken is skipped with a note naming the asset store
+or a rule as the way to keep it). A store being configured changes none of this: publishing is
+something asked for, never a side effect of syncing.
+
+Three ways to publish them, then:
+
+| | What it does |
+|---|---|
+| `textdb assets push` | Publishes the `new` and `modified` assets now |
+| `textdb sync --push / DIR` | The same, as part of that one sync (`--pull` likewise fetches) |
+| `asset_sync` = `push`, `pull` or `both` | Every sync of this store does it; the default is `off` |
+
+`--push` and `--pull` decide a single run; without either, the store's `asset_sync` setting decides,
+and with neither set the answer is `off`. Pulling is not the mirror of pushing: `asset_pull`
+defaults to `linked`, so a pull fetches the assets the notes link to and nothing else, until it is
+set to `all`.
+
+What a push does, in order: it copies the bytes into the store (a copy, never a move -- the real
+file stays on disk, where it is edited), hashes what arrived to be sure of it, then writes the
+`NAME.tdbasset` pointer next to the file and commits that pointer to textdb. The binary itself never
+enters textdb or git; the pointer is the versioned thing. Which store it goes to: `--to NAME` when
+given, else the store its pointer already names, else the first store declared. Inside the store the
+bytes go to the asset's own path under the root, so `/img/a.png` is `<root>/img/a.png` and the store
+stays browsable by hand.
+
+One deliberate refusal to know about: a sync that brings a `.gitattributes` in from textdb, or
+moves, sets aside or deletes one on disk, pushes no assets on that run -- the file that decides what
+counts as an asset has just changed under it. It reports that the rules changed, and an explicit
+push or the next sync with `--accept-rules` goes ahead. That way a rules file someone else committed
+cannot make a later sync publish what it should not.
+
+## Pulling assets into a vault
+
+`textdb assets pull` puts the real file where its pointer is: in the vault directory, at the
+pointer's own path without `.tdbasset` -- or under the name already on disk, where that differs only
+in letter case. What it fetches and what it leaves alone:
+
+| State | Pull |
+|---|---|
+| `not-pulled` | fetched |
+| `outdated` | fetched; what was here goes to `.textdb/trash/<yyyymmdd-HHMMSS>-<nanos>/…` first, never overwritten |
+| `modified` | kept: changed here, so not replaced (push it, or delete it and pull) |
+| `conflict` | kept, with the reason |
+
+Each file is downloaded to a partial name beside where it is going, hashed there against the
+pointer's `sha256` and size, and only then renamed into place. Bytes that are not the ones the
+pointer names therefore never appear under the real name: that asset fails, the partial file goes,
+and the message names `textdb assets verify`. The one exception is an asset whose store holds other
+bytes in that very file (`changed-in-store`): there the point is that they are not the pointer's,
+and a pull takes them as its new version. It commits the pointer naming them -- the only write a
+pull makes -- before putting the bytes in place, so a commit that fails leaves the vault as it was;
+the old copy goes to `.textdb/trash/` as an `outdated` one does, and the new pointer is written to
+disk and recorded in this directory's sync base, as a push does. A pull never creates a pointer the
+store has not got, and never writes one this directory has not caught up with: those are reported
+and left for a sync. Nothing is written through a symbolic link or junction
+already in the directory, whose target may be anywhere outside the vault. On a Google Drive store
+the download goes by the file's id, so an asset someone renamed, moved to another folder, or sent to
+Drive's trash is still found and fetched.
+
+`pull` on its own fetches everything in scope that needs it; `--linked-from PATH` narrows it to the
+assets the notes at or below that path link to. A sync's pull is the narrower one by default, since
+`asset_pull` is `linked` until it is set to `all` (see Sync below) -- so an explicit pull and a
+sync's pull deliberately differ. `--dry-run` says what it would fetch and how many bytes. Assets
+that could not be fetched exit 1.
 
 ## Which files are documents, assets or ignored
 
@@ -125,6 +212,21 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
 
 - Store table `asset_store(name, driver, root, options)`: `driver` ∈ `local`, `rclone`; `root` is
   the store-side identity (a folder, or an rclone remote path such as `teamdrive:textdb`).
+  **The owner's row:** declaring a store and removing one are refused for a token session, by the
+  store rather than by the CLI — on SQLite in its store module, on Postgres by a trigger on the
+  table, so a hand-written `INSERT` meets the same rule. A row says where a name's bytes are kept
+  for every account and every computer, so an account that could write one would move, or orphan,
+  every asset of that name for everybody. See [`permissions.md`](permissions.md), which also covers
+  why a store's own credentials stay per person, and what a pointer does and does not tell its
+  readers.
+- **A declared store is not re-addressed while pointers name it.** `--add` on a name whose row
+  points somewhere else, and `--remove` of a name any pointer names, are refused (exit 6) and say
+  how many pointers name it. The bytes are where the old root says and every pointer names them by
+  it, so the edit alone would leave each of those pointers naming nothing — on every computer
+  that has not bound the store locally, while the ones that have go on working, which is worse than
+  all of them failing. Moving a store is a move of the bytes: see "Moving a store" below.
+  Re-declaring the same place is not a repoint, and a name with no row at all can be declared
+  freely — that is how a removed row is recovered.
 - Machine binding, because the same shared drive is mounted or configured differently per user:
   environment `TEXTDB_ASSET_STORE_<NAME>` (name upper case, other characters `_`), else
   `asset-stores.json` in the config directory (`TEXTDB_CONFIG_DIR`, else `%APPDATA%\textdb`,
@@ -133,6 +235,10 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
   binding uses its root when that is an absolute path. `textdb assets stores` shows each binding
   and whether the store is reachable.
 - Layout: the asset at store path `/accounts/acme/arch.png` is kept at `<root>/accounts/acme/arch.png`.
+  Those are the owner's paths. Where a store delegates folders to accounts, an account's own paths
+  are a projection of them, and a push translates back before choosing where bytes go: one store is
+  one place, and its layout is the same whoever pushed to it. A pointer therefore names an item in
+  the owner's paths, which an account can read in its own pointers.
 - **local driver**: plain filesystem operations (works for a NAS, a USB disk, and Google Drive for
   Desktop / OneDrive clients in mirror mode). Item = path. Copies go through a hidden partial file
   (`.NAME.HOST-PID-NANOS.tdbpart`; one a process of this computer that is no longer running left
@@ -187,8 +293,89 @@ Declared in the textdb store (shared by the team through Postgres), bound per ma
   provider's trash; a lock of a process of this computer that is not running any more is removed,
   and one that could not be removed is reported. A Google document (no bytes) is never an asset.
   The local and rclone drivers' locks do not see each other: one team should reach a store
-  through one driver. Still to come: provider item ids, SharePoint's rewriting of Office files on upload, and
-  changes made directly in the drive (see stage 3 below).
+  through one driver. Google Drive remotes work as below; SharePoint's rewriting of Office files
+  on upload is still to come (see stage 3 below).
+- **Google Drive** (an rclone remote of type `drive`, as `rclone listremotes --long` shows, or a
+  `:drive` connection string; a shared drive in a team). Built in sprints (stage 3 below): file ids
+  as items, the listing with its id guard, pulls by id, pushes in place, Drive's trash following a
+  deleted pointer, and a pointer moved in textdb being told of and settled with `assets relocate`
+  are in; the states for changes made in the drive are planned, from what Drive was seen to do on a
+  test shared drive:
+  - *Item* = the Drive file id, recorded in the pointer's `item`. An id stays with a file through
+    renames, moves and in-place overwrites; a pointer an earlier build wrote (item = path) gets its
+    id at its next push.
+  - *One listing per command.* Every rclone run costs seconds (starting up and reaching Drive), so
+    a command lists the store root once, recursively, with ids, sizes and SHA-256 (Drive keeps
+    one for each upload), and the files in Drive's trash under it when it needs them, and works
+    from that. Shortcuts and Google documents are left out of every listing (`--drive-skip-shortcuts`,
+    `--drive-skip-gdocs`); a shortcut would otherwise look like a copy of its target.
+  - *Ids stay inside the store.* The person running textdb may reach other shared drives, and a
+    pointer anyone wrote to the store could name any file id: an id is read, moved or trashed only
+    when that listing has it under the store's root (live or in Drive's trash). Any other is
+    `invalid-item` and never touched.
+  - *Push overwrites in place* (so the file keeps its id and people browsing the drive keep their
+    links): with the path's lock held, and the file at the path being the pointer's id holding the
+    bytes it replaces, a server-side copy of it goes to `.textdb-trash/…` and is checked (rclone
+    cannot read Drive's revisions, so this keeps older versions a pointer may still name); then
+    the new bytes are uploaded onto the same file, which readers see whole or not at all (Drive
+    shows the old bytes until the upload finishes), and the file is looked at again: it must be the
+    same file (its id) holding the upload's bytes, read through by id where Drive keeps no SHA-256.
+    Anything else fails the push, and what was there goes back only onto its own file, empty then or
+    holding those bytes still; otherwise the trash copy is named and left, since bytes textdb did
+    not write are not its to overwrite. A file the drive cannot be asked about after an upload
+    rclone reported done counts as placed, and the push's own last look records the id and the bytes
+    it finds there. A push replaces the file its pointer names: where the pointer holds a file id,
+    another file that took over that name in the drive is refused, not overwritten, even when it
+    holds the very bytes being pushed and nothing would be uploaded; a pointer still holding a store
+    path has no id to check against and gets one from its next push. The `beside` name a push falls
+    back to is refused the same way when the drive holds two files of it, and a file Drive returns
+    no id for fails the push rather than being read by its name. A push leaves a path the drive holds two files of alone
+    (Drive allows that): which of them it would replace is not textdb's to guess. Bytes that are
+    not the ones replaced are kept, and the upload goes beside them, as today.
+  - *Pull downloads by id* (`rclone backend copyid`) to its partial file and checks the hash, so
+    an asset renamed or moved in the drive, or in Drive's trash, is still found. A pointer naming
+    older bytes than its file now holds is `changed-in-store`, and a pull takes the drive's bytes as
+    the pointer's new version rather than hunting for the old ones in `.textdb-trash`: what someone
+    put in the drive is what the drive holds, and the copy here goes to the vault's own trash. (The
+    replaced bytes stay in the store's `.textdb-trash` for a pointer that still names them, but
+    nothing fetches them from there: the design's earlier fallback was dropped for this, since
+    taking the older bytes would quietly undo what was done in the drive.)
+  - *Pointers moved in textdb* leave the file in the drive where it was: `mv` moves where the
+    pointer sits and touches no drive, and nothing moves a person's drive about on its own. The
+    asset is then `moved-here`, `assets status` says where its file actually is, and every sync says
+    so too, with the two ways out: `textdb assets relocate PATH` moves the file in the drive to the
+    asset's own path, and `textdb mv` back puts the pointer where the file is. Pulls work either way
+    (they go by id), so this is a tidiness to settle, not a breakage.
+    `relocate` looks the id's path up in the store's listing and moves it with `rclone moveto`,
+    which Drive does server-side, keeping the id and so every link people made to it. Not `rclone
+    backend moveid`, which copies and deletes: a real drive answered it with a file of a *new* id at
+    the new name and the old one in Drive's trash. Nothing already of that name in the drive is
+    overwritten, a file another pointer also names stays where it is, and a file someone sent to
+    Drive's trash is reported rather than restored: rclone untrashes only a whole folder (`backend
+    untrash` restored every trashed file of the one it was given), which would bring back files that
+    are no business of this move.
+  - *Pointers deleted in textdb* send their file to Drive's trash once no pointer names its id, the
+    file of that name is still the one the id names, the bytes there are the ones the pointer named,
+    every pointer of the store can be read, and the store is bound and reachable on this computer.
+    Anything else leaves the file where it is and the sync says why: bytes someone replaced in the
+    drive are told of, never taken away by a deletion here, and one pointer textdb cannot read stops
+    the tidying of every store until it is fixed or removed. The store's copy goes only once the
+    file on disk is safely in the directory's own trash. Drive empties its trash after 30 days, and
+    until then a pull by id still finds it. A pointer that never reached the store (one only on a
+    git branch, say) protects nothing: the store is what is asked.
+  - *Changes made directly in the drive* show in `assets status` and are followed on pull, never
+    undone in the drive: `changed-in-store` (same id, other bytes: someone replaced it; a pull
+    takes them as the pointer's new version, or a conflict when the local file changed too),
+    `moved-in-store` (the id is at another path: pulled from there, the pointer's path unchanged),
+    `trashed-in-store` (only in Drive's trash: still pulled), and not found once Drive purged it.
+    Two files listed at one path are `ambiguous` and never overwritten. `verify` lists files in the
+    store folder that no pointer names.
+  - Tests run only on a person's own computer, against a remote named by
+    `TEXTDB_TEST_GDRIVE` (a folder named `textdb-test`), each in a new subfolder removed at the
+    end; CI keeps testing rclone's local backend. Two files of one name are Drive's own doing and
+    rclone will not make them (it skips an identical file at the destination and deletes what it
+    moved, and overwrites other bytes), so that refusal is tested on a listing holding a name
+    twice; making two by hand in Drive's pages is what would try it on a drive.
 
 What a vault last had of each asset (to tell a local edit from a remote one) is kept in the same
 cache, keyed by host and directory and never roaming with a profile (a cache an older build kept
@@ -198,14 +385,61 @@ Push records the pointers it wrote in this directory's sync base for the vault's
 base's time and other files stay), refuses a pointer the store deleted since that sync, and checks
 the pointer's version before uploading as well as before committing.
 
+## Moving a store (not built)
+
+Tracked as [#17](https://github.com/sarukas/textdb/issues/17).
+
+Moving a store's bytes somewhere else — a new drive, a different provider, a folder reorganised at
+the top — is a migration, not a configuration edit, which is why `--add` on a name whose row points
+elsewhere is refused while pointers name it. What is missing is the thing that would make it safe,
+and it is written down here rather than half-built.
+
+**The shape it has to have.** Declare the new place as its own store, move the assets to it one at a
+time, then remove the old one once nothing names it. Both stores are declared while that runs and
+some pointers name each: that is a normal, consistent state, and it is what makes the move
+interruptible.
+
+- **Store to store, never through a checkout.** No machine will hold a team's binaries, so the bytes
+  must not pass through one: `rclone` to `rclone` on the same backend is a server-side copy (Drive
+  to Drive moves nothing through the machine running it), and local to remote or remote to local
+  streams one file at a time — bounded by the largest single asset, not by the vault. This is the
+  one capability the drivers do not have today: `relocate` moves a file *within* one store
+  (`move_to`), and nothing opens two stores at once.
+- **A checkout of pointers, with no bytes.** The pointers still have to be rewritten, and a pointer
+  is a document, so this runs from a synced directory as `relocate` does. That costs kilobytes: a
+  checkout can hold every pointer with nothing pulled — `not-pulled` is an ordinary state — and a
+  `not-pulled` asset migrates exactly like a pulled one.
+- **The pointers are the work queue.** "Still names the old store" is the list of what is left, so
+  the run needs no progress table and no migration id: `--limit N` does the next N, re-running
+  continues, and running it twice is not two moves. Grouped by `(store, item)` rather than by
+  pointer, so two pointers naming one file copy it once and both come to name the one file in the
+  new store (`asset_item_users` already answers that question).
+- **Per asset, in this order.** Copy the bytes to the asset's owner path in the new store; verify
+  the SHA-256 *there*; re-read the pointer and skip this one if its bytes changed since the copy
+  (the loop `push` already uses against a concurrent write); write the pointer and commit; leave
+  the old store's bytes alone. Deleting them is a separate later pass, never the same run: while the
+  old store still holds everything, undoing a half-finished move is pointer rewrites and nothing
+  else.
+- **The owner's.** It rewrites pointers across every share, so it is an admin operation like the
+  store rows themselves. A scoped version — an account moving its own subtree — falls out of the
+  same `rw` and `may_name` rules if it is ever wanted.
+- **Not decided.** Whether a move may also change the layout (a legacy flat store to owner paths is
+  the same machinery), and whether the later pass trashes the old bytes in the provider (Drive's own
+  trash, recoverable for thirty days) or deletes them outright.
+
+**Until then**, a store's files can be moved by hand — copy them to the new place, declare it under
+a new name, and `push` each asset to it, which needs the bytes on the pushing machine. That is
+exactly the limit this section exists to remove.
+
 ## Commands
 
 ```
 textdb assets stores [--add NAME [--driver local|rclone] --root ROOT] [--remove NAME] [--bind NAME=LOCATION]
-textdb assets status [PATH] [--dir DIR]            ok / new / modified / outdated / conflict / not-pulled / conflict-copy / invalid-pointer / invalid-path
+textdb assets status [PATH] [--dir DIR]            ok / new / modified / outdated / conflict / not-pulled / moved-here / conflict-copy / invalid-pointer / invalid-path
 textdb assets push [PATH…] [--dir DIR] [--to NAME] [-m MSG] [--dry-run]   upload, verify, then commit pointers
 textdb assets pull [PATH…] [--linked-from PATH] [--dir DIR] [--dry-run]   download, check the hash, put in place
 textdb assets verify [PATH] [--dir DIR]            hash local files and the asset store's copies (exit 1 on problems)
+textdb assets relocate [PATH…] [--dir DIR] [--dry-run]   move the files of `moved-here` assets to their asset's own path in the store
 textdb assets gitignore [PATH] [--dir DIR] [--dry-run]   write the managed .gitignore block
 textdb assets migrate-from-git [PATH] [--dir DIR] [--to NAME] [-m MSG] [--dry-run]   move the binaries git tracks to the asset store
 textdb sync PREFIX DIR [--push] [--pull]           documents, then pointers paired with their files, then assets pushed / pulled
@@ -259,9 +493,11 @@ Windows loads all the same) and under their short name, and they and `.textdbign
 assets: a pointer moved or deleted in textdb moves or trashes only an asset file. A sync that
 brings a `.gitattributes` from textdb, or moves, sets aside or deletes one on disk, pushes no assets: the next sync reports the rules changed, and only
 `--accept-rules` (or an explicit push) takes files the new rules make assets. `verify` counts an asset store it cannot reach as a
-problem. `status --json` gives `{ prefix, dir, assets, counts }`, each asset with `path`, `state`,
-`type` (the pointer's media type, or one from the name), and where known `size`, `store`,
-`sha256` (the pointer's), `version` (the pointer's in the store), `file` (its name on disk,
+problem. `status --json` gives `{ prefix, dir, assets, counts, notes }` -- the notes being the
+stores that could not be asked anything, so nothing there is taken for being in its place -- and
+each asset with `path`, `state`, `type` (the pointer's media type, or one from the name), and where
+known `size`, `store`, `in_store` (where the store keeps the file, when that is not the asset's own
+path), `sha256` (the pointer's), `version` (the pointer's in the store), `file` (its name on disk,
 relative to the directory) and `note`.
 
 Which files are candidates at all: besides the rules above, textdb's own and system files are
@@ -273,9 +509,13 @@ file, so the user's own lines after it take precedence, and it keeps directories
 rules visible so the pointers inside them stay in git. Store-side namespace
 operations take the asset's real path: `textdb mv /a/arch.png /b/arch.png` moves the pointer, and
 the next sync moves the real file on disk of every directory synced with the folder; the asset
-store keeps the bytes where they were put, which the pointer's item still names. `textdb rm
+store keeps the bytes where they were put, which the pointer's item still names. A store that keeps
+its files by an id of its own (Google Drive) can be tidied to match: the asset is `moved-here`, and
+`textdb assets relocate` moves the store's file to the asset's own path, or `textdb mv` back puts
+the pointer where the file is. `textdb rm
 /a/arch.png` deletes the pointer, and the next sync moves the real file to `.textdb/trash/`.
-Moving and trashing items in the asset store itself is still to come (stage 3, second part).
+A deleted pointer's file goes to the asset store's own trash too, where the store keeps one (Google
+Drive's, for thirty days).
 
 ## Sync
 
@@ -387,12 +627,21 @@ First part (done): the `rclone` driver: push, pull and verify through any rclone
 the local driver's layout, trash, partial copies and names beside, provider SHA-256 where there is
 one (else read back), locks by lock files and listing, rclone found through `TEXTDB_RCLONE`, next
 to `textdb` (a vault's `.textdb/bin`) or the PATH, and CI running the tests against rclone's local
-backend.
+backend. Tests use rclone only when `TEXTDB_RCLONE` names it, never one on the PATH: their quick
+rewrites and renames of files can look like ransomware to security software on a person's own
+computer.
 
-Second part: provider item ids and remote renames by id, SharePoint's rewriting of Office files
-(tracking the provider's version tag instead of comparing hashes), moving and trashing items in
-the asset store when their pointers move or go, and detection of changes made directly in the
-drive. These need real Google Drive and SharePoint accounts to build and test against.
+Second part, Google Drive (as described under asset stores): Drive file ids as items, one
+store listing per command with the id guard, pushes overwriting in place after a checked trash
+copy, pulls by id, moves by id and Drive's trash following pointers, the `changed-in-store`,
+`moved-in-store`, `trashed-in-store`, `invalid-item` and `ambiguous` states, and tests against a
+real shared drive. Sprints, each reviewed: (1) ids, listing, guard, pull by id (done); (2) push in
+place and trash copies (done); (3) Drive's trash following a deleted pointer, and a moved pointer
+told of and settled with `assets relocate` (done); (4) changes made in the drive.
+
+Third part, SharePoint: its rewriting of Office files on upload (tracking the provider's version
+tag instead of comparing hashes), with the same id-based moves and change detection. Needs a
+SharePoint account to build and test against.
 
 **A stand-in for rclone.** CI runs the driver against real rclone on its local backend, which
 proves the command line and the JSON, but a local backend never misbehaves: it always keeps a
@@ -447,4 +696,5 @@ For the folders the web server syncs (`TEXTDB_SYNC`), through the CLI as for syn
 
 Extracted text from PDF/Office for search; thumbnails; placeholder files or mounts; binary
 deltas; distributed copy-count enforcement; advisory locks; history rewrite of existing git
-repositories (documented as a separate, explicit step).
+repositories (documented as a separate, explicit step). Moving a store's bytes to another store has
+its own section above: designed, deliberately not built, and the edit that would fake it refused.

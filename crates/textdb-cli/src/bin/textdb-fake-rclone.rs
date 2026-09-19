@@ -15,6 +15,7 @@
 //! | `TEXTDB_FAKE_RCLONE_REWRITE=1` | SharePoint silently rewriting Office files on upload, so what lands is not what was sent |
 //! | `TEXTDB_FAKE_RCLONE_MOVE_GAP=1` | a server-side move that clears the destination and then fails, leaving the asset's path empty |
 //! | `TEXTDB_FAKE_RCLONE_LIST_LAG=N` | a provider that does not list a lock file for its first `N` listings |
+//! | `TEXTDB_FAKE_RCLONE_DENY=1` | a provider that answers and refuses: the credentials work, the file does not open |
 //!
 //! Every one of those is documented behaviour of the real providers, not invention: rclone's
 //! OneDrive page records that "Sharepoint … silently modifies uploaded files, mainly Office
@@ -40,6 +41,8 @@ use sha2::{Digest, Sha256};
 const ROOT: &str = "TEXTDB_FAKE_RCLONE_ROOT";
 /// Counts of listings that have already hidden a lock file, kept beside the remote.
 const STATE: &str = ".textdb-fake-rclone-state.json";
+/// Refuse everything but `version`: a store this computer reaches and may not read.
+const DENY: &str = "TEXTDB_FAKE_RCLONE_DENY";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -190,6 +193,17 @@ fn run(args: &[String]) -> Result<String, Fail> {
     let command = *operands.first().ok_or_else(|| fail(1, "no command"))?;
     let rest = &operands[1..];
     let want_hash = flags.iter().any(|f| f.starts_with("--hash"));
+
+    // A provider that answers and refuses. `version` still works, as rclone's own does without
+    // touching the remote, so this is a store the computer can reach and may not read -- which is
+    // not the same as one it cannot reach. Google's API reports it as a 403 naming the reason, and
+    // rclone passes that text through.
+    if command != "version" && env_on(DENY) {
+        return Err(fail(
+            1,
+            "2026/01/01 00:00:00 ERROR : textdb: Failed to copy: googleapi: Error 403: Insufficient permissions for this file, insufficientFilePermissions",
+        ));
+    }
 
     match command {
         "version" => Ok("rclone v0.0.0-textdb-fake\n".into()),

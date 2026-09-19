@@ -34,6 +34,23 @@ pub struct AssetStore {
 
 pub const DRIVERS: &[&str] = &["local", "rclone"];
 
+/// What a store knows of the file an item names, from the one look a command makes at it.
+pub struct Found {
+    /// Where the store keeps it now, as a store path.
+    pub path: String,
+    /// Of the bytes there, where the provider keeps a SHA-256 of them (Google Drive does).
+    pub sha256: Option<String>,
+    /// Of the bytes there: what tells a file replaced in the store where the provider keeps no
+    /// SHA-256 of it (an old upload), which no hash could then reveal.
+    pub size: u64,
+    /// In the provider's own trash rather than among its live files (Google Drive keeps it there
+    /// for thirty days, and a pull by id still finds it).
+    pub trashed: bool,
+    /// The store holds two live files of that path, which Google Drive allows: which of them an
+    /// item means is not textdb's to guess, and nothing is written over either.
+    pub two_of_a_name: bool,
+}
+
 pub trait Driver {
     /// Where the asset at store path `path` is kept, for messages.
     fn location(&self, path: &str) -> String;
@@ -54,6 +71,35 @@ pub trait Driver {
     fn put(&self, path: &str, src: &Path, sha256: &str, replaces: Option<&str>) -> Result<(Option<String>, Held)>;
     /// Copy the stored file to `dest`, which must not exist.
     fn get(&self, path: &str, item: Option<&str>, dest: &Path) -> Result<()>;
+    /// What the store knows of the file the item `item` names, from one look: a provider whose items
+    /// are ids of its own knows it wherever the file was moved to in the provider, and in the
+    /// provider's own trash. `None` where there is nothing to tell -- the item is a path already --
+    /// or the store has no file of that item at all, live or trashed.
+    fn found(&self, _item: &str) -> Result<Option<Found>> {
+        Ok(None)
+    }
+    /// Move the file the item `item` names to the store path `to`, keeping the provider's own file
+    /// and so its id, and returning the item the pointer should name now. `None` where there is
+    /// nothing to move: a store whose items are paths has the bytes at the pointer's old path
+    /// still, for whatever else names them, and the pointer's next push puts them at its own path.
+    fn move_to(&self, _item: &str, _to: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+    /// Send the file the item `item` names, holding the bytes whose SHA-256 is `sha256`, to the
+    /// provider's own trash, the caller having made sure no pointer names it any more. Other bytes
+    /// there are someone else's doing in the store and are never trashed: what was changed there is
+    /// told of, not undone. `false` where the provider keeps no trash of its own and the file stays.
+    fn trash(&self, _item: &str, _sha256: &str) -> Result<bool> {
+        Ok(false)
+    }
+    /// Every file the store keeps, where the store can list them: the item that names it (a
+    /// provider's id, or the store path where files are addressed by path) and the store path it is
+    /// at. What tells of files in a store that no pointer names -- compared by item, since that is
+    /// what a pointer holds. textdb's own are left out (the store's trash, the locks in it, a push's
+    /// partial copies). `None` where a driver cannot say.
+    fn files(&self) -> Result<Option<Vec<(String, String)>>> {
+        Ok(None)
+    }
     /// The folder on this computer the store keeps its files in, for a local store.
     fn local_root(&self) -> Option<&Path> {
         None
@@ -435,6 +481,67 @@ impl Driver for LocalDriver {
         Ok(Held::of(self.lock_file(path)?))
     }
 
+    fn files(&self) -> Result<Option<Vec<(String, String)>>> {
+        /// How deep a store's own folders are ever walked: a link to its own root would otherwise
+        /// walk for as long as the stack held.
+        const DEEPEST: usize = 64;
+        // What was there but not looked at. A listing of a store is read as "no pointer names
+        // these", so one that quietly left something out would have a reader deleting bytes on the
+        // strength of it: anything missed fails the listing instead of thinning it.
+        fn walk(root: &Path, at: &Path, depth: usize, out: &mut Vec<String>, missed: &mut Vec<String>) -> std::io::Result<()> {
+            if depth >= DEEPEST {
+                missed.push(format!("{} is more than {DEEPEST} folders deep", at.display()));
+                return Ok(());
+            }
+            for e in std::fs::read_dir(at)? {
+                let e = e?;
+                let path = e.path();
+                let name = e.file_name().to_string_lossy().into_owned();
+                // What a link leads to is not this store's to list, and whose bytes those are is
+                // not for a walk of somebody's folders to decide.
+                let kind = std::fs::symlink_metadata(&path)?;
+                if kind.is_symlink() {
+                    missed.push(format!("{} is a link or junction", path.display()));
+                } else if kind.is_dir() {
+                    // The store's own trash, and everything in it, is nothing a pointer names: that
+                    // folder at the store's root, where a push puts what it replaces, and not one
+                    // somebody gave the same name deeper in -- those files are theirs, and belong in
+                    // what the store is said to hold.
+                    if !(depth == 0 && name == TRASH) {
+                        match walk(root, &path, depth + 1, out, missed) {
+                            Ok(()) => {}
+                            // Gone while this walked -- a push moving bytes about, someone tidying.
+                            // What it held goes unlisted, which is not the same as nothing to list.
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => missed.push(format!("{} went while it was being listed", path.display())),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                } else if !(name.starts_with('.') && name.ends_with(".tdbpart")) {
+                    if let Ok(rel) = path.strip_prefix(root) {
+                        out.push(format!("/{}", rel.to_string_lossy().replace('\\', "/")));
+                    }
+                }
+            }
+            Ok(())
+        }
+        let (mut out, mut missed) = (Vec::new(), Vec::new());
+        match walk(&self.root, &self.root, 0, &mut out, &mut missed) {
+            Ok(()) => {}
+            // The store's own folder, not one below it: a store that is not there holds no files.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(Vec::new())),
+            Err(e) => return Err(io(format!("listing {}", self.root.display()), e)),
+        }
+        if let Some(first) = missed.first() {
+            return Err(StoreError::other(match missed.len() {
+                1 => format!("listing {}: {first}, so what the store holds is not all known", self.root.display()),
+                n => format!("listing {}: {first} ({n} such), so what the store holds is not all known", self.root.display()),
+            }));
+        }
+        out.sort();
+        // The item of a local store is the path its bytes are at, so each file names itself.
+        Ok(Some(out.into_iter().map(|at| (at.clone(), at)).collect()))
+    }
+
     fn local_root(&self) -> Option<&Path> {
         Some(&self.root)
     }
@@ -559,7 +666,16 @@ pub fn open(store: &AssetStore) -> Result<Box<dyn Driver>> {
                 },
             };
             let d = super::rclone::RcloneDriver::new(super::rclone::executable(), root);
-            d.check().map_err(|e| StoreError::invalid(format!("asset store {}: {}", store.name, e.message)))?;
+            d.check().map_err(|e| {
+                // The answer the check got, kept as it was: a store that answered and refused this
+                // computer is forbidden, a store that could not be reached is not, and the two must
+                // not arrive above as one thing.
+                let said = format!("asset store {}: {}", store.name, e.message);
+                match e.code.as_str() {
+                    "TX005" => StoreError::forbidden(said),
+                    _ => StoreError::invalid(said),
+                }
+            })?;
             Ok(Box::new(d))
         }
         other => Err(StoreError::invalid(format!("asset store {}: unknown driver {other}", store.name))),
@@ -575,6 +691,30 @@ mod tests {
         assert_eq!(stamp(UNIX_EPOCH), "19700101-000000");
         assert_eq!(stamp(UNIX_EPOCH + std::time::Duration::from_secs(1_789_460_100)), "20260915-081500");
         assert_eq!(stamp(UNIX_EPOCH + std::time::Duration::from_secs(951_782_400)), "20000229-000000");
+    }
+
+    #[test]
+    fn what_a_local_store_holds_leaves_out_textdbs_own_files_and_nobody_elses() {
+        // Its own name, since tests share a process and so the pid with one another.
+        let tmp = std::env::temp_dir().join(format!("textdb-driver-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("store");
+        std::fs::create_dir_all(root.join("img").join(TRASH)).unwrap();
+        std::fs::create_dir_all(root.join(TRASH).join("old")).unwrap();
+        std::fs::write(root.join("img/a.png"), b"one").unwrap();
+        // Half of a push that never finished, and bytes a push replaced: textdb's own, both.
+        std::fs::write(root.join("img/.a.png.tdbpart"), b"half").unwrap();
+        std::fs::write(root.join(TRASH).join("old/a.png"), b"gone").unwrap();
+        // A folder of that name below the root is somebody's own, and what it holds is the store's.
+        std::fs::write(root.join("img").join(TRASH).join("theirs.png"), b"mine").unwrap();
+        let d = LocalDriver { root: root.clone() };
+        let listed = d.files().unwrap().unwrap();
+        // The item of a local store is the path its bytes are at, so each file names itself.
+        let theirs = format!("/img/{TRASH}/theirs.png");
+        assert_eq!(listed, vec![(theirs.clone(), theirs), ("/img/a.png".to_string(), "/img/a.png".to_string())], "{listed:?}");
+        // A store folder that is not there holds no files to tell of, which is no error of its own.
+        assert_eq!(LocalDriver { root: tmp.join("nowhere") }.files().unwrap(), Some(Vec::new()));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

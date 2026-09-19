@@ -9,6 +9,7 @@
 //! and what lands anywhere is hashed before it is trusted. rclone also takes any flag from an
 //! `RCLONE_*` environment variable, so only its configuration is passed on from the environment.
 
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
-use super::driver::{beside, host_word, lock_name, partial_name, partial_pid, process_running, stamp, Driver, Held, LOCK_WAIT, TRASH};
+use super::driver::{beside, host_word, lock_name, partial_name, partial_pid, process_running, stamp, Driver, Found, Held, LOCK_WAIT, TRASH};
 use crate::store::{Result, StoreError};
 
 /// The rclone to run: `TEXTDB_RCLONE`, else the one next to this program (a vault's
@@ -54,11 +55,19 @@ pub struct RcloneDriver {
     exe: PathBuf,
     /// The remote folder the store keeps its files in, such as `teamdrive:textdb`.
     root: String,
+    /// Whether the remote is Google Drive, once asked.
+    drive: OnceCell<bool>,
+    /// The store's files as this command listed them, on Google Drive.
+    listing: RefCell<Option<Listing>>,
 }
 
 /// An entry as `rclone lsjson` lists it.
 #[derive(Deserialize)]
 struct Listed {
+    #[serde(rename = "Path", default)]
+    path: String,
+    #[serde(rename = "ID", default)]
+    id: String,
     #[serde(rename = "Name", default)]
     name: String,
     #[serde(rename = "Size")]
@@ -70,16 +79,59 @@ struct Listed {
 }
 
 /// What rclone said went wrong, without its log prefix.
+/// Whether what a provider said is a refusal rather than a failure.
+///
+/// From here the two look alike -- a run that exited non-zero -- and they are not alike at all: a
+/// failure is worth trying again and says nothing about the asset, while a refusal is a durable
+/// fact about this computer's access that no retry changes and that somebody has to go and ask
+/// for. Google's API reports one as a 403 naming its reason and rclone passes the text through. A
+/// bare 403 anywhere in a line is not enough, since a path or a byte count may hold those digits.
+fn refused(text: &str) -> bool {
+    let said = text.to_ascii_lowercase();
+    ["error 403", "error 401", " 403:", " 401:", "forbidden", "unauthorized", "permission denied", "insufficientpermissions", "insufficientfilepermissions", "accessnotconfigured"]
+        .iter()
+        .any(|m| said.contains(m))
+}
+
+/// What a failed run said, and whether it was a refusal: `forbidden` is what textdb calls the same
+/// answer about its own documents, so a refusal by a provider carries it too.
 fn failure(what: &str, out: &Output) -> StoreError {
-    let text = String::from_utf8_lossy(&out.stderr);
-    let said = text.lines().rev().map(str::trim).find(|l| !l.is_empty()).map(|l| {
-        let rest = l.split_once(" : ").or_else(|| l.split_once(": ")).map_or(l, |(_, rest)| rest);
-        rest.trim().to_string()
-    });
-    StoreError::other(match said {
-        Some(said) => format!("{what}: {said}"),
-        None => format!("{what}: rclone exited with {}", out.status),
-    })
+    let said = failure_said(what, out);
+    let (err, printed) = (String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout));
+    match refused(&err) || refused(&printed) {
+        true => StoreError::forbidden(said.message),
+        false => said,
+    }
+}
+
+fn failure_said(what: &str, out: &Output) -> StoreError {
+    let last = |text: &str| {
+        text.lines().rev().map(str::trim).find(|l| !l.is_empty()).map(|l| {
+            let rest = l.split_once(" : ").or_else(|| l.split_once(": ")).map_or(l, |(_, rest)| rest);
+            rest.trim().to_string()
+        })
+    };
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // What it said on stderr. A command stopped from outside it can exit with a code and say
+    // nothing at all, so whatever it printed comes next -- unless that is the listing or the hash it
+    // was asked for, which tells nothing about the failure -- and the code is kept either way.
+    match last(&stderr) {
+        Some(said) => StoreError::other(format!("{what}: {said}")),
+        None => StoreError::other(match last(&stdout).filter(|l| !l.starts_with(['{', '[', ']', '}', '"'])) {
+            Some(said) => format!("{what}: {said} (rclone exited with {})", out.status),
+            None => format!("{what}: rclone exited with {} and said nothing", out.status),
+        }),
+    }
+}
+
+/// Whether a failure is one another look will not mend: what rclone was told, or who it signed in
+/// as, rather than a moment's trouble reaching a provider.
+fn settled(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    ["find section in config file", "couldn't find remote", "didn't find backend", "invalid_grant", "failed to get token", "oauth", "unauthorized", "unknown flag", "unknown command", "flag needs an argument"]
+        .iter()
+        .any(|s| m.contains(s))
 }
 
 /// `root` and the path `rel` inside it.
@@ -88,6 +140,79 @@ fn join(root: &str, rel: &str) -> String {
     let drive = cfg!(windows) && root.len() == 2 && root.as_bytes()[0].is_ascii_alphabetic() && root.ends_with(':');
     let sep = if !drive && root.ends_with([':', '/', '\\']) { "" } else { "/" };
     format!("{root}{sep}{rel}")
+}
+
+/// The remote part of `root`, without the colon that ends it: `gdrive` of `gdrive:textdb`,
+/// `:drive,team_drive=0A…` of a connection string; empty for a plain folder.
+fn remote_name(root: &str) -> &str {
+    let start = usize::from(root.starts_with(':'));
+    root[start..].find(':').map_or("", |i| &root[..start + i])
+}
+
+/// The type of the remote `name` in `rclone listremotes --long` output (`gdrive:   drive`).
+fn remote_type(listed: &str, name: &str) -> Option<String> {
+    listed.lines().find_map(|line| {
+        let (n, rest) = line.split_once(':')?;
+        (n.trim() == name).then(|| rest.split_whitespace().next().unwrap_or("").to_string())
+    })
+}
+
+/// Whether `id` has the shape of a Google Drive file id: letters, digits, `-` and `_`, nothing
+/// that could be a path.
+fn is_drive_id(id: &str) -> bool {
+    (10..=200).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// A local path as an argument rclone cannot take for a remote: absolute, since a relative
+/// `notes:2024/a.png` would name the remote `notes`.
+fn local_arg(path: &Path) -> Result<String> {
+    let absolute = std::path::absolute(path).map_err(|e| StoreError::other(format!("{}: {e}", path.display())))?;
+    Ok(absolute.to_string_lossy().into_owned())
+}
+
+/// A file of a Google Drive store, as a listing of its root showed it.
+#[derive(Clone, Debug, PartialEq)]
+struct Entry {
+    /// Its store path, `/img/a.png`.
+    path: String,
+    size: u64,
+    /// Lower case, when Drive keeps one (not for some old uploads).
+    sha256: Option<String>,
+    /// In Drive's trash.
+    trashed: bool,
+}
+
+/// The files under a Google Drive store's root, by file id.
+#[derive(Default)]
+struct Listing {
+    by_id: HashMap<String, Entry>,
+    /// Whether the files in Drive's trash under the root are in.
+    trash_read: bool,
+}
+
+impl Listing {
+    /// Take in `rclone lsjson -R` output for the store's root (for Drive's trash under it, with
+    /// `trashed`). Folders, shortcuts (whose id is the target's and the shortcut's, a tab between)
+    /// and Google documents (no bytes) are no files of the store; a file listed already stays as
+    /// first listed.
+    fn add(&mut self, json: &[u8], trashed: bool) -> Result<()> {
+        let entries: Vec<Listed> = serde_json::from_slice(json).map_err(|e| StoreError::other(format!("unexpected rclone listing ({e})")))?;
+        for e in entries {
+            if e.is_dir || e.size < 0 || !is_drive_id(&e.id) {
+                continue;
+            }
+            let sha256 = e.hashes.get("sha256").filter(|h| h.len() == 64).map(|h| h.to_ascii_lowercase());
+            self.by_id.entry(e.id).or_insert(Entry { path: format!("/{}", e.path.trim_start_matches('/')), size: e.size as u64, sha256, trashed });
+        }
+        Ok(())
+    }
+}
+
+/// Where an item is: a store path, a Google Drive file under the store's root, or nowhere in it.
+enum Resolved {
+    Path(String),
+    File(String, Entry),
+    Missing,
 }
 
 /// The process id in the lock file name `KEY-MILLIS-HOST-PID-N.lock`, when that process is of this
@@ -122,18 +247,189 @@ impl Drop for RemoteLock {
 
 impl RcloneDriver {
     pub fn new(exe: PathBuf, root: String) -> RcloneDriver {
-        RcloneDriver { exe, root }
+        RcloneDriver { exe, root, drive: OnceCell::new(), listing: RefCell::new(None) }
+    }
+
+    /// Whether the store is on Google Drive: the type of its remote in the rclone configuration,
+    /// or a `:drive` connection string.
+    fn is_drive(&self) -> bool {
+        // Nothing here may run an rclone command through `command`, `run` or `ok`: they ask this
+        // again, and a cell being set cannot be set again (it panics).
+        *self.drive.get_or_init(|| {
+            let name = remote_name(&self.root);
+            if let Some(backend) = name.strip_prefix(':') {
+                return backend.split(',').next() == Some("drive");
+            }
+            let name = name.split(',').next().unwrap_or("");
+            // Through the bare command: the flags for a drive are what this answer decides. Asked
+            // only of a root naming a remote of more than one letter, so a folder on a Windows drive
+            // (`C:/img`, which `shared_root_problem` refuses as a shared root) costs nothing.
+            name.chars().count() > 1
+                && self
+                    .bare_command()
+                    .args(["listremotes", "--long"])
+                    .stdin(Stdio::null())
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .and_then(|o| remote_type(&String::from_utf8_lossy(&o.stdout), name))
+                    .as_deref()
+                    == Some("drive")
+        })
+    }
+
+    /// Every file under the store's root, recursively (those in Drive's trash, with `trashed`), as
+    /// `rclone lsjson` gives them.
+    fn list_all(&self, trashed: bool) -> Result<Vec<u8>> {
+        let mut args = vec!["lsjson", "-R", "--files-only", "--no-mimetype", "--hash", "--hash-type", "SHA256", "--drive-skip-shortcuts", "--drive-skip-gdocs"];
+        if trashed {
+            args.push("--drive-trashed-only");
+        }
+        args.extend(["--", self.root.as_str()]);
+        Ok(self.ok(&format!("listing {}", self.root), &args)?.stdout)
+    }
+
+    /// List the store's live files once for this command, when that has not been done yet: each
+    /// rclone run costs seconds.
+    fn ensure_listed(&self) -> Result<()> {
+        if self.listing.borrow().is_some() {
+            return Ok(());
+        }
+        let mut l = Listing::default();
+        l.add(&self.list_all(false)?, false)?;
+        *self.listing.borrow_mut() = Some(l);
+        Ok(())
+    }
+
+    /// The file with Drive id `id` under the store's root, live or in Drive's trash; the trash is
+    /// listed only when an id is not among the live files. An id anywhere else, in another drive the
+    /// person running textdb can reach, say, is `None`: nothing outside the store is read, moved or
+    /// trashed by id.
+    fn find_id(&self, id: &str) -> Result<Option<Entry>> {
+        if !is_drive_id(id) {
+            return Ok(None);
+        }
+        self.ensure_listed()?;
+        let mut cached = self.listing.borrow_mut();
+        let l = cached.as_mut().expect("listed above");
+        if !l.by_id.contains_key(id) && !l.trash_read {
+            l.add(&self.list_all(true)?, true)?;
+            l.trash_read = true;
+        }
+        Ok(l.by_id.get(id).cloned())
+    }
+
+    /// Where the item `item` is: a store path (`/img/a.png`) as it is, or on Google Drive a file
+    /// id, found under the store's root.
+    fn resolve(&self, item: &str) -> Result<Resolved> {
+        if item.starts_with('/') {
+            self.remote(item)?;
+            return Ok(Resolved::Path(item.to_string()));
+        }
+        if !is_drive_id(item) {
+            return Err(StoreError::invalid(format!("{item} is not a path inside an asset store")));
+        }
+        if !self.is_drive() {
+            return Err(StoreError::invalid(format!(
+                "{item} is a Google Drive file id, but {} is not reached through a Google Drive remote on this computer (rclone listremotes --long shows each remote's type; an alias or other remote wrapping a drive is not followed): bind the asset store to the drive remote itself",
+                self.root
+            )));
+        }
+        Ok(match self.find_id(item)? {
+            Some(e) => Resolved::File(item.to_string(), e),
+            None => Resolved::Missing,
+        })
+    }
+
+    /// The store path where `location` (a path, or a Drive file id) is now, for a push to lock and
+    /// replace.
+    fn live_path(&self, location: &str) -> Result<(String, Option<String>)> {
+        match self.resolve(location)? {
+            Resolved::Path(p) => Ok((p, None)),
+            Resolved::File(id, e) if !e.trashed => Ok((e.path, Some(id))),
+            Resolved::File(id, e) => Err(StoreError::invalid(format!(
+                "its file (Drive id {id}, {}) went to Drive's trash meanwhile: push again",
+                self.remote(&e.path).unwrap_or_default()
+            ))),
+            Resolved::Missing => Err(StoreError::not_found(format!("Drive id {location} names no file of the asset store {}", self.root))),
+        }
+    }
+
+    /// The remote the store is on, with its colon, for `rclone backend` commands.
+    fn backend_remote(&self) -> String {
+        format!("{}:", remote_name(&self.root))
+    }
+
+    /// The SHA-256 of the Drive file `id`, downloaded by its id to a temporary file.
+    fn hash_by_id(&self, id: &str) -> Result<String> {
+        static N: AtomicU64 = AtomicU64::new(0);
+        // A name claimed here and nowhere else, so what is hashed is what rclone downloaded and
+        // not a file something else on this computer left or put there.
+        let mut claimed = None;
+        for _ in 0..8 {
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+            let at = std::env::temp_dir().join(format!("textdb-hash-{}-{}-{nanos}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&at) {
+                Ok(_) => {
+                    claimed = Some(at);
+                    break;
+                }
+                // Another name for one already taken; anything else (nowhere to write, no temporary
+                // folder at all) is what went wrong and is told as it is, not tried eight times.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(StoreError::other(format!("making a temporary copy at {}: {e}", at.display()))),
+            }
+        }
+        let tmp = claimed.ok_or_else(|| StoreError::other("no name for a temporary copy was free".to_string()))?;
+        let dest = match local_arg(&tmp) {
+            Ok(dest) => dest,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+        let hashed = self
+            .ok(&format!("downloading Drive id {id} to hash it"), &["--inplace", "backend", "copyid", "--", &self.backend_remote(), id, &dest])
+            .and_then(|_| crate::assets::pointer::hash_file(&tmp).map(|(sha, _)| sha).map_err(|e| StoreError::other(format!("{}: {e}", tmp.display()))));
+        let _ = std::fs::remove_file(&tmp);
+        hashed
     }
 
     /// Whether the root is a folder rclone reaches, giving up on a remote that does not answer.
     pub fn check(&self) -> Result<()> {
-        let out = self.run(&["--contimeout", "15s", "--timeout", "30s", "--retries", "1", "--low-level-retries", "2", "lsjson", "--stat", "--no-mimetype", "--", &self.root])?;
-        match out.status.code() {
-            Some(0) if serde_json::from_slice::<Listed>(&out.stdout).is_ok_and(|l| l.is_dir) => Ok(()),
-            Some(0) => Err(StoreError::invalid(format!("{} is a file, not a folder", self.root))),
-            Some(3 | 4) => Err(StoreError::invalid(format!("the folder {} is not there (rclone mkdir {} makes it)", self.root, self.root))),
-            _ => Err(failure(&format!("reaching {}", self.root), &out)),
+        let mut last = None;
+        for attempt in 0..3 {
+            // Longer each time: a drive busy with this computer's own other commands has needed
+            // more than one short wait before it answers for the store again.
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_secs(if attempt == 1 { 2 } else { 5 }));
+            }
+            let args = ["--contimeout", "15s", "--timeout", "30s", "--retries", "1", "--low-level-retries", "2", "lsjson", "--stat", "--no-mimetype", "--", self.root.as_str()];
+            // The last look tells everything it did: a store that would not answer twice has exited
+            // 1 saying nothing at all, and rclone's own lines are what would say why.
+            let out = match attempt {
+                2 => self.loud_command().args(args).stdin(Stdio::null()).output().map_err(|e| self.not_run(e))?,
+                _ => self.run(&args)?,
+            };
+            match out.status.code() {
+                Some(0) if serde_json::from_slice::<Listed>(&out.stdout).is_ok_and(|l| l.is_dir) => return Ok(()),
+                Some(0) => return Err(StoreError::invalid(format!("{} is a file, not a folder", self.root))),
+                Some(3 | 4) => return Err(StoreError::invalid(format!("the folder {} is not there (rclone mkdir {} makes it)", self.root, self.root))),
+                // A moment's trouble reaching the provider (one busy with this computer's own other
+                // commands, say) is looked at again before a store counts as unreachable. Every
+                // code but the two above: a drive under load has answered this very command with
+                // exit 1, the code for a usage error, which the fixed arguments here cannot be. What
+                // no second look would mend -- the configuration, the sign-in -- is told at once.
+                _ => {
+                    let e = failure(&format!("reaching {}", self.root), &out);
+                    if settled(&e.message) {
+                        return Err(e);
+                    }
+                    last = Some(e);
+                }
+            }
         }
+        Err(last.unwrap_or_else(|| StoreError::other(format!("reaching {}", self.root))))
     }
 
     /// The remote path of store path `path`, refusing anything that would leave the root.
@@ -154,11 +450,17 @@ impl RcloneDriver {
         }
     }
 
-    fn command(&self) -> Command {
+    /// rclone with nothing from the environment that would change what a command does
+    /// (`RCLONE_IGNORE_EXISTING`, `RCLONE_DRY_RUN`…); its configuration still comes through. Names
+    /// compared in upper case: Windows, and rclone there, do not tell them apart.
+    fn bare_command(&self) -> Command {
+        self.logged_command("-q")
+    }
+
+    /// As [`RcloneDriver::bare_command`], with `log` as its one log flag: rclone refuses `-q` and
+    /// `-v` together, so a command that must explain itself takes the place of the quiet one.
+    fn logged_command(&self, log: &str) -> Command {
         let mut c = Command::new(&self.exe);
-        // A flag set through the environment (RCLONE_IGNORE_EXISTING, RCLONE_DRY_RUN…) would
-        // change what these commands do; rclone's configuration still comes through.
-        // Names compared in upper case: Windows, and rclone there, do not tell them apart.
         for (key, _) in std::env::vars_os() {
             let Some(key) = key.to_str() else { continue };
             let upper = key.to_ascii_uppercase();
@@ -166,8 +468,37 @@ impl RcloneDriver {
                 c.env_remove(key);
             }
         }
-        c.arg("-q");
+        c.arg(log);
         c
+    }
+
+    /// As [`RcloneDriver::command`], saying everything it does: for a failure that said nothing.
+    fn loud_command(&self) -> Command {
+        let mut c = self.logged_command("-vv");
+        if self.is_drive() {
+            c.args(["--drive-skip-shortcuts", "--drive-skip-gdocs"]);
+        }
+        c
+    }
+
+    fn command(&self) -> Command {
+        let mut c = self.bare_command();
+        // On Google Drive nothing is reached through a shortcut (to a folder of another drive, say),
+        // or taken for a file when it is a Google document: by path as by listing. Asked here, not
+        // read from what was asked before, so no command can go without these.
+        if self.is_drive() {
+            c.args(["--drive-skip-shortcuts", "--drive-skip-gdocs"]);
+        }
+        c
+    }
+
+    /// Another driver for the same store, knowing what this one knows of its remote.
+    fn sibling(&self) -> RcloneDriver {
+        let d = RcloneDriver::new(self.exe.clone(), self.root.clone());
+        if let Some(drive) = self.drive.get() {
+            let _ = d.drive.set(*drive);
+        }
+        d
     }
 
     fn not_run(&self, e: std::io::Error) -> StoreError {
@@ -315,7 +646,7 @@ impl RcloneDriver {
         let body = format!("{path}\nheld by process {} on {} since {}\n", std::process::id(), host_word(), stamp(now));
         let started = Instant::now();
         let (mut told, mut checked, mut wait, mut unlisted) = (false, None::<Instant>, Duration::from_millis(200), 0);
-        let own = || RemoteLock { driver: RcloneDriver::new(self.exe.clone(), self.root.clone()), path: mine_path.clone() };
+        let own = || RemoteLock { driver: self.sibling(), path: mine_path.clone() };
         // This push's lock file, once written; removed when dropped.
         let mut written: Option<RemoteLock> = None;
         loop {
@@ -387,6 +718,207 @@ impl RcloneDriver {
         }
     }
 
+    /// [`Driver::put`] at the store path `path`; the item returned is the path the bytes are at.
+    fn put_at(&self, path: &str, src: &Path, sha256: &str, replaces: Option<&str>, named: Option<&str>) -> Result<(Option<String>, Held)> {
+        self.remote(path)?;
+        if self.is_drive() {
+            self.refuse_two_of_a_name(path)?;
+        }
+        let here = || (Some(path.to_string()), Held::default());
+        // On a drive the id of the file at the path comes from the same look as its bytes, so a push
+        // reads and replaces the file its pointer names and never another that took over its name --
+        // not even when that one holds these very bytes and nothing would be uploaded.
+        let found = match self.is_drive() {
+            true => self.hashed_id(path)?.map(|(id, sha)| (sha, Some(id))),
+            false => self.hash(path, None)?.map(|(sha, _)| (sha, None)),
+        };
+        if let (Some((_, Some(there))), Some(named)) = (&found, named) {
+            if there.as_str() != named {
+                return Err(self.not_the_named(path, named, there));
+            }
+        }
+        match found {
+            Some((sha, _)) if sha == sha256 => Ok(here()),
+            None => self.place(path, src, sha256, None).map(|_| here()),
+            Some((sha, _)) if Some(sha.as_str()) == replaces => {
+                let expected = sha.as_str();
+                // On Google Drive the bytes are replaced in the file that is there, so its id, and
+                // every link people made to it, stay; elsewhere a checked copy is moved into place.
+                let replaced = match self.is_drive() {
+                    true => self.place_over(path, src, sha256, expected, named)?,
+                    false => self.place(path, src, sha256, replaces)?,
+                };
+                match replaced {
+                    true => Ok(here()),
+                    false => self.put_beside(path, src, sha256),
+                }
+            }
+            // Bytes something else may still name: kept, and these go next to them.
+            Some(_) => self.put_beside(path, src, sha256),
+        }
+    }
+
+    /// The cached listing after a file went to Drive's trash: it is none of the store's live files
+    /// now, and the assets after it still need no new listing of their own.
+    fn now_trashed(&self, id: &str) {
+        if let Some(e) = self.listing.borrow_mut().as_mut().and_then(|l| l.by_id.get_mut(id)) {
+            e.trashed = true;
+        }
+    }
+
+    /// The cached listing after a file moved in the drive: the same file, under its new path.
+    fn now_at(&self, id: &str, path: &str) {
+        if let Some(e) = self.listing.borrow_mut().as_mut().and_then(|l| l.by_id.get_mut(id)) {
+            e.path = path.to_string();
+        }
+    }
+
+    /// Keep the cached listing right after a push, so the assets after it need no new listing: the
+    /// file at `path` is now `id`, holding these bytes. What became of another file listed at that
+    /// path is not textdb's to guess (Drive keeps two files of one name apart, and either may be
+    /// live still), so the listing goes and the next look lists the store again.
+    fn remember(&self, id: &str, path: &str, size: u64, sha256: &str) {
+        let mut cached = self.listing.borrow_mut();
+        let Some(l) = cached.as_mut() else { return };
+        if l.by_id.iter().any(|(other, e)| other != id && e.path == path && !e.trashed) {
+            *cached = None;
+            return;
+        }
+        l.by_id.insert(id.to_string(), Entry { path: path.to_string(), size, sha256: Some(sha256.to_string()), trashed: false });
+    }
+
+    /// A push leaves a path Drive holds two files of alone: which of them it would replace, and
+    /// which a pointer names, is not textdb's to guess. Counted in the one listing this command
+    /// makes of the store, so a push of many assets asks nothing more; what would overwrite bytes
+    /// counts again, live, in [`RcloneDriver::place_over`].
+    fn refuse_two_of_a_name(&self, path: &str) -> Result<()> {
+        self.ensure_listed()?;
+        let two = self
+            .listing
+            .borrow()
+            .as_ref()
+            .is_some_and(|l| l.by_id.values().filter(|e| !e.trashed && e.path == path).count() > 1);
+        match two {
+            true => Err(self.two_of_a_name(path)),
+            false => Ok(()),
+        }
+    }
+
+    fn two_of_a_name(&self, path: &str) -> StoreError {
+        let dest = self.remote(path).unwrap_or_else(|_| path.to_string());
+        StoreError::invalid(format!("{dest} is two files of one name in the drive: keep one of them there, then push again"))
+    }
+
+    /// The file a pointer names is not the one at its path any more: someone in the drive moved it
+    /// away and another of that name took its place, so this push is not the one to write there.
+    fn not_the_named(&self, path: &str, named: &str, there: &str) -> StoreError {
+        let dest = self.remote(path).unwrap_or_else(|_| path.to_string());
+        StoreError::invalid(format!(
+            "the file the pointer names (Drive id {named}) is not the one at {dest} any more (Drive id {there} is): sync, then push again"
+        ))
+    }
+
+    /// Replace the bytes at `path`, keeping the provider's file and so its id, for the links people
+    /// made to it in the drive. A server-side copy of what is there goes to the store's trash first
+    /// and must hash to `replace` (not bytes put there some other way); then `src` is uploaded onto
+    /// the same file, which readers see whole or not at all, and what is there is hashed. `false`
+    /// when what was there turned out to be other bytes: nothing is uploaded.
+    fn place_over(&self, path: &str, src: &Path, sha256: &str, replace: &str, named: Option<&str>) -> Result<bool> {
+        let dest = self.remote(path)?;
+        // The file this push replaces, to be the same file afterwards: its id is what the pointer
+        // names and what the drive's links point at.
+        let Some(before) = self.stat(path, false)? else {
+            return Err(StoreError::other(format!("putting {dest} in place: nothing is there any more")));
+        };
+        // A pointer's own file, not another of that name someone moved into its place in the drive.
+        if let Some(named) = named {
+            if named != before.id {
+                return Err(self.not_the_named(path, named, &before.id));
+            }
+        }
+        // Counted live, not from the listing this command made: minutes of pushing many assets may
+        // have passed since, and a second file of this name made meanwhile is left to be sorted out
+        // in the drive rather than half replaced here.
+        let (dir, leaf) = path.rsplit_once('/').unwrap_or(("", path));
+        if self.names_in(dir)?.iter().filter(|n| *n == leaf).count() > 1 {
+            return Err(self.two_of_a_name(path));
+        }
+        let copy = self.trash_for(path);
+        let copied = self
+            .ok(&format!("copying {dest} to the trash"), &["copyto", "--ignore-times", "--", &dest, &self.remote(&copy)?])
+            .and_then(|_| self.hash(&copy, None));
+        match copied {
+            // Checked to be what this push replaces, not bytes put there some other way.
+            Ok(Some((sha, _))) if sha == replace => {}
+            Ok(Some(_)) => {
+                let _ = self.delete(&copy);
+                return Ok(false);
+            }
+            Ok(None) => {
+                let _ = self.delete(&copy);
+                return Err(StoreError::other(format!("copying {dest} to the trash: nothing is there afterwards")));
+            }
+            Err(e) => {
+                let _ = self.delete(&copy);
+                return Err(e);
+            }
+        }
+        let source = local_arg(src)?;
+        let uploaded = self.ok(&format!("uploading {} onto {dest}", src.display()), &["copyto", "--ignore-times", "--", &source, &dest]);
+        // Looked at again after a failure to look, so a moment's trouble reaching the provider is
+        // not taken for a failed upload.
+        let mut found = self.hashed_id(path);
+        for _ in 0..2 {
+            if found.is_err() {
+                std::thread::sleep(Duration::from_secs(1));
+                found = self.hashed_id(path);
+            }
+        }
+        match &found {
+            // The same file, holding what was uploaded.
+            Ok(Some((id, sha))) if *sha == sha256 && *id == before.id => return Ok(true),
+            // The upload went through and what it left cannot be looked at: it was checked as it went.
+            Err(_) if uploaded.is_ok() => return Ok(true),
+            _ => {}
+        }
+        let why = match (uploaded, &found) {
+            (Err(e), _) => e.message,
+            (Ok(_), Ok(Some((id, _)))) if *id != before.id => "another file of that name is there".to_string(),
+            (Ok(_), Ok(Some(_))) => "other bytes are there".to_string(),
+            (Ok(_), Ok(None)) => "nothing is there afterwards".to_string(),
+            (Ok(_), Err(e)) => e.message.clone(),
+        };
+        // What was there goes back only onto its own file, empty now or holding those bytes still:
+        // bytes textdb did not write are not its to overwrite, and the copy is named instead.
+        let ours = matches!(&found, Ok(None)) || matches!(&found, Ok(Some((id, sha))) if *id == before.id && sha == replace);
+        let back = match ours {
+            true => match self.ok(&format!("putting what was at {dest} back"), &["copyto", "--ignore-times", "--", &self.remote(&copy)?, &dest]) {
+                Ok(_) => "; what was there is back".to_string(),
+                Err(_) => format!("; a copy of what was there is at {}", self.location(&copy)),
+            },
+            false => format!("; a copy of what was there is at {}", self.location(&copy)),
+        };
+        Err(StoreError::other(format!("putting {dest} in place: {why}{back}")))
+    }
+
+    /// The file at the store path `path`: its provider id, and its SHA-256, read through by id
+    /// where Drive keeps none of it.
+    fn hashed_id(&self, path: &str) -> Result<Option<(String, String)>> {
+        let Some(l) = self.stat(path, true)? else { return Ok(None) };
+        let sha = match l.hashes.get("sha256").filter(|h| h.len() == 64) {
+            Some(sha) => sha.to_ascii_lowercase(),
+            None if is_drive_id(&l.id) => self.hash_by_id(&l.id)?,
+            // On a Drive store a file without an id is one textdb cannot tell from another of its
+            // name, and reading it by path is what the id is there to avoid.
+            None if self.is_drive() => return Err(StoreError::other(format!("{}: Drive gave no file id for it", self.remote(path)?))),
+            None => match self.hash(path, None)? {
+                Some((sha, _)) => sha,
+                None => return Ok(None),
+            },
+        };
+        Ok(Some((l.id, sha)))
+    }
+
     /// Keep `src` next to `path`, under the first [`beside`] name that is free or holds these
     /// bytes, whose lock is returned held.
     fn put_beside(&self, path: &str, src: &Path, sha256: &str) -> Result<(Option<String>, Held)> {
@@ -394,6 +926,9 @@ impl RcloneDriver {
         loop {
             let alt = beside(path, sha256, n);
             let lock = self.lock_remote(&alt)?;
+            if self.is_drive() {
+                self.refuse_two_of_a_name(&alt)?;
+            }
             match self.hash(&alt, None)? {
                 Some((sha, _)) if sha == sha256 => return Ok((Some(alt), Held::of(lock))),
                 Some(_) => n += 1,
@@ -419,7 +954,7 @@ impl RcloneDriver {
             let _ = self.delete(&part_path);
             e
         };
-        let source = src.to_string_lossy();
+        let source = local_arg(src).map_err(discard)?;
         // Straight to the partial name (already this push's own), so rclone leaves no partial of its own.
         self.ok(&format!("uploading {} to {part}", src.display()), &["copyto", "--ignore-times", "--inplace", "--", &source, &part]).map_err(discard)?;
         match self.hash(&part_path, None).map_err(discard)? {
@@ -494,23 +1029,46 @@ impl RcloneDriver {
 
 impl Driver for RcloneDriver {
     fn location(&self, path: &str) -> String {
+        if !path.starts_with('/') && is_drive_id(path) {
+            return format!("the file with Drive id {path} in {}", self.root);
+        }
         self.remote(path).unwrap_or_else(|_| path.to_string())
     }
 
     fn size(&self, path: &str, item: Option<&str>) -> Result<Option<u64>> {
-        Ok(self.stat(item.unwrap_or(path), false)?.map(|l| l.size as u64))
+        match self.resolve(item.unwrap_or(path))? {
+            Resolved::Path(p) => Ok(self.stat(&p, false)?.map(|l| l.size as u64)),
+            // Only in Drive's trash: not there (a pull still finds it by id).
+            Resolved::File(_, e) => Ok((!e.trashed).then_some(e.size)),
+            Resolved::Missing => Ok(None),
+        }
     }
 
     fn hash(&self, path: &str, item: Option<&str>) -> Result<Option<(String, u64)>> {
-        let path = item.unwrap_or(path);
-        let Some(l) = self.stat(path, true)? else { return Ok(None) };
-        let size = l.size as u64;
-        if let Some(sha) = l.hashes.get("sha256").filter(|h| h.len() == 64) {
-            return Ok(Some((sha.to_ascii_lowercase(), size)));
-        }
+        let (path, size) = match self.resolve(item.unwrap_or(path))? {
+            Resolved::Missing => return Ok(None),
+            // Only in Drive's trash: not there (a pull still finds it by id).
+            Resolved::File(_, e) if e.trashed => return Ok(None),
+            Resolved::File(id, e) => {
+                return match e.sha256 {
+                    Some(sha) => Ok(Some((sha, e.size))),
+                    // Drive keeps no SHA-256 of it (an old upload): downloaded by its id and
+                    // hashed, never read by a path other files may share.
+                    None => self.hash_by_id(&id).map(|sha| Some((sha, e.size))),
+                };
+            }
+            Resolved::Path(p) => {
+                let Some(l) = self.stat(&p, true)? else { return Ok(None) };
+                if let Some(sha) = l.hashes.get("sha256").filter(|h| h.len() == 64) {
+                    return Ok(Some((sha.to_ascii_lowercase(), l.size as u64)));
+                }
+                (p, l.size as u64)
+            }
+        };
         // The provider keeps no SHA-256 of this file: rclone reads it through.
-        let remote = self.remote(path)?;
-        let out = self.ok(&format!("hashing {remote}"), &["hashsum", "sha256", "--download", "--", &remote])?;
+        let remote = self.remote(&path)?;
+        let args = ["hashsum", "sha256", "--download", "--", remote.as_str()];
+        let out = self.ok(&format!("hashing {remote}"), &args)?;
         let text = String::from_utf8_lossy(&out.stdout);
         match text.split_whitespace().next().filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())) {
             Some(sha) => Ok(Some((sha.to_ascii_lowercase(), size))),
@@ -519,41 +1077,252 @@ impl Driver for RcloneDriver {
     }
 
     fn lock(&self, path: &str) -> Result<Held> {
-        self.remote(path)?;
-        Ok(Held::of(self.lock_remote(path)?))
+        let (path, _) = self.live_path(path)?;
+        Ok(Held::of(self.lock_remote(&path)?))
     }
 
     fn put(&self, path: &str, src: &Path, sha256: &str, replaces: Option<&str>) -> Result<(Option<String>, Held)> {
-        self.remote(path)?;
-        // The item is the path the bytes were put at, as for a local store.
-        let here = || (Some(path.to_string()), Held::default());
-        match self.hash(path, None)? {
-            Some((sha, _)) if sha == sha256 => Ok(here()),
-            None => self.place(path, src, sha256, None).map(|_| here()),
-            Some((sha, _)) if Some(sha.as_str()) == replaces => match self.place(path, src, sha256, replaces)? {
-                true => Ok(here()),
-                false => self.put_beside(path, src, sha256),
-            },
-            // Bytes something else may still name: kept, and these go next to them.
-            Some(_) => self.put_beside(path, src, sha256),
+        let (path, named) = self.live_path(path)?;
+        let (at, held) = self.put_at(&path, src, sha256, replaces, named.as_deref())?;
+        if !self.is_drive() {
+            return Ok((at, held));
+        }
+        let Some(at) = at else { return Ok((None, held)) };
+        // On Google Drive the item is the file's id, which stays with it through renames, moves and
+        // pushes. The id and the bytes come from one look, so a pointer never names a file of other
+        // bytes where two files share a name, as Drive allows.
+        let Some(l) = self.stat(&at, true)? else {
+            return Err(StoreError::other(format!("{}: placed, but nothing is there now", self.location(&at))));
+        };
+        if !is_drive_id(&l.id) {
+            return Err(StoreError::other(format!("{}: placed, but Drive gave no file id for it", self.location(&at))));
+        }
+        // The bytes are confirmed for the file the id names, never taken on trust: where Drive
+        // keeps no SHA-256 of it (an old upload), they are read through by that id.
+        let sha = match l.hashes.get("sha256").filter(|h| h.len() == 64) {
+            Some(sha) => sha.to_ascii_lowercase(),
+            None => self.hash_by_id(&l.id)?,
+        };
+        if sha != sha256 {
+            return Err(StoreError::other(format!("{}: placed, but the file of that name holds other bytes now; push it again", self.location(&at))));
+        }
+        self.remember(&l.id, &at, l.size as u64, &sha);
+        Ok((Some(l.id), held))
+    }
+
+    fn files(&self) -> Result<Option<Vec<(String, String)>>> {
+        let mut out: Vec<(String, String)> = match self.is_drive() {
+            // The listing this command already made of the store's live files: a drive's item is
+            // the file's id, which is what a pointer holds.
+            true => {
+                self.ensure_listed()?;
+                self.listing
+                    .borrow()
+                    .as_ref()
+                    .map_or_else(Vec::new, |l| l.by_id.iter().filter(|(_, e)| !e.trashed).map(|(id, e)| (id.clone(), e.path.clone())).collect())
+            }
+            // No hashes asked for: this says which files are there, not what is in them. A drive
+            // reached through an alias remote comes here too, so shortcuts and Google documents are
+            // skipped the same as above: neither is a file of the store's a pointer could name.
+            false => {
+                let listed = self.run(&[
+                    "lsjson",
+                    "-R",
+                    "--files-only",
+                    "--no-modtime",
+                    "--no-mimetype",
+                    "--drive-skip-shortcuts",
+                    "--drive-skip-gdocs",
+                    "--",
+                    &self.root,
+                ])?;
+                match listed.status.code() {
+                    // Addressed by path, so each file names itself.
+                    Some(0) => serde_json::from_slice::<Vec<Listed>>(&listed.stdout)
+                        .map_err(|e| StoreError::other(format!("listing {}: unexpected rclone output ({e})", self.root)))?
+                        .into_iter()
+                        .filter(|l| !l.is_dir && l.size >= 0)
+                        .map(|l| {
+                            let at = format!("/{}", l.path.trim_start_matches('/'));
+                            (at.clone(), at)
+                        })
+                        .collect(),
+                    // Nothing there is nothing to tell of.
+                    Some(3 | 4) => Vec::new(),
+                    _ => return Err(failure(&format!("listing {}", self.root), &listed)),
+                }
+            }
+        };
+        // textdb's own are not files a pointer should name: the store's trash and everything in it,
+        // and the partial copies a push writes beside a path.
+        out.retain(|(_, at)| {
+            let rel = at.trim_start_matches('/');
+            // That folder itself, not one whose name merely starts the same way: a folder somebody
+            // called `.textdb-trash-old` is theirs, and belongs in what the store is said to hold.
+            let in_trash = rel == TRASH || rel.strip_prefix(TRASH).is_some_and(|rest| rest.starts_with('/'));
+            !in_trash && !rel.rsplit('/').next().is_some_and(|name| name.starts_with('.') && name.ends_with(".tdbpart"))
+        });
+        out.sort();
+        out.dedup();
+        Ok(Some(out))
+    }
+
+    fn found(&self, item: &str) -> Result<Option<Found>> {
+        // Items that are paths are where they say; a drive knows where the file of an id is now.
+        if item.starts_with('/') || !is_drive_id(item) || !self.is_drive() {
+            return Ok(None);
+        }
+        // The store's live files, and its trash only when an id is not among them: one listing of
+        // each per command, however many assets ask after it.
+        let Some(e) = self.find_id(item)? else { return Ok(None) };
+        // Drive keeps two files of one name apart; which of them an item means cannot be said, so
+        // that is told of rather than guessed at.
+        let two = self
+            .listing
+            .borrow()
+            .as_ref()
+            .is_some_and(|l| l.by_id.values().filter(|other| !other.trashed && other.path == e.path).count() > 1);
+        Ok(Some(Found { path: e.path, sha256: e.sha256, size: e.size, trashed: e.trashed, two_of_a_name: two }))
+    }
+
+    fn move_to(&self, item: &str, to: &str) -> Result<Option<String>> {
+        // A store whose items are paths has nothing to move: the pointer's own path is its item.
+        if item.starts_with('/') || !self.is_drive() {
+            return Ok(None);
+        }
+        let dest = self.remote(to)?;
+        let (id, at) = match self.resolve(item)? {
+            // Purged from Drive's trash: nothing is left to move, and a push puts the bytes at the
+            // asset's own path again.
+            Resolved::Missing => return Ok(None),
+            // Never undone in the drive: a file someone sent to Drive's trash is told of, not
+            // restored, since rclone untrashes only a whole folder and a copy by id would be
+            // another file of another id with this one still trashed.
+            Resolved::File(id, e) if e.trashed => {
+                return Err(StoreError::invalid(format!(
+                    "its file (Drive id {id}, {}) is in Drive's trash: put it back in the drive, then sync again",
+                    self.remote(&e.path).unwrap_or_default()
+                )))
+            }
+            Resolved::File(id, e) => (id, e.path),
+            Resolved::Path(_) => return Ok(None),
+        };
+        if at == to {
+            return Ok(Some(id));
+        }
+        let from = self.remote(&at)?;
+        // Both names held, so no push puts bytes at either while the file is between them -- but one
+        // lock where the two names share it (a rename of letter case alone, since a lock ignores
+        // case), which would otherwise wait ten minutes on this very push.
+        let _held = self.lock_remote(&at)?;
+        let _held_to = match lock_name(&at) == lock_name(to) {
+            true => None,
+            false => Some(self.lock_remote(to)?),
+        };
+        self.refuse_two_of_a_name(&at)?;
+        // The file this move takes along is the one the pointer names, not another that took over
+        // its name in the drive.
+        match self.stat(&at, false)? {
+            Some(l) if l.id == id => {}
+            Some(l) => return Err(self.not_the_named(&at, &id, &l.id)),
+            None => return Err(StoreError::not_found(format!("{from} is not there any more: sync again"))),
+        }
+        // Bytes textdb did not put there are not this move's to write over.
+        if self.stat(to, false)?.is_some() {
+            return Err(StoreError::invalid(format!("{dest} is a file in the drive already: it is not for this move to replace")));
+        }
+        self.ok(&format!("moving {from} to {dest}"), &["moveto", "--", &from, &dest])?;
+        self.now_at(&id, to);
+        // The same file under its new name: Drive keeps the id through a move, which is what the
+        // links people made to it follow. Looked at again after a failure to look, as a push is, so
+        // a moment's trouble reaching the drive is not taken for a move that did not happen.
+        let mut found = self.stat(to, false);
+        for _ in 0..2 {
+            if found.is_err() {
+                std::thread::sleep(Duration::from_secs(1));
+                found = self.stat(to, false);
+            }
+        }
+        match found {
+            Ok(Some(l)) if l.id == id => Ok(Some(id)),
+            Ok(Some(l)) => Err(StoreError::other(format!("moving {from} to {dest}: the file there is another one (Drive id {})", l.id))),
+            Ok(None) => Err(StoreError::other(format!("moving {from} to {dest}: nothing is there afterwards"))),
+            // rclone reported the move done and the drive cannot be asked about it: it is rclone's
+            // to have made sure of, and the id is what the pointer names either way.
+            Err(_) => Ok(Some(id)),
         }
     }
 
-    /// `dest` is the caller's own partial name, so rclone downloads straight to it.
+    fn trash(&self, item: &str, sha256: &str) -> Result<bool> {
+        // A local or path-addressed store keeps no trash of the provider's own: its file stays.
+        if item.starts_with('/') || !self.is_drive() {
+            return Ok(false);
+        }
+        let (id, at) = match self.resolve(item)? {
+            // Purged, or someone in the drive put it there already: either way it is where a
+            // deleted pointer's file belongs.
+            Resolved::Missing => return Ok(true),
+            Resolved::File(_, e) if e.trashed => return Ok(true),
+            Resolved::File(id, e) => (id, e.path),
+            Resolved::Path(_) => return Ok(false),
+        };
+        let from = self.remote(&at)?;
+        let _held = self.lock_remote(&at)?;
+        self.refuse_two_of_a_name(&at)?;
+        // Trashed by its name, so that name must still hold the file the pointer named -- and the
+        // bytes it named. A push keeps a file's id through replacing its bytes, so the id alone says
+        // nothing of them: bytes someone put there in the drive since are theirs, and a deletion
+        // here is not what takes them away.
+        match self.hashed_id(&at)? {
+            Some((there, _)) if there != id => return Err(self.not_the_named(&at, &id, &there)),
+            Some((_, sha)) if sha != sha256 => {
+                return Err(StoreError::invalid(format!(
+                    "{from} holds bytes other than the ones its pointer named: someone replaced them in the drive, so pull them first and delete it again once they are here"
+                )))
+            }
+            Some(_) => {}
+            // The listing had the id at this name a moment ago: someone in the drive is moving it
+            // about, and where its bytes are now is for the next sync to find out.
+            None => return Err(StoreError::not_found(format!("{from} is not there any more: sync again"))),
+        }
+        // Drive's own trash, whatever a remote's own configuration would do: Drive keeps it for
+        // thirty days, and until then a pull by id still finds the bytes.
+        self.ok(&format!("sending {from} to Drive's trash"), &["--drive-use-trash=true", "deletefile", "--", &from])?;
+        // None of the store's live files now; the assets after it still need no new listing.
+        self.now_trashed(&id);
+        Ok(true)
+    }
+
+    /// `dest` is the caller's own partial name, so rclone downloads straight to it. On Google
+    /// Drive an item that is a file id is downloaded by that id, wherever under the store's root it
+    /// is now, in Drive's trash too.
     fn get(&self, path: &str, item: Option<&str>, dest: &Path) -> Result<()> {
         let at = item.unwrap_or(path);
-        let from = self.remote(at)?;
         if dest.exists() {
             return Err(StoreError::invalid(format!("{} exists already", dest.display())));
         }
-        // A folder there would be copied whole.
-        if self.stat(at, false)?.is_none() {
-            return Err(StoreError::not_found(format!("{from} is not a file in the asset store")));
-        }
+        let resolved = self.resolve(at)?;
+        let from = match &resolved {
+            Resolved::Path(p) => {
+                let from = self.remote(p)?;
+                // A folder there would be copied whole.
+                if self.stat(p, false)?.is_none() {
+                    return Err(StoreError::not_found(format!("{from} is not a file in the asset store")));
+                }
+                from
+            }
+            Resolved::File(id, e) => format!("{} (Drive id {id}{})", self.remote(&e.path)?, if e.trashed { ", in Drive's trash" } else { "" }),
+            Resolved::Missing => return Err(StoreError::not_found(format!("Drive id {at} names no file of the asset store {}", self.root))),
+        };
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| StoreError::other(format!("{}: {e}", parent.display())))?;
         }
-        let fetched = self.ok(&format!("downloading {from}"), &["copyto", "--ignore-times", "--inplace", "--", &from, &dest.to_string_lossy()]).map(|_| ());
+        let dest_text = local_arg(dest)?;
+        let fetched = match &resolved {
+            Resolved::File(id, _) => self.ok(&format!("downloading {from}"), &["--inplace", "backend", "copyid", "--", &self.backend_remote(), id, &dest_text]),
+            _ => self.ok(&format!("downloading {from}"), &["copyto", "--ignore-times", "--inplace", "--", &from, &dest_text]),
+        }
+        .map(|_| ());
         let fetched = fetched.and_then(|_| match dest.is_file() {
             true => Ok(()),
             false => Err(StoreError::other(format!("downloading {from}: not a file"))),
@@ -570,15 +1339,23 @@ mod tests {
     use super::*;
     use crate::assets::pointer::hash_file;
 
-    /// rclone for tests: `TEXTDB_RCLONE`, else `rclone` on the PATH. Without one the test is
-    /// skipped, unless `TEXTDB_REQUIRE_RCLONE` is set (as in CI).
+    /// rclone for tests: `TEXTDB_RCLONE` only, as CI sets it, never one found on the PATH. These
+    /// tests rewrite and rename files quickly, which security software on a person's own computer
+    /// may take for ransomware. Without it the test is skipped, unless `TEXTDB_REQUIRE_RCLONE` is set.
     fn test_rclone() -> Option<PathBuf> {
-        let exe = executable();
-        let runs = Command::new(&exe).arg("version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+        let exe = std::env::var_os("TEXTDB_RCLONE").filter(|e| !e.is_empty()).map(PathBuf::from);
+        let runs = exe.as_ref().is_some_and(|exe| Command::new(exe).arg("version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()));
         if !runs && std::env::var_os("TEXTDB_REQUIRE_RCLONE").is_some() {
-            panic!("TEXTDB_REQUIRE_RCLONE is set, but {} does not run", exe.display());
+            panic!("TEXTDB_REQUIRE_RCLONE is set, but TEXTDB_RCLONE does not name an rclone that runs");
         }
-        runs.then_some(exe)
+        exe.filter(|_| runs)
+    }
+
+    /// Give `d` the store listing `json` describes, as a command's first look at a drive would.
+    fn listed(d: &RcloneDriver, json: &serde_json::Value) {
+        let mut l = Listing::default();
+        l.add(&serde_json::to_vec(json).unwrap(), false).unwrap();
+        *d.listing.borrow_mut() = Some(l);
     }
 
     fn walk(dir: &Path) -> Vec<PathBuf> {
@@ -591,6 +1368,234 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn drive_listings_hold_the_files_of_the_store_and_nothing_that_only_looks_like_one() {
+        let sha = "AB".repeat(32);
+        let live = serde_json::json!([
+            { "Path": "img/a.png", "Name": "a.png", "Size": 3, "IsDir": false, "Hashes": { "sha256": sha }, "ID": "1AbCdEfGhIjKlMnOp" },
+            { "Path": "img", "Name": "img", "Size": -1, "IsDir": true, "ID": "1FolderIdAbCdEfG" },
+            { "Path": "doc.docx", "Name": "doc.docx", "Size": -1, "IsDir": false, "ID": "1-jYdDUUfEkVxOTBHpMz" },
+            { "Path": "shortcut", "Name": "shortcut", "Size": 3, "IsDir": false, "Hashes": { "sha256": sha }, "ID": "1AbCdEfGhIjKlMnOp\t18DE605eCvttHBN7y" },
+        ]);
+        let trashed = serde_json::json!([
+            { "Path": "old/b.png", "Name": "b.png", "Size": 5, "IsDir": false, "ID": "1TrashedIdAbCdEf" },
+            { "Path": "img/a.png", "Name": "a.png", "Size": 9, "IsDir": false, "ID": "1AbCdEfGhIjKlMnOp" },
+        ]);
+        let mut l = Listing::default();
+        l.add(&serde_json::to_vec(&live).unwrap(), false).unwrap();
+        l.add(&serde_json::to_vec(&trashed).unwrap(), true).unwrap();
+        assert_eq!(l.by_id.len(), 2, "no folder, Google document or shortcut: {:?}", l.by_id);
+        assert_eq!(l.by_id["1AbCdEfGhIjKlMnOp"], Entry { path: "/img/a.png".into(), size: 3, sha256: Some("ab".repeat(32)), trashed: false });
+        assert_eq!(l.by_id["1TrashedIdAbCdEf"], Entry { path: "/old/b.png".into(), size: 5, sha256: None, trashed: true });
+        assert!(Listing::default().add(b"not json", false).is_err());
+
+        assert!(is_drive_id("1-7rj9nEmLs5ziRcXEV-ueu_2lr_BjQK4") && is_drive_id("0ADEgOn1dRANgUk9PVA"));
+        for not in ["/img/a.png", "a\tb-cdefghijkl", "../../etc/passwd", "short", "gdrive:textdb-test"] {
+            assert!(!is_drive_id(not), "{not}");
+        }
+        assert_eq!(remote_name("gdrive:textdb"), "gdrive");
+        assert_eq!(remote_name(":drive,team_drive=0AB:textdb"), ":drive,team_drive=0AB");
+        assert_eq!(remote_name("/tmp/store"), "");
+        let remotes = "gdrive:     drive\nbucket:     s3\n";
+        assert_eq!(remote_type(remotes, "gdrive").as_deref(), Some("drive"));
+        assert_eq!(remote_type(remotes, "bucket").as_deref(), Some("s3"));
+        assert_eq!(remote_type(remotes, "nowhere"), None);
+    }
+
+    #[test]
+    fn a_push_keeps_the_listing_right_for_the_assets_after_it() {
+        let one = serde_json::json!([
+            { "Path": "img/a.png", "Name": "a.png", "Size": 3, "IsDir": false, "ID": "1OldIdAbCdEfGhI" },
+            { "Path": "img/b.png", "Name": "b.png", "Size": 4, "IsDir": false, "ID": "1OtherIdAbCdEfG" },
+        ]);
+        let d = RcloneDriver::new(PathBuf::from("rclone"), "gdrive:textdb".to_string());
+        listed(&d, &one);
+
+        // A push replaced the bytes in the file that was there: the same id, its new bytes, and
+        // every other file of the store as it was.
+        d.remember("1OldIdAbCdEfGhI", "/img/a.png", 9, &"cd".repeat(32));
+        let listing = d.listing.borrow();
+        let by_id = &listing.as_ref().unwrap().by_id;
+        assert_eq!(by_id["1OldIdAbCdEfGhI"], Entry { path: "/img/a.png".into(), size: 9, sha256: Some("cd".repeat(32)), trashed: false });
+        assert_eq!(by_id["1OtherIdAbCdEfG"], Entry { path: "/img/b.png".into(), size: 4, sha256: None, trashed: false });
+        drop(listing);
+
+        // A file of that name textdb did not place: what became of it is not guessed, and the next
+        // look lists the store again.
+        let two = serde_json::json!([
+            { "Path": "img/a.png", "Name": "a.png", "Size": 3, "IsDir": false, "ID": "1OldIdAbCdEfGhI" },
+            { "Path": "img/a.png", "Name": "a.png", "Size": 7, "IsDir": false, "ID": "1TwinIdAbCdEfGh" },
+        ]);
+        listed(&d, &two);
+        d.remember("1OldIdAbCdEfGhI", "/img/a.png", 9, &"cd".repeat(32));
+        assert!(d.listing.borrow().is_none(), "the listing was kept although another file held that name");
+    }
+
+    /// Two files of one name is Drive's own doing, not something rclone can be asked for, so the
+    /// refusal is tested on a listing that holds them; the gated test below asks a real drive for
+    /// them as well.
+    #[test]
+    fn a_path_the_drive_holds_two_files_of_is_refused_before_a_push_reads_anything() {
+        let d = RcloneDriver::new(PathBuf::from("rclone"), "gdrive:textdb".to_string());
+        listed(
+            &d,
+            &serde_json::json!([
+                { "Path": "img/a.png", "Name": "a.png", "Size": 3, "IsDir": false, "ID": "1OneIdAbCdEfGhIj" },
+                { "Path": "img/a.png", "Name": "a.png", "Size": 7, "IsDir": false, "ID": "1TwoIdAbCdEfGhIj" },
+                { "Path": "img/b.png", "Name": "b.png", "Size": 4, "IsDir": false, "ID": "1OtherIdAbCdEfGh" },
+            ]),
+        );
+        match d.refuse_two_of_a_name("/img/a.png") {
+            Err(e) => assert!(e.message.contains("two files of one name"), "{}", e.message),
+            Ok(()) => panic!("a push was let through to a path the drive holds two files of"),
+        }
+        // The one name the drive holds twice, not every name beside it.
+        d.refuse_two_of_a_name("/img/b.png").unwrap();
+        d.refuse_two_of_a_name("/img/none.png").unwrap();
+    }
+
+    /// A Google Drive folder called `textdb-test` to test against (`TEXTDB_TEST_GDRIVE`, such as
+    /// `gdrive:textdb-test`), and rclone; the test is skipped without one. Tests write only into a
+    /// new folder of their own in it, removed at the end.
+    fn test_gdrive() -> Option<(PathBuf, String)> {
+        let base = std::env::var("TEXTDB_TEST_GDRIVE").ok().filter(|b| !b.is_empty())?;
+        let base = base.trim_end_matches('/').to_string();
+        assert_eq!(base.rsplit(['/', ':']).next(), Some("textdb-test"), "TEXTDB_TEST_GDRIVE must name a folder called textdb-test, not {base}");
+        // The test builds `backend` arguments from the remote's name, which a connection string is
+        // not; the driver itself takes either.
+        assert!(
+            !base.starts_with(':') && !base.split(':').next().unwrap_or("").contains(','),
+            "TEXTDB_TEST_GDRIVE must name a configured remote (gdrive:textdb-test), not a connection string: {base}"
+        );
+        Some((test_rclone().expect("TEXTDB_TEST_GDRIVE is set, but rclone does not run"), base))
+    }
+
+    /// A folder on the remote, removed for good when dropped.
+    struct Purge(PathBuf, String);
+
+    impl Drop for Purge {
+        fn drop(&mut self) {
+            let _ = RcloneDriver::new(self.0.clone(), String::new()).command().args(["purge", "--drive-use-trash=false", &self.1]).output();
+        }
+    }
+
+    #[test]
+    fn google_drive_items_are_file_ids_found_after_renames_and_in_the_trash_and_only_inside_the_store() {
+        let Some((exe, base)) = test_gdrive() else { return };
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
+        let run_dir = format!("{base}/driver-{}-{nanos}", std::process::id());
+        let (root, outside) = (format!("{run_dir}/store"), format!("{run_dir}/outside"));
+        // rclone as the driver runs it: no flags from RCLONE_* variables, which could send these
+        // commands somewhere the driver does not go.
+        let rc = |args: &[&str]| {
+            let out = RcloneDriver::new(exe.clone(), base.clone()).command().args(args).output().unwrap();
+            assert!(out.status.success(), "rclone {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        assert!(RcloneDriver::new(exe.clone(), base.clone()).is_drive(), "TEXTDB_TEST_GDRIVE must be on a Google Drive remote");
+        let id_at = |path: &str| serde_json::from_str::<serde_json::Value>(&rc(&["lsjson", "--stat", path])).unwrap()["ID"].as_str().unwrap().to_string();
+        rc(&["mkdir", &root]);
+        let _purge = Purge(exe.clone(), run_dir.clone());
+        let tmp = std::env::temp_dir().join(format!("textdb-gdrive-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("a.png");
+        std::fs::write(&src, b"drive bytes").unwrap();
+        let sha = hash_file(&src).unwrap().0;
+
+        let d = RcloneDriver::new(exe.clone(), root.clone());
+        d.check().unwrap();
+        assert!(d.is_drive());
+        let id = d.put("/img/a.png", &src, &sha, None).unwrap().0.unwrap();
+        assert!(is_drive_id(&id), "the item is the file's Drive id: {id}");
+        assert_eq!(d.hash("/img/a.png", Some(&id)).unwrap(), Some((sha.clone(), 11)));
+
+        // A second push replaces the bytes in the same file, so its id and the drive's links to it
+        // stay, and the bytes it replaced are in the store's trash for pointers that name them.
+        std::fs::write(&src, b"drive bytes two").unwrap();
+        let sha2 = hash_file(&src).unwrap().0;
+        let again = d.put("/img/a.png", &src, &sha2, Some(&sha)).unwrap().0.unwrap();
+        assert_eq!(again, id, "a push gave the file a new id");
+        // Read from the store, not from what this driver remembered of its push.
+        let after = RcloneDriver::new(exe.clone(), root.clone());
+        after.check().unwrap();
+        assert_eq!(after.hash("/img/a.png", Some(&id)).unwrap(), Some((sha2.clone(), 15)));
+        let trashed = rc(&["lsjson", "-R", "--hash", "--hash-type", "SHA256", &format!("{root}/{TRASH}")]);
+        assert!(trashed.contains(&sha), "the replaced bytes are not in the store's trash: {trashed}");
+
+        // A push by the id a pointer holds (what every push after the first one is) replaces the
+        // bytes of that very file: the file it names is the one at the path, so it goes through.
+        std::fs::write(&src, b"drive bytes three").unwrap();
+        let sha3 = hash_file(&src).unwrap().0;
+        let by_id = RcloneDriver::new(exe.clone(), root.clone());
+        assert_eq!(by_id.put(&id, &src, &sha3, Some(&sha2)).unwrap().0.as_deref(), Some(id.as_str()), "a push by id gave the file a new id");
+
+        // Its file moved away in the drive and another of that name put in its place, holding the
+        // bytes this push means to replace: the push is refused rather than overwriting a file the
+        // pointer does not name. This driver listed the store before those two changes, as a push of
+        // many assets has, so the refusal cannot rest on the listing being fresh.
+        rc(&["moveto", &format!("{root}/img/a.png"), &format!("{root}/img/kept.png")]);
+        rc(&["copyto", &src.to_string_lossy(), &format!("{root}/img/a.png")]);
+        std::fs::write(&src, b"drive bytes four").unwrap();
+        let sha4 = hash_file(&src).unwrap().0;
+        match by_id.put(&id, &src, &sha4, Some(&sha3)) {
+            Err(e) => assert!(e.message.contains("is not the one at"), "{}", e.message),
+            Ok(_) => panic!("a push replaced a file the pointer does not name"),
+        }
+        // The file the pointer names, back at its name, holding what the push by id left.
+        rc(&["deletefile", &format!("{root}/img/a.png")]);
+        rc(&["moveto", &format!("{root}/img/kept.png"), &format!("{root}/img/a.png")]);
+        let back = RcloneDriver::new(exe.clone(), root.clone());
+        assert_eq!(back.hash("/img/a.png", Some(&id)).unwrap(), Some((sha3.clone(), 17)));
+
+        // Renamed and moved in the drive: found by its id (a new command lists the store afresh).
+        rc(&["moveto", &format!("{root}/img/a.png"), &format!("{root}/elsewhere/renamed.png")]);
+        let d = RcloneDriver::new(exe.clone(), root.clone());
+        assert_eq!(d.size("/img/a.png", Some(&id)).unwrap(), Some(17));
+        d.get("/img/a.png", Some(&id), &tmp.join("moved.png")).unwrap();
+        assert_eq!(std::fs::read(tmp.join("moved.png")).unwrap(), b"drive bytes three");
+
+        // In Drive's trash: still fetched by id, but a push onto it is refused rather than written elsewhere.
+        rc(&["deletefile", &format!("{root}/elsewhere/renamed.png")]);
+        let d = RcloneDriver::new(exe.clone(), root.clone());
+        assert_eq!(d.size("/img/a.png", Some(&id)).unwrap(), None, "a file only in Drive's trash is not there");
+        d.get("/img/a.png", Some(&id), &tmp.join("trashed.png")).unwrap();
+        assert_eq!(std::fs::read(tmp.join("trashed.png")).unwrap(), b"drive bytes three");
+        match d.lock(&id) {
+            Err(e) => assert!(e.message.contains("trash"), "{}", e.message),
+            Ok(_) => panic!("a push onto a file in Drive's trash was let through"),
+        }
+
+        // A file outside the store is never read, whatever its id; nor is an item that is no id.
+        rc(&["copyto", &src.to_string_lossy(), &format!("{outside}/x.png")]);
+        let outside_id = id_at(&format!("{outside}/x.png"));
+        let d = RcloneDriver::new(exe.clone(), root.clone());
+        assert!(d.get("/x.png", Some(&outside_id), &tmp.join("outside.png")).is_err());
+        assert!(!tmp.join("outside.png").exists());
+        assert_eq!(d.hash("/x.png", Some(&outside_id)).unwrap(), None);
+        assert!(d.get("/x.png", Some("../outside/x.png"), &tmp.join("up.png")).is_err());
+
+        // Nor anything through a shortcut under the root to a folder outside it.
+        let inside_remote = |p: &str| p.split_once(':').map_or(p, |(_, rest)| rest).to_string();
+        rc(&["backend", "shortcut", &format!("{}:", remote_name(&base)), &inside_remote(&outside), &format!("{}/short", inside_remote(&root))]);
+        let d = RcloneDriver::new(exe.clone(), root.clone());
+        d.check().unwrap();
+        assert!(!matches!(d.hash("/short/x.png", None), Ok(Some(_))), "hashed through a shortcut");
+        assert!(d.get("/short/x.png", None, &tmp.join("short.png")).is_err());
+        assert!(!tmp.join("short.png").exists());
+
+        // A path the drive holds two files of is not tested here: Drive allows two, but rclone will
+        // not make them. Asked three ways against a real drive -- a copy by id into the folder that
+        // already holds the name, and a copy to a folder of its own then a move by id in beside the
+        // first, naming the folder and naming the file -- it ends with one file every time, because
+        // an identical file at the destination makes rclone skip the transfer and delete what it
+        // moved, and other bytes there it overwrites. One run did leave two, from a listing of a
+        // folder it had just written itself: a race, not something a test can ask for. The refusal
+        // is tested on a listing that holds one name twice instead, in the unit test
+        // `a_path_the_drive_holds_two_files_of_is_refused_before_a_push_reads_anything`, which CI
+        // runs; two made by hand in Drive's own pages are what would try it on a drive.
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

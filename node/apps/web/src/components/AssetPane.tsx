@@ -235,6 +235,15 @@ export function AssetPane({ pointer, link, hub, author, onAction, onOpenFolder, 
             {item && <span className="mono">{item.type}</span>}
             {item?.size !== undefined && <span>{formatBytes(item.size)}</span>}
             {item?.store && <span className="muted" title="The asset store its bytes are kept in">{item.store}</span>}
+            {/* Where the file sits in the store when that is not where the asset is: what tells
+                someone whose asset moved, or whose file somebody moved in the store, which of the
+                two happened -- and the states that ask for `textdb assets relocate` say to move it
+                from here. */}
+            {item?.in_store && (
+              <span className="muted mono" title="Where its file is in the asset store, which is not where the asset is">
+                in store: {item.in_store}
+              </span>
+            )}
           </span>
         </div>
         <div className="doc-actions">
