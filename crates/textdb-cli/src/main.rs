@@ -27,6 +27,7 @@ type Result<T> = std::result::Result<T, StoreError>;
 
 mod assets;
 mod basecache;
+mod proto;
 mod git;
 mod links;
 mod lock;

@@ -1,6 +1,6 @@
 # ADR 0008 — Split the CLI into a local client and a remote store, wire-optimal at the seam
 
-Status: accepted; steps 1 and 2 implemented, steps 3–5 planned
+Status: accepted; steps 1–3 implemented (step 3 without a carrier), steps 4–5 planned
 
 ## Context
 
@@ -127,6 +127,30 @@ Batch and the chunk have-and-put exchange move to step 3: a batch is a message-l
 and belongs with the `Request` enum, and the chunk exchange is the first piece of the replica.
 Restore-then-apply for a re-created file stays open.
 
+### 1c. Step 3: the seam as messages, with no wire yet
+
+`crates/textdb-cli/src/proto.rs` is the message layer. Every `Store` method is a `Request`
+variant with owned fields and a `Response` variant; a `Reply` is a response or a `StoreError`,
+so a conflict crosses with its `TX001` code and detail intact. A `Codec` turns messages into
+bytes and back (JSON first); a `Transport` carries them, with `call` and a `call_many` that
+sends a `Batch` request answered reply by reply. `RemoteStore` is the `Store` on the near
+side of a transport, and `dispatch` the far side: one request applied to a real store.
+
+`Loopback` is the transport with no network: encode, decode, dispatch to a store in this
+process, encode the reply, decode it. `TEXTDB_TEST_LOOPBACK=1` puts it under whatever store
+the CLI opens, and the whole CLI test suite runs through it unchanged on both engines. That is
+the proof the seam needed: every row type has been through the codec and back, sync and the
+counter above the trait cannot tell the difference, and the numbers of steps 1 and 2 hold.
+
+Two things the messages settle for the carriers to come. A sync base crosses as
+`SyncBaseWire`, every field including the three its report form skips. An `import` is cut
+into batches by the client, each one a message answered with its stats and its per-file
+errors, so progress is reported from the replies. `wait` is a request with a timeout, which
+a carrier will turn into a long poll or a stream.
+
+The batch message exists and is tested; nothing above the trait sends one yet. The chunk
+have-and-put exchange is not started.
+
 ### 2. The seam is the `Store` trait, defined as messages and streams, never as a wire
 
 Two seams exist in the code. The **operation seam** is the `Store` trait, already implemented
@@ -163,9 +187,10 @@ To be carrier-agnostic:
 1. **Done:** base cache, hunks down, ranges up, wire counter.
 2. **Done:** the vault-sized terms (§1b): base rows kept in the checkout, heads as a delta,
    the base saved as a delta, a rebased push applied to disk at once.
-3. `textdb-proto`: the message types, codecs and `Transport`, with the loopback transport
-   running the whole test suite; batch as a first-class message; chunk have-and-put for the
-   no-cache fallback.
+3. **Done** as a module of the CLI crate (§1c): the message types, the JSON codec, `Transport`
+   with batch, the loopback running the whole suite. Left: sync sending its plan as a batch,
+   the chunk have-and-put exchange, and the split into a `textdb-proto` crate, which waits
+   for the gateway binary that will share it.
 4. First carrier: HTTPS. WebSocket and Flight as later `Transport` implementations.
 5. Gateway deployment and the asset-store delegation endpoint on the same service.
 

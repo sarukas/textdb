@@ -12,7 +12,7 @@ use crate::config::{parse_store, StoreUrl};
 
 /// An error in the store's own terms: the `TX00n` code the bindings use, a message, and for a
 /// conflict the payload with the current text of the contested lines.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StoreError {
     pub code: String,
     pub message: String,
@@ -98,7 +98,7 @@ impl From<std::io::Error> for StoreError {
 /// Every key is always present: a value that does not apply is `null`, never omitted. The
 /// old shape skipped `nwords`, `versions`, `authors` and others when absent, which left a
 /// consumer unable to tell "not applicable" from "this build does not have it".
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Entry {
     // The minimal tier: what every surface carries, whatever the command or format.
     pub path: String,
@@ -170,7 +170,7 @@ pub struct Author {
 }
 
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 /// One version of a file, in the order the `commits` view and `textdb_history` use — one
 /// order on both engines and in every SDK. `SELECT *` consumed positionally used to swap
 /// `nbytes` and `kind` between them.
@@ -191,7 +191,7 @@ pub struct Commit {
 }
 
 /// A rename, move or delete as it touched one file or folder.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PathEvent {
     pub id: i64,
     pub ts: String,
@@ -211,7 +211,7 @@ pub struct PathEvent {
 ///
 /// One row per matching *line* on every surface. `search` used to return one row per document
 /// with a best-guess line on three of the four surfaces that carried the same column name.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hit {
     pub path: String,
     /// The version the line number belongs to — what `--base-version` takes. Without it a
@@ -233,7 +233,7 @@ pub struct Hit {
 }
 
 /// One document a search matched, for the paths-only and count modes.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileHit {
     pub path: String,
     pub version: i64,
@@ -241,7 +241,7 @@ pub struct FileHit {
 }
 
 /// A link that pointed at what a move took elsewhere and no longer reaches it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MovedLink {
     /// The file the link is written in.
     pub path: String,
@@ -260,7 +260,7 @@ pub struct MovedLink {
 }
 
 /// A link as `links` and `backlinks` list it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkRow {
     /// The file the link is written in.
     pub path: String,
@@ -298,7 +298,7 @@ pub fn asset_link(mut l: LinkRow) -> LinkRow {
 
 /// Lines `from..=to` (1-based) as numbered in the base version become `text`; `to = from - 1`
 /// inserts before `from`. Several make one commit (`replace-lines --stdin-json`, `meta`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LineRange {
     pub from: i64,
     pub to: i64,
@@ -358,7 +358,7 @@ pub fn splice_lines(content: &[u8], ranges: &[LineRange]) -> Result<Vec<u8>> {
 }
 
 /// Lines `old_from..old_from + old_count` (1-based) became `new_from..new_from + new_count`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Hunk {
     pub old_from: i64,
     pub old_count: i64,
@@ -368,7 +368,7 @@ pub struct Hunk {
     pub new_text: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Chunk {
     pub ord: i64,
     pub hash: String,
@@ -378,7 +378,7 @@ pub struct Chunk {
     pub nlines: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Change {
     pub seq: i64,
     pub ts: String,
@@ -401,7 +401,7 @@ pub struct Written {
 }
 
 /// What one SQL statement returned.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SqlResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
@@ -416,7 +416,7 @@ pub struct SqlResult {
 
 /// One change a statement made: a file's content (`create`, `edit`: versions and a unified
 /// diff), a `move`, `delete` or `mkdir`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BatchChange {
     pub op: String,
     pub path: String,
@@ -431,7 +431,7 @@ pub struct BatchChange {
 }
 
 /// What `revert-batch` did, or with `dry_run` would do.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RevertOutcome {
     pub batch: String,
     pub dry_run: bool,
@@ -444,20 +444,20 @@ pub struct RevertOutcome {
     pub skipped: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RestoredFile {
     pub path: String,
     pub version: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MovedBack {
     pub from: String,
     pub to: String,
 }
 
 /// A live file's current version, as `sync` compares it with the sync base.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileHead {
     pub path: String,
     pub version: i64,
@@ -468,7 +468,7 @@ pub struct FileHead {
 /// recorded, answered by the store over the rows it holds (ADR 0008, step 2): the files whose
 /// version is not the row's, or that have no row, and the rows whose file is gone. A sync
 /// rebuilds the full listing from its rows and this, so the listing never crosses the seam.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct HeadsDelta {
     pub changed: Vec<FileHead>,
     pub gone: Vec<String>,
@@ -494,7 +494,7 @@ pub fn heads_delta(prefix: &str, rows: &[BaseFile], heads: Vec<FileHead>) -> Hea
 }
 
 /// The git checkout a directory was in when it was synced.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitState {
     pub commit: Option<String>,
     pub branch: Option<String>,
@@ -505,7 +505,7 @@ pub struct GitState {
 }
 
 /// What a store folder and a directory held when `sync` last reconciled them.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncBase {
     pub prefix: String,
     pub dir: String,
@@ -547,7 +547,7 @@ pub struct BaseFile {
     pub conflict: bool,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ImportStats {
     pub files: usize,
     pub created: usize,
@@ -559,7 +559,7 @@ pub struct ImportStats {
 
 /// A textdb store. Paths are `/folder/file.md`; versions are per file and consecutive.
 /// A property name in use across the store.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct PropKey {
     pub key: String,
     pub docs: i64,
@@ -569,14 +569,14 @@ pub struct PropKey {
 }
 
 /// One value a property takes.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct PropValue {
     pub value: Option<String>,
     pub docs: i64,
 }
 
 /// A document a property query matched.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct PropHit {
     pub path: String,
     pub nbytes: i64,
@@ -586,7 +586,7 @@ pub struct PropHit {
 }
 
 /// One heading, with its document's own figures alongside.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct OutlineRow {
     pub path: String,
     /// The last component, as written.
@@ -608,7 +608,7 @@ pub struct OutlineRow {
 }
 
 /// A distinct heading in use, for autosuggest.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct HeadingName {
     pub heading: String,
     pub sections: i64,
@@ -620,7 +620,7 @@ pub struct HeadingName {
 
 /// One share as a caller sees it listed: the account's own name for it, the rights, and — only
 /// for the admin — where it actually is in the store.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ShareRow {
     pub account: String,
     pub alias: String,
@@ -636,7 +636,7 @@ pub struct ShareRow {
 }
 
 /// One item in the trash: what it was, and the delete it went with.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrashRow {
     pub id: i64,
     pub name: String,
@@ -660,7 +660,7 @@ pub struct TrashRow {
 }
 
 /// Who this connection is.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Whoami {
     /// `None` for the owner, who opened the store without a token.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -673,7 +673,7 @@ pub struct Whoami {
     pub shares: Vec<ShareRow>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AccountRow {
     pub name: String,
     pub kind: String,
@@ -685,7 +685,7 @@ pub struct AccountRow {
     pub shares: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TokenRow {
     pub id: i64,
     pub account: String,
@@ -705,7 +705,7 @@ pub struct TokenRow {
 /// How many pointers name one location in an asset store, counted over every pointer the store
 /// holds rather than the caller's view. Counts, and nothing else: which asset names those bytes,
 /// and where it is, stay inside the binding that looked.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ItemUsers {
     /// Pointers other than the asset's own that name the location.
     pub others: usize,
@@ -714,7 +714,7 @@ pub struct ItemUsers {
 }
 
 /// Which places in an asset store some pointer names, and how many pointers could not be read.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ItemsNamed {
     /// One answer per location asked about, in the order they were given.
     pub named: Vec<bool>,
@@ -1031,6 +1031,12 @@ pub fn open(store: &str) -> Result<Box<dyn Store>> {
     let opened: Box<dyn Store> = match parse_store(store) {
         StoreUrl::Sqlite(path) => Box::new(sqlite::SqliteStore::open(&path)?),
         StoreUrl::Postgres(url) => Box::new(pg::PgStore::connect(&url)?),
+    };
+    // `TEXTDB_TEST_LOOPBACK=1`: every call goes through the message layer and its codec and
+    // back (ADR 0008, step 3), so a test run proves the seam without a wire.
+    let opened: Box<dyn Store> = match std::env::var("TEXTDB_TEST_LOOPBACK") {
+        Ok(on) if !on.is_empty() && on != "0" => Box::new(crate::proto::RemoteStore::connect(crate::proto::Loopback::new(opened, crate::proto::Json))?),
+        _ => opened,
     };
     // `TEXTDB_WIRE_STATS=<path>|-`: count what crosses the seam (ADR 0008), written on exit.
     Ok(match std::env::var("TEXTDB_WIRE_STATS") {
